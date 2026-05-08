@@ -745,11 +745,17 @@ def _call_gemini(system_prompt: str, user_message: str, timeout_s: int = 12) -> 
         "systemInstruction": {
             "parts": [{"text": system_prompt}]
         },
-        "generationConfig": {
+"generationConfig": {
             "temperature": 0.7,        # warm but not wild — we want consistent voice
-            "maxOutputTokens": 240,    # 2-4 sentences fits easily under this cap
+            "maxOutputTokens": 800,    # generous headroom; the actual paragraph is short
             "topP": 0.95,
             "candidateCount": 1,
+            # Gemini 2.5 family models think internally before producing
+            # output, and the thinking counts against maxOutputTokens. For
+            # a 2-4 sentence paragraph, we don't need deep reasoning —
+            # disable thinking so the entire token budget goes to the
+            # actual output. (Older models ignore this field; safe to send.)
+            "thinkingConfig": {"thinkingBudget": 0},
         },
         # Gemini's default safety filters are fine for our use case — we're
         # not asking for anything edgy. If they ever block legitimate weather
