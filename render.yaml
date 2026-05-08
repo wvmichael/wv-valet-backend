@@ -1,0 +1,47 @@
+# WeatherValet · Render deployment config
+# ========================================
+# This file lets Render auto-configure the service. After you connect
+# your GitHub repo in the Render dashboard, Render reads this file and
+# sets up the service automatically.
+#
+# What this configures:
+#   - A free-tier web service running app.py via gunicorn
+#   - The build command (install dependencies)
+#   - The start command (run the Flask app on the port Render provides)
+#   - Health check at /
+#
+# What you still need to set manually in the Render dashboard:
+#   - Environment variables (GEMINI_API_KEY, WV_ALLOWED_ORIGINS, etc.)
+#     Render won't read these from .env.example — that's intentional;
+#     real keys never live in the repo.
+#
+# Free tier note: Render's free tier sleeps the service after 15 min of
+# inactivity. First request after sleep takes ~30 sec to wake up. For
+# prototype testing this is fine. When traffic justifies it, upgrade
+# to the $7/month tier (no sleep).
+
+services:
+  - type: web
+    name: wv-valet-backend
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 30 --workers 2
+    healthCheckPath: /
+    envVars:
+      # These are placeholders — set the real values in the Render dashboard
+      # under Environment → Add Environment Variable
+      - key: PYTHON_VERSION
+        value: "3.11"
+      - key: GEMINI_MODEL
+        value: gemini-1.5-flash-latest
+      # Sensitive values (set these manually in dashboard, not in this file):
+      #   GEMINI_API_KEY
+      #   STRIPE_SECRET_KEY
+      #   STRIPE_WEBHOOK_SECRET
+      #   TWILIO_ACCOUNT_SID
+      #   TWILIO_AUTH_TOKEN
+      #   TWILIO_FROM_NUMBER
+      #   METEOROLOGIST_PHONE
+      #   WV_ADMIN_PASS
+      #   WV_ALLOWED_ORIGINS
