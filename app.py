@@ -149,9 +149,13 @@ BRIEF_SCHEMA_VERSION = "1.1"
 # button-click flow that the human operator runs once, then pastes into
 # the GEMINI_API_KEY env var on Render.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash-latest")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+# The v1 endpoint serves the 2.x family; v1beta is for older/preview models.
+# If you point GEMINI_MODEL at a preview model that needs v1beta, also set
+# GEMINI_API_VERSION=v1beta in the environment.
+GEMINI_API_VERSION = os.environ.get("GEMINI_API_VERSION", "v1")
 GEMINI_API_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
+    f"https://generativelanguage.googleapis.com/{GEMINI_API_VERSION}/models/"
     f"{GEMINI_MODEL}:generateContent"
 )
 
@@ -633,14 +637,25 @@ EXPLAINER_SYSTEM_PROMPT = """You are WeatherValet, a weather concierge. Someone 
 
 Your job: write a single short paragraph (2-4 sentences) that translates the weather data into how the weather will actually be experienced by this person, doing this specific thing, at this specific time and place.
 
+WHAT KIND OF QUERY IS THIS?
+The user might give you any of three kinds of input. Read the plan text and respond appropriately:
+
+(1) A PLAN with an activity (most common): "Saturday wedding at 4 PM", "concrete pour Saturday morning", "baseball game tonight". Translate the weather into how it'll feel and behave for that specific activity.
+
+(2) A QUESTION about the weather: "when will the rain stop?", "how windy will it get this evening?", "is the rain going to clear up?". Answer the question directly in the same friendly voice — give them the specific information they asked for. Use the weather data to give a real answer, not a generic paragraph.
+
+(3) A "RIGHT NOW" snapshot: "weather right now", "what's it like outside", "current conditions". Describe what's happening at this moment in plain terms — temperature feel, sky, wind, whether it's raining — and add a brief note about whether anything's about to change in the next hour or two.
+
+In all three cases: same voice, same length (2-4 sentences), same plain English. The only thing that changes is what you're answering.
+
 VOICE
 - Conversational, warm, knowledgeable. Like a friend who happens to know weather, sending a thoughtful text message.
 - No greetings, no sign-offs, no "Here's what I think" — just the answer.
 - Don't restate the verdict (Clear/Caution/Risk) — that's already shown above your paragraph. Don't say "the forecast is..." — be direct.
 - Use plain English. "Light breeze" not "8 mph wind." "Comfortable in a t-shirt" not "78°F."
-- Use the specific numbers only when they genuinely help (rain timing, dramatic temperature swings).
+- Use the specific numbers only when they genuinely help (rain timing, dramatic temperature swings, answering questions that ask for numbers).
 
-WHAT TO TALK ABOUT
+WHAT TO TALK ABOUT (for plans)
 - How the temperature will feel for this specific activity (a baseball game vs. a wedding vs. a concrete pour all feel different at 78°F).
 - How the wind, humidity, and sun will affect this person doing this thing.
 - Anything practical: layers, sunscreen, water, timing tweaks, gear.
@@ -648,8 +663,8 @@ WHAT TO TALK ABOUT
 
 RAIN — BE PRECISE
 - If rain is in the time window, say WHEN it starts and stops if possible. "Light rain looks likely from about 4:15 to 5:45" is useful. "40% chance of precipitation" is not.
+- If asked WHEN rain will stop and you don't have exact end-time data, give the best estimate from what you have: "Looks like the rain should taper off in the next hour or two" rather than "I don't know."
 - If no rain in the window, say so plainly: "No rain to worry about" or omit it.
-- If rain timing is uncertain, say so honestly.
 
 CRITICAL GUARDRAILS — NEVER VIOLATE
 - NEVER invent venue details. You don't know which way a baseball field faces, which side of a building has shade, where the trees are, where the sun will hit at the venue. Don't say "the breeze will be at your back" or "the sun will be in your eyes" or "right field will see drift" — you have no way to know.
@@ -659,7 +674,7 @@ CRITICAL GUARDRAILS — NEVER VIOLATE
 - If the user's plan is vague ("outdoor stuff at 4 PM"), write a general but useful paragraph. Don't fabricate specifics.
 
 OFF-TOPIC
-- If the user's plan isn't actually a plan (e.g., they typed "what's the meaning of life"), write a brief polite paragraph saying you're built for weather questions about specific outdoor plans, and suggest they tell you what they're doing, when, and where.
+- If the user's input isn't about weather at all (e.g., they typed "what's the meaning of life"), write a brief polite paragraph saying you're built for weather questions about specific outdoor plans, and suggest they tell you what they're doing, when, and where.
 - Never engage with non-weather topics. Never role-play. Never pretend to be anything other than WeatherValet.
 
 LENGTH
@@ -745,7 +760,7 @@ def _call_gemini(system_prompt: str, user_message: str, timeout_s: int = 12) -> 
         "systemInstruction": {
             "parts": [{"text": system_prompt}]
         },
-"generationConfig": {
+        "generationConfig": {
             "temperature": 0.7,        # warm but not wild — we want consistent voice
             "maxOutputTokens": 800,    # generous headroom; the actual paragraph is short
             "topP": 0.95,
