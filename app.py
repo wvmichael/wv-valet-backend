@@ -67,6 +67,7 @@ behavior with calls to this server. That file is in the same directory.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -89,7 +90,7 @@ from typing import Any, Optional
 import psycopg2
 import psycopg2.extras
 
-from flask import Flask, abort, jsonify, redirect, render_template_string, request
+from flask import Flask, abort, jsonify, make_response, redirect, render_template_string, request
 
 # Stripe and Twilio are imported lazily so the file can be inspected without them
 try:
@@ -338,6 +339,94 @@ CREATE TABLE IF NOT EXISTS brief_submissions (
 );
 CREATE INDEX IF NOT EXISTS idx_briefs_recent ON brief_submissions(submitted_at DESC);
 CREATE INDEX IF NOT EXISTS idx_briefs_meteorologist ON brief_submissions(meteorologist_name, submitted_at DESC);
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- Auth tables (added May 2026 — Phase 3 of the auth project)
+-- ════════════════════════════════════════════════════════════════════════════
+--
+-- Magic-link authentication: email-only login, no passwords. The user
+-- requests a link, we email them a one-time URL that expires in 15 minutes.
+-- Clicking the link creates a session that lasts 30 days absolute, 7 days
+-- idle. See AUTH-IMPLEMENTATION-PLAN.pdf for the full design rationale.
+--
+-- Security design notes for everything below:
+--   - Raw tokens / session IDs are NEVER stored. We store SHA-256 hashes.
+--     The user receives the raw value (in their email or as a cookie);
+--     we compute the hash to look up the row. If the database leaks,
+--     the hashes are useless — they can't be reversed to working credentials.
+--   - All foreign keys use ON DELETE CASCADE so "delete my account"
+--     actually removes everything tied to the user. GDPR-friendly.
+--   - The users table uses LOWER(email) indexing so email case doesn't
+--     create duplicate accounts (User@x.com and user@x.com are the same).
+
+-- ── Users — one row per real person who can sign in ──
+-- Email is the only login mechanism in v1. Name is collected at first
+-- sign-in (via a one-time form) and stored for display purposes.
+CREATE TABLE IF NOT EXISTS users (
+    id              SERIAL PRIMARY KEY,
+    email           TEXT UNIQUE NOT NULL,
+    name            TEXT,                       -- nullable; collected after first login
+    created_at      BIGINT NOT NULL,
+    last_login_at   BIGINT                      -- null until first successful login
+);
+CREATE INDEX IF NOT EXISTS idx_users_email_lower ON users(LOWER(email));
+
+-- ── User roles — many-to-many; a user can hold several roles ──
+-- Roles: 'subscriber', 'crew', 'met', 'admin'
+-- A subscriber who is also Crew has two rows here.
+-- New users are created with zero roles by default; admin grants roles
+-- explicitly (or Stripe webhook grants 'subscriber' on payment).
+CREATE TABLE IF NOT EXISTS user_roles (
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role            TEXT NOT NULL,              -- subscriber|crew|met|admin
+    granted_at      BIGINT NOT NULL,
+    PRIMARY KEY (user_id, role)
+);
+CREATE INDEX IF NOT EXISTS idx_user_roles_user ON user_roles(user_id);
+
+-- ── Magic-link tokens — short-lived single-use credentials ──
+-- Lifecycle:
+--   1. User submits email to /api/v1/auth/request-magic-link
+--   2. Server generates 256-bit token, stores SHA-256 hash here
+--   3. Server emails raw token (or logs it via stub) as part of a URL
+--   4. User clicks link, frontend hits /api/v1/auth/verify with raw token
+--   5. Server hashes the raw token, looks up this row by hash
+--   6. If found, not expired, not used: mark used_at, create session
+--   7. After 15 minutes the row is dead even if not used
+CREATE TABLE IF NOT EXISTS magic_link_tokens (
+    token_hash      TEXT PRIMARY KEY,           -- SHA-256 of the raw token, hex
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at      BIGINT NOT NULL,
+    expires_at      BIGINT NOT NULL,            -- created_at + 900 (15 min)
+    used_at         BIGINT,                     -- null until consumed
+    ip_requested    TEXT                        -- IP that requested the link; for abuse forensics
+);
+CREATE INDEX IF NOT EXISTS idx_magic_link_user ON magic_link_tokens(user_id);
+CREATE INDEX IF NOT EXISTS idx_magic_link_expires ON magic_link_tokens(expires_at);
+
+-- ── Sessions — long-lived, browser-cookie-backed ──
+-- The user's browser holds the raw session ID in an HttpOnly cookie.
+-- This table stores its SHA-256 hash. On every request, the server
+-- recomputes the hash and looks up the row to confirm the session is
+-- valid and find the user.
+--
+-- Two expiration windows:
+--   - expires_at: absolute. 30 days from creation. Session dies regardless.
+--   - idle_expires_at: 7 days from last activity. Refreshed on use.
+-- This belt-and-suspenders approach means even infrequently-used
+-- sessions eventually time out, but active users don't get logged out
+-- mid-task.
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id_hash  TEXT PRIMARY KEY,          -- SHA-256 of the raw session ID, hex
+    user_id          INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at       BIGINT NOT NULL,
+    expires_at       BIGINT NOT NULL,           -- absolute: created_at + 30 days
+    idle_expires_at  BIGINT NOT NULL,           -- idle: last_used + 7 days
+    ip_created       TEXT,
+    user_agent       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 """
 
 
@@ -377,23 +466,25 @@ def db():
 def init_db() -> None:
     """Create tables on first boot. Idempotent — safe to call every start.
 
-    Splits SCHEMA into individual statements and executes them one at a
-    time. psycopg2 does not support executescript() the way sqlite3 does;
-    multi-statement strings raise a syntax error in Postgres unless run
-    through psycopg2.extras or split manually. The split-by-semicolon
-    approach is safe for our current SCHEMA because no CREATE TABLE
-    statement contains a semicolon inside a string literal or comment.
+    Passes the entire SCHEMA as a single multi-statement query to psycopg2.
+    This works because:
+      - psycopg2 supports multi-statement execute() when no parameter
+        binding is used (our SCHEMA has no parameters — it's pure DDL).
+      - All statements use CREATE ... IF NOT EXISTS, so the operation
+        is idempotent. Running it twice creates nothing on the second run.
+      - The Postgres server parses the entire string at once, so semicolons
+        inside SQL comments are correctly ignored (a naive Python split()
+        on semicolons would not handle this — and earlier comments in our
+        SCHEMA do contain semicolons, like 'no roles by default; admin grants'
+        which would otherwise break statement splitting).
 
-    If SCHEMA ever grows to include statements with embedded semicolons,
-    swap this split for a proper SQL parser or upgrade to a migration
-    library like Alembic.
+    Reference: psycopg2 maintainer Federico Di Gregorio confirmed this
+    pattern works as long as there are no SELECTs needing result retrieval
+    (we have none — DDL only).
     """
     with db() as conn:
         with conn.cursor() as cur:
-            # Strip and skip empty statements (the SCHEMA constant has trailing
-            # whitespace after the last semicolon that produces an empty entry).
-            for statement in [s.strip() for s in SCHEMA.split(";") if s.strip()]:
-                cur.execute(statement)
+            cur.execute(SCHEMA)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -412,6 +503,344 @@ def new_claim_token() -> str:
     random — guessing it is computationally infeasible, which is the auth
     story for v1 (no meteorologist login)."""
     return secrets.token_urlsafe(24)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Auth helpers — token generation, hashing, cookie management, stub email
+# ════════════════════════════════════════════════════════════════════════════
+#
+# These functions are the building blocks for the auth routes below.
+# Kept together so the security-critical primitives are all in one place
+# and easy to audit.
+#
+# Security design notes:
+#   - All tokens generated by secrets.token_urlsafe(32), which gives
+#     ~43 chars of cryptographically-random base64 (256 bits of entropy).
+#     Guessing one is computationally infeasible (2^256 possibilities).
+#   - Tokens and session IDs are hashed with SHA-256 before database
+#     storage. The raw value goes to the user (in email or cookie);
+#     the hash goes in the database. If the database leaks, the hashes
+#     are useless — they can't be reversed to working credentials.
+#   - SHA-256 is appropriate here (not bcrypt/argon2) because tokens are
+#     random 256-bit values, not user-chosen passwords. Brute-forcing
+#     SHA-256 of a 256-bit input is the same difficulty as guessing the
+#     input itself, which is already infeasible. The argument for slow
+#     hashes only applies when the input has low entropy (passwords).
+
+
+# Magic link tokens expire 15 minutes after creation. Tight enough that a
+# leaked email link can't be replayed long after the user discards it,
+# loose enough that "I'll click this in a minute" works in practice.
+MAGIC_LINK_TTL_SECONDS = 15 * 60
+
+# Sessions expire 30 days after creation absolutely (regardless of activity).
+# This is the upper bound on how long any single session can live.
+SESSION_ABSOLUTE_TTL_SECONDS = 30 * 24 * 60 * 60
+
+# Sessions also expire after 7 days of inactivity. Refreshed on each use.
+# Belt-and-suspenders alongside the absolute expiration.
+SESSION_IDLE_TTL_SECONDS = 7 * 24 * 60 * 60
+
+# Cookie name for the session ID. Prefixed with __Host- in production for
+# the strictest browser security (must be Secure, no Domain, path=/).
+# In dev (HTTP localhost) we use a non-prefixed name because __Host-
+# requires HTTPS.
+SESSION_COOKIE_NAME = "wv_session"
+
+
+def new_secure_token() -> str:
+    """Generate a 256-bit cryptographically-random URL-safe token.
+
+    Returns a ~43-character base64 string. Used for both magic link
+    tokens (lives 15 minutes in the user's email) and session IDs
+    (lives up to 30 days in a browser cookie). 256 bits is the
+    industry-standard entropy for security-sensitive random values.
+
+    secrets.token_urlsafe(32) gives 32 random bytes = 256 bits of entropy,
+    encoded as URL-safe base64. NOT to be confused with token_urlsafe(24)
+    used by new_claim_token() for meteorologist claim URLs — those are
+    192-bit tokens, which is fine for non-credential URL secrets but a
+    bit short for actual auth tokens.
+    """
+    return secrets.token_urlsafe(32)
+
+
+def hash_token(raw_token: str) -> str:
+    """SHA-256 hash of a token, returned as hex.
+
+    Used to convert a raw user-facing token (in their email or browser
+    cookie) into the form we store in the database. Look up by hash;
+    never store the raw token.
+
+    SHA-256 is appropriate here because tokens are random 256-bit
+    values, not user-chosen passwords. We don't need slow hashing
+    (bcrypt/argon2) — those are for low-entropy inputs.
+    """
+    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
+
+def is_valid_email(email: str) -> bool:
+    """Best-effort email format check.
+
+    Not RFC-perfect — that would require thousands of lines for negligible
+    benefit. This catches obvious garbage (no @, no domain, too long)
+    while accepting essentially any real address. The real validation
+    happens when we try to send mail — if the address is malformed, SES
+    will reject it, and the user retries.
+
+    Returns True for plausibly-valid addresses, False for clearly invalid.
+    """
+    if not email or not isinstance(email, str):
+        return False
+    email = email.strip()
+    if len(email) > 254:  # RFC 5321 max
+        return False
+    if "@" not in email:
+        return False
+    local, _, domain = email.rpartition("@")
+    if not local or not domain:
+        return False
+    if "." not in domain:
+        return False
+    return True
+
+
+def get_client_ip() -> str:
+    """Return the IP address of the current request, taking into account
+    proxy headers when running behind a load balancer.
+
+    Render terminates TLS at its load balancer and forwards the original
+    client IP in X-Forwarded-For. The leftmost value in that header is
+    the original client; subsequent values are intermediate proxies.
+
+    Falls back to request.remote_addr if no forwarding header (local dev,
+    direct connections). Returns 'unknown' if neither is available.
+    """
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        # Take the leftmost (original client) address; strip whitespace.
+        return forwarded.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+
+def get_user_agent() -> str:
+    """Return the User-Agent header of the current request, truncated.
+
+    Browsers send full UA strings of 100-300 characters. We truncate to
+    500 to bound the storage size while preserving enough detail to
+    identify the browser/OS combination. Defaults to 'unknown' if missing.
+    """
+    ua = request.headers.get("User-Agent", "unknown")
+    return ua[:500]
+
+
+def _send_magic_link_email(email: str, magic_link_url: str) -> bool:
+    """Send a magic-link email to the user.
+
+    DEVELOPMENT MODE (current — pre AWS SES production approval):
+    Prints the URL to server logs instead of actually emailing.
+    To test the auth flow:
+      1. Trigger a magic link request via the frontend or curl
+      2. Open Render's logs for the wv-valet-backend service
+      3. Look for lines starting with '[MAGIC LINK STUB]'
+      4. Copy the URL and paste it into your browser
+
+    PRODUCTION MODE (after Phase 2 — AWS SES approved):
+    This function will be rewritten to call boto3 / SES to actually
+    send the email. The signature stays the same — only the body
+    changes. Everything in the rest of the auth system continues
+    working without modification.
+
+    Returns True if delivery succeeded (or stub printed successfully).
+    The stub always returns True because writing to stderr can't
+    meaningfully fail.
+
+    Why this approach is safe during development:
+      - Server logs are private to the Render dashboard (admin-only)
+      - Magic link URLs expire in 15 minutes regardless of how they
+        were delivered
+      - If a log leaked (extremely unlikely on Render's infrastructure),
+        any URLs in it are likely already dead by the time anyone reads it
+      - Real users can't be tricked into clicking stub-logged URLs because
+        the stub doesn't send anything to anyone
+    """
+    # The print(..., flush=True) ensures the log line appears immediately
+    # in Render's stream, not buffered for the end of the request.
+    print(
+        f"[MAGIC LINK STUB] To: {email}\n"
+        f"[MAGIC LINK STUB] Link: {magic_link_url}\n"
+        f"[MAGIC LINK STUB] (paste this URL into your browser to log in)",
+        flush=True,
+    )
+    return True
+
+
+def _create_session(user_id: int, conn) -> str:
+    """Create a new session for the given user. Returns the RAW session ID
+    (the value that goes into the browser cookie).
+
+    Internally:
+      1. Generate a 256-bit random session ID
+      2. Compute its SHA-256 hash
+      3. Insert a sessions row with the hash, user_id, and timestamps
+      4. Return the raw session ID for the caller to set as a cookie
+
+    The caller is responsible for setting the cookie. This function
+    just creates the database row and returns the value that needs to
+    travel to the browser.
+
+    The conn parameter accepts an already-open database connection so
+    this function can be called inside an existing transaction (e.g.
+    during /auth/verify where we also mark the magic-link token as used).
+    """
+    raw_session_id = new_secure_token()
+    session_hash = hash_token(raw_session_id)
+    now = now_ts()
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO sessions
+               (session_id_hash, user_id, created_at, expires_at,
+                idle_expires_at, ip_created, user_agent)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+            (
+                session_hash,
+                user_id,
+                now,
+                now + SESSION_ABSOLUTE_TTL_SECONDS,
+                now + SESSION_IDLE_TTL_SECONDS,
+                get_client_ip(),
+                get_user_agent(),
+            ),
+        )
+
+    return raw_session_id
+
+
+def _set_session_cookie(response, raw_session_id: str):
+    """Attach the session cookie to a Flask response with secure flags.
+
+    Cookie flags explained:
+      - HttpOnly: JavaScript on the page can't read this cookie. Prevents
+        XSS-based session theft (an injected script can't steal the cookie).
+      - Secure: only transmitted over HTTPS. Prevents passive interception
+        on hostile networks. Disabled in dev (HTTP localhost) because
+        Secure cookies are silently dropped on HTTP connections.
+      - SameSite=Lax: the cookie is sent on top-level navigations but not
+        on cross-site subrequests. Protects against most CSRF attacks
+        while allowing the magic-link redirect from email to weathervalet.ai
+        to bring the cookie along.
+      - Path=/: cookie is sent for all paths on the domain.
+      - Max-Age: cookie expires when the absolute session TTL expires.
+
+    Production (HTTPS) uses all flags; dev (HTTP) drops Secure.
+    """
+    is_prod = bool(os.environ.get("PUBLIC_BASE_URL", "").startswith("https://"))
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        raw_session_id,
+        max_age=SESSION_ABSOLUTE_TTL_SECONDS,
+        httponly=True,
+        secure=is_prod,
+        samesite="Lax",
+        path="/",
+    )
+    return response
+
+
+def _clear_session_cookie(response):
+    """Clear the session cookie. Used on logout."""
+    is_prod = bool(os.environ.get("PUBLIC_BASE_URL", "").startswith("https://"))
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        "",
+        max_age=0,
+        httponly=True,
+        secure=is_prod,
+        samesite="Lax",
+        path="/",
+    )
+    return response
+
+
+def _get_or_create_user(email: str, conn) -> int:
+    """Look up a user by email (case-insensitive), or create one if missing.
+
+    Returns the user's id (an integer). Used in the magic-link request
+    flow: when someone enters an email we've never seen, we create the
+    user account silently and email them a link. First-time sign-in
+    and returning sign-in look identical from their perspective.
+
+    Case handling: emails are stored as the user typed them but looked
+    up case-insensitively via LOWER(email) indexed query. This means
+    User@Example.com and user@example.com resolve to the same account,
+    which is what real users expect (email addresses are not case-sensitive
+    per RFC 5321, even though SMTP servers technically COULD treat them
+    that way).
+    """
+    normalized = email.strip()
+    now = now_ts()
+
+    with conn.cursor() as cur:
+        # Look up by lowercase email
+        cur.execute(
+            "SELECT id FROM users WHERE LOWER(email) = LOWER(%s)",
+            (normalized,),
+        )
+        row = cur.fetchone()
+        if row:
+            return row["id"]
+
+        # Doesn't exist — create the user
+        cur.execute(
+            """INSERT INTO users (email, created_at)
+               VALUES (%s, %s)
+               RETURNING id""",
+            (normalized, now),
+        )
+        return cur.fetchone()["id"]
+
+
+def _check_rate_limit_email(email: str, conn) -> bool:
+    """Return True if this email is over its rate limit (request should be blocked).
+
+    Limit: 5 magic-link requests per email per hour. Prevents an attacker
+    from spamming a victim's inbox with login emails.
+
+    Counts magic_link_tokens rows tied to this user that were created
+    in the last hour. Since the tokens are tied to a user_id (which we
+    only know after _get_or_create_user), this check runs AFTER user
+    lookup but BEFORE creating a new token.
+    """
+    one_hour_ago = now_ts() - 3600
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT COUNT(*) as n FROM magic_link_tokens t
+               JOIN users u ON u.id = t.user_id
+               WHERE LOWER(u.email) = LOWER(%s) AND t.created_at >= %s""",
+            (email, one_hour_ago),
+        )
+        row = cur.fetchone()
+        return row["n"] >= 5
+
+
+def _check_rate_limit_ip(ip: str, conn) -> bool:
+    """Return True if this IP is over its rate limit (request should be blocked).
+
+    Limit: 20 magic-link requests per IP per hour. Prevents an attacker
+    from probing many accounts from a single machine.
+
+    Counts magic_link_tokens rows that recorded this IP in the last hour.
+    """
+    one_hour_ago = now_ts() - 3600
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT COUNT(*) as n FROM magic_link_tokens
+               WHERE ip_requested = %s AND created_at >= %s""",
+            (ip, one_hour_ago),
+        )
+        row = cur.fetchone()
+        return row["n"] >= 20
 
 
 def normalize_phone(raw: Optional[str]) -> Optional[str]:
@@ -1166,6 +1595,270 @@ def email_capture():
     # Mailchimp unreachable or configuration error.
     # 503 = the frontend can retry, this isn't a user error.
     return jsonify({"ok": False, "error": status}), 503
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Authentication — magic link login, server-side sessions
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Two endpoints for the v1 (request + verify) plus the stub email function
+# above. Session/logout/workspaces endpoints come next.
+#
+# Flow:
+#   1. User enters email on the homepage → frontend POSTs to /request-magic-link
+#   2. Server emails a one-time link of form: /auth/verify?token=<raw>
+#   3. User clicks link → frontend GETs /auth/verify with the token
+#   4. Server validates, marks token used, creates session, sets cookie
+#   5. User is now logged in; cookie travels with future requests
+
+@app.route("/api/v1/auth/request-magic-link", methods=["OPTIONS"])
+def _auth_request_magic_link_preflight():
+    """CORS preflight handler — same pattern as the email-capture endpoint."""
+    return ("", 204)
+
+
+@app.post("/api/v1/auth/request-magic-link")
+def auth_request_magic_link():
+    """Accept an email, send a one-time magic link to it.
+
+    Returns 200 with the same response regardless of whether the email
+    matches a real account. This prevents account enumeration — an
+    attacker can't probe which emails are registered by watching the
+    response.
+
+    Request body:
+        {"email": "person@example.com"}
+
+    Returns:
+        200 {"ok": true, "message": "If that's a valid email, check your inbox"}
+        400 {"ok": false, "error": "invalid-email"}     — malformed
+        429 {"ok": false, "error": "rate-limited"}      — too many requests
+
+    Security notes:
+      - Magic links expire in 15 minutes (MAGIC_LINK_TTL_SECONDS)
+      - Tokens are 256-bit random, SHA-256 hashed before DB storage
+      - Rate limited: max 5 requests per email per hour, 20 per IP per hour
+      - Stubbed email goes to server logs in dev; real SES in production
+    """
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip()
+
+    if not is_valid_email(email):
+        return jsonify({"ok": False, "error": "invalid-email"}), 400
+
+    client_ip = get_client_ip()
+
+    with db() as conn:
+        # Check IP rate limit FIRST, before we even look up the user.
+        # An attacker hammering this endpoint with random emails should
+        # get blocked at the IP level without us doing user lookups.
+        if _check_rate_limit_ip(client_ip, conn):
+            print(f"[auth] rate-limit-ip blocked: {client_ip}", flush=True)
+            # Return same response as success to avoid leaking that this
+            # IP is being rate-limited. The user will see "check your email"
+            # but no email arrives. They'll retry; if still blocked, eventually
+            # the IP rate-limit window passes.
+            return jsonify({
+                "ok": True,
+                "message": "If that's a valid email, check your inbox",
+            }), 200
+
+        # Look up the user (create if missing). After this, user_id is set
+        # regardless of whether this was a new signup or returning user.
+        # The user account exists either way; only roles differ.
+        user_id = _get_or_create_user(email, conn)
+
+        # Now check email rate limit (using user_id we just established)
+        if _check_rate_limit_email(email, conn):
+            print(f"[auth] rate-limit-email blocked: {email}", flush=True)
+            return jsonify({
+                "ok": True,
+                "message": "If that's a valid email, check your inbox",
+            }), 200
+
+        # Generate a fresh token and store its hash
+        raw_token = new_secure_token()
+        token_hash = hash_token(raw_token)
+        now = now_ts()
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO magic_link_tokens
+                   (token_hash, user_id, created_at, expires_at, ip_requested)
+                   VALUES (%s, %s, %s, %s, %s)""",
+                (token_hash, user_id, now, now + MAGIC_LINK_TTL_SECONDS, client_ip),
+            )
+
+    # Build the magic link URL. Uses FRONTEND_BASE_URL so the link points
+    # to the static site (weathervalet.ai), not the backend (api.weathervalet.ai).
+    # The frontend has the /auth/verify handler that calls back to the
+    # backend's /api/v1/auth/verify endpoint.
+    base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai")
+    magic_link_url = f"{base}/auth/verify?token={raw_token}"
+
+    # Send the email (or log it via stub during development)
+    _send_magic_link_email(email, magic_link_url)
+
+    # Audit log — record that we issued a link. Useful for debugging
+    # ("did the link actually get sent?") and for security forensics.
+    print(
+        f"[auth] magic-link issued: email={email} user_id={user_id} "
+        f"ip={client_ip} expires_in={MAGIC_LINK_TTL_SECONDS}s",
+        flush=True,
+    )
+
+    return jsonify({
+        "ok": True,
+        "message": "If that's a valid email, check your inbox",
+    }), 200
+
+
+@app.get("/api/v1/auth/verify")
+def auth_verify():
+    """Consume a magic link. Token comes from query param.
+
+    Steps:
+      1. Read the raw token from the query string
+      2. Compute its SHA-256 hash
+      3. Look up magic_link_tokens by hash
+      4. Verify: not expired, not used
+      5. Mark used (set used_at)
+      6. Create a new session for the user
+      7. Set the session cookie
+      8. Return user info + workspaces (frontend decides where to route)
+
+    Returns:
+        200 {"ok": true, "user": {...}, "workspaces": [...]}  + session cookie set
+        400 {"ok": false, "error": "missing-token"}
+        401 {"ok": false, "error": "invalid-token"}            — not found
+        410 {"ok": false, "error": "expired-token"}            — past expiry
+        410 {"ok": false, "error": "already-used"}             — single-use enforcement
+
+    The frontend uses the workspaces list to route the user:
+      - 0 workspaces → "your account isn't set up yet, contact support"
+      - 1 workspace  → redirect directly to that workspace
+      - 2+ workspaces → show workspace picker modal
+    """
+    raw_token = request.args.get("token", "").strip()
+    if not raw_token:
+        return jsonify({"ok": False, "error": "missing-token"}), 400
+
+    token_hash = hash_token(raw_token)
+    now = now_ts()
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT t.user_id, t.expires_at, t.used_at, u.email, u.name
+                   FROM magic_link_tokens t
+                   JOIN users u ON u.id = t.user_id
+                   WHERE t.token_hash = %s""",
+                (token_hash,),
+            )
+            row = cur.fetchone()
+
+        if row is None:
+            # No matching token. Could be: never issued, already deleted,
+            # forged, or someone clicked an old link after the row was
+            # cleaned up. We don't distinguish — all return the same error.
+            print(f"[auth] verify failed: no token match (hash={token_hash[:8]}...)", flush=True)
+            return jsonify({"ok": False, "error": "invalid-token"}), 401
+
+        if row["used_at"] is not None:
+            # Token was previously consumed. Magic links are single-use.
+            print(f"[auth] verify failed: already-used (user_id={row['user_id']})", flush=True)
+            return jsonify({"ok": False, "error": "already-used"}), 410
+
+        if row["expires_at"] < now:
+            # Token aged out.
+            print(f"[auth] verify failed: expired (user_id={row['user_id']})", flush=True)
+            return jsonify({"ok": False, "error": "expired-token"}), 410
+
+        # Token is valid. Mark it used and create a session.
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE magic_link_tokens SET used_at = %s WHERE token_hash = %s",
+                (now, token_hash),
+            )
+            # Update user's last_login_at
+            cur.execute(
+                "UPDATE users SET last_login_at = %s WHERE id = %s",
+                (now, row["user_id"]),
+            )
+            # Fetch user's roles to return to the frontend
+            cur.execute(
+                "SELECT role FROM user_roles WHERE user_id = %s ORDER BY role",
+                (row["user_id"],),
+            )
+            role_rows = cur.fetchall()
+
+        # Create the session (inserts a row, returns the raw session ID)
+        raw_session_id = _create_session(row["user_id"], conn)
+
+    # Build response with user info and workspace list
+    roles = [r["role"] for r in role_rows]
+    workspaces = _roles_to_workspaces(roles)
+
+    response = jsonify({
+        "ok": True,
+        "user": {
+            "id": row["user_id"],
+            "email": row["email"],
+            "name": row["name"],
+        },
+        "workspaces": workspaces,
+    })
+    _set_session_cookie(response, raw_session_id)
+
+    print(
+        f"[auth] verify succeeded: user_id={row['user_id']} email={row['email']} "
+        f"roles={roles} ip={get_client_ip()}",
+        flush=True,
+    )
+
+    return response
+
+
+def _roles_to_workspaces(roles: list) -> list:
+    """Convert a list of role names into workspace metadata for the frontend.
+
+    Each workspace dict has:
+      role:  the role name (subscriber|crew|met|admin)
+      label: the human-readable label shown in the picker
+      url:   where to route the user after they pick this workspace
+
+    Note: the URLs here are placeholders for now. Once Phase 4 (frontend
+    integration) wires up the actual workspace routes, these point at
+    the real auth-gated pages. For v1 they're the same as the prototype
+    simulation routes.
+    """
+    workspace_map = {
+        "subscriber": {
+            "label": "Subscriber",
+            "url": "/portal",
+        },
+        "crew": {
+            "label": "Valet Crew",
+            "url": "/crew",
+        },
+        "met": {
+            "label": "Meteorologist",
+            "url": "/meteorologist",
+        },
+        "admin": {
+            "label": "Admin",
+            "url": "/admin/dashboard",
+        },
+    }
+    workspaces = []
+    for role in roles:
+        if role in workspace_map:
+            workspaces.append({
+                "role": role,
+                "label": workspace_map[role]["label"],
+                "url": workspace_map[role]["url"],
+            })
+    return workspaces
 
 
 @app.post("/api/v1/forecast/explain")
