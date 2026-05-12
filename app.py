@@ -159,6 +159,39 @@ GEMINI_API_URL = (
     f"{GEMINI_MODEL}:generateContent"
 )
 
+# ──────────────────────────────────────────────────────────────────────────
+# Mailchimp — marketing list / waitlist capture
+# ──────────────────────────────────────────────────────────────────────────
+# The API key has the data center suffix appended (e.g. "abc123...-us8").
+# We split it to derive the API base URL: every Mailchimp account is on
+# a specific data center, and the API URL must match.
+#
+# Endpoint pattern: https://{dc}.api.mailchimp.com/3.0/lists/{audience_id}/members
+# Auth: HTTP Basic with username "anystring" and password = API key
+#
+# Set both env vars on Render:
+#   MAILCHIMP_API_KEY = the full API key including -us8 suffix
+#   MAILCHIMP_AUDIENCE_ID = the 10-character audience identifier
+MAILCHIMP_API_KEY = os.environ.get("MAILCHIMP_API_KEY", "")
+MAILCHIMP_AUDIENCE_ID = os.environ.get("MAILCHIMP_AUDIENCE_ID", "")
+# Derive the data center from the API key suffix. Default to us8 to match
+# our current account; if a future key is on a different DC, this still works.
+MAILCHIMP_DC = MAILCHIMP_API_KEY.split("-")[-1] if "-" in MAILCHIMP_API_KEY else "us8"
+MAILCHIMP_API_URL = f"https://{MAILCHIMP_DC}.api.mailchimp.com/3.0"
+
+# Which tags are valid. The frontend passes a `source` field (e.g.
+# "pricing-pro-single") and we map it to the corresponding Mailchimp tag.
+# Tags not in this dict get mapped to "general-interest" as a safe default.
+MAILCHIMP_VALID_TAGS = {
+    "pricing-hobbyist",
+    "pricing-pro-single",
+    "pricing-pro-multi",
+    "pricing-pro-enterprise",
+    "crew-applicant",
+    "footer-cta",
+    "general-interest",
+}
+
 # Pricing tiers. Amounts in cents; Stripe expects integer cents.
 TIERS = {
     "single": {
@@ -881,6 +914,171 @@ def _fallback_paragraph(payload: dict) -> str:
     if verdict == "risk":
         return "Conditions are stacked against this one. Take a careful look at the details below before committing."
     return "Here's the snapshot for your plan. The details are below."
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Mailchimp integration — email capture
+# ──────────────────────────────────────────────────────────────────────────
+
+def _call_mailchimp_add_member(email: str, tag: str, timeout_s: int = 10) -> tuple[bool, str]:
+    """Add an email to the Mailchimp audience with a tag.
+
+    Returns (success, message) tuple. On failure, message describes what
+    went wrong; on success, message is a status indicator.
+
+    Mailchimp's "members" endpoint adds OR updates a contact based on
+    email. For new emails, status="subscribed" (no double-opt-in friction
+    for our waitlist context). For existing emails, the endpoint returns
+    400 with "Member Exists" — we treat that as a soft success (the
+    email is in the list, which is what we wanted) and update tags.
+
+    Auth: HTTP Basic. Username can be anything ("anystring" is fine);
+    password is the full API key.
+    """
+    if not MAILCHIMP_API_KEY or not MAILCHIMP_AUDIENCE_ID:
+        return (False, "mailchimp not configured")
+
+    # Normalize the tag — fall back to general-interest if unknown
+    if tag not in MAILCHIMP_VALID_TAGS:
+        tag = "general-interest"
+
+    url = f"{MAILCHIMP_API_URL}/lists/{MAILCHIMP_AUDIENCE_ID}/members"
+    body = {
+        "email_address": email,
+        "status": "subscribed",
+        "tags": [tag],
+    }
+
+    # HTTP Basic auth header
+    import base64
+    auth_str = base64.b64encode(f"anystring:{MAILCHIMP_API_KEY}".encode("utf-8")).decode("ascii")
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Basic {auth_str}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            resp.read()  # drain the body; we don't need the content on success
+            return (True, "added")
+    except urllib.error.HTTPError as e:
+        # Read the error body to check for "Member Exists" — that's a
+        # soft-success: the email was already in the list, no harm done.
+        err_body = ""
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+
+        if e.code == 400 and "Member Exists" in err_body:
+            # Already on the list. Try to update their tags so this
+            # capture context is recorded (e.g. they previously joined
+            # via crew-applicant and now they hit pricing-pro-single).
+            _mailchimp_update_tag(email, tag, timeout_s=timeout_s)
+            return (True, "already-subscribed")
+
+        # Other HTTP errors: log and return failure with status
+        print(f"[mailchimp] HTTPError {e.code}: {err_body[:300]}", file=sys.stderr)
+        return (False, f"mailchimp returned {e.code}")
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        print(f"[mailchimp] network error: {e}", file=sys.stderr)
+        return (False, "mailchimp unreachable")
+    except Exception as e:
+        print(f"[mailchimp] unexpected error: {e}", file=sys.stderr)
+        return (False, "mailchimp call failed")
+
+
+def _mailchimp_update_tag(email: str, tag: str, timeout_s: int = 10) -> None:
+    """Update tags on an existing Mailchimp member.
+
+    Used when "Member Exists" is returned from the add call — we still
+    want to record this capture context. Failure is soft-logged; we
+    never raise.
+    """
+    # Mailchimp identifies members by MD5 hash of lowercased email
+    import hashlib
+    member_hash = hashlib.md5(email.lower().encode("utf-8")).hexdigest()
+    url = f"{MAILCHIMP_API_URL}/lists/{MAILCHIMP_AUDIENCE_ID}/members/{member_hash}/tags"
+
+    body = {"tags": [{"name": tag, "status": "active"}]}
+
+    import base64
+    auth_str = base64.b64encode(f"anystring:{MAILCHIMP_API_KEY}".encode("utf-8")).decode("ascii")
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Basic {auth_str}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s):
+            pass  # 204 No Content on success
+    except Exception as e:
+        # Soft-log; don't disrupt the capture flow
+        print(f"[mailchimp] tag-update failed: {e}", file=sys.stderr)
+
+
+@app.route("/api/v1/email-capture", methods=["OPTIONS"])
+def _email_capture_preflight():
+    """CORS preflight for the email capture endpoint.
+
+    Same pattern as _forecast_explain_preflight — browsers send OPTIONS
+    before POST when there's a JSON body; we return 204 and the after_request
+    hook attaches the CORS headers.
+    """
+    return ("", 204)
+
+
+@app.post("/api/v1/email-capture")
+def email_capture():
+    """Capture an email submission and add it to the Mailchimp audience.
+
+    Expected JSON body:
+        {
+          "email": "person@example.com",
+          "source": "pricing-pro-single" | "crew-applicant" | etc.
+        }
+
+    The `source` field tells Mailchimp WHICH CTA brought this email in,
+    so we can email different audiences later (e.g. "Pro Single tier is
+    now live" goes only to people tagged pricing-pro-single).
+
+    Returns:
+        200 with {"ok": true, "status": "added"|"already-subscribed"}
+        400 if email is missing or invalid
+        503 if Mailchimp is unreachable (frontend can retry)
+
+    NEVER returns Mailchimp's API key or other secrets in any path.
+    """
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    source = (data.get("source") or "general-interest").strip()
+
+    # Basic email validation — Mailchimp will also validate, but rejecting
+    # obvious garbage here saves API calls and gives faster feedback.
+    if not email or "@" not in email or "." not in email.split("@")[-1]:
+        return jsonify({"ok": False, "error": "invalid-email"}), 400
+
+    if len(email) > 254:  # RFC 5321 max
+        return jsonify({"ok": False, "error": "email-too-long"}), 400
+
+    ok, status = _call_mailchimp_add_member(email, source)
+
+    if ok:
+        return jsonify({"ok": True, "status": status}), 200
+
+    # Mailchimp unreachable or configuration error.
+    # 503 = the frontend can retry, this isn't a user error.
+    return jsonify({"ok": False, "error": status}), 503
 
 
 @app.post("/api/v1/forecast/explain")
