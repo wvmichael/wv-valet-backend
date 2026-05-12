@@ -32,7 +32,7 @@ Architecture:
     Netlify (static v2.4 HTML/JS)  ──[POST /api/v1/verification/checkout]──▶  This Flask app
                                                                                     │
                                                                                     ├─ creates Stripe Checkout Session
-                                                                                    ├─ inserts row in SQLite (status='pending')
+                                                                                    ├─ inserts row in Postgres (status='pending')
                                                                                     └─ returns hosted_url to frontend
                                                                                     
     Customer ──redirected to Stripe──▶  pays  ──redirect──▶  /verification/standby
@@ -41,7 +41,7 @@ Architecture:
                                       Stripe webhook ──▶ /webhooks/stripe
                                                               │
                                                               ├─ verifies signature
-                                                              ├─ marks SQLite row 'paid'
+                                                              ├─ marks Postgres row 'paid'
                                                               ├─ Twilio SMS to customer
                                                               └─ Twilio SMS to meteorologist (with brief + claim link)
                                                               
@@ -49,7 +49,7 @@ Architecture:
 
 Run:
 
-    pip install flask stripe twilio
+    pip install flask stripe twilio psycopg2-binary
     export STRIPE_SECRET_KEY=sk_test_...
     export STRIPE_WEBHOOK_SECRET=whsec_...
     export TWILIO_ACCOUNT_SID=AC...
@@ -58,6 +58,7 @@ Run:
     export METEOROLOGIST_PHONE=+15555550101    # Timmy's phone for v1
     export PUBLIC_BASE_URL=https://api.weathervalet.ai   # how Stripe webhooks reach us
     export FRONTEND_BASE_URL=https://weathervalet.ai     # where customers come from
+    export DATABASE_URL=postgresql://localhost/wv_valet   # Postgres connection
     python app.py
 
 The frontend changes are in static/upsell.js — they replace the v2.4 modal
@@ -69,7 +70,6 @@ from __future__ import annotations
 import json
 import os
 import secrets
-import sqlite3
 import sys
 import time
 from contextlib import contextmanager
@@ -77,6 +77,17 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+# Postgres driver. psycopg2-binary bundles the native libpq library, which
+# means we don't need pg_config / libpq-dev on the build system. This is
+# the recommended package for Render and other PaaS hosts.
+#
+# RealDictCursor makes cur.fetchone() and cur.fetchall() return dicts
+# keyed by column name (e.g. row['stripe_session_id']), preserving the
+# access pattern from the prior sqlite3.Row implementation. Without this,
+# rows would come back as tuples and every row access would break.
+import psycopg2
+import psycopg2.extras
 
 from flask import Flask, abort, jsonify, redirect, render_template_string, request
 
@@ -125,8 +136,36 @@ PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://localhost:8080")
 # Where customers came from — used for the success/cancel redirect URLs.
 FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "http://localhost:8000")
 
-# Where SQLite lives. Override for tests.
-DB_PATH = Path(os.environ.get("WV_DB_PATH", "wv_valet.db"))
+# Postgres connection URL. Render auto-injects DATABASE_URL when a
+# Postgres service is linked to a web service via the Render dashboard.
+# The URL format is: postgresql://user:pass@host:port/dbname
+#
+# Local development fallback: assumes a Postgres instance running on
+# localhost. In practice you'd run `docker run -e POSTGRES_PASSWORD=...
+# -p 5432:5432 postgres:15` or use Postgres.app on macOS.
+#
+# Migration from SQLite (May 2026): the prior DB_PATH = "wv_valet.db"
+# pattern is replaced because Render's ephemeral filesystem means SQLite
+# data doesn't survive deploys. Postgres on Render is durable and
+# survives redeploys, making it the right answer for production auth
+# and any other persistent state.
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+# Defensive URL scheme normalization. Some Render deploy paths (and other
+# PaaS hosts) provide DATABASE_URL with the older `postgres://` prefix.
+# Modern psycopg2 (2.9+) accepts both schemes via parse_dsn, but other
+# tools in the broader ecosystem (SQLAlchemy 1.4+, certain ORMs) explicitly
+# reject `postgres://`. Normalizing here means the URL works everywhere
+# even if someone adds SQLAlchemy later.
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
+
+if not DATABASE_URL:
+    # Local dev fallback. If Postgres isn't running locally, the app
+    # will fail to start with a clear connection error rather than
+    # silently creating an empty SQLite file (which was the prior
+    # behavior and could mask configuration mistakes).
+    DATABASE_URL = "postgresql://localhost/wv_valet"
 
 # Where the WeatherValet Meteorologist Brief lives — the JSON file the
 # Decision Engine reads on every per-ticket call. The /admin/brief form
@@ -219,10 +258,11 @@ SLA_MINUTES = 30
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Database — SQLite, single file, no setup
+# Database — Postgres, durable, multi-process safe
 # ════════════════════════════════════════════════════════════════════════════
 #
-# One table for now. The columns map directly to the lifecycle of a request:
+# One table for now (verification_requests) plus an audit log
+# (brief_submissions). Columns map directly to the lifecycle of a request:
 #
 #   pending   → checkout session created, customer hasn't paid yet
 #   paid      → Stripe webhook fired, SMSes sent
@@ -232,12 +272,22 @@ SLA_MINUTES = 30
 #
 # The `claim_token` is a per-request secret in the meteorologist's SMS link,
 # so we don't need them logged in. It's a 32-char URL-safe random token.
+#
+# Postgres-vs-SQLite notes for the schema below:
+#   - SERIAL replaces INTEGER PRIMARY KEY AUTOINCREMENT. Postgres
+#     auto-generates a sequence and returns the value via RETURNING id
+#     instead of cur.lastrowid.
+#   - BIGINT replaces INTEGER for Unix-timestamp columns. INTEGER (4 bytes)
+#     overflows in 2038; BIGINT (8 bytes) is safe through year 292B.
+#   - CREATE INDEX IF NOT EXISTS syntax is identical between SQLite and
+#     Postgres.
+#   - All other column types (TEXT, etc.) are identical.
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS verification_requests (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    created_at          INTEGER NOT NULL,
-    updated_at          INTEGER NOT NULL,
+    id                  SERIAL PRIMARY KEY,
+    created_at          BIGINT NOT NULL,
+    updated_at          BIGINT NOT NULL,
     status              TEXT NOT NULL,           -- pending|paid|claimed|completed|expired
     tier                TEXT NOT NULL,           -- single|day_pass|pro_monthly
     price_cents         INTEGER NOT NULL,
@@ -260,8 +310,8 @@ CREATE TABLE IF NOT EXISTS verification_requests (
 
     -- Meteorologist workflow
     claim_token         TEXT UNIQUE NOT NULL,    -- per-request secret in the claim URL
-    claimed_at          INTEGER,
-    completed_at        INTEGER,
+    claimed_at          BIGINT,
+    completed_at        BIGINT,
     meteorologist_verdict   TEXT,
     meteorologist_notes     TEXT
 );
@@ -275,8 +325,8 @@ CREATE INDEX IF NOT EXISTS idx_stripe_session ON verification_requests(stripe_se
 -- file), and gives us an audit trail for future accountability + AI training.
 -- One row per POST, never updated — append-only by design.
 CREATE TABLE IF NOT EXISTS brief_submissions (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    submitted_at        INTEGER NOT NULL,        -- Unix timestamp seconds
+    id                  SERIAL PRIMARY KEY,
+    submitted_at        BIGINT NOT NULL,         -- Unix timestamp seconds
     meteorologist_name  TEXT NOT NULL,
     region_name         TEXT NOT NULL,
     verdict             TEXT NOT NULL,           -- dry|wet|mixed|stormy|clear
@@ -293,11 +343,31 @@ CREATE INDEX IF NOT EXISTS idx_briefs_meteorologist ON brief_submissions(meteoro
 
 @contextmanager
 def db():
-    """Context-managed SQLite connection with row factory and foreign keys on."""
-    conn = sqlite3.connect(DB_PATH, isolation_level=None)  # autocommit
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")  # better concurrent reads
+    """Context-managed Postgres connection with dict row factory and autocommit.
+
+    Returns a connection that:
+      - Uses RealDictCursor so cur.fetchone() returns dicts keyed by column
+        name (preserving the prior row['column'] access pattern from sqlite3.Row)
+      - Has autocommit enabled, matching the prior SQLite behavior where
+        every statement was committed immediately. Each call site that
+        currently fires a single INSERT/UPDATE relies on this — switching
+        to transaction mode would silently drop those writes.
+      - Is closed on context exit, freeing the connection for reuse.
+
+    Failure modes:
+      - psycopg2.OperationalError: connection refused, DNS failure, wrong
+        DATABASE_URL. Surface to caller; do not retry inside this function.
+      - psycopg2.errors.UndefinedTable: tables haven't been created yet.
+        _ensure_db() should have run init_db() on first request, but if it
+        didn't, the caller sees a 500 and a clear error.
+
+    Connection pooling deferred to future optimization. At current volume
+    (~100 requests/day), creating a fresh connection per request is wasteful
+    but correct. When traffic justifies it, add psycopg2.pool.ThreadedConnectionPool
+    or front the database with pgbouncer.
+    """
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    conn.autocommit = True
     try:
         yield conn
     finally:
@@ -305,9 +375,25 @@ def db():
 
 
 def init_db() -> None:
-    """Create tables on first boot. Idempotent — safe to call every start."""
+    """Create tables on first boot. Idempotent — safe to call every start.
+
+    Splits SCHEMA into individual statements and executes them one at a
+    time. psycopg2 does not support executescript() the way sqlite3 does;
+    multi-statement strings raise a syntax error in Postgres unless run
+    through psycopg2.extras or split manually. The split-by-semicolon
+    approach is safe for our current SCHEMA because no CREATE TABLE
+    statement contains a semicolon inside a string literal or comment.
+
+    If SCHEMA ever grows to include statements with embedded semicolons,
+    swap this split for a proper SQL parser or upgrade to a migration
+    library like Alembic.
+    """
     with db() as conn:
-        conn.executescript(SCHEMA)
+        with conn.cursor() as cur:
+            # Strip and skip empty statements (the SCHEMA constant has trailing
+            # whitespace after the last semicolon that produces an empty entry).
+            for statement in [s.strip() for s in SCHEMA.split(";") if s.strip()]:
+                cur.execute(statement)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -517,20 +603,21 @@ def merge_brief_submission(submission: dict) -> dict:
     # and couldn't reconstruct who submitted what when.
     try:
         with db() as conn:
-            conn.execute(
-                """INSERT INTO brief_submissions
-                   (submitted_at, meteorologist_name, region_name, verdict,
-                    start_time, end_time, summary, confidence, notes)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    now_ts(),
-                    submission.get("meteorologist_name") or brief.get("meteorologist", "WeatherValet Meteorologist"),
-                    region_name,
-                    verdict if verdict in {"dry", "wet", "mixed", "stormy", "clear"} else "unknown",
-                    window["start"], window["end"], window["summary"],
-                    window["confidence"], submission.get("notes") or "",
-                ),
-            )
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO brief_submissions
+                       (submitted_at, meteorologist_name, region_name, verdict,
+                        start_time, end_time, summary, confidence, notes)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        now_ts(),
+                        submission.get("meteorologist_name") or brief.get("meteorologist", "WeatherValet Meteorologist"),
+                        region_name,
+                        verdict if verdict in {"dry", "wet", "mixed", "stormy", "clear"} else "unknown",
+                        window["start"], window["end"], window["summary"],
+                        window["confidence"], submission.get("notes") or "",
+                    ),
+                )
     except Exception as e:
         # Audit logging is best-effort — never block a save because the
         # log table is unavailable. The brief file is the source of truth
@@ -1238,20 +1325,26 @@ def create_checkout_session():
         ai_brief = "(Decision Engine not installed in this deployment.)"
 
     with db() as conn:
-        cur = conn.execute(
-            """INSERT INTO verification_requests
-               (created_at, updated_at, status, tier, price_cents,
-                customer_email, customer_phone,
-                plan_text, plan_industry, plan_location, plan_window,
-                ai_brief_markdown, ai_status_key, claim_token)
-               VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (now_ts(), now_ts(), tier_key, tier["price_cents"],
-             customer_email, customer_phone,
-             plan_text, body.get("plan_industry"), body.get("plan_location"),
-             body.get("plan_window"),
-             ai_brief, body.get("ai_status_key"), claim_token),
-        )
-        request_id = cur.lastrowid
+        with conn.cursor() as cur:
+            # Use RETURNING id to get the auto-generated primary key. This
+            # replaces the prior cur.lastrowid pattern (a SQLite-specific
+            # convenience). Postgres requires the RETURNING clause to
+            # retrieve auto-generated values from an INSERT.
+            cur.execute(
+                """INSERT INTO verification_requests
+                   (created_at, updated_at, status, tier, price_cents,
+                    customer_email, customer_phone,
+                    plan_text, plan_industry, plan_location, plan_window,
+                    ai_brief_markdown, ai_status_key, claim_token)
+                   VALUES (%s, %s, 'pending', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   RETURNING id""",
+                (now_ts(), now_ts(), tier_key, tier["price_cents"],
+                 customer_email, customer_phone,
+                 plan_text, body.get("plan_industry"), body.get("plan_location"),
+                 body.get("plan_window"),
+                 ai_brief, body.get("ai_status_key"), claim_token),
+            )
+            request_id = cur.fetchone()['id']
 
     # Create the Stripe Checkout Session.
     # Test mode: use sk_test_... keys; payments are simulated, no real charges.
@@ -1300,10 +1393,11 @@ def create_checkout_session():
 
     # Record the Stripe session id so the webhook can match it back.
     with db() as conn:
-        conn.execute(
-            "UPDATE verification_requests SET stripe_session_id = ?, updated_at = ? WHERE id = ?",
-            (session.id, now_ts(), request_id),
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE verification_requests SET stripe_session_id = %s, updated_at = %s WHERE id = %s",
+                (session.id, now_ts(), request_id),
+            )
 
     return jsonify({
         "request_id": request_id,
@@ -1359,20 +1453,22 @@ def _mark_paid_and_notify(request_id: int, *, payment_id: Optional[str] = None,
     past 'pending', we skip the SMS sends — otherwise customers get duplicate
     texts every time the webhook gets retried."""
     with db() as conn:
-        row = conn.execute(
-            "SELECT * FROM verification_requests WHERE id = ?",
-            (request_id,),
-        ).fetchone()
-        if row is None:
-            print(f"[webhook] no row for request_id={request_id}", flush=True)
-            return
-        if row["status"] != "pending":
-            print(f"[webhook] request {request_id} already {row['status']}, skipping notifications", flush=True)
-            return
-        conn.execute(
-            "UPDATE verification_requests SET status='paid', stripe_payment_id=?, updated_at=? WHERE id=?",
-            (payment_id, now_ts(), request_id),
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM verification_requests WHERE id = %s",
+                (request_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                print(f"[webhook] no row for request_id={request_id}", flush=True)
+                return
+            if row["status"] != "pending":
+                print(f"[webhook] request {request_id} already {row['status']}, skipping notifications", flush=True)
+                return
+            cur.execute(
+                "UPDATE verification_requests SET status='paid', stripe_payment_id=%s, updated_at=%s WHERE id=%s",
+                (payment_id, now_ts(), request_id),
+            )
 
     # Customer SMS — the standby promise. Keep it short, warm, time-bounded.
     customer_msg = (
@@ -1413,12 +1509,14 @@ def status():
     if not request_id:
         return jsonify({"error": "rid required"}), 400
     with db() as conn:
-        row = conn.execute(
-            """SELECT id, status, created_at, claimed_at, completed_at,
-                      meteorologist_verdict, meteorologist_notes
-               FROM verification_requests WHERE id = ?""",
-            (request_id,),
-        ).fetchone()
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, status, created_at, claimed_at, completed_at,
+                          meteorologist_verdict, meteorologist_notes
+                   FROM verification_requests WHERE id = %s""",
+                (request_id,),
+            )
+            row = cur.fetchone()
     if not row:
         return jsonify({"error": "not found"}), 404
 
@@ -1467,16 +1565,20 @@ def meteorologist_home():
     # all current regions in its dropdown).
     try:
         with db() as conn:
-            rows = conn.execute(
-                """SELECT id, submitted_at, meteorologist_name, region_name,
-                          verdict, start_time, end_time, summary, confidence
-                   FROM brief_submissions
-                   ORDER BY submitted_at DESC
-                   LIMIT 20"""
-            ).fetchall()
-    except sqlite3.OperationalError:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, submitted_at, meteorologist_name, region_name,
+                              verdict, start_time, end_time, summary, confidence
+                       FROM brief_submissions
+                       ORDER BY submitted_at DESC
+                       LIMIT 20"""
+                )
+                rows = cur.fetchall()
+    except (psycopg2.OperationalError, psycopg2.errors.UndefinedTable):
         # Table might not exist yet on a fresh boot — _ensure_db hasn't run
-        # for this process. Treat as empty.
+        # for this process, or the database is unreachable. Treat as empty.
+        # The Postgres-specific UndefinedTable is the closest analog to
+        # SQLite's OperationalError "no such table".
         rows = []
 
     # Decorate each row with a relative-time label so the meteorologist
@@ -1533,20 +1635,23 @@ def meteorologist_view(claim_token: str):
     a private SMS, so possession proves authorization. For v1 this is fine;
     for v2 add a meteorologist account system."""
     with db() as conn:
-        row = conn.execute(
-            "SELECT * FROM verification_requests WHERE claim_token = ?",
-            (claim_token,),
-        ).fetchone()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM verification_requests WHERE claim_token = %s",
+                (claim_token,),
+            )
+            row = cur.fetchone()
     if not row:
         abort(404)
 
     if row["status"] == "paid":
         # First view — mark it claimed so the dashboard shows accountability.
         with db() as conn:
-            conn.execute(
-                "UPDATE verification_requests SET status='claimed', claimed_at=?, updated_at=? WHERE id=?",
-                (now_ts(), now_ts(), row["id"]),
-            )
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE verification_requests SET status='claimed', claimed_at=%s, updated_at=%s WHERE id=%s",
+                    (now_ts(), now_ts(), row["id"]),
+                )
 
     return render_template_string(METEOROLOGIST_TEMPLATE, row=dict(row),
                                   sla_minutes=SLA_MINUTES, now=now_ts())
@@ -1556,10 +1661,12 @@ def meteorologist_view(claim_token: str):
 def meteorologist_complete(claim_token: str):
     """Meteorologist submits their verdict. We mark completed and SMS customer."""
     with db() as conn:
-        row = conn.execute(
-            "SELECT * FROM verification_requests WHERE claim_token = ?",
-            (claim_token,),
-        ).fetchone()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM verification_requests WHERE claim_token = %s",
+                (claim_token,),
+            )
+            row = cur.fetchone()
     if not row:
         abort(404)
     if row["status"] == "completed":
@@ -1572,13 +1679,14 @@ def meteorologist_complete(claim_token: str):
         abort(400)
 
     with db() as conn:
-        conn.execute(
-            """UPDATE verification_requests
-               SET status='completed', completed_at=?, updated_at=?,
-                   meteorologist_verdict=?, meteorologist_notes=?
-               WHERE id=?""",
-            (now_ts(), now_ts(), verdict, notes, row["id"]),
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE verification_requests
+                   SET status='completed', completed_at=%s, updated_at=%s,
+                       meteorologist_verdict=%s, meteorologist_notes=%s
+                   WHERE id=%s""",
+                (now_ts(), now_ts(), verdict, notes, row["id"]),
+            )
 
     # Customer SMS — verdict ready. We don't dump the full text into SMS
     # because that gets unwieldy; we link them back to the standby page
@@ -1677,20 +1785,23 @@ def admin_queue():
         return auth_resp
 
     with db() as conn:
-        rows = conn.execute(
-            """SELECT id, created_at, status, tier, customer_phone,
-                      plan_text, plan_location, ai_status_key,
-                      claimed_at, completed_at
-               FROM verification_requests
-               WHERE created_at > ?
-               ORDER BY created_at DESC LIMIT 100""",
-            (now_ts() - 86400 * 7,),
-        ).fetchall()
-        counts = conn.execute(
-            """SELECT status, COUNT(*) as n FROM verification_requests
-               WHERE created_at > ? GROUP BY status""",
-            (now_ts() - 86400 * 7,),
-        ).fetchall()
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, created_at, status, tier, customer_phone,
+                          plan_text, plan_location, ai_status_key,
+                          claimed_at, completed_at
+                   FROM verification_requests
+                   WHERE created_at > %s
+                   ORDER BY created_at DESC LIMIT 100""",
+                (now_ts() - 86400 * 7,),
+            )
+            rows = cur.fetchall()
+            cur.execute(
+                """SELECT status, COUNT(*) as n FROM verification_requests
+                   WHERE created_at > %s GROUP BY status""",
+                (now_ts() - 86400 * 7,),
+            )
+            counts = cur.fetchall()
     return render_template_string(
         ADMIN_TEMPLATE,
         rows=[dict(r) for r in rows],
@@ -1722,55 +1833,58 @@ def admin_dashboard():
     ).timestamp())
 
     with db() as conn:
-        # Today's tickets, ordered with most recent first
-        today_rows = conn.execute(
-            """SELECT id, created_at, status, tier, price_cents,
-                      customer_phone, plan_text, plan_location,
-                      ai_status_key, claimed_at, completed_at,
-                      meteorologist_verdict
-               FROM verification_requests
-               WHERE created_at >= ?
-               ORDER BY created_at DESC""",
-            (midnight,),
-        ).fetchall()
+        with conn.cursor() as cur:
+            # Today's tickets, ordered with most recent first
+            cur.execute(
+                """SELECT id, created_at, status, tier, price_cents,
+                          customer_phone, plan_text, plan_location,
+                          ai_status_key, claimed_at, completed_at,
+                          meteorologist_verdict
+                   FROM verification_requests
+                   WHERE created_at >= %s
+                   ORDER BY created_at DESC""",
+                (midnight,),
+            )
+            today_rows = cur.fetchall()
 
-        # Summary counts — today only
-        # Total tickets includes everything created today regardless of
-        # whether payment cleared; pending/completed counts are subsets.
-        total_today = len(today_rows)
-        pending_count = sum(
-            1 for r in today_rows if r["status"] in ("pending", "paid", "claimed")
-        )
-        completed_count = sum(1 for r in today_rows if r["status"] == "completed")
-        expired_count = sum(1 for r in today_rows if r["status"] == "expired")
+            # Summary counts — today only
+            # Total tickets includes everything created today regardless of
+            # whether payment cleared; pending/completed counts are subsets.
+            total_today = len(today_rows)
+            pending_count = sum(
+                1 for r in today_rows if r["status"] in ("pending", "paid", "claimed")
+            )
+            completed_count = sum(1 for r in today_rows if r["status"] == "completed")
+            expired_count = sum(1 for r in today_rows if r["status"] == "expired")
 
-        # Revenue today — only count requests that actually paid (paid + later)
-        revenue_cents = sum(
-            r["price_cents"] for r in today_rows
-            if r["status"] in ("paid", "claimed", "completed")
-        )
+            # Revenue today — only count requests that actually paid (paid + later)
+            revenue_cents = sum(
+                r["price_cents"] for r in today_rows
+                if r["status"] in ("paid", "claimed", "completed")
+            )
 
-        # Overdue count — requests past SLA that haven't completed
-        now = now_ts()
-        overdue_count = sum(
-            1 for r in today_rows
-            if r["status"] in ("pending", "paid", "claimed")
-            and (now - r["created_at"]) // 60 >= SLA_MINUTES
-        )
+            # Overdue count — requests past SLA that haven't completed
+            now = now_ts()
+            overdue_count = sum(
+                1 for r in today_rows
+                if r["status"] in ("pending", "paid", "claimed")
+                and (now - r["created_at"]) // 60 >= SLA_MINUTES
+            )
 
-        # AI vs Human disagreement — across ALL completed requests in the
-        # last 30 days, not just today, because the daily volume is small
-        # and the metric is noisy on tiny samples. We surface "today's"
-        # numbers in the per-row table; the headline rate is over time.
-        completed_history = conn.execute(
-            """SELECT ai_status_key, meteorologist_verdict
-               FROM verification_requests
-               WHERE status = 'completed'
-                 AND created_at >= ?
-                 AND ai_status_key IS NOT NULL
-                 AND meteorologist_verdict IS NOT NULL""",
-            (now - 86400 * 30,),
-        ).fetchall()
+            # AI vs Human disagreement — across ALL completed requests in the
+            # last 30 days, not just today, because the daily volume is small
+            # and the metric is noisy on tiny samples. We surface "today's"
+            # numbers in the per-row table; the headline rate is over time.
+            cur.execute(
+                """SELECT ai_status_key, meteorologist_verdict
+                   FROM verification_requests
+                   WHERE status = 'completed'
+                     AND created_at >= %s
+                     AND ai_status_key IS NOT NULL
+                     AND meteorologist_verdict IS NOT NULL""",
+                (now - 86400 * 30,),
+            )
+            completed_history = cur.fetchall()
 
     # Walk completed history and classify each meteorologist verdict
     total_compared = 0
@@ -3127,10 +3241,12 @@ def admin_jump(request_id):
     if auth_resp is not None:
         return auth_resp
     with db() as conn:
-        row = conn.execute(
-            "SELECT claim_token FROM verification_requests WHERE id = ?",
-            (request_id,),
-        ).fetchone()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT claim_token FROM verification_requests WHERE id = %s",
+                (request_id,),
+            )
+            row = cur.fetchone()
     if not row:
         abort(404)
     return redirect(f"/meteorologist/{row['claim_token']}")
