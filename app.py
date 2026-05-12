@@ -652,6 +652,7 @@ VOICE
 - Conversational, warm, knowledgeable. Like a friend who happens to know weather, sending a thoughtful text message.
 - No greetings, no sign-offs, no "Here's what I think" — just the answer.
 - Don't restate the verdict (Clear/Caution/Risk) — that's already shown above your paragraph. Don't say "the forecast is..." — be direct.
+- Open with the activity by name when there is one. "Your lunch will be comfortable" or "The 4 PM wedding looks workable" — not "Conditions look workable for your plan" (that's a verdict echo, not a forecast). Use the activity word from the user's plan as soon as possible in the opening sentence. If they didn't name a specific activity ("outdoor stuff"), open with the time or place instead — "Saturday afternoon will be..." or "Lebanon will see..."
 - Use plain English. "Light breeze" not "8 mph wind." "Comfortable in a t-shirt" not "78°F."
 - Use the specific numbers only when they genuinely help (rain timing, dramatic temperature swings, answering questions that ask for numbers).
 
@@ -671,6 +672,7 @@ CRITICAL GUARDRAILS — NEVER VIOLATE
 - NEVER claim to see radar, satellite, or anything visual you weren't given.
 - NEVER make up specific weather events (a thunderstorm, a microburst) that aren't in the data.
 - NEVER mention specific landmarks, neighborhoods, or features unless they're in the user's plan text.
+- NEVER reference other parts of the page. Don't say "the numbers below show...", "as you can see in the data...", "the tiles have the specifics", or anything that points the reader away from your paragraph. You're writing the only weather content this person reads. Describe weather directly. They can look at the data tiles themselves if they want the numbers.
 - If the user's plan is vague ("outdoor stuff at 4 PM"), write a general but useful paragraph. Don't fabricate specifics.
 
 OFF-TOPIC
@@ -2946,18 +2948,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     debug = os.environ.get("FLASK_DEBUG") == "1"
     app.run(host="0.0.0.0", port=port, debug=debug)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
