@@ -68,6 +68,7 @@ behavior with calls to this server. That file is in the same directory.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -485,6 +486,28 @@ CREATE TABLE IF NOT EXISTS login_attempts (
 );
 CREATE INDEX IF NOT EXISTS idx_login_attempts_ip_time ON login_attempts(ip, attempted_at DESC);
 CREATE INDEX IF NOT EXISTS idx_login_attempts_email_time ON login_attempts(email, attempted_at DESC);
+
+-- ── Stripe event ledger — webhook idempotency ──
+-- Stripe retries failed webhooks (and sometimes succeeds twice through
+-- network glitches). To avoid double-creating users / double-sending
+-- emails, we record every event ID we've fully processed. The webhook
+-- handler checks this table FIRST; if the event ID is already here,
+-- we ack with 200 and skip the work.
+--
+-- Columns:
+--   event_id    — Stripe's "evt_..." identifier, unique per event
+--   event_type  — the type field ("checkout.session.completed", etc.)
+--   processed_at — when we finished processing it
+--   payload_kb  — first 1024 bytes of the JSON, for audit/debugging
+--                (not the full payload — webhooks can be ~10KB and we
+--                don't want to balloon the DB just for forensics)
+CREATE TABLE IF NOT EXISTS stripe_events (
+    event_id        TEXT PRIMARY KEY,
+    event_type      TEXT NOT NULL,
+    processed_at    BIGINT NOT NULL,
+    payload_kb      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_stripe_events_type ON stripe_events(event_type, processed_at DESC);
 """
 
 
@@ -3155,6 +3178,337 @@ def _mark_paid_and_notify(request_id: int, *, payment_id: Optional[str] = None,
             f"30-min SLA. Tap the link."
         )
         send_sms(METEOROLOGIST_PHONE, met_msg)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Stripe webhook v2 — subscription signup flow (Phase 4)
+# ────────────────────────────────────────────────────────────────────────────
+#
+# Listens for checkout.session.completed events from Stripe and handles
+# the subscription onboarding flow:
+#   1. Verify Stripe's HMAC signature against STRIPE_WEBHOOK_SECRET
+#   2. Check the event ID against stripe_events table (idempotency)
+#   3. If session.mode == 'subscription':
+#        a. Find or create the user matching session.customer_details.email
+#        b. Grant them the 'subscriber' role (if not already)
+#        c. Send them a magic-link email with intent=password-reset so
+#           they can set their initial password
+#   4. If session.mode == 'payment' (one-time $19 purchase):
+#        a. Log it but don't create an account (per product decision —
+#           $19 is a transactional purchase, not an account-creation event)
+#   5. Record the event in stripe_events
+#   6. Return 200
+#
+# Note: this is the NEW endpoint at /api/v1/stripe/webhook. The older
+# /webhooks/stripe route (line ~3076) is left in place for now but has
+# no Stripe destination pointing at it. If the $19 verification_requests
+# flow is later re-wired, it can either move to this endpoint or keep
+# its own — but right now, this is the only live webhook.
+
+def _validate_stripe_signature(payload: bytes, sig_header: str, secret: str,
+                                tolerance_seconds: int = 300) -> bool:
+    """Validate a Stripe webhook signature using HMAC-SHA256.
+
+    Stripe documents this scheme at:
+      https://stripe.com/docs/webhooks/signatures
+
+    The Stripe-Signature header looks like:
+      t=1492774577,v1=5257a869e7ecebeda32...
+
+    Where:
+      t  = the timestamp when Stripe signed the request (seconds since epoch)
+      v1 = the HMAC-SHA256 hex digest of "{t}.{payload}" keyed with our secret
+
+    Validation steps:
+      1. Parse the header into t and v1 values
+      2. Reject if timestamp is more than `tolerance_seconds` old (default 5min).
+         This prevents replay attacks where someone captures a real webhook
+         and re-sends it later.
+      3. Compute our own HMAC of "{t}.{payload}" and constant-time compare
+         against the v1 value.
+
+    Returns True only when the signature is valid AND fresh. Any malformed
+    header, missing fields, wrong digest, or stale timestamp → False.
+
+    Constant-time comparison via hmac.compare_digest prevents timing-attack
+    leaks where an attacker could narrow in on the secret one byte at a time.
+    """
+    if not payload or not sig_header or not secret:
+        return False
+
+    # Parse header into key=value pairs
+    parts = {}
+    for chunk in sig_header.split(","):
+        chunk = chunk.strip()
+        if "=" not in chunk:
+            continue
+        key, value = chunk.split("=", 1)
+        parts.setdefault(key, value)
+
+    timestamp_str = parts.get("t")
+    sig_v1 = parts.get("v1")
+    if not timestamp_str or not sig_v1:
+        return False
+
+    try:
+        timestamp = int(timestamp_str)
+    except ValueError:
+        return False
+
+    # Replay protection — reject anything older than tolerance.
+    # now_ts() returns seconds since epoch, same units as Stripe's t.
+    if abs(now_ts() - timestamp) > tolerance_seconds:
+        print(
+            f"[stripe-webhook] signature timestamp out of tolerance: "
+            f"t={timestamp} now={now_ts()} delta={abs(now_ts() - timestamp)}s",
+            flush=True,
+        )
+        return False
+
+    # Compute the expected signature. Stripe signs the literal byte sequence
+    # "t={timestamp_str}.{raw_payload}" — the timestamp must be the EXACT
+    # string from the header (no re-formatting), and the payload must be the
+    # raw bytes (no JSON re-serialization).
+    signed_payload = f"{timestamp_str}.".encode("utf-8") + payload
+    expected_sig = hmac.new(
+        secret.encode("utf-8"),
+        signed_payload,
+        hashlib.sha256,
+    ).hexdigest()
+
+    return hmac.compare_digest(expected_sig, sig_v1)
+
+
+def _stripe_event_already_processed(event_id: str) -> bool:
+    """Check if we've already handled this Stripe event ID.
+
+    Stripe retries failed webhooks and occasionally double-sends successful
+    ones through network issues. The event_id is unique per event, so we
+    use it as the idempotency key. The stripe_events table holds every
+    event we've fully processed.
+
+    Returns True if the event was already processed (caller should skip
+    work and return 200 to ack), False if it's new.
+    """
+    if not event_id:
+        return False
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM stripe_events WHERE event_id = %s LIMIT 1",
+                (event_id,),
+            )
+            return cur.fetchone() is not None
+
+
+def _stripe_event_record(event_id: str, event_type: str, payload: bytes) -> None:
+    """Record that we've processed a Stripe event.
+
+    Called AFTER the event has been fully handled (account created, email
+    sent, etc.). If we crash mid-processing, the row isn't written and
+    Stripe's next retry will re-trigger the full flow. This is intentional:
+    a partial failure is better re-tried than silently lost.
+
+    payload_kb stores only the first 1024 bytes — enough to audit
+    "what kind of event was this" without ballooning the table.
+    """
+    if not event_id:
+        return
+    payload_preview = payload[:1024].decode("utf-8", errors="replace") if payload else ""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO stripe_events
+                   (event_id, event_type, processed_at, payload_kb)
+                   VALUES (%s, %s, %s, %s)
+                   ON CONFLICT (event_id) DO NOTHING""",
+                (event_id, event_type, now_ts(), payload_preview),
+            )
+
+
+def _grant_subscriber_role(user_id: int, conn) -> bool:
+    """Grant the 'subscriber' role to a user. Idempotent — returns True
+    only if the role was newly added (False if they already had it).
+    Used after a successful subscription webhook.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM user_roles WHERE user_id = %s AND role = %s",
+            (user_id, "subscriber"),
+        )
+        if cur.fetchone() is not None:
+            return False
+        cur.execute(
+            """INSERT INTO user_roles (user_id, role, granted_at)
+               VALUES (%s, %s, %s)
+               ON CONFLICT DO NOTHING""",
+            (user_id, "subscriber", now_ts()),
+        )
+        return True
+
+
+@app.route("/api/v1/stripe/webhook", methods=["OPTIONS"])
+def _stripe_webhook_v2_preflight():
+    """CORS preflight. Stripe doesn't send preflights but this route
+    being CORS-clean is harmless and matches the codebase pattern."""
+    return ("", 204)
+
+
+@app.post("/api/v1/stripe/webhook")
+def stripe_webhook_v2():
+    """Stripe POSTs subscription events here.
+
+    Configured at Stripe dashboard → Event destinations:
+      URL:    https://wv-valet-backend.onrender.com/api/v1/stripe/webhook
+      Events: checkout.session.completed
+
+    Security: STRIPE_WEBHOOK_SECRET must be set on Render. Without it,
+    we return 500 (not 200) because a misconfigured webhook is worse
+    than a slow webhook — Stripe will retry, and someone will notice.
+    """
+    if not STRIPE_WEBHOOK_SECRET:
+        print("[stripe-webhook] STRIPE_WEBHOOK_SECRET not configured", flush=True)
+        return jsonify({"error": "webhook-not-configured"}), 500
+
+    # Read the raw payload bytes. Do NOT use request.get_json() — that
+    # parses and re-serializes, which breaks the signature.
+    payload = request.get_data(as_text=False)
+    sig_header = request.headers.get("Stripe-Signature", "")
+
+    # Signature gate — anything that doesn't validate is rejected before
+    # we look at the payload. Could be a probe, a forgery attempt, or a
+    # legitimate event with the wrong secret in env vars.
+    if not _validate_stripe_signature(payload, sig_header, STRIPE_WEBHOOK_SECRET):
+        print(
+            f"[stripe-webhook] signature validation failed "
+            f"(payload_len={len(payload)} sig_present={bool(sig_header)})",
+            flush=True,
+        )
+        return jsonify({"error": "invalid-signature"}), 400
+
+    # Parse the JSON only after signature validation passed.
+    try:
+        event = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        print(f"[stripe-webhook] payload parse error: {e!r}", flush=True)
+        return jsonify({"error": "invalid-payload"}), 400
+
+    event_id = event.get("id", "")
+    event_type = event.get("type", "")
+
+    # Idempotency check — if we've seen this event ID before, skip.
+    if _stripe_event_already_processed(event_id):
+        print(f"[stripe-webhook] event {event_id} already processed, skipping", flush=True)
+        return jsonify({"received": True, "duplicate": True}), 200
+
+    # Dispatch. Today we only handle checkout.session.completed. Other
+    # event types ack with 200 (so Stripe doesn't retry) but do nothing.
+    if event_type != "checkout.session.completed":
+        print(f"[stripe-webhook] unhandled event type: {event_type} (id={event_id})", flush=True)
+        # Record it anyway so we don't reprocess on retries
+        _stripe_event_record(event_id, event_type, payload)
+        return jsonify({"received": True, "handled": False}), 200
+
+    # Extract the checkout session
+    session = event.get("data", {}).get("object", {})
+    mode = session.get("mode", "")  # 'subscription' | 'payment' | 'setup'
+    customer_details = session.get("customer_details") or {}
+    email = (customer_details.get("email") or "").strip()
+    customer_name = (customer_details.get("name") or "").strip()
+    stripe_customer_id = session.get("customer") or ""
+
+    print(
+        f"[stripe-webhook] checkout.session.completed received: "
+        f"id={event_id} mode={mode} email={email} customer={stripe_customer_id}",
+        flush=True,
+    )
+
+    if mode == "subscription":
+        # Account-creation flow. We need a valid email; without it, we
+        # can't create a user or send a welcome link.
+        if not email or not is_valid_email(email):
+            print(f"[stripe-webhook] subscription mode but invalid email: '{email}'", flush=True)
+            _stripe_event_record(event_id, event_type, payload)
+            return jsonify({"received": True, "handled": False, "reason": "invalid-email"}), 200
+
+        try:
+            with db() as conn:
+                # Find or create the user. _get_or_create_user is idempotent —
+                # if they already exist, returns their id. If not, creates a
+                # new row with no password set.
+                user_id = _get_or_create_user(email, conn)
+
+                # If we got a name from Stripe and the user doesn't have one
+                # yet, fill it in. Don't overwrite an existing name (the user
+                # may have set their own preferred form).
+                if customer_name:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """UPDATE users SET name = %s
+                               WHERE id = %s AND (name IS NULL OR name = '')""",
+                            (customer_name, user_id),
+                        )
+
+                # Grant subscriber role
+                newly_granted = _grant_subscriber_role(user_id, conn)
+
+            # Send the password-reset email so the new subscriber can set
+            # their password and sign in. Reusing the magic-link infra —
+            # password-reset and first-time-account-setup are the same flow.
+            base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai")
+            raw_token = new_secure_token()
+            token_hash = hash_token(raw_token)
+            now = now_ts()
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO magic_link_tokens
+                           (token_hash, user_id, created_at, expires_at, ip_requested)
+                           VALUES (%s, %s, %s, %s, %s)""",
+                        (token_hash, user_id, now, now + MAGIC_LINK_TTL_SECONDS, "stripe-webhook"),
+                    )
+            magic_link_url = f"{base}/?auth=verify&token={raw_token}&intent=password-reset"
+            _send_magic_link_email(email, magic_link_url, intent="password-reset")
+
+            print(
+                f"[stripe-webhook] subscription provisioned: "
+                f"user_id={user_id} email={email} newly_granted={newly_granted}",
+                flush=True,
+            )
+
+            # Record the event so we don't reprocess on retries
+            _stripe_event_record(event_id, event_type, payload)
+            return jsonify({"received": True, "handled": True, "user_id": user_id}), 200
+
+        except Exception as e:
+            # DB error, email send failure, etc. Don't record the event —
+            # Stripe will retry, and the retry has a real chance of working
+            # (transient DB issues, Resend hiccups, etc.). Log loudly.
+            print(
+                f"[stripe-webhook] FAILED to provision subscription for {email}: {e!r}",
+                flush=True,
+            )
+            return jsonify({"error": "internal-error"}), 500
+
+    elif mode == "payment":
+        # One-time payment ($19 Met-verified review). Per product decision,
+        # we do NOT create an account here — the $19 product is transactional
+        # only. The existing verification_requests flow (separate webhook,
+        # currently inactive) handles its own bookkeeping.
+        print(
+            f"[stripe-webhook] one-time payment received (no account created): "
+            f"email={email} session={session.get('id')}",
+            flush=True,
+        )
+        _stripe_event_record(event_id, event_type, payload)
+        return jsonify({"received": True, "handled": True, "mode": "payment"}), 200
+
+    else:
+        # 'setup' mode or anything else we don't handle. Ack so Stripe
+        # doesn't retry, but log so we notice if a new mode appears.
+        print(f"[stripe-webhook] unhandled mode: '{mode}' (id={event_id})", flush=True)
+        _stripe_event_record(event_id, event_type, payload)
+        return jsonify({"received": True, "handled": False, "mode": mode}), 200
 
 
 # ────────────────────────────────────────────────────────────────────────────
