@@ -718,6 +718,19 @@ def _send_magic_link_email(email: str, magic_link_url: str, intent: str = "sign-
     api_key = os.environ.get("RESEND_API_KEY", "").strip()
     from_addr = os.environ.get("EMAIL_FROM", "").strip()
 
+    # Diagnostic logging — shows enough to know if env vars are read
+    # at send time, without leaking the full API key. Remove or quiet
+    # this block after email delivery is confirmed working in prod.
+    api_key_preview = (
+        f"{api_key[:4]}...{api_key[-3:]} (len={len(api_key)})"
+        if api_key else "EMPTY"
+    )
+    print(
+        f"[MAGIC LINK DIAG] api_key={api_key_preview} from='{from_addr}' "
+        f"intent={intent} recipient={email}",
+        flush=True,
+    )
+
     # Stub fallback — no API key configured, just log the link.
     if not api_key or not from_addr:
         print(
@@ -795,6 +808,12 @@ def _send_magic_link_email(email: str, magic_link_url: str, intent: str = "sign-
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            # Cloudflare (sits in front of api.resend.com) sometimes blocks
+            # requests with no User-Agent or with Python's default
+            # "Python-urllib/3.x" UA as suspicious automation. A real-looking
+            # UA gets through without the WAF interception that returns
+            # Cloudflare's "error code: 1010".
+            "User-Agent": "WeatherValet-Backend/1.0 (+https://weathervalet.ai)",
         },
     )
 
