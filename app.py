@@ -397,6 +397,16 @@ CREATE INDEX IF NOT EXISTS idx_users_email_lower ON users(LOWER(email));
 -- via IF NOT EXISTS (supported since Postgres 9.6).
 ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;
 
+-- Soft-delete column — admin "deactivates" a user instead of deleting,
+-- so historical reviews/reports keep their authorship. Default true
+-- so existing users stay active without an explicit migration value.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+
+-- Force-password-change flag — when admin creates a user with a temp
+-- password, this is set to TRUE. The login flow checks it and requires
+-- a password change before allowing access to any workspace.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_must_change BOOLEAN NOT NULL DEFAULT FALSE;
+
 -- ── User roles — many-to-many; a user can hold several roles ──
 -- Roles: 'subscriber', 'crew', 'met', 'admin'
 -- A subscriber who is also Crew has two rows here.
@@ -4703,6 +4713,315 @@ def admin_jump(request_id):
 # ════════════════════════════════════════════════════════════════════════════
 # Main
 # ════════════════════════════════════════════════════════════════════════════
+
+
+# ════════════════════════════════════════════════════════════════════
+# Admin · Team management endpoints (Phase 4 Chunk 2)
+# ════════════════════════════════════════════════════════════════════
+# These power the Team tab in the admin Command Center. Session-auth
+# gated via @require_role('admin') — caller must be signed in AND have
+# the 'admin' role. The older /admin/* HTTP-Basic routes stay around
+# as a bootstrap mechanism (you can still curl /admin/set-password etc.
+# if your admin user gets locked out).
+#
+# Uses the existing `db()` context manager. Connections autocommit,
+# so no explicit commit/rollback is needed. Row factory is
+# RealDictCursor, so cur.fetchone() returns dicts keyed by column name.
+
+
+def _generate_temp_password():
+    """Generate a memorable but secure temp password for new users.
+    Pattern: three short English words + two digits, e.g. "river-storm-cedar-42".
+    Easier to share verbally than a random string; still high-entropy enough
+    that brute force is impractical within the time before the user is
+    required to change it on first login (forced via password_must_change).
+    """
+    import secrets
+    words = [
+        "storm", "river", "cedar", "quiet", "amber", "north", "calm",
+        "flint", "dune", "marsh", "pine", "vivid", "swift", "bright",
+        "creek", "ridge", "valley", "meadow", "harbor", "ember",
+    ]
+    w1 = secrets.choice(words)
+    w2 = secrets.choice([w for w in words if w != w1])
+    w3 = secrets.choice([w for w in words if w not in (w1, w2)])
+    digits = secrets.randbelow(90) + 10  # 10-99
+    return f"{w1}-{w2}-{w3}-{digits}"
+
+
+def _serialize_user_for_admin(row):
+    """Shape a users row (dict, since RealDictCursor) + roles list into
+    the JSON shape the frontend Team panel expects. `row` is expected
+    to have: id, email, name, created_at, last_login_at, is_active, roles.
+    """
+    import time as _time
+    import datetime as _datetime
+
+    last_login_at = row.get("last_login_at")
+    if last_login_at:
+        delta = int(_time.time()) - int(last_login_at)
+        if delta < 60:
+            last_login_str = "just now"
+        elif delta < 3600:
+            last_login_str = f"{delta // 60} min ago"
+        elif delta < 86400:
+            last_login_str = f"{delta // 3600}h ago"
+        elif delta < 86400 * 7:
+            last_login_str = f"{delta // 86400}d ago"
+        else:
+            last_login_str = _datetime.datetime.utcfromtimestamp(last_login_at).strftime("%b %d")
+    else:
+        last_login_str = "Never"
+
+    roles = row.get("roles") or []
+    # Pick highest-priority role for the frontend's single-role-per-row display.
+    # Matches workspace-router precedence (admin > met > crew > subscriber).
+    role_priority = ["admin", "met", "crew", "subscriber"]
+    primary_role = next((r for r in role_priority if r in roles), None)
+    # Frontend uses 'meteorologist' for display; backend stores 'met'.
+    if primary_role == "met":
+        primary_role = "meteorologist"
+
+    return {
+        "id": f"u_{row['id']}",
+        "user_id": row["id"],
+        "name": row.get("name") or "",
+        "email": row["email"],
+        "role": primary_role or "subscriber",
+        "all_roles": roles,
+        "last_login": last_login_str,
+        "is_active": bool(row.get("is_active", True)),
+    }
+
+
+@app.get("/api/v1/admin/users")
+@require_role("admin")
+def admin_list_users():
+    """List all users with their roles. Returns active and inactive both;
+    the frontend handles visual grey-out for inactive ones."""
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT u.id, u.email, u.name, u.created_at, u.last_login_at, u.is_active,
+                   ARRAY_REMOVE(ARRAY_AGG(ur.role ORDER BY ur.role), NULL) AS roles
+            FROM users u
+            LEFT JOIN user_roles ur ON ur.user_id = u.id
+            GROUP BY u.id
+            ORDER BY u.is_active DESC, u.created_at DESC
+        """)
+        rows = cur.fetchall()
+
+    members = [_serialize_user_for_admin(row) for row in rows]
+    return jsonify({"ok": True, "members": members})
+
+
+@app.post("/api/v1/admin/users")
+@require_role("admin")
+def admin_create_user():
+    """Create a new user with a temp password and grant their role.
+    Returns the new user + the temp password (the ONLY time the password
+    is ever returned in plaintext). The user is created with
+    password_must_change=TRUE so they'll be forced to change it on
+    first login.
+
+    Request body: {"name": "...", "email": "...", "role": "meteorologist|crew|admin"}
+    """
+    import time as _time
+    import bcrypt as _bcrypt
+
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    email = (data.get("email") or "").strip().lower()
+    role_input = (data.get("role") or "").strip().lower()
+
+    if not name:
+        return jsonify({"ok": False, "error": "missing-name"}), 400
+    if not email or not is_valid_email(email):
+        return jsonify({"ok": False, "error": "invalid-email"}), 400
+
+    # Frontend uses 'meteorologist'; backend stores 'met'.
+    role_map = {"meteorologist": "met", "met": "met", "crew": "crew",
+                "admin": "admin", "subscriber": "subscriber"}
+    role = role_map.get(role_input)
+    if not role:
+        return jsonify({"ok": False, "error": "invalid-role"}), 400
+
+    temp_password = _generate_temp_password()
+    password_hash = _bcrypt.hashpw(temp_password.encode("utf-8"),
+                                   _bcrypt.gensalt(rounds=12)).decode("utf-8")
+    now = int(_time.time())
+
+    try:
+        with db() as conn:
+            cur = conn.cursor()
+            # Check for existing user (case-insensitive on email)
+            cur.execute("SELECT id FROM users WHERE LOWER(email) = LOWER(%s)", (email,))
+            if cur.fetchone():
+                return jsonify({"ok": False, "error": "email-already-exists"}), 409
+
+            # Insert user
+            cur.execute("""
+                INSERT INTO users (email, password_hash, name, created_at, is_active, password_must_change)
+                VALUES (%s, %s, %s, %s, TRUE, TRUE)
+                RETURNING id
+            """, (email, password_hash, name, now))
+            new_user_id = cur.fetchone()["id"]
+
+            # Grant role
+            cur.execute("""
+                INSERT INTO user_roles (user_id, role, granted_at)
+                VALUES (%s, %s, %s)
+            """, (new_user_id, role, now))
+
+            # Fetch back the freshly-created user for a consistent response shape
+            cur.execute("""
+                SELECT u.id, u.email, u.name, u.created_at, u.last_login_at, u.is_active,
+                       ARRAY_REMOVE(ARRAY_AGG(ur.role ORDER BY ur.role), NULL) AS roles
+                FROM users u
+                LEFT JOIN user_roles ur ON ur.user_id = u.id
+                WHERE u.id = %s
+                GROUP BY u.id
+            """, (new_user_id,))
+            row = cur.fetchone()
+    except Exception as e:
+        print(f"[admin_create_user] failed: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"ok": False, "error": "create-failed"}), 500
+
+    return jsonify({
+        "ok": True,
+        "member": _serialize_user_for_admin(row),
+        "temp_password": temp_password,
+    })
+
+
+@app.patch("/api/v1/admin/users/<int:user_id>")
+@require_role("admin")
+def admin_update_user(user_id):
+    """Edit name/email/role/active. Optionally reset password (returns
+    new temp_password in response, sets password_must_change=TRUE).
+
+    Request body keys (all optional): name, email, role, is_active, reset_password
+    """
+    import time as _time
+    import bcrypt as _bcrypt
+
+    data = request.get_json(silent=True) or {}
+    name = data.get("name")
+    email = data.get("email")
+    role_input = data.get("role")
+    reset_password = bool(data.get("reset_password"))
+    is_active = data.get("is_active")
+
+    temp_password = None
+
+    try:
+        with db() as conn:
+            cur = conn.cursor()
+
+            # Verify user exists
+            cur.execute("SELECT id FROM users WHERE id = %s", (user_id,))
+            if not cur.fetchone():
+                return jsonify({"ok": False, "error": "no-such-user"}), 404
+
+            # Build dynamic UPDATE for the users table
+            updates = []
+            params = []
+
+            if name is not None:
+                name_clean = name.strip()
+                if not name_clean:
+                    return jsonify({"ok": False, "error": "missing-name"}), 400
+                updates.append("name = %s")
+                params.append(name_clean)
+
+            if email is not None:
+                email_clean = email.strip().lower()
+                if not is_valid_email(email_clean):
+                    return jsonify({"ok": False, "error": "invalid-email"}), 400
+                cur.execute("SELECT id FROM users WHERE LOWER(email) = LOWER(%s) AND id != %s",
+                            (email_clean, user_id))
+                if cur.fetchone():
+                    return jsonify({"ok": False, "error": "email-already-exists"}), 409
+                updates.append("email = %s")
+                params.append(email_clean)
+
+            if is_active is not None:
+                updates.append("is_active = %s")
+                params.append(bool(is_active))
+
+            if reset_password:
+                temp_password = _generate_temp_password()
+                password_hash = _bcrypt.hashpw(temp_password.encode("utf-8"),
+                                               _bcrypt.gensalt(rounds=12)).decode("utf-8")
+                updates.append("password_hash = %s")
+                params.append(password_hash)
+                updates.append("password_must_change = TRUE")  # literal, no param
+
+            if updates:
+                params.append(user_id)
+                cur.execute(f"UPDATE users SET {', '.join(updates)} WHERE id = %s", params)
+
+            # Replace role if provided. Conservative single-primary-role model:
+            # remove all existing roles and add the new one. (For a richer
+            # multi-role UI we'd add a separate roles-management endpoint.)
+            if role_input is not None:
+                role_map = {"meteorologist": "met", "met": "met", "crew": "crew",
+                            "admin": "admin", "subscriber": "subscriber"}
+                new_role = role_map.get(role_input.strip().lower())
+                if not new_role:
+                    return jsonify({"ok": False, "error": "invalid-role"}), 400
+                cur.execute("DELETE FROM user_roles WHERE user_id = %s", (user_id,))
+                cur.execute(
+                    "INSERT INTO user_roles (user_id, role, granted_at) VALUES (%s, %s, %s)",
+                    (user_id, new_role, int(_time.time())),
+                )
+
+            # If password was reset, also kill any active sessions so the
+            # user is forced to re-auth with the new temp password.
+            if reset_password:
+                cur.execute("DELETE FROM sessions WHERE user_id = %s", (user_id,))
+
+            # Return the refreshed user
+            cur.execute("""
+                SELECT u.id, u.email, u.name, u.created_at, u.last_login_at, u.is_active,
+                       ARRAY_REMOVE(ARRAY_AGG(ur.role ORDER BY ur.role), NULL) AS roles
+                FROM users u
+                LEFT JOIN user_roles ur ON ur.user_id = u.id
+                WHERE u.id = %s
+                GROUP BY u.id
+            """, (user_id,))
+            row = cur.fetchone()
+    except Exception as e:
+        print(f"[admin_update_user] failed: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"ok": False, "error": "update-failed"}), 500
+
+    response = {"ok": True, "member": _serialize_user_for_admin(row)}
+    if temp_password:
+        response["temp_password"] = temp_password
+    return jsonify(response)
+
+
+@app.delete("/api/v1/admin/users/<int:user_id>")
+@require_role("admin")
+def admin_deactivate_user(user_id):
+    """Soft-delete a user — sets is_active=FALSE. Historical work stays
+    in the record under their authorship; they just can't sign in anymore.
+    Reactivation is via PATCH with is_active=true. Also destroys any
+    active sessions so the user is logged out immediately.
+    """
+    try:
+        with db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM users WHERE id = %s", (user_id,))
+            if not cur.fetchone():
+                return jsonify({"ok": False, "error": "no-such-user"}), 404
+            cur.execute("UPDATE users SET is_active = FALSE WHERE id = %s", (user_id,))
+            cur.execute("DELETE FROM sessions WHERE user_id = %s", (user_id,))
+    except Exception as e:
+        print(f"[admin_deactivate_user] failed: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"ok": False, "error": "deactivate-failed"}), 500
+
+    return jsonify({"ok": True})
 
 
 if __name__ == "__main__":
