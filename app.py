@@ -73,6 +73,8 @@ import os
 import secrets
 import sys
 import time
+import urllib.request
+import urllib.error
 from contextlib import contextmanager
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
@@ -693,42 +695,123 @@ def get_user_agent() -> str:
 def _send_magic_link_email(email: str, magic_link_url: str) -> bool:
     """Send a magic-link email to the user.
 
-    DEVELOPMENT MODE (current — pre AWS SES production approval):
-    Prints the URL to server logs instead of actually emailing.
-    To test the auth flow:
-      1. Trigger a magic link request via the frontend or curl
-      2. Open Render's logs for the wv-valet-backend service
-      3. Look for lines starting with '[MAGIC LINK STUB]'
-      4. Copy the URL and paste it into your browser
+    DELIVERY: Resend (resend.com) via their HTTP API.
+    Requires two environment variables on Render:
+      RESEND_API_KEY  — server token from resend.com/api-keys
+      EMAIL_FROM      — sender address at a verified domain
+                        (e.g., noreply@weathervalet.ai)
 
-    PRODUCTION MODE (after Phase 2 — AWS SES approved):
-    This function will be rewritten to call boto3 / SES to actually
-    send the email. The signature stays the same — only the body
-    changes. Everything in the rest of the auth system continues
-    working without modification.
+    If RESEND_API_KEY is not set, falls back to printing the magic link
+    to server logs (development/stub mode). This lets local dev and
+    early testing continue to work even before Resend is wired up, and
+    gives us a clean rollback if Resend has a transient outage.
 
-    Returns True if delivery succeeded (or stub printed successfully).
-    The stub always returns True because writing to stderr can't
-    meaningfully fail.
-
-    Why this approach is safe during development:
-      - Server logs are private to the Render dashboard (admin-only)
-      - Magic link URLs expire in 15 minutes regardless of how they
-        were delivered
-      - If a log leaked (extremely unlikely on Render's infrastructure),
-        any URLs in it are likely already dead by the time anyone reads it
-      - Real users can't be tricked into clicking stub-logged URLs because
-        the stub doesn't send anything to anyone
+    Returns True on success (or successful stub print), False on send
+    failure. The auth flow does not block on this return value — a
+    failed send is logged but doesn't reveal anything to the user
+    (which would enable email-enumeration attacks).
     """
-    # The print(..., flush=True) ensures the log line appears immediately
-    # in Render's stream, not buffered for the end of the request.
-    print(
-        f"[MAGIC LINK STUB] To: {email}\n"
-        f"[MAGIC LINK STUB] Link: {magic_link_url}\n"
-        f"[MAGIC LINK STUB] (paste this URL into your browser to log in)",
-        flush=True,
+    api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    from_addr = os.environ.get("EMAIL_FROM", "").strip()
+
+    # Stub fallback — no API key configured, just log the link.
+    if not api_key or not from_addr:
+        print(
+            f"[MAGIC LINK STUB] To: {email}\n"
+            f"[MAGIC LINK STUB] Link: {magic_link_url}\n"
+            f"[MAGIC LINK STUB] (no RESEND_API_KEY set; logging only)",
+            flush=True,
+        )
+        return True
+
+    # Build the email payload. Resend accepts both 'html' and 'text';
+    # we send both so users with plain-text mail clients still see
+    # something readable.
+    subject = "Sign in to WeatherValet"
+    html_body = (
+        '<div style="font-family: -apple-system, BlinkMacSystemFont, '
+        '\'Segoe UI\', Roboto, sans-serif; max-width: 480px; margin: 0 auto; '
+        'padding: 24px;">'
+        '<h2 style="color: #0E1116; font-size: 20px; margin: 0 0 16px;">'
+        'Sign in to WeatherValet</h2>'
+        '<p style="color: rgba(15,17,22,0.75); font-size: 15px; line-height: 1.5;">'
+        'Tap the button below to sign in. This link expires in 15 minutes '
+        'and can only be used once.</p>'
+        f'<p style="margin: 28px 0;"><a href="{magic_link_url}" '
+        'style="display: inline-block; background: #4169E1; color: #fff; '
+        'padding: 12px 24px; border-radius: 8px; text-decoration: none; '
+        'font-weight: 600;">Sign in to WeatherValet</a></p>'
+        '<p style="color: rgba(15,17,22,0.55); font-size: 13px; line-height: 1.5;">'
+        'If the button doesn\'t work, copy and paste this link into your browser:'
+        f'<br><span style="word-break: break-all;">{magic_link_url}</span></p>'
+        '<p style="color: rgba(15,17,22,0.45); font-size: 12px; '
+        'margin-top: 32px; border-top: 1px solid rgba(15,17,22,0.08); padding-top: 16px;">'
+        'If you didn\'t request this sign-in link, you can safely ignore '
+        'this email \u2014 no one can sign in without clicking the link above.</p>'
+        '</div>'
     )
-    return True
+    text_body = (
+        "Sign in to WeatherValet\n\n"
+        "Tap this link to sign in. It expires in 15 minutes and can only "
+        "be used once:\n\n"
+        f"{magic_link_url}\n\n"
+        "If you didn't request this sign-in link, you can safely ignore "
+        "this email \u2014 no one can sign in without clicking the link above."
+    )
+
+    payload = json.dumps({
+        "from": from_addr,
+        "to": [email],
+        "subject": subject,
+        "html": html_body,
+        "text": text_body,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            # Resend returns 200 with a JSON body containing the email ID
+            # on success. We don't inspect the body; status code is enough.
+            if 200 <= resp.status < 300:
+                return True
+            print(
+                f"[MAGIC LINK SEND] Resend returned status {resp.status} "
+                f"for {email}",
+                flush=True,
+            )
+            return False
+    except urllib.error.HTTPError as e:
+        # Most common: 422 (invalid email), 401 (bad API key), 403
+        # (domain not verified). Log the body so we can debug from
+        # Render logs without leaking through user-facing errors.
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        print(
+            f"[MAGIC LINK SEND] Resend HTTPError {e.code} for {email}: {body}",
+            flush=True,
+        )
+        return False
+    except Exception as e:
+        # Network errors, timeouts, etc. We don't want a transient
+        # Resend outage to break the auth flow — log it and return False
+        # so the calling code can decide what to do.
+        print(
+            f"[MAGIC LINK SEND] Unexpected error for {email}: {e!r}",
+            flush=True,
+        )
+        return False
 
 
 def _create_session(user_id: int, conn) -> str:
@@ -1526,8 +1609,7 @@ def _ensure_db():
 
 # Use urllib for the Gemini call — we don't want to add `requests` as a
 # dependency just for one HTTP call. urllib is in the Python stdlib.
-import urllib.request
-import urllib.error
+# (urllib.request and urllib.error are imported at the top of the file.)
 
 
 # The system prompt is the most important text in this entire file.
