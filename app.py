@@ -723,17 +723,27 @@ def _set_session_cookie(response, raw_session_id: str):
     Cookie flags explained:
       - HttpOnly: JavaScript on the page can't read this cookie. Prevents
         XSS-based session theft (an injected script can't steal the cookie).
-      - Secure: only transmitted over HTTPS. Prevents passive interception
-        on hostile networks. Disabled in dev (HTTP localhost) because
-        Secure cookies are silently dropped on HTTP connections.
-      - SameSite=Lax: the cookie is sent on top-level navigations but not
-        on cross-site subrequests. Protects against most CSRF attacks
-        while allowing the magic-link redirect from email to weathervalet.ai
-        to bring the cookie along.
+      - Secure: only transmitted over HTTPS. Required when SameSite=None.
+        Prevents passive interception on hostile networks.
+      - SameSite=None: required for cross-site cookies in modern browsers.
+        Our frontend (weathervalet.ai) and backend (wv-valet-backend.onrender.com)
+        are different sites, so fetch() calls from frontend JS are
+        cross-site requests. With SameSite=Lax (the safer default), the
+        browser would refuse to send the cookie on these requests. We
+        use SameSite=None to allow it, paired with Secure (required by
+        browsers for SameSite=None) and HttpOnly (defense against XSS).
+        CSRF protection comes from the fetch() API itself — by default
+        fetch doesn't send cookies cross-origin unless we explicitly
+        opt in with credentials:'include', AND the server returns
+        Access-Control-Allow-Credentials:true. So an attacker site
+        can't trick a browser into sending our cookie to us.
       - Path=/: cookie is sent for all paths on the domain.
       - Max-Age: cookie expires when the absolute session TTL expires.
 
-    Production (HTTPS) uses all flags; dev (HTTP) drops Secure.
+    In dev (HTTP localhost) we drop Secure and use SameSite=Lax instead
+    because SameSite=None requires Secure. Cross-site auth doesn't work
+    in dev anyway because localhost isn't a public origin — you'd test
+    by hitting the backend directly or using a tunnel like ngrok.
     """
     is_prod = bool(os.environ.get("PUBLIC_BASE_URL", "").startswith("https://"))
     response.set_cookie(
@@ -742,14 +752,19 @@ def _set_session_cookie(response, raw_session_id: str):
         max_age=SESSION_ABSOLUTE_TTL_SECONDS,
         httponly=True,
         secure=is_prod,
-        samesite="Lax",
+        samesite="None" if is_prod else "Lax",
         path="/",
     )
     return response
 
 
 def _clear_session_cookie(response):
-    """Clear the session cookie. Used on logout."""
+    """Clear the session cookie. Used on logout.
+
+    Matches the flags used in _set_session_cookie so the browser sees
+    the same cookie identity and replaces (rather than additionally
+    setting a second cookie at a different scope).
+    """
     is_prod = bool(os.environ.get("PUBLIC_BASE_URL", "").startswith("https://"))
     response.set_cookie(
         SESSION_COOKIE_NAME,
@@ -757,7 +772,7 @@ def _clear_session_cookie(response):
         max_age=0,
         httponly=True,
         secure=is_prod,
-        samesite="Lax",
+        samesite="None" if is_prod else "Lax",
         path="/",
     )
     return response
@@ -1257,6 +1272,14 @@ def _add_cors_headers(response):
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        # Allow the browser to send/receive cookies on cross-origin requests.
+        # Required for the auth flow: frontend (weathervalet.ai) calls
+        # backend (wv-valet-backend.onrender.com), which sets a session
+        # cookie via Set-Cookie. Without this header, the browser silently
+        # drops the cookie. Without credentials:'include' on the frontend
+        # fetch call, the browser doesn't send the cookie back on
+        # subsequent requests.
+        response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Access-Control-Max-Age"] = "3600"
         # Vary on Origin so caches don't serve the wrong CORS response
         response.headers["Vary"] = "Origin"
@@ -1849,10 +1872,16 @@ def auth_request_magic_link():
 
     # Build the magic link URL. Uses FRONTEND_BASE_URL so the link points
     # to the static site (weathervalet.ai), not the backend (api.weathervalet.ai).
-    # The frontend has the /auth/verify handler that calls back to the
-    # backend's /api/v1/auth/verify endpoint.
+    # The frontend has a JS handler that detects this URL pattern and calls
+    # back to the backend's /api/v1/auth/verify endpoint.
+    #
+    # URL pattern: /?auth=verify&token=<raw>
+    # We use query params on the root path (not /auth/verify path) because
+    # the static site doesn't have routing infrastructure to map arbitrary
+    # paths to index.html. Future polish: add a Render Static rewrite rule
+    # mapping /auth/verify → /index.html, then use the cleaner path-based URL.
     base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai")
-    magic_link_url = f"{base}/auth/verify?token={raw_token}"
+    magic_link_url = f"{base}/?auth=verify&token={raw_token}"
 
     # Send the email (or log it via stub during development)
     _send_magic_link_email(email, magic_link_url)
