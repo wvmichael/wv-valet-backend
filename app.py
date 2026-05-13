@@ -692,7 +692,7 @@ def get_user_agent() -> str:
     return ua[:500]
 
 
-def _send_magic_link_email(email: str, magic_link_url: str) -> bool:
+def _send_magic_link_email(email: str, magic_link_url: str, intent: str = "sign-in") -> bool:
     """Send a magic-link email to the user.
 
     DELIVERY: Resend (resend.com) via their HTTP API.
@@ -705,6 +705,10 @@ def _send_magic_link_email(email: str, magic_link_url: str) -> bool:
     to server logs (development/stub mode). This lets local dev and
     early testing continue to work even before Resend is wired up, and
     gives us a clean rollback if Resend has a transient outage.
+
+    The `intent` argument toggles the email subject and body framing:
+      "sign-in"        → "Sign in to WeatherValet"
+      "password-reset" → "Reset your WeatherValet password"
 
     Returns True on success (or successful stub print), False on send
     failure. The auth flow does not block on this return value — a
@@ -724,39 +728,56 @@ def _send_magic_link_email(email: str, magic_link_url: str) -> bool:
         )
         return True
 
-    # Build the email payload. Resend accepts both 'html' and 'text';
-    # we send both so users with plain-text mail clients still see
-    # something readable.
-    subject = "Sign in to WeatherValet"
+    # Subject + body adapt based on the intent. The visual style of the
+    # email is identical; only the wording changes.
+    is_reset = (intent == "password-reset")
+    subject = (
+        "Reset your WeatherValet password" if is_reset
+        else "Sign in to WeatherValet"
+    )
+    heading_text = "Reset your password" if is_reset else "Sign in to WeatherValet"
+    button_text = "Set a new password" if is_reset else "Sign in to WeatherValet"
+    body_text = (
+        "Tap the button below to set a new password. This link expires "
+        "in 15 minutes and can only be used once."
+        if is_reset
+        else "Tap the button below to sign in. This link expires in 15 "
+             "minutes and can only be used once."
+    )
+    safety_text = (
+        "If you didn't request this password reset, you can safely "
+        "ignore this email \u2014 your password won't change."
+        if is_reset
+        else "If you didn't request this sign-in link, you can safely "
+             "ignore this email \u2014 no one can sign in without "
+             "clicking the link above."
+    )
+
     html_body = (
         '<div style="font-family: -apple-system, BlinkMacSystemFont, '
         '\'Segoe UI\', Roboto, sans-serif; max-width: 480px; margin: 0 auto; '
         'padding: 24px;">'
-        '<h2 style="color: #0E1116; font-size: 20px; margin: 0 0 16px;">'
-        'Sign in to WeatherValet</h2>'
-        '<p style="color: rgba(15,17,22,0.75); font-size: 15px; line-height: 1.5;">'
-        'Tap the button below to sign in. This link expires in 15 minutes '
-        'and can only be used once.</p>'
+        f'<h2 style="color: #0E1116; font-size: 20px; margin: 0 0 16px;">'
+        f'{heading_text}</h2>'
+        f'<p style="color: rgba(15,17,22,0.75); font-size: 15px; line-height: 1.5;">'
+        f'{body_text}</p>'
         f'<p style="margin: 28px 0;"><a href="{magic_link_url}" '
         'style="display: inline-block; background: #4169E1; color: #fff; '
         'padding: 12px 24px; border-radius: 8px; text-decoration: none; '
-        'font-weight: 600;">Sign in to WeatherValet</a></p>'
+        f'font-weight: 600;">{button_text}</a></p>'
         '<p style="color: rgba(15,17,22,0.55); font-size: 13px; line-height: 1.5;">'
         'If the button doesn\'t work, copy and paste this link into your browser:'
         f'<br><span style="word-break: break-all;">{magic_link_url}</span></p>'
         '<p style="color: rgba(15,17,22,0.45); font-size: 12px; '
         'margin-top: 32px; border-top: 1px solid rgba(15,17,22,0.08); padding-top: 16px;">'
-        'If you didn\'t request this sign-in link, you can safely ignore '
-        'this email \u2014 no one can sign in without clicking the link above.</p>'
+        f'{safety_text}</p>'
         '</div>'
     )
     text_body = (
-        "Sign in to WeatherValet\n\n"
-        "Tap this link to sign in. It expires in 15 minutes and can only "
-        "be used once:\n\n"
+        f"{heading_text}\n\n"
+        f"{body_text}\n\n"
         f"{magic_link_url}\n\n"
-        "If you didn't request this sign-in link, you can safely ignore "
-        "this email \u2014 no one can sign in without clicking the link above."
+        f"{safety_text}"
     )
 
     payload = json.dumps({
@@ -2076,6 +2097,14 @@ def auth_request_magic_link():
     """
     data = request.get_json(silent=True) or {}
     email = (data.get("email") or "").strip()
+    # Optional: frontend passes "password-reset" to flag this as a
+    # password-reset (not a plain sign-in). The intent is round-tripped
+    # into the magic-link URL itself so the frontend knows what to do
+    # AFTER verify (just sign in vs. show set-password form).
+    # Acceptable values: "sign-in" (default), "password-reset".
+    intent = (data.get("intent") or "sign-in").strip()
+    if intent not in ("sign-in", "password-reset"):
+        intent = "sign-in"
 
     if not is_valid_email(email):
         return jsonify({"ok": False, "error": "invalid-email"}), 400
@@ -2134,10 +2163,13 @@ def auth_request_magic_link():
     # paths to index.html. Future polish: add a Render Static rewrite rule
     # mapping /auth/verify → /index.html, then use the cleaner path-based URL.
     base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai")
-    magic_link_url = f"{base}/?auth=verify&token={raw_token}"
+    # URL pattern: /?auth=verify&token=<raw>&intent=<sign-in|password-reset>
+    # The intent is what the frontend reads to know whether to show
+    # "set new password" form after verify, or just sign the user in.
+    magic_link_url = f"{base}/?auth=verify&token={raw_token}&intent={intent}"
 
     # Send the email (or log it via stub during development)
-    _send_magic_link_email(email, magic_link_url)
+    _send_magic_link_email(email, magic_link_url, intent=intent)
 
     # Audit log — record that we issued a link. Useful for debugging
     # ("did the link actually get sent?") and for security forensics.
@@ -2388,6 +2420,77 @@ def auth_verify():
     )
 
     return response
+
+
+# ── Set or change password (used by password-reset flow) ──
+@app.route("/api/v1/auth/set-password", methods=["OPTIONS"])
+def _auth_set_password_preflight():
+    """CORS preflight."""
+    return ("", 204)
+
+
+@app.post("/api/v1/auth/set-password")
+def auth_set_password():
+    """Set a new password for the currently signed-in user.
+
+    Used as the second step of the password-reset flow:
+      1. User clicks magic link in their email
+      2. Frontend calls /api/v1/auth/verify → user is now signed in
+      3. Frontend shows "Set a new password" form
+      4. Frontend POSTs {"new_password": "..."} to THIS endpoint
+      5. Backend hashes + stores the password, clears password_must_change
+      6. User is now signed in AND has a fresh password
+
+    Authentication: session cookie (the verify step created it). We
+    deliberately do NOT require the old password — this endpoint is
+    used precisely when the user has forgotten or never set a password.
+    A session cookie already proves they hold the magic-link token,
+    which was emailed to the verified address; that's the authentication.
+
+    Request body:
+        {"new_password": "their-chosen-password"}
+
+    Returns:
+        200 {"ok": true}
+        400 {"ok": false, "error": "password-too-short"}
+        400 {"ok": false, "error": "missing-fields"}
+        401 {"ok": false, "error": "not-authenticated"}
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    data = request.get_json(silent=True) or {}
+    new_password = (data.get("new_password") or "")
+
+    if not new_password:
+        return jsonify({"ok": False, "error": "missing-fields"}), 400
+
+    # Same minimum as the admin set-password endpoint (8 chars). If you
+    # want to lift this later, do it in one place: this endpoint plus
+    # the admin one. Frontend should enforce it too for UX.
+    if len(new_password) < 8:
+        return jsonify({"ok": False, "error": "password-too-short"}), 400
+
+    new_hash = hash_password(new_password)
+    user_id = user["id"]
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE users
+                   SET password_hash = %s,
+                       password_must_change = FALSE
+                   WHERE id = %s""",
+                (new_hash, user_id),
+            )
+
+    print(
+        f"[auth] set-password succeeded: user_id={user_id} ip={get_client_ip()}",
+        flush=True,
+    )
+
+    return jsonify({"ok": True}), 200
 
 
 def _roles_to_workspaces(roles: list) -> list:
