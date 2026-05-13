@@ -2475,6 +2475,147 @@ def admin_set_password():
     return jsonify({"ok": True, "user_id": row["id"]}), 200
 
 
+@app.post("/admin/grant-role")
+def admin_grant_role():
+    """Admin-only endpoint to grant a role to a user.
+
+    Mirrors /admin/set-password's pattern: HTTP Basic auth (same admin
+    credentials), JSON body, returns user_id on success.
+
+    Until Stripe webhook signup grants 'subscriber' automatically, this
+    is how subscribers get their role. For 'crew', 'met', and 'admin',
+    this is always how roles are granted (no self-service).
+
+    Request body (JSON):
+        {"email": "person@example.com", "role": "subscriber"}
+
+    Valid roles: subscriber, crew, met, admin
+
+    Returns:
+        200 {"ok": true, "user_id": N, "role": "..."}
+        400 {"ok": false, "error": "..."}
+        401 — admin auth failed
+        404 {"ok": false, "error": "no-such-user"}
+        409 {"ok": false, "error": "already-has-role"}
+            (user already has this role; nothing to do)
+
+    Idempotent semantics: granting a role twice is treated as a conflict
+    (409) rather than a silent success — so admin can detect "I thought
+    I already did this" cases. Conflict resolution: if you genuinely
+    meant to grant again, this means you didn't.
+    """
+    auth_resp = _admin_auth()
+    if auth_resp is not None:
+        return auth_resp
+
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip()
+    role = (data.get("role") or "").strip().lower()
+
+    if not email or not role:
+        return jsonify({"ok": False, "error": "missing-fields"}), 400
+
+    if role not in ("subscriber", "crew", "met", "admin"):
+        return jsonify({"ok": False, "error": "invalid-role"}), 400
+
+    if not is_valid_email(email):
+        return jsonify({"ok": False, "error": "invalid-email"}), 400
+
+    with db() as conn:
+        # Look up user
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM users WHERE LOWER(email) = LOWER(%s)",
+                (email,),
+            )
+            user_row = cur.fetchone()
+
+        if user_row is None:
+            return jsonify({"ok": False, "error": "no-such-user"}), 404
+
+        user_id = user_row["id"]
+
+        # Check if role already exists
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM user_roles WHERE user_id = %s AND role = %s",
+                (user_id, role),
+            )
+            existing = cur.fetchone()
+
+        if existing is not None:
+            return jsonify({"ok": False, "error": "already-has-role"}), 409
+
+        # Grant the role
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO user_roles (user_id, role, granted_at) VALUES (%s, %s, %s)",
+                (user_id, role, now_ts()),
+            )
+
+    print(f"[admin] role granted: user_id={user_id} email={email} role={role}", flush=True)
+    return jsonify({"ok": True, "user_id": user_id, "role": role}), 200
+
+
+@app.post("/admin/revoke-role")
+def admin_revoke_role():
+    """Admin-only endpoint to revoke a role from a user.
+
+    Opposite of /admin/grant-role. Removes the user_roles row but does
+    NOT delete sessions — the user stays logged in but loses access to
+    that workspace's endpoints. They'll see the workspace disappear
+    from their picker on next session check.
+
+    Request body (JSON):
+        {"email": "person@example.com", "role": "subscriber"}
+
+    Returns:
+        200 {"ok": true, "user_id": N, "role": "..."}
+        400 {"ok": false, "error": "..."}
+        401 — admin auth failed
+        404 {"ok": false, "error": "no-such-user"} or "role-not-held"
+    """
+    auth_resp = _admin_auth()
+    if auth_resp is not None:
+        return auth_resp
+
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip()
+    role = (data.get("role") or "").strip().lower()
+
+    if not email or not role:
+        return jsonify({"ok": False, "error": "missing-fields"}), 400
+
+    if not is_valid_email(email):
+        return jsonify({"ok": False, "error": "invalid-email"}), 400
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM users WHERE LOWER(email) = LOWER(%s)",
+                (email,),
+            )
+            user_row = cur.fetchone()
+
+        if user_row is None:
+            return jsonify({"ok": False, "error": "no-such-user"}), 404
+
+        user_id = user_row["id"]
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM user_roles WHERE user_id = %s AND role = %s RETURNING role",
+                (user_id, role),
+            )
+            deleted = cur.fetchone()
+
+        if deleted is None:
+            return jsonify({"ok": False, "error": "role-not-held"}), 404
+
+    print(f"[admin] role revoked: user_id={user_id} email={email} role={role}", flush=True)
+    return jsonify({"ok": True, "user_id": user_id, "role": role}), 200
+
+
 @app.post("/api/v1/forecast/explain")
 def forecast_explain():
     """Generate the friendly, activity-aware paragraph for a forecast ticket.
