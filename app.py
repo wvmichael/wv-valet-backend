@@ -843,6 +843,164 @@ def _check_rate_limit_ip(ip: str, conn) -> bool:
         return row["n"] >= 20
 
 
+def _get_current_user() -> Optional[dict]:
+    """Read the session cookie, validate it, return user info or None.
+
+    Used by /auth/session, /auth/logout, and the require_auth decorator.
+    Centralizes session-validation logic so we don't duplicate it across
+    every protected endpoint.
+
+    Returns a dict with the same shape as the verify endpoint's `user`
+    field plus the roles list, or None if no valid session exists.
+
+    Side effect: on successful validation, the session's idle_expires_at
+    is refreshed to now + SESSION_IDLE_TTL_SECONDS. This means active
+    users keep their sessions alive; idle users eventually time out.
+
+    Why the side effect: without refreshing on each use, the idle timeout
+    would be meaningless. Either we'd never time out (idle expiration
+    set once at session creation), or we'd time out everyone after 7
+    days regardless of activity. The refresh makes idle expiration
+    behave the way users expect.
+
+    Performance note: this writes to the database on every auth-checked
+    request. At current scale (~100 req/day) that's negligible. At
+    larger scale, batch the refresh (e.g., only refresh if last refresh
+    was more than 1 hour ago) or move sessions to a faster store like
+    Redis.
+
+    Failure modes:
+      - No cookie present: returns None (not an error)
+      - Cookie present but no matching session row: returns None
+        (could be: session was revoked, session expired and cleaned up,
+        or cookie was forged)
+      - Session row exists but expired: returns None, leaves the row
+        for later cleanup
+      - Database unreachable: raises psycopg2.OperationalError to caller
+    """
+    raw_session_id = request.cookies.get(SESSION_COOKIE_NAME)
+    if not raw_session_id:
+        return None
+
+    session_hash = hash_token(raw_session_id)
+    now = now_ts()
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            # Join session + user + roles in one query for efficiency
+            cur.execute(
+                """SELECT s.user_id, s.expires_at, s.idle_expires_at,
+                          u.email, u.name
+                   FROM sessions s
+                   JOIN users u ON u.id = s.user_id
+                   WHERE s.session_id_hash = %s""",
+                (session_hash,),
+            )
+            row = cur.fetchone()
+
+        if row is None:
+            return None
+
+        # Validate expiration
+        if row["expires_at"] < now:
+            return None
+        if row["idle_expires_at"] < now:
+            return None
+
+        # Refresh idle expiration (extend by SESSION_IDLE_TTL_SECONDS from now)
+        # Only writes if we're actually extending — defensive against rare race
+        # where two simultaneous requests both refresh.
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE sessions SET idle_expires_at = %s WHERE session_id_hash = %s",
+                (now + SESSION_IDLE_TTL_SECONDS, session_hash),
+            )
+
+        # Fetch user's roles
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT role FROM user_roles WHERE user_id = %s ORDER BY role",
+                (row["user_id"],),
+            )
+            role_rows = cur.fetchall()
+
+    return {
+        "id": row["user_id"],
+        "email": row["email"],
+        "name": row["name"],
+        "roles": [r["role"] for r in role_rows],
+    }
+
+
+def require_auth(view_func):
+    """Decorator that ensures the request has a valid session.
+
+    On success: attaches `request.user` (the dict from _get_current_user)
+    and calls the wrapped view function.
+
+    On failure: returns 401 JSON. The frontend should handle this by
+    showing the sign-in modal.
+
+    Usage:
+        @app.get('/api/v1/account/profile')
+        @require_auth
+        def my_profile():
+            return jsonify({'email': request.user['email']})
+
+    Note: this decorator is for API endpoints that return JSON. For
+    HTML page routes, you'd want a different pattern that redirects
+    to a login page. We don't have HTML page auth in v1 — the admin
+    pages still use HTTP Basic auth (separate code path).
+    """
+    from functools import wraps
+
+    @wraps(view_func)
+    def wrapper(*args, **kwargs):
+        user = _get_current_user()
+        if user is None:
+            return jsonify({"ok": False, "error": "not-authenticated"}), 401
+        # Stash user on the request object so the view can access it
+        request.user = user
+        return view_func(*args, **kwargs)
+
+    return wrapper
+
+
+def require_role(role_name: str):
+    """Decorator factory that ensures the user has a specific role.
+
+    Builds on require_auth. After confirming the user is logged in,
+    checks their roles list for `role_name`.
+
+    Usage:
+        @app.get('/api/v1/met/queue')
+        @require_role('met')
+        def met_queue():
+            ...
+
+    A user with multiple roles (e.g. subscriber + admin) can access
+    endpoints gated for either role.
+
+    Returns 401 if not logged in, 403 if logged in without the role.
+    Distinguishing these helps the frontend show the right message
+    ("please sign in" vs "you don't have access to this").
+    """
+    from functools import wraps
+
+    def decorator(view_func):
+        @wraps(view_func)
+        def wrapper(*args, **kwargs):
+            user = _get_current_user()
+            if user is None:
+                return jsonify({"ok": False, "error": "not-authenticated"}), 401
+            if role_name not in user["roles"]:
+                return jsonify({"ok": False, "error": "forbidden"}), 403
+            request.user = user
+            return view_func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
 def normalize_phone(raw: Optional[str]) -> Optional[str]:
     """Coerce '317-555-0123' / '(317) 555-0123' / '+13175550123' all to
     +13175550123. v1 assumes US numbers — for international, use the
@@ -1859,6 +2017,79 @@ def _roles_to_workspaces(roles: list) -> list:
                 "url": workspace_map[role]["url"],
             })
     return workspaces
+
+
+# ── Session inspection — what the frontend calls on every page load ──
+@app.get("/api/v1/auth/session")
+def auth_session():
+    """Return info about the currently-logged-in user.
+
+    Reads the session cookie, validates it, returns the same shape as
+    /auth/verify (user info + workspaces). Or 401 if not logged in.
+
+    Returns:
+        200 {"ok": true, "user": {...}, "workspaces": [...]}
+        401 {"ok": false, "error": "not-authenticated"}
+
+    This is what the frontend calls on every page load to determine
+    whether to show "Sign in" or "Welcome back, [name]". It also
+    refreshes the session's idle expiration as a side effect (via
+    _get_current_user).
+
+    NOT decorated with @require_auth because we want to return a clean
+    401 instead of the decorator's generic 401. Same outcome, different
+    code path for clarity.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    workspaces = _roles_to_workspaces(user["roles"])
+    return jsonify({
+        "ok": True,
+        "user": {
+            "id": user["id"],
+            "email": user["email"],
+            "name": user["name"],
+        },
+        "workspaces": workspaces,
+    }), 200
+
+
+# ── Logout — destroys the current session ──
+@app.post("/api/v1/auth/logout")
+def auth_logout():
+    """Destroy the current session and clear the cookie.
+
+    Returns:
+        200 {"ok": true}
+
+    Always returns 200, even if no session existed. We don't reveal
+    session state in error responses — an attacker probing the endpoint
+    can't tell whether they hit a real session or a forged one.
+
+    Side effects:
+      - Deletes the sessions row by hash
+      - Clears the wv_session cookie in the response
+
+    A logged-out user can't access protected endpoints until they go
+    through the magic-link flow again.
+    """
+    raw_session_id = request.cookies.get(SESSION_COOKIE_NAME)
+
+    if raw_session_id:
+        session_hash = hash_token(raw_session_id)
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM sessions WHERE session_id_hash = %s",
+                    (session_hash,),
+                )
+
+    # Clear the cookie regardless of whether we found a row to delete
+    response = jsonify({"ok": True})
+    _clear_session_cookie(response)
+    return response, 200
 
 
 @app.post("/api/v1/forecast/explain")
