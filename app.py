@@ -537,6 +537,25 @@ CREATE TABLE IF NOT EXISTS confessionals (
     created_at      BIGINT NOT NULL              -- ms since epoch
 );
 CREATE INDEX IF NOT EXISTS idx_confessionals_user ON confessionals(user_id, created_at DESC);
+
+-- ── Report verifies (Phase 5a) ──
+-- Records each (user, report) verification pair. Used to:
+--   - Aggregate per-report "X people verified this" counts
+--   - Prevent a user from double-verifying the same report
+--   - Enforce the 5-minute un-verify window (delete row if recent)
+--
+-- Composite primary key on (user_id, report_id) gives us idempotency
+-- for free: a duplicate POST does nothing instead of creating duplicates.
+-- report_id is a TEXT column because the frontend uses string IDs
+-- like 'r-1737' that may not all be numeric.
+CREATE TABLE IF NOT EXISTS report_verifies (
+    user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    report_id     TEXT NOT NULL,
+    created_at    BIGINT NOT NULL,
+    PRIMARY KEY (user_id, report_id)
+);
+CREATE INDEX IF NOT EXISTS idx_verifies_report ON report_verifies(report_id);
+CREATE INDEX IF NOT EXISTS idx_verifies_user ON report_verifies(user_id, created_at DESC);
 """
 
 
@@ -6163,6 +6182,168 @@ def confessionals_delete(entry_id):
                 return jsonify({"ok": False, "error": "edit-window-closed"}), 403
 
             cur.execute("DELETE FROM confessionals WHERE id = %s", (entry_id,))
+
+    return jsonify({"ok": True})
+
+
+# ════════════════════════════════════════════════════════════════════
+# Report verifies (Phase 5a — May 14)
+# ════════════════════════════════════════════════════════════════════
+#
+# Replaces localStorage-only persistence of "I see it too" verifies.
+# Each row is one (user, report) pair. Composite primary key gives us
+# idempotency: a duplicate POST does nothing instead of creating a
+# duplicate row.
+#
+# Endpoints:
+#   GET    /api/v1/verifies                    — list current user's verifies
+#   POST   /api/v1/verifies                    — verify a report
+#   DELETE /api/v1/verifies/<report_id>        — un-verify (within 5 min)
+#
+# Auth: session cookie required.
+#
+# Token/profile economics (the +2 tokens, the verificationsCount stat,
+# the renderFeed bump) all stay client-side for now. Backend just
+# persists the verify pair so it's shared across devices.
+
+UNVERIFY_WINDOW_MS = 5 * 60 * 1000  # 5 minutes — matches frontend constant
+
+
+@app.route("/api/v1/verifies", methods=["OPTIONS"])
+def _verifies_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/verifies")
+def verifies_list():
+    """Return the current user's verifies as a list of {report_id, created_at}.
+
+    The frontend uses this to rebuild its in-memory Set on page load,
+    replacing the previous localStorage rehydration step.
+
+    Returns:
+        200 {"ok": true, "verifies": [{"report_id": "...", "created_at": 12345}, ...]}
+        401 {"ok": false, "error": "not-authenticated"}
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT report_id, created_at FROM report_verifies
+                   WHERE user_id = %s
+                   ORDER BY created_at DESC""",
+                (user["id"],),
+            )
+            rows = cur.fetchall()
+
+    verifies = [
+        {"report_id": r["report_id"], "created_at": r["created_at"]}
+        for r in rows
+    ]
+    return jsonify({"ok": True, "verifies": verifies})
+
+
+@app.post("/api/v1/verifies")
+def verifies_create():
+    """Verify a report.
+
+    Request body:
+        {"report_id": "r-1737"}
+
+    Idempotent — verifying an already-verified report returns 200 with
+    the existing row's created_at. The frontend can treat any 200 as
+    "the verify is recorded" regardless of whether it's new.
+
+    Returns:
+        200 {"ok": true, "verify": {"report_id": "...", "created_at": 12345}}
+        400 {"ok": false, "error": "missing-report-id"}
+        401 {"ok": false, "error": "not-authenticated"}
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    data = request.get_json(silent=True) or {}
+    report_id = (data.get("report_id") or "").strip()
+    if not report_id:
+        return jsonify({"ok": False, "error": "missing-report-id"}), 400
+
+    now_ms = int(time.time() * 1000)
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                # ON CONFLICT DO NOTHING — duplicate verifies are silently
+                # idempotent. We then fetch whatever row exists (whether
+                # the one we just tried to insert, or a pre-existing one).
+                cur.execute(
+                    """INSERT INTO report_verifies (user_id, report_id, created_at)
+                       VALUES (%s, %s, %s)
+                       ON CONFLICT (user_id, report_id) DO NOTHING""",
+                    (user["id"], report_id, now_ms),
+                )
+                cur.execute(
+                    """SELECT created_at FROM report_verifies
+                       WHERE user_id = %s AND report_id = %s""",
+                    (user["id"], report_id),
+                )
+                row = cur.fetchone()
+    except Exception as e:
+        print(f"[verifies_create] failed: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"ok": False, "error": "create-failed"}), 500
+
+    return jsonify({"ok": True, "verify": {
+        "report_id": report_id,
+        "created_at": row["created_at"] if row else now_ms,
+    }})
+
+
+@app.route("/api/v1/verifies/<report_id>", methods=["OPTIONS"])
+def _verifies_delete_preflight(report_id):
+    return ("", 204)
+
+
+@app.delete("/api/v1/verifies/<report_id>")
+def verifies_delete(report_id):
+    """Un-verify a report. Only allowed within UNVERIFY_WINDOW_MS (5 min)
+    of the verify. After that window, the row is part of the historical
+    record and can't be removed.
+
+    Returns:
+        200 {"ok": true}
+        401 {"ok": false, "error": "not-authenticated"}
+        404 {"ok": false, "error": "not-found"}
+        403 {"ok": false, "error": "unverify-window-closed"}
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    now_ms = int(time.time() * 1000)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT created_at FROM report_verifies
+                   WHERE user_id = %s AND report_id = %s""",
+                (user["id"], report_id),
+            )
+            row = cur.fetchone()
+
+            if row is None:
+                return jsonify({"ok": False, "error": "not-found"}), 404
+
+            if now_ms - row["created_at"] > UNVERIFY_WINDOW_MS:
+                return jsonify({"ok": False, "error": "unverify-window-closed"}), 403
+
+            cur.execute(
+                """DELETE FROM report_verifies
+                   WHERE user_id = %s AND report_id = %s""",
+                (user["id"], report_id),
+            )
 
     return jsonify({"ok": True})
 
