@@ -9240,6 +9240,147 @@ def me_crew_location_update():
 
 
 # ════════════════════════════════════════════════════════════════════
+# Severe weather status for current user (Storm Shelter auto-trigger)
+# ════════════════════════════════════════════════════════════════════
+#
+# Returns the most severe NWS alert tier currently active for the user's
+# primary saved location. Frontend polls this every 60 seconds when
+# signed in; if the response flips to 'warning' or 'watch', the Storm
+# Shelter UI auto-activates.
+#
+# Returns 200 even when there's no alert (status='clear') so the
+# frontend can rely on the response shape. Anonymous users (no signed-in
+# session, no saved location) get 'no-location' — frontend treats that
+# as "don't auto-trigger; manual only".
+
+@app.route("/api/v1/me/severe-weather-status", methods=["OPTIONS"])
+def _me_severe_weather_preflight():
+    return ("", 204)
+
+
+# In-memory cache for NWS active alerts: avoid hammering api.weather.gov
+# 60-second-per-user (could be N polls × M users). One fetch per 60s
+# serves all callers. Cached for 60s.
+_NWS_ALERTS_CACHE = {"data": None, "fetched_at": 0}
+_NWS_ALERTS_CACHE_LOCK = threading.Lock()
+
+
+def _get_cached_nws_alerts() -> list:
+    """Return the latest active NWS alerts list, fetching at most once
+    per 60 seconds across all callers."""
+    with _NWS_ALERTS_CACHE_LOCK:
+        now = time.time()
+        if _NWS_ALERTS_CACHE["data"] is not None and \
+           (now - _NWS_ALERTS_CACHE["fetched_at"]) < 60:
+            return _NWS_ALERTS_CACHE["data"]
+    # Fetch outside the lock so concurrent callers don't all serialize
+    fresh = _fetch_active_nws_alerts()
+    with _NWS_ALERTS_CACHE_LOCK:
+        _NWS_ALERTS_CACHE["data"] = fresh
+        _NWS_ALERTS_CACHE["fetched_at"] = time.time()
+    return fresh
+
+
+def _alert_tier_rank(event: str) -> int:
+    """Higher number = more severe. Used to pick the worst active alert.
+    Tornado Warning beats Severe Thunderstorm Warning beats Flash Flood
+    Warning beats their respective Watches."""
+    event_lower = (event or "").lower()
+    if "tornado warning" in event_lower: return 100
+    if "tornado watch" in event_lower: return 60
+    if "severe thunderstorm warning" in event_lower: return 80
+    if "severe thunderstorm watch" in event_lower: return 55
+    if "flash flood warning" in event_lower: return 75
+    if "flood warning" in event_lower: return 70
+    return 10  # any other alert we somehow got
+
+
+def _event_to_shelter_tier(event: str) -> str:
+    """Map NWS event name → Storm Shelter tier key."""
+    event_lower = (event or "").lower()
+    if "warning" in event_lower:
+        return "warning"
+    if "watch" in event_lower:
+        return "watch"
+    return "clear"
+
+
+@app.get("/api/v1/me/severe-weather-status")
+def me_severe_weather_status():
+    """Get current severe-weather tier for the signed-in user's primary location.
+
+    Returns:
+        {"ok": true, "status": "warning"|"watch"|"clear"|"no-location",
+         "event": "Tornado Warning",  (when active)
+         "headline": "...",
+         "area_desc": "...",
+         "expires_at": <ms timestamp>,
+         "location_label": "Lebanon, IN"}
+    """
+    user = _get_current_user()
+    if user is None:
+        # Don't 401 — frontend handles this cleanly without auth.
+        # Anonymous users just don't get auto-trigger.
+        return jsonify({"ok": True, "status": "no-location"})
+
+    # Find their primary saved location
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT label, lat, lng FROM saved_locations
+                   WHERE user_id = %s AND is_primary = TRUE
+                   LIMIT 1""",
+                (user["id"],),
+            )
+            row = cur.fetchone()
+
+    if not row or row.get("lat") is None or row.get("lng") is None:
+        return jsonify({"ok": True, "status": "no-location"})
+
+    user_lat = float(row["lat"])
+    user_lng = float(row["lng"])
+    user_location_label = row.get("label") or ""
+
+    # Fetch alerts (cached for 60s)
+    alerts = _get_cached_nws_alerts()
+
+    # Find the worst alert whose polygon contains the user's location
+    worst = None
+    worst_rank = 0
+    for alert in alerts:
+        geom = alert.get("geometry")
+        if not geom:
+            continue
+        try:
+            geom_str = json.dumps(geom)
+            if not _point_in_polygon_geojson(user_lat, user_lng, geom_str):
+                continue
+        except Exception:
+            continue
+        rank = _alert_tier_rank(alert.get("event", ""))
+        if rank > worst_rank:
+            worst_rank = rank
+            worst = alert
+
+    if not worst:
+        return jsonify({
+            "ok": True,
+            "status": "clear",
+            "location_label": user_location_label,
+        })
+
+    return jsonify({
+        "ok": True,
+        "status": _event_to_shelter_tier(worst.get("event", "")),
+        "event": worst.get("event"),
+        "headline": worst.get("headline"),
+        "area_desc": worst.get("area_desc"),
+        "expires_at": worst.get("expires_at"),
+        "location_label": user_location_label,
+    })
+
+
+# ════════════════════════════════════════════════════════════════════
 # Daily brief delivery (Item #3 — Chunk 3A)
 # ════════════════════════════════════════════════════════════════════
 #
