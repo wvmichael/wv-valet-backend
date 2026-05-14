@@ -481,6 +481,11 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS crew_home_lng DOUBLE PRECISION;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS crew_home_label TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS crew_active BOOLEAN NOT NULL DEFAULT TRUE;
 
+-- Phase 10 Met welcome card: tracks whether the Met has dismissed the
+-- first-login welcome card in their workspace. NULL = hasn't seen/dismissed
+-- yet (show the card); timestamp = already dismissed (hide).
+ALTER TABLE users ADD COLUMN IF NOT EXISTS met_onboarded_at BIGINT;
+
 -- Phase 10 Met tips: track which Met completed each verification + a
 -- customer-facing token for the review/tip page (separate from Met's
 -- claim_token so we can give customers a URL that doesn't expose
@@ -9250,14 +9255,18 @@ def _me_profile_preflight():
 
 @app.get("/api/v1/me/profile")
 def me_profile_get():
-    """Return the current user's basic profile (name, email, phone)."""
+    """Return the current user's basic profile (name, email, phone).
+
+    Also returns Met-specific onboarding state: `met_onboarded_at` is
+    null until the Met dismisses the workspace welcome card.
+    """
     user = _get_current_user()
     if user is None:
         return jsonify({"ok": False, "error": "not-authenticated"}), 401
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, email, name, phone FROM users WHERE id = %s",
+                "SELECT id, email, name, phone, met_onboarded_at FROM users WHERE id = %s",
                 (user["id"],),
             )
             row = cur.fetchone()
@@ -9269,6 +9278,7 @@ def me_profile_get():
             "email": row["email"],
             "name": row.get("name") or "",
             "phone": row.get("phone") or "",
+            "met_onboarded_at": row.get("met_onboarded_at"),
         },
     })
 
@@ -9349,6 +9359,35 @@ def me_profile_update():
             "phone": row.get("phone") or "",
         },
     })
+
+
+@app.route("/api/v1/me/met-onboarding-dismiss", methods=["OPTIONS"])
+def _me_met_onboarding_dismiss_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/me/met-onboarding-dismiss")
+def me_met_onboarding_dismiss():
+    """Met dismissed the workspace welcome card. Stamps met_onboarded_at
+    so the card never shows again for this user. Idempotent — calling
+    twice has no extra effect.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "met" not in (user.get("roles") or []) and "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE users
+                   SET met_onboarded_at = COALESCE(met_onboarded_at, %s)
+                   WHERE id = %s""",
+                (now_ms, user["id"]),
+            )
+    return jsonify({"ok": True})
 
 
 # ════════════════════════════════════════════════════════════════════
