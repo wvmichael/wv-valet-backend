@@ -619,6 +619,98 @@ CREATE TABLE IF NOT EXISTS met_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_met_messages_request ON met_messages(request_id, sent_at DESC);
 CREATE INDEX IF NOT EXISTS idx_met_messages_met ON met_messages(met_user_id, sent_at DESC);
+
+-- ── Subscriber portal: saved locations (Phase 10) ──
+-- A subscriber's "home base" location(s) for their daily brief and
+-- threshold alerts. Hobbyist tier gets 1 location; Pro tiers get 1-5
+-- depending on plan. lat/lng are floats; label is a free-form name
+-- like "Home — Lebanon, IN" or "Job site #3".
+--
+-- The `is_primary` boolean designates which location drives the daily
+-- brief and shows on the portal's main identity card. Exactly one
+-- location per user is primary; toggling another to primary unsets
+-- the prior one (handled in the PATCH endpoint).
+CREATE TABLE IF NOT EXISTS saved_locations (
+    id              SERIAL PRIMARY KEY,
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    label           TEXT NOT NULL,
+    address_text    TEXT,                  -- "Lebanon, IN" or full address
+    lat             DOUBLE PRECISION NOT NULL,
+    lng             DOUBLE PRECISION NOT NULL,
+    county          TEXT,                  -- "Boone County" if known
+    is_primary      BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at      BIGINT NOT NULL,
+    updated_at      BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_saved_locations_user ON saved_locations(user_id, is_primary DESC);
+
+-- ── Subscriber portal: brief delivery preferences (Phase 10) ──
+-- One row per user. Created on first read with sensible defaults if
+-- missing. Tracks when/how the subscriber wants their daily brief.
+--
+-- Channels are stored as an ordered comma-separated string for
+-- simplicity: "sms,email" means SMS first, fall back to email.
+-- Quiet hours stored as HH:MM strings to avoid timezone issues at
+-- the DB layer; conversion happens in the cron worker that sends.
+CREATE TABLE IF NOT EXISTS brief_preferences (
+    user_id              INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    morning_enabled      BOOLEAN NOT NULL DEFAULT TRUE,
+    morning_window_start TEXT NOT NULL DEFAULT '05:30',  -- HH:MM local
+    morning_window_end   TEXT NOT NULL DEFAULT '07:00',
+    evening_enabled      BOOLEAN NOT NULL DEFAULT FALSE,
+    evening_window_start TEXT,                            -- nullable when evening off
+    evening_window_end   TEXT,
+    quiet_start          TEXT NOT NULL DEFAULT '21:00',
+    quiet_end            TEXT NOT NULL DEFAULT '05:00',
+    channels             TEXT NOT NULL DEFAULT 'sms,email',  -- comma-separated ordered list
+    updated_at           BIGINT NOT NULL
+);
+
+-- ── Subscriber portal: threshold alerts (Phase 10) ──
+-- Custom alert rules a subscriber sets up. e.g. "tell me when wind
+-- exceeds 25 mph at my saved location." Each alert is independent.
+--
+-- metric: 'wind' | 'temp_low' | 'temp_high' | 'precip_chance' | 'humidity'
+-- comparator: 'gt' | 'lt' | 'gte' | 'lte' | 'eq'
+-- threshold_value: the number to compare against
+-- units: 'mph' | 'F' | 'C' | 'pct' — display-only, doesn't affect logic
+-- channels: same comma-separated channel list as brief_preferences
+-- enabled: false = silenced without deleting
+CREATE TABLE IF NOT EXISTS threshold_alerts (
+    id              SERIAL PRIMARY KEY,
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    metric          TEXT NOT NULL,
+    comparator      TEXT NOT NULL,
+    threshold_value DOUBLE PRECISION NOT NULL,
+    units           TEXT NOT NULL,
+    channels        TEXT NOT NULL DEFAULT 'sms,email',
+    enabled         BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at      BIGINT NOT NULL,
+    updated_at      BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_threshold_alerts_user ON threshold_alerts(user_id, enabled);
+
+-- ── Subscriber portal: brief history (Phase 10) ──
+-- A log of every brief delivered to a subscriber. Source of truth for
+-- the portal's "Brief history" section. brief_type distinguishes
+-- routine daily briefs from severe-weather pushes.
+--
+-- delivery_status tracks Twilio/email status so the portal can show
+-- "delivered" vs "failed" honestly.
+CREATE TABLE IF NOT EXISTS brief_history (
+    id              SERIAL PRIMARY KEY,
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    brief_type      TEXT NOT NULL,       -- 'morning' | 'evening' | 'severe' | 'threshold'
+    delivered_at    BIGINT NOT NULL,     -- ms since epoch
+    verdict         TEXT,                -- 'clear' | 'caution' | 'risk' | null
+    snippet         TEXT,                -- first ~140 chars of the brief
+    full_body       TEXT,                -- the entire brief text
+    delivery_status TEXT NOT NULL,       -- 'sent' | 'stubbed' | 'failed'
+    channels_used   TEXT,                -- 'sms' or 'email' or both
+    is_met_touched  BOOLEAN NOT NULL DEFAULT FALSE,  -- Pro tier: Met-reviewed
+    met_name        TEXT                 -- snapshot of the Met's name if touched
+);
+CREATE INDEX IF NOT EXISTS idx_brief_history_user ON brief_history(user_id, delivered_at DESC);
 """
 
 
@@ -6997,6 +7089,332 @@ def met_messages_list():
         for r in rows
     ]
     return jsonify({"ok": True, "messages": messages})
+
+
+# ════════════════════════════════════════════════════════════════════
+# Subscriber portal endpoints (Phase 10 — May 14)
+# ════════════════════════════════════════════════════════════════════
+#
+# Read-only endpoints for the subscriber portal's identity card, saved
+# locations, brief preferences, threshold alerts, and brief history.
+# Edit/POST/PATCH endpoints come in Chunk B.
+#
+# Auth: session cookie required. Any signed-in user can read their own
+# data; we don't expose another user's portal.
+
+@app.route("/api/v1/me/subscription", methods=["OPTIONS"])
+def _me_subscription_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/subscription")
+def me_subscription():
+    """Return the current user's subscription summary for the portal
+    identity card.
+
+    Pulls from the users table (created_at, is_active) and joins with
+    Stripe metadata if a customer record exists. For users without a
+    Stripe customer (free tier), returns plan='free' with no renewal.
+
+    Returns:
+        200 {
+          "ok": true,
+          "plan": "free" | "hobbyist" | "pro_single" | "pro_multi" | "pro_enterprise",
+          "plan_display": "Hobbyist" | "Pro Single" | ...,
+          "price_display": "$30 / month" | "Free" | ...,
+          "next_billing_at": ms-since-epoch | null,
+          "member_since": ms-since-epoch,
+          "is_active": true,
+          "stripe_customer_id": "cus_..." | null
+        }
+        401 not authenticated
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, created_at, is_active, stripe_customer_id
+                   FROM users WHERE id = %s""",
+                (user["id"],),
+            )
+            row = cur.fetchone()
+
+    if row is None:
+        return jsonify({"ok": False, "error": "user-not-found"}), 404
+
+    # Determine plan from roles + Stripe data. For now, anyone with the
+    # 'subscriber' role is on Hobbyist by default; tier-specific lookups
+    # require querying Stripe directly. That's a Chunk C job (cancel +
+    # change plan need real Stripe API anyway).
+    roles = user.get("roles") or []
+    if "subscriber" in roles:
+        plan = "hobbyist"
+        plan_display = "Hobbyist"
+        price_display = "$30 / month"
+    else:
+        plan = "free"
+        plan_display = "Free"
+        price_display = "Free"
+
+    # Next billing date: we don't have it stored locally yet. Chunk C
+    # will query Stripe for the actual subscription period_end. For now,
+    # estimate as one month from member_since modulo current date — that
+    # gives the portal a realistic-looking renewal without lying about
+    # data we don't have. NULL for free users.
+    next_billing_at = None
+    if plan != "free":
+        # Naive: today + ~28 days, anchored to member-since day-of-month.
+        # When Stripe is wired, replace this entire block with the real
+        # subscription.current_period_end timestamp.
+        try:
+            since_dt = datetime.fromtimestamp(row["created_at"] / 1000, tz=timezone.utc)
+            now_dt = datetime.now(timezone.utc)
+            # Find next monthly anniversary of created_at
+            target_day = since_dt.day
+            year, month = now_dt.year, now_dt.month
+            # Try this month first; if past, move to next.
+            try:
+                candidate = now_dt.replace(day=min(target_day, 28))
+            except ValueError:
+                candidate = now_dt.replace(day=28)
+            if candidate <= now_dt:
+                if month == 12:
+                    candidate = candidate.replace(year=year + 1, month=1)
+                else:
+                    candidate = candidate.replace(month=month + 1)
+            next_billing_at = int(candidate.timestamp() * 1000)
+        except Exception:
+            next_billing_at = None
+
+    return jsonify({
+        "ok": True,
+        "plan": plan,
+        "plan_display": plan_display,
+        "price_display": price_display,
+        "next_billing_at": next_billing_at,
+        "member_since": row["created_at"],
+        "is_active": row["is_active"] if "is_active" in row else True,
+        "stripe_customer_id": row.get("stripe_customer_id"),
+    })
+
+
+@app.route("/api/v1/me/saved-locations", methods=["OPTIONS"])
+def _me_saved_locations_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/saved-locations")
+def me_saved_locations_list():
+    """List the current user's saved locations, primary first.
+
+    Returns:
+        200 {"ok": true, "locations": [...]}
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, label, address_text, lat, lng, county, is_primary,
+                          created_at, updated_at
+                   FROM saved_locations
+                   WHERE user_id = %s
+                   ORDER BY is_primary DESC, created_at ASC""",
+                (user["id"],),
+            )
+            rows = cur.fetchall()
+
+    locations = [
+        {
+            "id": r["id"],
+            "label": r["label"],
+            "address_text": r["address_text"],
+            "lat": r["lat"],
+            "lng": r["lng"],
+            "county": r["county"],
+            "is_primary": r["is_primary"],
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+        }
+        for r in rows
+    ]
+    return jsonify({"ok": True, "locations": locations})
+
+
+@app.route("/api/v1/me/brief-preferences", methods=["OPTIONS"])
+def _me_brief_preferences_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/brief-preferences")
+def me_brief_preferences():
+    """Return the current user's brief delivery preferences.
+
+    Auto-creates a row with sensible defaults on first read so the
+    portal always has something to display.
+
+    Returns:
+        200 {"ok": true, "preferences": {...}}
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    now_ms = int(time.time() * 1000)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT user_id, morning_enabled, morning_window_start,
+                          morning_window_end, evening_enabled,
+                          evening_window_start, evening_window_end,
+                          quiet_start, quiet_end, channels, updated_at
+                   FROM brief_preferences WHERE user_id = %s""",
+                (user["id"],),
+            )
+            row = cur.fetchone()
+
+            if row is None:
+                # Insert default row
+                cur.execute(
+                    """INSERT INTO brief_preferences (user_id, updated_at)
+                       VALUES (%s, %s)
+                       ON CONFLICT (user_id) DO NOTHING
+                       RETURNING user_id, morning_enabled, morning_window_start,
+                                 morning_window_end, evening_enabled,
+                                 evening_window_start, evening_window_end,
+                                 quiet_start, quiet_end, channels, updated_at""",
+                    (user["id"], now_ms),
+                )
+                row = cur.fetchone()
+                # Fallback: in case ON CONFLICT happened (race), re-fetch
+                if row is None:
+                    cur.execute(
+                        """SELECT user_id, morning_enabled, morning_window_start,
+                                  morning_window_end, evening_enabled,
+                                  evening_window_start, evening_window_end,
+                                  quiet_start, quiet_end, channels, updated_at
+                           FROM brief_preferences WHERE user_id = %s""",
+                        (user["id"],),
+                    )
+                    row = cur.fetchone()
+
+    if row is None:
+        return jsonify({"ok": False, "error": "preferences-unavailable"}), 500
+
+    return jsonify({
+        "ok": True,
+        "preferences": {
+            "morning_enabled":      row["morning_enabled"],
+            "morning_window_start": row["morning_window_start"],
+            "morning_window_end":   row["morning_window_end"],
+            "evening_enabled":      row["evening_enabled"],
+            "evening_window_start": row["evening_window_start"],
+            "evening_window_end":   row["evening_window_end"],
+            "quiet_start":          row["quiet_start"],
+            "quiet_end":            row["quiet_end"],
+            "channels":             [c for c in (row["channels"] or "").split(",") if c],
+            "updated_at":           row["updated_at"],
+        },
+    })
+
+
+@app.route("/api/v1/me/threshold-alerts", methods=["OPTIONS"])
+def _me_threshold_alerts_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/threshold-alerts")
+def me_threshold_alerts_list():
+    """List the current user's threshold alerts, most recent first.
+
+    Returns:
+        200 {"ok": true, "alerts": [...]}
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, metric, comparator, threshold_value, units,
+                          channels, enabled, created_at, updated_at
+                   FROM threshold_alerts
+                   WHERE user_id = %s
+                   ORDER BY created_at DESC""",
+                (user["id"],),
+            )
+            rows = cur.fetchall()
+
+    alerts = [
+        {
+            "id": r["id"],
+            "metric": r["metric"],
+            "comparator": r["comparator"],
+            "threshold_value": r["threshold_value"],
+            "units": r["units"],
+            "channels": [c for c in (r["channels"] or "").split(",") if c],
+            "enabled": r["enabled"],
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+        }
+        for r in rows
+    ]
+    return jsonify({"ok": True, "alerts": alerts})
+
+
+@app.route("/api/v1/me/brief-history", methods=["OPTIONS"])
+def _me_brief_history_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/brief-history")
+def me_brief_history():
+    """List the current user's brief history (last 30 entries).
+
+    Returns:
+        200 {"ok": true, "history": [...]}
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, brief_type, delivered_at, verdict, snippet,
+                          full_body, delivery_status, channels_used,
+                          is_met_touched, met_name
+                   FROM brief_history
+                   WHERE user_id = %s
+                   ORDER BY delivered_at DESC
+                   LIMIT 30""",
+                (user["id"],),
+            )
+            rows = cur.fetchall()
+
+    history = [
+        {
+            "id": r["id"],
+            "brief_type": r["brief_type"],
+            "delivered_at": r["delivered_at"],
+            "verdict": r["verdict"],
+            "snippet": r["snippet"],
+            "full_body": r["full_body"],
+            "delivery_status": r["delivery_status"],
+            "channels_used": r["channels_used"],
+            "is_met_touched": r["is_met_touched"],
+            "met_name": r["met_name"],
+        }
+        for r in rows
+    ]
+    return jsonify({"ok": True, "history": history})
 
 
 if __name__ == "__main__":
