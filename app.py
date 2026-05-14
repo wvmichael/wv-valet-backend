@@ -556,6 +556,42 @@ CREATE TABLE IF NOT EXISTS report_verifies (
 );
 CREATE INDEX IF NOT EXISTS idx_verifies_report ON report_verifies(report_id);
 CREATE INDEX IF NOT EXISTS idx_verifies_user ON report_verifies(user_id, created_at DESC);
+
+-- ── Met posts (Phase 6a) ──
+-- Posts the meteorologist publishes to the Crew feed. Three lifecycle
+-- states tracked via the `status` column:
+--   'live'      — currently visible on Crew surfaces
+--   'scheduled' — published-to-the-future; promoted to 'live' when the
+--                 scheduled_for timestamp passes (frontend timer)
+--   'cancelled' — scheduled post the Met cancelled before promotion;
+--                 kept for audit, never shown on Crew surfaces
+--
+-- The id column uses the frontend's own ID format ("met-post-<ts>-<rand>")
+-- so the frontend can keep generating IDs client-side without round-trips.
+-- author_id ties the post to the Met who wrote it (REFERENCES users).
+-- Lat/lng are nullable for posts without a map location.
+--
+-- Times: submitted_at and scheduled_for are ms-since-epoch BIGINTs, same
+-- pattern as confessionals + verifies. The frontend converts to ISO
+-- strings as needed for display.
+CREATE TABLE IF NOT EXISTS met_posts (
+    id              TEXT PRIMARY KEY,
+    author_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    text            TEXT NOT NULL,
+    author_name     TEXT,                -- snapshot of name at publish time
+    author_initials TEXT,                -- snapshot of initials (e.g. "MR")
+    lat             DOUBLE PRECISION,    -- nullable
+    lng             DOUBLE PRECISION,    -- nullable
+    status          TEXT NOT NULL,       -- 'live' | 'scheduled' | 'cancelled'
+    submitted_at    BIGINT,              -- ms since epoch; null for scheduled
+    scheduled_for   BIGINT,              -- ms since epoch; null for live
+    cancelled_at    BIGINT,              -- ms since epoch; null unless cancelled
+    verified        INTEGER NOT NULL DEFAULT 0,
+    created_at      BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_met_posts_status ON met_posts(status);
+CREATE INDEX IF NOT EXISTS idx_met_posts_author ON met_posts(author_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_met_posts_scheduled ON met_posts(scheduled_for) WHERE status = 'scheduled';
 """
 
 
@@ -6343,6 +6379,397 @@ def verifies_delete(report_id):
                 """DELETE FROM report_verifies
                    WHERE user_id = %s AND report_id = %s""",
                 (user["id"], report_id),
+            )
+
+    return jsonify({"ok": True})
+
+
+# ════════════════════════════════════════════════════════════════════
+# Met posts (Phase 6a — May 14)
+# ════════════════════════════════════════════════════════════════════
+#
+# Replaces localStorage-only persistence of meteorologist posts to the
+# Crew feed. Three lifecycle states (live/scheduled/cancelled). Posts
+# stay in the table forever — cancelled and consumed-from-scheduled
+# posts aren't deleted, just status-flipped, so we have a history.
+#
+# Endpoints:
+#   GET    /api/v1/met-posts                   — list (all statuses)
+#   POST   /api/v1/met-posts                   — create new post (live OR scheduled)
+#   PATCH  /api/v1/met-posts/<id>              — update fields (scheduled only)
+#   DELETE /api/v1/met-posts/<id>              — cancel (scheduled only; sets status='cancelled')
+#
+# Auth: session cookie required. Currently any authed user can read all
+# posts (because Crew need to see them); only the author or an admin
+# can create/update/cancel.
+#
+# Note on promotion (scheduled → live): the FRONTEND timer handles this
+# (Chunk 6c-2 in index.html). When a Met has the workspace open and the
+# scheduled time passes, the frontend calls PATCH to flip status='live'
+# and set submitted_at. If no Met is watching, the post stays 'scheduled'
+# in the DB; the next Met to open the workspace promotes it (slightly
+# late). For v1 scale (1-2 Mets), this is acceptable.
+
+def _serialize_met_post(row):
+    """Convert a DB row to the shape the frontend uses.
+
+    Frontend keys match exactly so the GET /api/v1/met-posts response
+    can drop straight into the in-memory MET_POSTS array.
+    """
+    return {
+        "id":              row["id"],
+        "text":            row["text"],
+        "author":          row["author_name"] or "",
+        "authorInitials":  row["author_initials"] or "",
+        "isMetPost":       True,
+        "lat":             row["lat"],
+        "lng":             row["lng"],
+        "status":          row["status"],
+        "verified":        row["verified"],
+        # ISO strings — frontend uses these for display + Date math
+        "submittedAt":     datetime.fromtimestamp(row["submitted_at"] / 1000, tz=timezone.utc).isoformat()
+                              if row["submitted_at"] else None,
+        "scheduledFor":    datetime.fromtimestamp(row["scheduled_for"] / 1000, tz=timezone.utc).isoformat()
+                              if row["scheduled_for"] else None,
+        "cancelledAt":     datetime.fromtimestamp(row["cancelled_at"] / 1000, tz=timezone.utc).isoformat()
+                              if row["cancelled_at"] else None,
+    }
+
+
+@app.route("/api/v1/met-posts", methods=["OPTIONS"])
+def _met_posts_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met-posts")
+def met_posts_list():
+    """Return all met posts (live, scheduled, and cancelled) sorted with
+    newest at the top.
+
+    Crew surfaces filter by status='live' client-side. The Met workspace
+    surfaces filter by status='scheduled' for the queue panel. Returning
+    everything in one call simplifies the frontend's cache logic.
+
+    Returns:
+        200 {"ok": true, "posts": [{...}, ...]}
+        401 {"ok": false, "error": "not-authenticated"}
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, text, author_name, author_initials, lat, lng,
+                          status, submitted_at, scheduled_for, cancelled_at,
+                          verified, created_at
+                   FROM met_posts
+                   ORDER BY created_at DESC"""
+            )
+            rows = cur.fetchall()
+
+    posts = [_serialize_met_post(r) for r in rows]
+    return jsonify({"ok": True, "posts": posts})
+
+
+@app.post("/api/v1/met-posts")
+def met_posts_create():
+    """Create a new Met post.
+
+    Request body:
+        {
+          "id": "met-post-1234567-456",         # client-generated
+          "text": "Cell weakening over...",     # required
+          "lat": 39.8,                           # optional
+          "lng": -86.2,                          # optional
+          "status": "live" | "scheduled",        # required
+          "scheduledFor": "2026-05-14T15:00:00Z" # required if scheduled
+        }
+
+    Returns:
+        200 {"ok": true, "post": {...}}
+        400 {"ok": false, "error": "missing-text" | "invalid-status" | "missing-scheduled-time"}
+        401 {"ok": false, "error": "not-authenticated"}
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"ok": False, "error": "missing-text"}), 400
+    if len(text) > 4000:
+        text = text[:4000]
+
+    status = (data.get("status") or "").strip()
+    if status not in ("live", "scheduled"):
+        return jsonify({"ok": False, "error": "invalid-status"}), 400
+
+    # ID is client-generated to match the frontend's existing format.
+    # Fall back to a server ID if none supplied (defensive).
+    post_id = (data.get("id") or "").strip()
+    if not post_id:
+        post_id = "met-post-" + str(int(time.time() * 1000)) + "-" + secrets.token_hex(2)
+
+    lat = data.get("lat")
+    lng = data.get("lng")
+    # Allow numeric or string-ified numbers; nulls pass through.
+    try:
+        lat = float(lat) if lat is not None else None
+        lng = float(lng) if lng is not None else None
+    except (ValueError, TypeError):
+        lat = lng = None
+
+    now_ms = int(time.time() * 1000)
+
+    submitted_at = None
+    scheduled_for = None
+
+    if status == "live":
+        submitted_at = now_ms
+    else:  # scheduled
+        scheduled_for_iso = (data.get("scheduledFor") or "").strip()
+        if not scheduled_for_iso:
+            return jsonify({"ok": False, "error": "missing-scheduled-time"}), 400
+        try:
+            # Accept ISO 8601 with or without Z. Python's fromisoformat is
+            # strict but tolerant if we strip the trailing Z.
+            iso = scheduled_for_iso.rstrip("Z")
+            if iso.endswith("+00:00"):
+                iso = iso[:-6]
+            scheduled_dt = datetime.fromisoformat(iso)
+            # Treat naive datetimes as UTC (matches frontend behavior)
+            if scheduled_dt.tzinfo is None:
+                scheduled_dt = scheduled_dt.replace(tzinfo=timezone.utc)
+            scheduled_for = int(scheduled_dt.timestamp() * 1000)
+        except (ValueError, TypeError) as e:
+            print(f"[met_posts_create] bad scheduledFor: {scheduled_for_iso!r}: {e}", flush=True)
+            return jsonify({"ok": False, "error": "invalid-scheduled-time"}), 400
+
+    # Snapshot author info at publish time so the post displays correctly
+    # even if the user later changes their name.
+    author_name = (user.get("name") or "").strip() or "Meteorologist"
+    parts = author_name.split()
+    author_initials = "".join(p[0] for p in parts).upper()[:2] or "MT"
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO met_posts
+                       (id, author_id, text, author_name, author_initials,
+                        lat, lng, status, submitted_at, scheduled_for,
+                        verified, created_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, %s)
+                       ON CONFLICT (id) DO NOTHING""",
+                    (post_id, user["id"], text, author_name, author_initials,
+                     lat, lng, status, submitted_at, scheduled_for, now_ms),
+                )
+                cur.execute(
+                    """SELECT id, text, author_name, author_initials, lat, lng,
+                              status, submitted_at, scheduled_for, cancelled_at,
+                              verified, created_at
+                       FROM met_posts WHERE id = %s""",
+                    (post_id,),
+                )
+                row = cur.fetchone()
+    except Exception as e:
+        print(f"[met_posts_create] failed: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"ok": False, "error": "create-failed"}), 500
+
+    if row is None:
+        return jsonify({"ok": False, "error": "create-failed"}), 500
+    return jsonify({"ok": True, "post": _serialize_met_post(row)})
+
+
+@app.route("/api/v1/met-posts/<post_id>", methods=["OPTIONS"])
+def _met_posts_id_preflight(post_id):
+    return ("", 204)
+
+
+@app.patch("/api/v1/met-posts/<post_id>")
+def met_posts_update(post_id):
+    """Update a Met post. Used in two scenarios:
+
+    1. Edit a scheduled post (Met changes their mind before promotion)
+       Allowed fields: text, lat, lng, scheduledFor
+    2. Promote a scheduled post to live (frontend timer; status flip)
+       Allowed fields: status='live', submittedAt
+
+    The PATCH semantics: only the fields the caller sends are updated.
+    Other fields stay as-is.
+
+    Authorization: only the author or an admin can update. Returns 403
+    if a non-author non-admin tries. (Note: in the current simple model,
+    anyone with the met role could in principle update anyone's post —
+    but the author check keeps it tight even within a small team.)
+
+    Returns:
+        200 {"ok": true, "post": {...}}
+        401 {"ok": false, "error": "not-authenticated"}
+        403 {"ok": false, "error": "forbidden"}
+        404 {"ok": false, "error": "not-found"}
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    data = request.get_json(silent=True) or {}
+
+    # Build update SET clauses dynamically based on which fields are present.
+    set_clauses = []
+    params = []
+
+    if "text" in data:
+        text = (data.get("text") or "").strip()
+        if not text:
+            return jsonify({"ok": False, "error": "missing-text"}), 400
+        if len(text) > 4000:
+            text = text[:4000]
+        set_clauses.append("text = %s")
+        params.append(text)
+
+    if "lat" in data:
+        try:
+            lat = float(data["lat"]) if data["lat"] is not None else None
+            set_clauses.append("lat = %s")
+            params.append(lat)
+        except (ValueError, TypeError):
+            pass
+
+    if "lng" in data:
+        try:
+            lng = float(data["lng"]) if data["lng"] is not None else None
+            set_clauses.append("lng = %s")
+            params.append(lng)
+        except (ValueError, TypeError):
+            pass
+
+    if "scheduledFor" in data:
+        if data["scheduledFor"]:
+            try:
+                iso = data["scheduledFor"].rstrip("Z")
+                if iso.endswith("+00:00"):
+                    iso = iso[:-6]
+                dt = datetime.fromisoformat(iso)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                set_clauses.append("scheduled_for = %s")
+                params.append(int(dt.timestamp() * 1000))
+            except (ValueError, TypeError):
+                return jsonify({"ok": False, "error": "invalid-scheduled-time"}), 400
+        else:
+            set_clauses.append("scheduled_for = NULL")
+
+    if "status" in data:
+        status = (data.get("status") or "").strip()
+        if status not in ("live", "scheduled", "cancelled"):
+            return jsonify({"ok": False, "error": "invalid-status"}), 400
+        set_clauses.append("status = %s")
+        params.append(status)
+        # If promoting to live, set submitted_at to now (the promotion
+        # timer's "the scheduled moment is now" semantics).
+        if status == "live" and "submittedAt" not in data:
+            set_clauses.append("submitted_at = %s")
+            params.append(int(time.time() * 1000))
+
+    if "submittedAt" in data and data["submittedAt"]:
+        try:
+            iso = data["submittedAt"].rstrip("Z")
+            if iso.endswith("+00:00"):
+                iso = iso[:-6]
+            dt = datetime.fromisoformat(iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            set_clauses.append("submitted_at = %s")
+            params.append(int(dt.timestamp() * 1000))
+        except (ValueError, TypeError):
+            pass
+
+    if not set_clauses:
+        return jsonify({"ok": False, "error": "no-fields-to-update"}), 400
+
+    # Authorization: only author or admin.
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT author_id FROM met_posts WHERE id = %s",
+                (post_id,),
+            )
+            existing = cur.fetchone()
+            if existing is None:
+                return jsonify({"ok": False, "error": "not-found"}), 404
+
+            is_admin = "admin" in (user.get("roles") or [])
+            if existing["author_id"] != user["id"] and not is_admin:
+                return jsonify({"ok": False, "error": "forbidden"}), 403
+
+            params.append(post_id)
+            cur.execute(
+                f"UPDATE met_posts SET {', '.join(set_clauses)} WHERE id = %s",
+                tuple(params),
+            )
+
+            cur.execute(
+                """SELECT id, text, author_name, author_initials, lat, lng,
+                          status, submitted_at, scheduled_for, cancelled_at,
+                          verified, created_at
+                   FROM met_posts WHERE id = %s""",
+                (post_id,),
+            )
+            row = cur.fetchone()
+
+    return jsonify({"ok": True, "post": _serialize_met_post(row)})
+
+
+@app.delete("/api/v1/met-posts/<post_id>")
+def met_posts_cancel(post_id):
+    """Cancel a scheduled Met post. Sets status='cancelled' and records
+    the cancellation timestamp. Does NOT remove the row — we keep
+    cancelled posts for audit history.
+
+    Live posts cannot be cancelled — they're already published. The
+    frontend never offers a "cancel" button on a live post.
+
+    Returns:
+        200 {"ok": true}
+        401 {"ok": false, "error": "not-authenticated"}
+        403 {"ok": false, "error": "forbidden" | "cannot-cancel-live"}
+        404 {"ok": false, "error": "not-found"}
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT author_id, status FROM met_posts WHERE id = %s",
+                (post_id,),
+            )
+            row = cur.fetchone()
+
+            if row is None:
+                return jsonify({"ok": False, "error": "not-found"}), 404
+
+            is_admin = "admin" in (user.get("roles") or [])
+            if row["author_id"] != user["id"] and not is_admin:
+                return jsonify({"ok": False, "error": "forbidden"}), 403
+
+            if row["status"] == "live":
+                return jsonify({"ok": False, "error": "cannot-cancel-live"}), 403
+
+            if row["status"] == "cancelled":
+                # Idempotent — already cancelled
+                return jsonify({"ok": True})
+
+            cur.execute(
+                """UPDATE met_posts
+                   SET status = 'cancelled', cancelled_at = %s
+                   WHERE id = %s""",
+                (int(time.time() * 1000), post_id),
             )
 
     return jsonify({"ok": True})
