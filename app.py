@@ -3370,6 +3370,97 @@ def _grant_subscriber_role(user_id: int, conn) -> bool:
         return True
 
 
+def _revoke_subscriber_role(user_id: int, conn) -> bool:
+    """Revoke the 'subscriber' role from a user. Idempotent — returns True
+    only if the role was actually removed (False if they didn't have it).
+    Used by the subscription-cancellation webhook (Phase 1).
+
+    Other roles (admin, crew, met) are untouched — a Met who happened
+    to also be a subscriber doesn't lose their Met access when they
+    cancel their subscription.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM user_roles WHERE user_id = %s AND role = %s",
+            (user_id, "subscriber"),
+        )
+        return cur.rowcount > 0
+
+
+def _find_user_for_stripe_customer(stripe_customer_id: str, email_fallback: Optional[str] = None) -> Optional[int]:
+    """Look up the user matching a Stripe customer ID.
+
+    Primary lookup: users.stripe_customer_id. Populated for any user
+    who subscribed after Phase 2 of the May 14 work.
+
+    Fallback: if no row matches the customer ID AND an email was
+    provided (e.g. fetched from Stripe's customer object), look up by
+    email. This handles existing subscribers created before Phase 2
+    whose stripe_customer_id is still NULL.
+
+    Returns the integer user_id, or None if no match found.
+    """
+    if not stripe_customer_id and not email_fallback:
+        return None
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            if stripe_customer_id:
+                cur.execute(
+                    "SELECT id FROM users WHERE stripe_customer_id = %s LIMIT 1",
+                    (stripe_customer_id,),
+                )
+                row = cur.fetchone()
+                if row:
+                    return row["id"]
+
+            if email_fallback:
+                cur.execute(
+                    "SELECT id FROM users WHERE LOWER(email) = LOWER(%s) LIMIT 1",
+                    (email_fallback.strip(),),
+                )
+                row = cur.fetchone()
+                if row:
+                    # Found via email — backfill the customer ID for future lookups
+                    if stripe_customer_id:
+                        cur.execute(
+                            "UPDATE users SET stripe_customer_id = %s WHERE id = %s",
+                            (stripe_customer_id, row["id"]),
+                        )
+                    return row["id"]
+
+    return None
+
+
+def _fetch_stripe_customer_email(stripe_customer_id: str) -> Optional[str]:
+    """Fetch a customer's email from Stripe's API. Used as a fallback when
+    a webhook references a customer ID we don't have linked yet.
+
+    Returns the email string, or None if the lookup fails. Uses urllib
+    directly (no Stripe SDK dependency).
+    """
+    if not stripe_customer_id or not STRIPE_SECRET_KEY:
+        return None
+    try:
+        req = urllib.request.Request(
+            f"https://api.stripe.com/v1/customers/{stripe_customer_id}",
+            method="GET",
+            headers={
+                "Authorization": f"Bearer {STRIPE_SECRET_KEY}",
+                "User-Agent": "WeatherValet-Backend/1.0 (+https://weathervalet.ai)",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if 200 <= resp.status < 300:
+                body = json.loads(resp.read().decode("utf-8"))
+                email = body.get("email")
+                if email and isinstance(email, str):
+                    return email.strip()
+    except Exception as e:
+        print(f"[stripe-webhook] customer fetch failed for {stripe_customer_id}: {e!r}", flush=True)
+    return None
+
+
 @app.route("/api/v1/stripe/webhook", methods=["OPTIONS"])
 def _stripe_webhook_v2_preflight():
     """CORS preflight. Stripe doesn't send preflights but this route
@@ -3424,126 +3515,210 @@ def stripe_webhook_v2():
         print(f"[stripe-webhook] event {event_id} already processed, skipping", flush=True)
         return jsonify({"received": True, "duplicate": True}), 200
 
-    # Dispatch. Today we only handle checkout.session.completed. Other
-    # event types ack with 200 (so Stripe doesn't retry) but do nothing.
-    if event_type != "checkout.session.completed":
+    # Dispatch. Today we handle:
+    #   - checkout.session.completed       → subscription signup (Phase 4)
+    #   - customer.subscription.deleted    → subscription cancellation (Phase 1)
+    # Other event types ack with 200 (so Stripe doesn't retry) but do nothing.
+    if event_type not in ("checkout.session.completed", "customer.subscription.deleted"):
         print(f"[stripe-webhook] unhandled event type: {event_type} (id={event_id})", flush=True)
         # Record it anyway so we don't reprocess on retries
         _stripe_event_record(event_id, event_type, payload)
         return jsonify({"received": True, "handled": False}), 200
 
-    # Extract the checkout session
-    session = event.get("data", {}).get("object", {})
-    mode = session.get("mode", "")  # 'subscription' | 'payment' | 'setup'
-    customer_details = session.get("customer_details") or {}
-    email = (customer_details.get("email") or "").strip()
-    customer_name = (customer_details.get("name") or "").strip()
-    stripe_customer_id = session.get("customer") or ""
+    # ────────────────────────────────────────────────────────────────
+    # checkout.session.completed — subscription signup (or one-time payment)
+    # ────────────────────────────────────────────────────────────────
+    if event_type == "checkout.session.completed":
+        # Extract the checkout session
+        session = event.get("data", {}).get("object", {})
+        mode = session.get("mode", "")  # 'subscription' | 'payment' | 'setup'
+        customer_details = session.get("customer_details") or {}
+        email = (customer_details.get("email") or "").strip()
+        customer_name = (customer_details.get("name") or "").strip()
+        stripe_customer_id = session.get("customer") or ""
 
-    print(
-        f"[stripe-webhook] checkout.session.completed received: "
-        f"id={event_id} mode={mode} email={email} customer={stripe_customer_id}",
-        flush=True,
-    )
+        print(
+            f"[stripe-webhook] checkout.session.completed received: "
+            f"id={event_id} mode={mode} email={email} customer={stripe_customer_id}",
+            flush=True,
+        )
 
-    if mode == "subscription":
-        # Account-creation flow. We need a valid email; without it, we
-        # can't create a user or send a welcome link.
-        if not email or not is_valid_email(email):
-            print(f"[stripe-webhook] subscription mode but invalid email: '{email}'", flush=True)
-            _stripe_event_record(event_id, event_type, payload)
-            return jsonify({"received": True, "handled": False, "reason": "invalid-email"}), 200
+        if mode == "subscription":
+            # Account-creation flow. We need a valid email; without it, we
+            # can't create a user or send a welcome link.
+            if not email or not is_valid_email(email):
+                print(f"[stripe-webhook] subscription mode but invalid email: '{email}'", flush=True)
+                _stripe_event_record(event_id, event_type, payload)
+                return jsonify({"received": True, "handled": False, "reason": "invalid-email"}), 200
 
-        try:
-            with db() as conn:
-                # Find or create the user. _get_or_create_user is idempotent —
-                # if they already exist, returns their id. If not, creates a
-                # new row with no password set.
-                user_id = _get_or_create_user(email, conn)
+            try:
+                with db() as conn:
+                    # Find or create the user. _get_or_create_user is idempotent —
+                    # if they already exist, returns their id. If not, creates a
+                    # new row with no password set.
+                    user_id = _get_or_create_user(email, conn)
 
-                # If we got a name from Stripe and the user doesn't have one
-                # yet, fill it in. Don't overwrite an existing name (the user
-                # may have set their own preferred form).
-                if customer_name:
+                    # If we got a name from Stripe and the user doesn't have one
+                    # yet, fill it in. Don't overwrite an existing name (the user
+                    # may have set their own preferred form).
+                    if customer_name:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """UPDATE users SET name = %s
+                                   WHERE id = %s AND (name IS NULL OR name = '')""",
+                                (customer_name, user_id),
+                            )
+
+                    # Link the Stripe customer ID to the user (Phase 2). Lets
+                    # subsequent webhooks (cancellation, payment failure) look
+                    # up the user by customer ID without a Stripe round-trip.
+                    # We always overwrite — if a user re-subscribes after a
+                    # cancellation, the customer ID may have changed.
+                    if stripe_customer_id:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE users SET stripe_customer_id = %s WHERE id = %s",
+                                (stripe_customer_id, user_id),
+                            )
+
+                    # Grant subscriber role
+                    newly_granted = _grant_subscriber_role(user_id, conn)
+
+                # Send the password-reset email so the new subscriber can set
+                # their password and sign in. Reusing the magic-link infra —
+                # password-reset and first-time-account-setup are the same flow.
+                base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai")
+                raw_token = new_secure_token()
+                token_hash = hash_token(raw_token)
+                now = now_ts()
+                with db() as conn:
                     with conn.cursor() as cur:
                         cur.execute(
-                            """UPDATE users SET name = %s
-                               WHERE id = %s AND (name IS NULL OR name = '')""",
-                            (customer_name, user_id),
+                            """INSERT INTO magic_link_tokens
+                               (token_hash, user_id, created_at, expires_at, ip_requested)
+                               VALUES (%s, %s, %s, %s, %s)""",
+                            (token_hash, user_id, now, now + MAGIC_LINK_TTL_SECONDS, "stripe-webhook"),
                         )
+                magic_link_url = f"{base}/?auth=verify&token={raw_token}&intent=new-account"
+                _send_magic_link_email(email, magic_link_url, intent="new-account")
 
-                # Link the Stripe customer ID to the user (Phase 2). Lets
-                # subsequent webhooks (cancellation, payment failure) look
-                # up the user by customer ID without a Stripe round-trip.
-                # We always overwrite — if a user re-subscribes after a
-                # cancellation, the customer ID may have changed.
-                if stripe_customer_id:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            "UPDATE users SET stripe_customer_id = %s WHERE id = %s",
-                            (stripe_customer_id, user_id),
-                        )
+                print(
+                    f"[stripe-webhook] subscription provisioned: "
+                    f"user_id={user_id} email={email} newly_granted={newly_granted}",
+                    flush=True,
+                )
 
-                # Grant subscriber role
-                newly_granted = _grant_subscriber_role(user_id, conn)
+                # Record the event so we don't reprocess on retries
+                _stripe_event_record(event_id, event_type, payload)
+                return jsonify({"received": True, "handled": True, "user_id": user_id}), 200
 
-            # Send the password-reset email so the new subscriber can set
-            # their password and sign in. Reusing the magic-link infra —
-            # password-reset and first-time-account-setup are the same flow.
-            base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai")
-            raw_token = new_secure_token()
-            token_hash = hash_token(raw_token)
-            now = now_ts()
-            with db() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """INSERT INTO magic_link_tokens
-                           (token_hash, user_id, created_at, expires_at, ip_requested)
-                           VALUES (%s, %s, %s, %s, %s)""",
-                        (token_hash, user_id, now, now + MAGIC_LINK_TTL_SECONDS, "stripe-webhook"),
-                    )
-            magic_link_url = f"{base}/?auth=verify&token={raw_token}&intent=new-account"
-            _send_magic_link_email(email, magic_link_url, intent="new-account")
+            except Exception as e:
+                # DB error, email send failure, etc. Don't record the event —
+                # Stripe will retry, and the retry has a real chance of working
+                # (transient DB issues, Resend hiccups, etc.). Log loudly.
+                print(
+                    f"[stripe-webhook] FAILED to provision subscription for {email}: {e!r}",
+                    flush=True,
+                )
+                return jsonify({"error": "internal-error"}), 500
 
+        elif mode == "payment":
+            # One-time payment ($19 Met-verified review). Per product decision,
+            # we do NOT create an account here — the $19 product is transactional
+            # only. The existing verification_requests flow (separate webhook,
+            # currently inactive) handles its own bookkeeping.
             print(
-                f"[stripe-webhook] subscription provisioned: "
-                f"user_id={user_id} email={email} newly_granted={newly_granted}",
+                f"[stripe-webhook] one-time payment received (no account created): "
+                f"email={email} session={session.get('id')}",
                 flush=True,
             )
-
-            # Record the event so we don't reprocess on retries
             _stripe_event_record(event_id, event_type, payload)
-            return jsonify({"received": True, "handled": True, "user_id": user_id}), 200
+            return jsonify({"received": True, "handled": True, "mode": "payment"}), 200
+
+        else:
+            # 'setup' mode or anything else we don't handle. Ack so Stripe
+            # doesn't retry, but log so we notice if a new mode appears.
+            print(f"[stripe-webhook] unhandled mode: '{mode}' (id={event_id})", flush=True)
+            _stripe_event_record(event_id, event_type, payload)
+            return jsonify({"received": True, "handled": False, "mode": mode}), 200
+
+    # ────────────────────────────────────────────────────────────────
+    # customer.subscription.deleted — subscription cancellation (Phase 1)
+    # ────────────────────────────────────────────────────────────────
+    if event_type == "customer.subscription.deleted":
+        # For this event, data.object is the Subscription, not a checkout
+        # session. The key fields we care about:
+        #   - customer: the Stripe customer ID
+        #   - status: should be 'canceled' but we don't gate on it
+        subscription = event.get("data", {}).get("object", {})
+        stripe_customer_id = subscription.get("customer") or ""
+        sub_status = subscription.get("status", "")
+
+        print(
+            f"[stripe-webhook] customer.subscription.deleted received: "
+            f"id={event_id} customer={stripe_customer_id} status={sub_status}",
+            flush=True,
+        )
+
+        if not stripe_customer_id:
+            # Malformed event with no customer ID — nothing we can do.
+            _stripe_event_record(event_id, event_type, payload)
+            return jsonify({"received": True, "handled": False, "reason": "no-customer-id"}), 200
+
+        try:
+            # Find the user. Try the customer ID first; if that misses (legacy
+            # subscribers from before Phase 2 may not have it linked), fetch
+            # the email from Stripe's customer API and try by email.
+            user_id = _find_user_for_stripe_customer(stripe_customer_id)
+            if user_id is None:
+                email = _fetch_stripe_customer_email(stripe_customer_id)
+                if email:
+                    user_id = _find_user_for_stripe_customer(stripe_customer_id, email_fallback=email)
+
+            if user_id is None:
+                # No matching user. Record the event so we don't reprocess,
+                # but don't 500 — the subscription is genuinely cancelled at
+                # Stripe regardless, and us not having the user just means
+                # we have nothing local to revoke.
+                print(
+                    f"[stripe-webhook] cancellation event for unknown customer "
+                    f"{stripe_customer_id} (no matching user)",
+                    flush=True,
+                )
+                _stripe_event_record(event_id, event_type, payload)
+                return jsonify({"received": True, "handled": False, "reason": "no-matching-user"}), 200
+
+            # Revoke the subscriber role. Other roles (admin, crew, met) stay.
+            # Note: we do NOT kill their sessions or deactivate the account.
+            # If they're also a Crew member or Met, they keep that access.
+            # A subscriber-only user simply loses their subscriber workspace
+            # the next time the frontend re-fetches /auth/session.
+            with db() as conn:
+                revoked = _revoke_subscriber_role(user_id, conn)
+
+            print(
+                f"[stripe-webhook] subscription revoked: "
+                f"user_id={user_id} revoked={revoked} customer={stripe_customer_id}",
+                flush=True,
+            )
+            _stripe_event_record(event_id, event_type, payload)
+            return jsonify({"received": True, "handled": True, "user_id": user_id, "revoked": revoked}), 200
 
         except Exception as e:
-            # DB error, email send failure, etc. Don't record the event —
-            # Stripe will retry, and the retry has a real chance of working
-            # (transient DB issues, Resend hiccups, etc.). Log loudly.
+            # Don't record the event — Stripe will retry, transient errors
+            # may resolve themselves.
             print(
-                f"[stripe-webhook] FAILED to provision subscription for {email}: {e!r}",
+                f"[stripe-webhook] FAILED to process cancellation "
+                f"for {stripe_customer_id}: {e!r}",
                 flush=True,
             )
             return jsonify({"error": "internal-error"}), 500
 
-    elif mode == "payment":
-        # One-time payment ($19 Met-verified review). Per product decision,
-        # we do NOT create an account here — the $19 product is transactional
-        # only. The existing verification_requests flow (separate webhook,
-        # currently inactive) handles its own bookkeeping.
-        print(
-            f"[stripe-webhook] one-time payment received (no account created): "
-            f"email={email} session={session.get('id')}",
-            flush=True,
-        )
-        _stripe_event_record(event_id, event_type, payload)
-        return jsonify({"received": True, "handled": True, "mode": "payment"}), 200
-
-    else:
-        # 'setup' mode or anything else we don't handle. Ack so Stripe
-        # doesn't retry, but log so we notice if a new mode appears.
-        print(f"[stripe-webhook] unhandled mode: '{mode}' (id={event_id})", flush=True)
-        _stripe_event_record(event_id, event_type, payload)
-        return jsonify({"received": True, "handled": False, "mode": mode}), 200
+    # Defensive: unhandled event type at end of dispatch. Shouldn't be
+    # reachable given the early-return at the top, but keeps the function
+    # type-clean.
+    _stripe_event_record(event_id, event_type, payload)
+    return jsonify({"received": True, "handled": False}), 200
 
 
 # ────────────────────────────────────────────────────────────────────────────
