@@ -6323,6 +6323,42 @@ def admin_update_user(user_id):
     response = {"ok": True, "member": _serialize_user_for_admin(row)}
     if temp_password:
         response["temp_password"] = temp_password
+
+    # Phase 10 Admin Chunk B: audit-log significant changes. We log
+    # deactivation/reactivation explicitly (most sensitive); password
+    # resets and role changes are also recorded.
+    try:
+        actor = getattr(request, "user", None) or _get_current_user()
+        if actor:
+            actor_name = actor.get("name") or actor.get("email") or "admin"
+            actor_id = actor.get("id")
+            if is_active is not None:
+                action = "user.deactivate" if not is_active else "user.reactivate"
+                _audit_log(
+                    actor_user_id=actor_id, actor_name=actor_name,
+                    action=action, target_type="user", target_id=user_id,
+                    details={"target_email": row.get("email") if row else None},
+                )
+            if reset_password:
+                _audit_log(
+                    actor_user_id=actor_id, actor_name=actor_name,
+                    action="user.password_reset",
+                    target_type="user", target_id=user_id,
+                    details={"target_email": row.get("email") if row else None},
+                )
+            if role_input is not None:
+                _audit_log(
+                    actor_user_id=actor_id, actor_name=actor_name,
+                    action="user.role_change",
+                    target_type="user", target_id=user_id,
+                    details={
+                        "target_email": row.get("email") if row else None,
+                        "new_role": role_input,
+                    },
+                )
+    except Exception as e:
+        print(f"[admin_update_user] audit log failed: {e}", flush=True)
+
     return jsonify(response)
 
 
@@ -10638,6 +10674,265 @@ def admin_crew_reject(app_id):
 
     print(f"[crew-reject] application={app_id} rejected by admin={user['id']}", flush=True)
     return jsonify({"ok": True})
+
+
+# ════════════════════════════════════════════════════════════════════
+# Admin: Recent payments + refund (Phase 10 Admin Chunk B)
+# ════════════════════════════════════════════════════════════════════
+#
+# NOTE: We don't add new user-list or deactivate endpoints here — those
+# already exist from earlier admin work (GET /api/v1/admin/users at
+# line ~6122 returns all users with roles + is_active; PATCH at ~6222
+# handles deactivation via {"is_active": false}). We rely on those and
+# focus this chunk on payments + audit-log endpoints which are new.
+#
+# Audit-log writes for user deactivation get added inside the existing
+# PATCH handler (see admin_update_user).
+
+@app.route("/api/v1/admin/payments", methods=["OPTIONS"])
+def _admin_payments_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/payments")
+def admin_payments_list():
+    """List the last 50 paid/completed verification requests."""
+    user, err = _require_admin()
+    if err:
+        return err
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, created_at, updated_at, status, tier, price_cents,
+                          customer_email, customer_phone, plan_text, plan_location,
+                          stripe_session_id, stripe_payment_id,
+                          claimed_at, completed_at, meteorologist_verdict
+                   FROM verification_requests
+                   WHERE status IN ('paid','claimed','completed','refunded')
+                   ORDER BY created_at DESC LIMIT 50"""
+            )
+            rows = cur.fetchall()
+
+    payments = []
+    for r in rows:
+        payments.append({
+            "request_id": r["id"],
+            "created_at": r["created_at"],
+            "status": r["status"],
+            "tier": r["tier"],
+            "price_cents": r["price_cents"],
+            "customer_email": r["customer_email"],
+            "customer_phone": r["customer_phone"],
+            "plan_text": r["plan_text"],
+            "plan_location": r["plan_location"],
+            "stripe_payment_id": r["stripe_payment_id"],
+            "claimed_at": r["claimed_at"],
+            "completed_at": r["completed_at"],
+            "verdict": r.get("meteorologist_verdict"),
+        })
+    return jsonify({"ok": True, "payments": payments})
+
+
+@app.route("/api/v1/admin/payments/refund", methods=["OPTIONS"])
+def _admin_payments_refund_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/payments/refund")
+def admin_payments_refund():
+    """Issue a Stripe refund for a verification payment.
+
+    Body:
+      {"request_id": 42, "reason": "Met missed SLA", "amount_cents": null}
+        - reason is optional but recorded for the audit log
+        - amount_cents null = full refund; otherwise partial
+
+    The actual refund goes to Stripe via stripe.Refund.create. We update
+    the verification_requests row's status to 'refunded' so the same
+    request can't be refunded twice.
+    """
+    actor, err = _require_admin()
+    if err:
+        return err
+
+    if stripe is None or not STRIPE_SECRET_KEY:
+        return jsonify({"ok": False, "error": "stripe-not-configured"}), 503
+
+    data = request.get_json(silent=True) or {}
+    try:
+        request_id = int(data.get("request_id") or 0)
+    except (ValueError, TypeError):
+        request_id = 0
+    if not request_id:
+        return jsonify({"ok": False, "error": "missing-request-id"}), 400
+
+    reason = (data.get("reason") or "").strip() or None
+    amount_cents = data.get("amount_cents")
+    if amount_cents is not None:
+        try:
+            amount_cents = int(amount_cents)
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "error": "invalid-amount"}), 400
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, status, price_cents, stripe_payment_id,
+                          customer_email, customer_phone
+                   FROM verification_requests WHERE id = %s""",
+                (request_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    if row["status"] == "refunded":
+        return jsonify({"ok": False, "error": "already-refunded"}), 409
+    if not row["stripe_payment_id"]:
+        return jsonify({"ok": False, "error": "no-stripe-payment-id"}), 400
+
+    # Stripe Refund API. payment_intent OR charge — our stripe_payment_id
+    # was populated as session.payment_intent OR session.id (in _mark_paid_and_notify),
+    # so try payment_intent first, fall back to charge.
+    refund_params = {"payment_intent": row["stripe_payment_id"]}
+    if amount_cents is not None and amount_cents > 0:
+        refund_params["amount"] = amount_cents
+
+    try:
+        refund = stripe.Refund.create(**refund_params)
+    except Exception as e:
+        # Try as charge if payment_intent failed
+        try:
+            refund_params = {"charge": row["stripe_payment_id"]}
+            if amount_cents is not None and amount_cents > 0:
+                refund_params["amount"] = amount_cents
+            refund = stripe.Refund.create(**refund_params)
+        except Exception as e2:
+            print(f"[admin-refund] FAILED request={request_id}: {e!r} / {e2!r}", flush=True)
+            return jsonify({
+                "ok": False,
+                "error": "stripe-error",
+                "message": f"Stripe refused the refund: {str(e2)[:200]}",
+            }), 500
+
+    # Mark request as refunded so we don't double-refund
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE verification_requests SET status='refunded', updated_at=%s WHERE id=%s",
+                (int(time.time()), request_id),
+            )
+
+    _audit_log(
+        actor_user_id=actor["id"],
+        actor_name=actor.get("name") or actor.get("email"),
+        action="payment.refund",
+        target_type="verification_request",
+        target_id=request_id,
+        details={
+            "stripe_refund_id": getattr(refund, "id", None),
+            "amount_cents": amount_cents if amount_cents else row["price_cents"],
+            "reason": reason,
+            "customer_email": row["customer_email"],
+        },
+    )
+
+    # Notify customer by SMS (best effort)
+    try:
+        if row["customer_phone"]:
+            send_sms(
+                row["customer_phone"],
+                "WeatherValet: Your $19 review has been refunded. "
+                "Please allow 5-10 business days for the funds to appear.",
+            )
+    except Exception:
+        pass
+
+    print(f"[admin-refund] request={request_id} refunded by admin={actor['id']}", flush=True)
+    return jsonify({
+        "ok": True,
+        "refund_id": getattr(refund, "id", None),
+        "request_id": request_id,
+    })
+
+
+# ════════════════════════════════════════════════════════════════════
+# Admin: Audit log read (Phase 10 Admin Chunk B)
+# ════════════════════════════════════════════════════════════════════
+
+@app.route("/api/v1/admin/audit-log", methods=["OPTIONS"])
+def _admin_audit_log_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/audit-log")
+def admin_audit_log_list():
+    """Paginated audit log. Newest first.
+
+    Query params:
+      ?limit=<n>  default 50, max 200
+      ?before=<created_at>  cursor for pagination (ms timestamp)
+      ?action=<prefix>  optional action filter (e.g. 'crew.' matches all crew actions)
+    """
+    user, err = _require_admin()
+    if err:
+        return err
+
+    try:
+        limit = min(int(request.args.get("limit") or 50), 200)
+    except (ValueError, TypeError):
+        limit = 50
+
+    before = request.args.get("before")
+    action_prefix = (request.args.get("action") or "").strip()
+
+    where = []
+    params: list = []
+    if before:
+        try:
+            where.append("created_at < %s")
+            params.append(int(before))
+        except (ValueError, TypeError):
+            pass
+    if action_prefix:
+        where.append("action LIKE %s")
+        params.append(action_prefix + "%")
+
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    sql = f"""
+        SELECT id, actor_user_id, actor_name, action,
+               target_type, target_id, details_json, created_at
+        FROM admin_audit_log
+        {where_sql}
+        ORDER BY created_at DESC LIMIT %s
+    """
+    params.append(limit)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall()
+
+    entries = []
+    for r in rows:
+        details = None
+        if r["details_json"]:
+            try:
+                details = json.loads(r["details_json"])
+            except (ValueError, TypeError):
+                details = {"_unparsed": r["details_json"][:200]}
+        entries.append({
+            "id": r["id"],
+            "actor_user_id": r["actor_user_id"],
+            "actor_name": r.get("actor_name") or "",
+            "action": r["action"],
+            "target_type": r.get("target_type"),
+            "target_id": r.get("target_id"),
+            "details": details,
+            "created_at": r["created_at"],
+        })
+
+    return jsonify({"ok": True, "entries": entries})
 
 
 if __name__ == "__main__":
