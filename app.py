@@ -592,6 +592,33 @@ CREATE TABLE IF NOT EXISTS met_posts (
 CREATE INDEX IF NOT EXISTS idx_met_posts_status ON met_posts(status);
 CREATE INDEX IF NOT EXISTS idx_met_posts_author ON met_posts(author_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_met_posts_scheduled ON met_posts(scheduled_for) WHERE status = 'scheduled';
+
+-- ── Met follow-up messages (Phase 7) ──
+-- Audit trail of messages a meteorologist sends to a customer outside
+-- of the original brief — e.g. "the forecast just changed, here's a
+-- revised call." Lets Met history show "you've messaged this customer
+-- 3 times" and gives us records for billing/compliance.
+--
+-- request_id is nullable because in the prototype phase, follow-ups can
+-- be sent from mock-data rows that don't have a real verification_requests
+-- ID yet. When the history surface is wired to real data, request_id
+-- becomes mandatory.
+--
+-- delivery_status: 'sent' = Twilio accepted, 'stubbed' = no Twilio creds
+-- (dev mode), 'failed' = Twilio error, 'queued' = mid-flight.
+CREATE TABLE IF NOT EXISTS met_messages (
+    id              SERIAL PRIMARY KEY,
+    met_user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    request_id      INTEGER REFERENCES verification_requests(id) ON DELETE SET NULL,
+    customer_phone  TEXT,                -- E.164 if known; null if mock-data send
+    customer_label  TEXT,                -- "Patel Construction" for display in Met history
+    body            TEXT NOT NULL,
+    delivery_status TEXT NOT NULL,       -- 'sent' | 'stubbed' | 'failed' | 'queued'
+    twilio_sid      TEXT,                -- nullable; only set on real Twilio sends
+    sent_at         BIGINT NOT NULL      -- ms since epoch
+);
+CREATE INDEX IF NOT EXISTS idx_met_messages_request ON met_messages(request_id, sent_at DESC);
+CREATE INDEX IF NOT EXISTS idx_met_messages_met ON met_messages(met_user_id, sent_at DESC);
 """
 
 
@@ -6773,6 +6800,203 @@ def met_posts_cancel(post_id):
             )
 
     return jsonify({"ok": True})
+
+
+# ════════════════════════════════════════════════════════════════════
+# Met follow-up messages (Phase 7 — May 14)
+# ════════════════════════════════════════════════════════════════════
+#
+# Lets a meteorologist send a follow-up SMS to a customer when the
+# forecast changes after the original brief was delivered.
+#
+# Endpoints:
+#   POST /api/v1/met/messages          — send a follow-up
+#   GET  /api/v1/met/messages?...      — list messages, optional request_id filter
+#
+# Auth: requires the met or admin role.
+
+@app.route("/api/v1/met/messages", methods=["OPTIONS"])
+def _met_messages_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/met/messages")
+def met_messages_send():
+    """Send a follow-up SMS to a verification customer.
+
+    Request body:
+        {
+          "request_id": 42,              # optional — links to verification_requests
+          "customer_phone": "+15551234", # optional — required if no request_id
+          "customer_label": "Patel Co",  # display label for the Met history row
+          "body": "Storm has shifted..."  # required, the message text
+        }
+
+    If request_id is provided AND that request has a customer_phone, we use
+    that phone (the request_id phone is authoritative). If no request_id is
+    provided but customer_phone is, we use the phone directly — this is the
+    path for mock-data rows in the prototype Met history.
+
+    Returns:
+        200 {"ok": true, "message_id": 7, "delivery_status": "sent"}
+        400 {"ok": false, "error": "..."}
+        401 {"ok": false, "error": "not-authenticated"}
+        403 {"ok": false, "error": "forbidden"}
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    body = (data.get("body") or "").strip()
+    if not body:
+        return jsonify({"ok": False, "error": "missing-body"}), 400
+    if len(body) > 1600:
+        # Twilio caps SMS at ~1600 chars before segmenting heavily
+        body = body[:1600]
+
+    request_id = data.get("request_id")
+    try:
+        request_id = int(request_id) if request_id else None
+    except (ValueError, TypeError):
+        request_id = None
+
+    customer_phone = (data.get("customer_phone") or "").strip() or None
+    customer_label = (data.get("customer_label") or "").strip() or None
+
+    # If request_id provided, look up phone + label from the request record.
+    # The request record's phone is authoritative when present.
+    if request_id is not None:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT customer_phone, plan_text FROM verification_requests WHERE id = %s",
+                    (request_id,),
+                )
+                req_row = cur.fetchone()
+        if req_row:
+            if req_row.get("customer_phone"):
+                customer_phone = req_row["customer_phone"]
+            if not customer_label and req_row.get("plan_text"):
+                # Use the first ~40 chars of plan_text as a fallback label
+                customer_label = req_row["plan_text"][:40]
+
+    # Determine delivery path. If we have a real phone, attempt Twilio.
+    # If not, we still record the message but mark it stubbed — the Met
+    # gets feedback that the action happened.
+    delivery_status = "stubbed"
+    twilio_sid = None
+    if customer_phone:
+        # send_sms returns True on real send OR stub-fallback; we can't
+        # distinguish the two from its return value. Use the env vars
+        # directly to decide what delivery_status to record.
+        sent = send_sms(customer_phone, body)
+        if sent and TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER and TwilioClient:
+            delivery_status = "sent"
+            # Note: we don't currently extract the SID from send_sms — it
+            # logs to stdout. A future enhancement would have send_sms
+            # return the SID. For now, the stdout log is the trail.
+        elif sent:
+            delivery_status = "stubbed"
+        else:
+            delivery_status = "failed"
+
+    now_ms = int(time.time() * 1000)
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO met_messages
+                       (met_user_id, request_id, customer_phone, customer_label,
+                        body, delivery_status, twilio_sid, sent_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                       RETURNING id""",
+                    (user["id"], request_id, customer_phone, customer_label,
+                     body, delivery_status, twilio_sid, now_ms),
+                )
+                msg_id = cur.fetchone()["id"]
+    except Exception as e:
+        print(f"[met_messages_send] DB write failed: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"ok": False, "error": "log-write-failed"}), 500
+
+    print(
+        f"[met-message] sent: id={msg_id} met_user={user['id']} "
+        f"to={customer_phone or '(none)'} status={delivery_status} "
+        f"label={customer_label!r}",
+        flush=True,
+    )
+
+    return jsonify({
+        "ok": True,
+        "message_id": msg_id,
+        "delivery_status": delivery_status,
+        "sent_at": now_ms,
+    })
+
+
+@app.get("/api/v1/met/messages")
+def met_messages_list():
+    """List Met follow-up messages.
+
+    Query params:
+        request_id  — optional, filter to messages for one request
+        met_only    — optional ('1' or 'true'), filter to current Met's sends
+
+    Returns:
+        200 {"ok": true, "messages": [...]}
+        401 / 403 as elsewhere
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    request_id_filter = request.args.get("request_id")
+    met_only = request.args.get("met_only", "").lower() in ("1", "true", "yes")
+
+    sql = """SELECT id, met_user_id, request_id, customer_phone, customer_label,
+                    body, delivery_status, twilio_sid, sent_at
+             FROM met_messages WHERE 1=1"""
+    params = []
+    if request_id_filter:
+        try:
+            sql += " AND request_id = %s"
+            params.append(int(request_id_filter))
+        except (ValueError, TypeError):
+            pass
+    if met_only:
+        sql += " AND met_user_id = %s"
+        params.append(user["id"])
+    sql += " ORDER BY sent_at DESC LIMIT 200"
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall()
+
+    messages = [
+        {
+            "id": r["id"],
+            "met_user_id": r["met_user_id"],
+            "request_id": r["request_id"],
+            "customer_phone": r["customer_phone"],
+            "customer_label": r["customer_label"],
+            "body": r["body"],
+            "delivery_status": r["delivery_status"],
+            "twilio_sid": r["twilio_sid"],
+            "sent_at": r["sent_at"],
+        }
+        for r in rows
+    ]
+    return jsonify({"ok": True, "messages": messages})
 
 
 if __name__ == "__main__":
