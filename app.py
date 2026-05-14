@@ -1245,7 +1245,7 @@ def _get_current_user() -> Optional[dict]:
             # Join session + user + roles in one query for efficiency
             cur.execute(
                 """SELECT s.user_id, s.expires_at, s.idle_expires_at,
-                          u.email, u.name
+                          u.email, u.name, u.is_active
                    FROM sessions s
                    JOIN users u ON u.id = s.user_id
                    WHERE s.session_id_hash = %s""",
@@ -1260,6 +1260,25 @@ def _get_current_user() -> Optional[dict]:
         if row["expires_at"] < now:
             return None
         if row["idle_expires_at"] < now:
+            return None
+
+        # Deactivated-account check (Phase 3). If a user was deactivated
+        # mid-session, their session may not have been killed yet (race
+        # between deactivation and the next request). Treat the session
+        # as invalid here so EVERY authed endpoint (not just login) sees
+        # the deactivation immediately. We also delete the session row so
+        # subsequent requests short-circuit at the "no matching session"
+        # check above.
+        if not row.get("is_active", True):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM sessions WHERE session_id_hash = %s",
+                    (session_hash,),
+                )
+            print(
+                f"[auth] session invalidated: deactivated user_id={row['user_id']}",
+                flush=True,
+            )
             return None
 
         # Refresh idle expiration (extend by SESSION_IDLE_TTL_SECONDS from now)
@@ -2306,7 +2325,7 @@ def auth_login():
         # Look up the user by lowercase email
         with conn.cursor() as cur:
             cur.execute(
-                """SELECT id, email, name, password_hash
+                """SELECT id, email, name, password_hash, is_active
                    FROM users WHERE LOWER(email) = LOWER(%s)""",
                 (email,),
             )
@@ -2341,6 +2360,21 @@ def auth_login():
             _log_login_attempt(email, client_ip, False, conn)
             print(f"[auth] login failed: wrong-password user_id={user_row['id']} ip={client_ip}", flush=True)
             return jsonify({"ok": False, "error": "invalid-credentials"}), 401
+
+        # Deactivated-account check. Comes AFTER password verification so
+        # an attacker probing for valid emails can't distinguish "wrong
+        # password" from "valid password on deactivated account" via timing
+        # or response patterns. The user (who actually has the right
+        # password) gets a clear error, attackers get the same 401 as any
+        # other failure.
+        if not user_row.get("is_active", True):
+            _log_login_attempt(email, client_ip, False, conn)
+            print(
+                f"[auth] login blocked: deactivated user_id={user_row['id']} "
+                f"email={email} ip={client_ip}",
+                flush=True,
+            )
+            return jsonify({"ok": False, "error": "account-deactivated"}), 403
 
         # Success — log it, update last_login_at, create session, fetch roles
         _log_login_attempt(email, client_ip, True, conn)
@@ -2417,7 +2451,8 @@ def auth_verify():
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """SELECT t.user_id, t.expires_at, t.used_at, u.email, u.name
+                """SELECT t.user_id, t.expires_at, t.used_at,
+                          u.email, u.name, u.is_active
                    FROM magic_link_tokens t
                    JOIN users u ON u.id = t.user_id
                    WHERE t.token_hash = %s""",
@@ -2441,6 +2476,24 @@ def auth_verify():
             # Token aged out.
             print(f"[auth] verify failed: expired (user_id={row['user_id']})", flush=True)
             return jsonify({"ok": False, "error": "expired-token"}), 410
+
+        # Deactivated-account check. If the user was deactivated between
+        # link issuance and click, refuse the sign-in. We also burn the
+        # token (mark used) so an attacker who intercepted the link can't
+        # replay it after a potential reactivation. The user can request
+        # a fresh link after reactivation.
+        if not row.get("is_active", True):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE magic_link_tokens SET used_at = %s WHERE token_hash = %s",
+                    (now, token_hash),
+                )
+            print(
+                f"[auth] verify blocked: deactivated user_id={row['user_id']} "
+                f"email={row['email']}",
+                flush=True,
+            )
+            return jsonify({"ok": False, "error": "account-deactivated"}), 403
 
         # Token is valid. Mark it used and create a session.
         with conn.cursor() as cur:
