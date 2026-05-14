@@ -410,6 +410,15 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TR
 -- a password change before allowing access to any workspace.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS password_must_change BOOLEAN NOT NULL DEFAULT FALSE;
 
+-- Stripe customer ID — populated when a user signs up via Stripe
+-- subscription checkout. Lets us look up the user from any Stripe
+-- webhook event (cancellation, payment failure, upgrade) without
+-- needing the email round-trip. Nullable because not every user has
+-- a Stripe customer (manual admin-created accounts, free-tier users).
+-- Indexed for the cancellation webhook's user lookup.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_users_stripe_customer ON users(stripe_customer_id) WHERE stripe_customer_id IS NOT NULL;
+
 -- ── User roles — many-to-many; a user can hold several roles ──
 -- Roles: 'subscriber', 'crew', 'met', 'admin'
 -- A subscriber who is also Crew has two rows here.
@@ -3461,6 +3470,18 @@ def stripe_webhook_v2():
                             """UPDATE users SET name = %s
                                WHERE id = %s AND (name IS NULL OR name = '')""",
                             (customer_name, user_id),
+                        )
+
+                # Link the Stripe customer ID to the user (Phase 2). Lets
+                # subsequent webhooks (cancellation, payment failure) look
+                # up the user by customer ID without a Stripe round-trip.
+                # We always overwrite — if a user re-subscribes after a
+                # cancellation, the customer ID may have changed.
+                if stripe_customer_id:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE users SET stripe_customer_id = %s WHERE id = %s",
+                            (stripe_customer_id, user_id),
                         )
 
                 # Grant subscriber role
