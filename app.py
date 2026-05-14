@@ -7819,6 +7819,386 @@ def me_threshold_alerts_delete(alert_id):
     return jsonify({"ok": True})
 
 
+# ════════════════════════════════════════════════════════════════════
+# Saved locations — write endpoints (Phase 10 Chunk B2)
+# ════════════════════════════════════════════════════════════════════
+#
+# CRUD for the subscriber's saved location(s) + a geocoding helper that
+# turns a free-form address string into lat/lng using Open-Meteo's free
+# geocoding API. The helper is also exposed as its own endpoint so the
+# frontend's "Look up" button can show the resolved location before the
+# user commits to saving it.
+
+def _geocode_address(query: str) -> Optional[dict]:
+    """Look up a free-form address string using Open-Meteo's geocoding API.
+
+    No API key required, no rate-limit signup. Returns the first result
+    or None if no match. Result shape:
+        {
+          "lat": float,
+          "lng": float,
+          "name": "Lebanon",
+          "admin1": "Indiana",       # state
+          "admin2": "Boone County",   # county
+          "country": "United States"
+        }
+
+    Network failures return None silently — caller treats it as "no match"
+    and asks the user to drop a pin manually.
+    """
+    if not query or not isinstance(query, str):
+        return None
+    q = query.strip()
+    if not q:
+        return None
+
+    try:
+        # URL-encode the query
+        from urllib.parse import quote
+        url = (
+            "https://geocoding-api.open-meteo.com/v1/search"
+            f"?name={quote(q)}&count=1&language=en&format=json"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "weathervalet/1.0"})
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, ValueError, TimeoutError) as e:
+        print(f"[GEOCODE] failed for '{q[:80]}': {e}", flush=True)
+        return None
+    except Exception as e:
+        print(f"[GEOCODE] unexpected error for '{q[:80]}': {e}", flush=True)
+        return None
+
+    results = (data or {}).get("results") or []
+    if not results:
+        return None
+
+    r = results[0]
+    return {
+        "lat": float(r.get("latitude")),
+        "lng": float(r.get("longitude")),
+        "name": r.get("name") or q,
+        "admin1": r.get("admin1") or "",   # state
+        "admin2": r.get("admin2") or "",   # county
+        "country": r.get("country") or "",
+    }
+
+
+@app.route("/api/v1/geocode", methods=["OPTIONS"])
+def _geocode_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/geocode")
+def geocode_lookup():
+    """Geocode a free-form address string.
+
+    Query params:
+        q  — the address string ("Lebanon, IN" or "1600 Pennsylvania Ave")
+
+    Returns:
+        200 {"ok": true, "result": {...}}   match found
+        200 {"ok": true, "result": null}    no match (treat as user error)
+        400 missing q
+        401 not authenticated (we keep this auth-only to avoid being a
+            free geocoder for the internet)
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({"ok": False, "error": "missing-query"}), 400
+
+    result = _geocode_address(q)
+    return jsonify({"ok": True, "result": result})
+
+
+@app.post("/api/v1/me/saved-locations")
+def me_saved_locations_create():
+    """Create a new saved location for the current user.
+
+    Two input shapes are accepted:
+      A) {"address_text": "Lebanon, IN", "label": "Home"}
+         — backend geocodes to get lat/lng
+      B) {"address_text": "Lebanon, IN", "label": "Home",
+          "lat": 40.0481, "lng": -86.4694, "county": "Boone County"}
+         — frontend already has coords (e.g. after pin-drop), backend trusts them
+
+    `is_primary` defaults to TRUE if this is the user's first location.
+    If `is_primary` is explicitly TRUE and another location exists, the
+    other one is automatically unset (exactly-one-primary invariant).
+
+    Returns:
+        200 {"ok": true, "location": {...}}
+        400 invalid input or geocoding failure
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    data = request.get_json(silent=True) or {}
+
+    label = (data.get("label") or "").strip()
+    if not label:
+        # Auto-generate a label from address_text if not supplied
+        label = (data.get("address_text") or "Saved location").strip()[:80]
+    if len(label) > 120:
+        label = label[:120]
+
+    address_text = (data.get("address_text") or "").strip() or None
+
+    # If lat/lng provided, trust them. Otherwise geocode.
+    lat = data.get("lat")
+    lng = data.get("lng")
+    county = (data.get("county") or "").strip() or None
+
+    if lat is None or lng is None:
+        # Need to geocode from address_text
+        if not address_text:
+            return jsonify({"ok": False, "error": "no-location-data"}), 400
+        geo = _geocode_address(address_text)
+        if not geo:
+            return jsonify({"ok": False, "error": "geocoding-failed"}), 400
+        lat = geo["lat"]
+        lng = geo["lng"]
+        if not county:
+            county = geo.get("admin2") or None
+    else:
+        try:
+            lat = float(lat)
+            lng = float(lng)
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "error": "invalid-coords"}), 400
+        # Sanity check — somewhere on Earth
+        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+            return jsonify({"ok": False, "error": "invalid-coords"}), 400
+
+    now_ms = int(time.time() * 1000)
+    requested_primary = bool(data.get("is_primary", False))
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            # If user has no existing locations, force is_primary=TRUE
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM saved_locations WHERE user_id = %s",
+                (user["id"],),
+            )
+            row = cur.fetchone()
+            existing_count = row["n"] if row else 0
+            is_primary = requested_primary or (existing_count == 0)
+
+            # If setting primary, unset any existing primary first
+            if is_primary and existing_count > 0:
+                cur.execute(
+                    "UPDATE saved_locations SET is_primary = FALSE, updated_at = %s "
+                    "WHERE user_id = %s AND is_primary = TRUE",
+                    (now_ms, user["id"]),
+                )
+
+            cur.execute(
+                """INSERT INTO saved_locations
+                   (user_id, label, address_text, lat, lng, county, is_primary,
+                    created_at, updated_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   RETURNING id, label, address_text, lat, lng, county,
+                             is_primary, created_at, updated_at""",
+                (user["id"], label, address_text, lat, lng, county, is_primary,
+                 now_ms, now_ms),
+            )
+            new_row = cur.fetchone()
+
+    return jsonify({
+        "ok": True,
+        "location": {
+            "id": new_row["id"],
+            "label": new_row["label"],
+            "address_text": new_row["address_text"],
+            "lat": new_row["lat"],
+            "lng": new_row["lng"],
+            "county": new_row["county"],
+            "is_primary": new_row["is_primary"],
+            "created_at": new_row["created_at"],
+            "updated_at": new_row["updated_at"],
+        },
+    })
+
+
+@app.route("/api/v1/me/saved-locations/<int:loc_id>", methods=["OPTIONS"])
+def _me_saved_location_id_preflight(loc_id):
+    return ("", 204)
+
+
+@app.patch("/api/v1/me/saved-locations/<int:loc_id>")
+def me_saved_locations_update(loc_id):
+    """Update an existing saved location. Owner-only.
+
+    Same field-validation rules as create. Re-geocoding is NOT automatic —
+    if the address_text changes but no new lat/lng is supplied, we keep
+    the existing lat/lng (user must do a fresh geocode + pin-drop to move).
+
+    Setting is_primary=true unsets any other primary location for this user.
+
+    Returns:
+        200 {"ok": true, "location": {...}}
+        404 not found or not owned
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    data = request.get_json(silent=True) or {}
+    now_ms = int(time.time() * 1000)
+
+    set_clauses = []
+    params = []
+
+    if "label" in data:
+        label = (data["label"] or "").strip()
+        if not label or len(label) > 120:
+            return jsonify({"ok": False, "error": "invalid-label"}), 400
+        set_clauses.append("label = %s")
+        params.append(label)
+
+    if "address_text" in data:
+        addr = (data["address_text"] or "").strip()
+        set_clauses.append("address_text = %s")
+        params.append(addr or None)
+
+    if "lat" in data or "lng" in data:
+        # If either coord is in the body, both must be present and valid
+        try:
+            lat = float(data["lat"])
+            lng = float(data["lng"])
+        except (KeyError, ValueError, TypeError):
+            return jsonify({"ok": False, "error": "invalid-coords"}), 400
+        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+            return jsonify({"ok": False, "error": "invalid-coords"}), 400
+        set_clauses.append("lat = %s")
+        params.append(lat)
+        set_clauses.append("lng = %s")
+        params.append(lng)
+
+    if "county" in data:
+        set_clauses.append("county = %s")
+        params.append((data["county"] or "").strip() or None)
+
+    requested_primary = data.get("is_primary")
+    if requested_primary is not None:
+        set_clauses.append("is_primary = %s")
+        params.append(bool(requested_primary))
+
+    if not set_clauses:
+        return jsonify({"ok": False, "error": "no-fields-to-update"}), 400
+
+    set_clauses.append("updated_at = %s")
+    params.append(now_ms)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            # Verify ownership
+            cur.execute(
+                "SELECT user_id FROM saved_locations WHERE id = %s",
+                (loc_id,),
+            )
+            existing = cur.fetchone()
+            if existing is None or existing["user_id"] != user["id"]:
+                return jsonify({"ok": False, "error": "not-found"}), 404
+
+            # If toggling this location to primary, unset others first
+            if requested_primary is True:
+                cur.execute(
+                    "UPDATE saved_locations SET is_primary = FALSE, updated_at = %s "
+                    "WHERE user_id = %s AND is_primary = TRUE AND id != %s",
+                    (now_ms, user["id"], loc_id),
+                )
+
+            params.extend([loc_id, user["id"]])
+            cur.execute(
+                f"UPDATE saved_locations SET {', '.join(set_clauses)} "
+                f"WHERE id = %s AND user_id = %s",
+                tuple(params),
+            )
+            cur.execute(
+                """SELECT id, label, address_text, lat, lng, county, is_primary,
+                          created_at, updated_at
+                   FROM saved_locations WHERE id = %s""",
+                (loc_id,),
+            )
+            row = cur.fetchone()
+
+    return jsonify({
+        "ok": True,
+        "location": {
+            "id": row["id"],
+            "label": row["label"],
+            "address_text": row["address_text"],
+            "lat": row["lat"],
+            "lng": row["lng"],
+            "county": row["county"],
+            "is_primary": row["is_primary"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        },
+    })
+
+
+@app.delete("/api/v1/me/saved-locations/<int:loc_id>")
+def me_saved_locations_delete(loc_id):
+    """Delete a saved location. Owner-only.
+
+    If the deleted location was primary AND another location exists,
+    the most recently created location is promoted to primary so the
+    invariant (subscriber always has a primary location when they have
+    any locations) holds.
+
+    Returns:
+        200 {"ok": true}
+        404 not found or not owned
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    now_ms = int(time.time() * 1000)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT user_id, is_primary FROM saved_locations WHERE id = %s",
+                (loc_id,),
+            )
+            row = cur.fetchone()
+            if row is None or row["user_id"] != user["id"]:
+                return jsonify({"ok": False, "error": "not-found"}), 404
+
+            was_primary = row["is_primary"]
+
+            cur.execute(
+                "DELETE FROM saved_locations WHERE id = %s AND user_id = %s",
+                (loc_id, user["id"]),
+            )
+
+            # If we removed the primary, promote the newest remaining location
+            if was_primary:
+                cur.execute(
+                    """SELECT id FROM saved_locations
+                       WHERE user_id = %s
+                       ORDER BY created_at DESC LIMIT 1""",
+                    (user["id"],),
+                )
+                successor = cur.fetchone()
+                if successor:
+                    cur.execute(
+                        "UPDATE saved_locations SET is_primary = TRUE, updated_at = %s "
+                        "WHERE id = %s",
+                        (now_ms, successor["id"]),
+                    )
+
+    return jsonify({"ok": True})
+
+
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 8080))
