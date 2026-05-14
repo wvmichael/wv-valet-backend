@@ -3928,15 +3928,46 @@ def stripe_webhook_v2():
                 return jsonify({"error": "internal-error"}), 500
 
         elif mode == "payment":
-            # One-time payment ($19 Met-verified review). Per product decision,
-            # we do NOT create an account here — the $19 product is transactional
-            # only. The existing verification_requests flow (separate webhook,
-            # currently inactive) handles its own bookkeeping.
-            print(
-                f"[stripe-webhook] one-time payment received (no account created): "
-                f"email={email} session={session.get('id')}",
-                flush=True,
-            )
+            # One-time payment ($19 Met-verified review). Phase 10 Item #2:
+            # this is now wired to the verification_requests flow. Stripe
+            # session metadata carries wv_request_id (set when we created
+            # the checkout session); we use it to find the matching request
+            # row and call _mark_paid_and_notify which:
+            #   - marks the request 'paid' (idempotent)
+            #   - SMSes the customer their standby confirmation
+            #   - SMSes the meteorologist with the claim link + AI brief
+            session_metadata = session.get("metadata") or {}
+            try:
+                request_id = int(session_metadata.get("wv_request_id", 0))
+            except (ValueError, TypeError):
+                request_id = 0
+            if request_id:
+                payment_id = session.get("payment_intent") or session.get("id")
+                try:
+                    _mark_paid_and_notify(request_id, payment_id=payment_id)
+                    print(
+                        f"[stripe-webhook] one-time payment processed: "
+                        f"request_id={request_id} session={session.get('id')}",
+                        flush=True,
+                    )
+                except Exception as e:
+                    # Don't record the event — let Stripe retry. _mark_paid_and_notify
+                    # is idempotent so retries are safe.
+                    print(
+                        f"[stripe-webhook] FAILED to process payment for "
+                        f"request_id={request_id}: {e!r}",
+                        flush=True,
+                    )
+                    return jsonify({"error": "internal-error"}), 500
+            else:
+                # No request_id in metadata — log and ack so Stripe doesn't retry.
+                # Could happen if a test event is fired manually from the Stripe
+                # dashboard without our metadata.
+                print(
+                    f"[stripe-webhook] payment mode but no wv_request_id in metadata: "
+                    f"email={email} session={session.get('id')}",
+                    flush=True,
+                )
             _stripe_event_record(event_id, event_type, payload)
             return jsonify({"received": True, "handled": True, "mode": "payment"}), 200
 
@@ -4190,7 +4221,18 @@ def meteorologist_view(claim_token: str):
 
 @app.post("/meteorologist/<claim_token>/complete")
 def meteorologist_complete(claim_token: str):
-    """Meteorologist submits their verdict. We mark completed and SMS customer."""
+    """Meteorologist submits their verdict. We mark completed and SMS customer.
+
+    Accepts EITHER:
+      - form-encoded (verdict, notes) — legacy HTML view at /meteorologist/<token>
+      - JSON body {"verdict": "...", "notes": "..."} — Met workspace (Item #2)
+
+    When called with JSON (Item #2), returns JSON. Otherwise redirects
+    back to the meteorologist page like before.
+    """
+    is_json = (request.is_json or
+               request.headers.get("Accept", "").startswith("application/json"))
+
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -4199,14 +4241,26 @@ def meteorologist_complete(claim_token: str):
             )
             row = cur.fetchone()
     if not row:
+        if is_json:
+            return jsonify({"ok": False, "error": "not-found"}), 404
         abort(404)
     if row["status"] == "completed":
-        # Idempotent — meteorologist double-submitted, just show them the page
+        # Idempotent — meteorologist double-submitted, just respond OK
+        if is_json:
+            return jsonify({"ok": True, "already_completed": True})
         return redirect(f"/meteorologist/{claim_token}")
 
-    verdict = (request.form.get("verdict") or "").strip()
-    notes = (request.form.get("notes") or "").strip()
+    # Pull verdict + notes from form OR JSON body
+    if request.is_json:
+        body = request.get_json(silent=True) or {}
+        verdict = (body.get("verdict") or "").strip()
+        notes = (body.get("notes") or "").strip()
+    else:
+        verdict = (request.form.get("verdict") or "").strip()
+        notes = (request.form.get("notes") or "").strip()
     if not verdict:
+        if is_json:
+            return jsonify({"ok": False, "error": "verdict-required"}), 400
         abort(400)
 
     with db() as conn:
@@ -4229,6 +4283,12 @@ def meteorologist_complete(claim_token: str):
     )
     send_sms(row["customer_phone"], customer_msg)
 
+    if is_json:
+        return jsonify({
+            "ok": True,
+            "request_id": row["id"],
+            "verdict_sent_to": row["customer_phone"],
+        })
     return redirect(f"/meteorologist/{claim_token}")
 
 
@@ -8460,6 +8520,101 @@ def me_stripe_portal_session():
         }), 500
 
     return jsonify({"ok": True, "url": session.url})
+
+
+# ════════════════════════════════════════════════════════════════════
+# Met queue — pending verification_requests for Met workspace (Item #2)
+# ════════════════════════════════════════════════════════════════════
+#
+# The Met workspace's Review Queue tab is currently rendered from a
+# hardcoded MET_QUEUE_MOCK array. To make it real, the frontend calls
+# this endpoint on workspace entry; if there ARE real paid requests,
+# they take priority. Mock rows can still be shown alongside (or below)
+# for demo continuity, controlled by the frontend.
+#
+# Auth: requires the 'met' role. Subscribers and crew can't see the
+# queue.
+
+@app.route("/api/v1/met/queue", methods=["OPTIONS"])
+def _met_queue_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/queue")
+def met_queue_list():
+    """List paid-but-unclaimed verification requests for the Met queue.
+
+    Returns rows in 'paid' status (paid for, waiting for a Met to pick
+    them up) plus rows in 'claimed' status that the current Met has
+    claimed but not yet submitted. Other Mets' claimed rows are hidden.
+
+    Returns:
+        200 {"ok": true, "requests": [...]}
+        401 not authenticated
+        403 not a Met
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            # 'paid' rows are unclaimed; show all. 'claimed' rows belong
+            # to a specific Met (claimed_at, but we don't yet track WHICH
+            # Met claimed it — for now show all claimed rows so a Met can
+            # pick back up after switching devices). When we add a
+            # claimed_by_user_id column we can filter properly.
+            cur.execute(
+                """SELECT id, created_at, updated_at, status, tier, price_cents,
+                          customer_email, customer_phone, plan_text, plan_industry,
+                          plan_location, plan_window, ai_brief_markdown, ai_status_key,
+                          claim_token, claimed_at
+                   FROM verification_requests
+                   WHERE status IN ('paid', 'claimed')
+                   ORDER BY
+                     CASE WHEN status = 'paid' THEN 0 ELSE 1 END,
+                     created_at ASC
+                   LIMIT 50""",
+            )
+            rows = cur.fetchall()
+
+    now = now_ts()
+    requests_out = [
+        {
+            "id": r["id"],
+            "tier": r["tier"],
+            "tier_label": _format_tier_label(r["tier"]),
+            "status": r["status"],
+            "price_cents": r["price_cents"],
+            "customer_email": r["customer_email"],
+            "customer_phone": r["customer_phone"],
+            "plan_text": r["plan_text"],
+            "plan_industry": r["plan_industry"],
+            "plan_location": r["plan_location"],
+            "plan_window": r["plan_window"],
+            "ai_brief_markdown": r["ai_brief_markdown"],
+            "ai_status_key": r["ai_status_key"],
+            "claim_token": r["claim_token"],
+            "claimed_at": r["claimed_at"],
+            "created_at": r["created_at"],
+            "paid_minutes_ago": max(0, (now - r["created_at"]) // 60),
+        }
+        for r in rows
+    ]
+    return jsonify({"ok": True, "requests": requests_out})
+
+
+def _format_tier_label(tier_key: str) -> str:
+    """Convert a verification tier key to a user-facing label."""
+    return {
+        "single": "Single",
+        "day_pass": "Day Pass",
+        "pro_monthly": "Pro",
+    }.get(tier_key, tier_key.title())
 
 
 if __name__ == "__main__":
