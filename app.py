@@ -76,6 +76,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
@@ -448,6 +449,13 @@ CREATE INDEX IF NOT EXISTS idx_users_stripe_customer ON users(stripe_customer_id
 -- Null = no active subscription (free user).
 -- Values: 'hobbyist' | 'pro_single' | 'pro_multi' | 'pro_enterprise'
 ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_tier TEXT;
+
+-- ── Phone number (Phase 10 Item #3) ──
+-- E.164 format ("+15555550101"). Used for daily brief SMS delivery
+-- and threshold alerts. Collected during subscriber signup (via Stripe
+-- Checkout's phone collection, or via the portal). Nullable — many
+-- subscribers may prefer email-only.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT;
 
 -- ── User roles — many-to-many; a user can hold several roles ──
 -- Roles: 'subscriber', 'crew', 'met', 'admin'
@@ -3820,6 +3828,7 @@ def stripe_webhook_v2():
         customer_details = session.get("customer_details") or {}
         email = (customer_details.get("email") or "").strip()
         customer_name = (customer_details.get("name") or "").strip()
+        customer_phone = (customer_details.get("phone") or "").strip()
         stripe_customer_id = session.get("customer") or ""
 
         print(
@@ -3852,6 +3861,16 @@ def stripe_webhook_v2():
                                 """UPDATE users SET name = %s
                                    WHERE id = %s AND (name IS NULL OR name = '')""",
                                 (customer_name, user_id),
+                            )
+
+                    # Phase 10 Item #3: capture phone from Stripe if collected.
+                    # We always overwrite — Stripe is the source of truth for
+                    # billing/contact info, and the customer just confirmed it.
+                    if customer_phone:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE users SET phone = %s WHERE id = %s",
+                                (customer_phone, user_id),
                             )
 
                     # Link the Stripe customer ID to the user (Phase 2). Lets
@@ -8416,6 +8435,10 @@ def subscribe_create_checkout():
         "success_url": success_url,
         "cancel_url": cancel_url,
         "allow_promotion_codes": True,
+        # Phase 10 Item #3: collect phone number at checkout so daily
+        # briefs and threshold alerts can be sent by SMS without an
+        # extra portal step. Stripe surfaces this as an optional field.
+        "phone_number_collection": {"enabled": True},
     }
     if existing_stripe_customer:
         session_params["customer"] = existing_stripe_customer
@@ -8615,6 +8638,536 @@ def _format_tier_label(tier_key: str) -> str:
         "day_pass": "Day Pass",
         "pro_monthly": "Pro",
     }.get(tier_key, tier_key.title())
+
+
+# ════════════════════════════════════════════════════════════════════
+# User profile updates (Phase 10 Item #3 — supporting infra)
+# ════════════════════════════════════════════════════════════════════
+#
+# Lets a signed-in user update their own name + phone. Used by the
+# subscriber portal so users who didn't supply phone at Stripe checkout
+# can still enable SMS delivery for their daily brief.
+
+@app.route("/api/v1/me/profile", methods=["OPTIONS"])
+def _me_profile_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/profile")
+def me_profile_get():
+    """Return the current user's basic profile (name, email, phone)."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, email, name, phone FROM users WHERE id = %s",
+                (user["id"],),
+            )
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "user-not-found"}), 404
+    return jsonify({
+        "ok": True,
+        "profile": {
+            "email": row["email"],
+            "name": row.get("name") or "",
+            "phone": row.get("phone") or "",
+        },
+    })
+
+
+@app.patch("/api/v1/me/profile")
+def me_profile_update():
+    """Update the current user's name and/or phone.
+
+    Accepts:
+      {
+        "name": "Jane Smith",     (optional)
+        "phone": "+15551234567"   (optional, must be E.164 if present)
+      }
+
+    Phone is normalized lightly — leading whitespace stripped and
+    bare 10-digit US numbers ("3175551234") get a "+1" prefix. Anything
+    else is rejected (we'd rather refuse than silently send to the
+    wrong number).
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    data = request.get_json(silent=True) or {}
+    set_clauses = []
+    params = []
+
+    if "name" in data:
+        name = (data["name"] or "").strip()
+        if len(name) > 200:
+            return jsonify({"ok": False, "error": "name-too-long"}), 400
+        set_clauses.append("name = %s")
+        params.append(name or None)
+
+    if "phone" in data:
+        phone_raw = (data["phone"] or "").strip()
+        if phone_raw == "":
+            # Empty string = clear the phone
+            set_clauses.append("phone = NULL")
+        else:
+            # Try to normalize. We accept:
+            #   "+15551234567" — already E.164
+            #   "5551234567"   — bare US 10-digit, prepend "+1"
+            #   "(555) 123-4567" or "555-123-4567" — strip and prepend "+1"
+            digits_only = "".join(c for c in phone_raw if c.isdigit())
+            if phone_raw.startswith("+") and 8 <= len(digits_only) <= 15:
+                phone_norm = "+" + digits_only
+            elif len(digits_only) == 10:
+                phone_norm = "+1" + digits_only
+            elif len(digits_only) == 11 and digits_only.startswith("1"):
+                phone_norm = "+" + digits_only
+            else:
+                return jsonify({"ok": False, "error": "invalid-phone"}), 400
+            set_clauses.append("phone = %s")
+            params.append(phone_norm)
+
+    if not set_clauses:
+        return jsonify({"ok": False, "error": "no-fields-to-update"}), 400
+
+    params.append(user["id"])
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE users SET {', '.join(set_clauses)} WHERE id = %s",
+                tuple(params),
+            )
+            cur.execute(
+                "SELECT email, name, phone FROM users WHERE id = %s",
+                (user["id"],),
+            )
+            row = cur.fetchone()
+
+    return jsonify({
+        "ok": True,
+        "profile": {
+            "email": row["email"],
+            "name": row.get("name") or "",
+            "phone": row.get("phone") or "",
+        },
+    })
+
+
+# ════════════════════════════════════════════════════════════════════
+# Daily brief delivery (Item #3 — Chunk 3A)
+# ════════════════════════════════════════════════════════════════════
+#
+# Subscribers set their brief preferences (morning_window_start/end,
+# channels, location) in the portal. This module:
+#   1. Runs a background scheduler thread that checks every 60 seconds
+#   2. For each subscriber whose preferences match the current time AND
+#      who has NOT already received their brief today, fetch forecast,
+#      generate AI brief, send via channels, record in brief_history.
+#   3. Skips Pro-tier subscribers (Chunk 3B handles Met-touched briefs).
+#
+# Threading notes:
+#   - The scheduler runs in a daemon thread spawned at first request.
+#   - One scheduler instance per Python process. Render runs a single
+#     gunicorn worker (default for our service) so we get exactly one.
+#   - If the process restarts mid-day, the scheduler picks back up.
+#   - Idempotency via brief_history: we check "did we send today already?"
+#     before each send, so even multiple workers wouldn't double-send.
+
+_BRIEF_SCHEDULER_STARTED = False
+_BRIEF_SCHEDULER_LOCK = threading.Lock()
+
+
+def _fetch_forecast(lat: float, lng: float) -> Optional[dict]:
+    """Fetch a forecast from Open-Meteo for the given lat/lng.
+
+    Returns a dict with the day's high/low, hourly precipitation,
+    wind, and overall conditions; or None on failure. Used by the
+    brief generator — no user is present so we hit the API directly
+    from the backend (unlike ticket forecasts which the frontend fetches).
+    """
+    try:
+        url = (
+            "https://api.open-meteo.com/v1/forecast"
+            f"?latitude={lat}&longitude={lng}"
+            "&hourly=temperature_2m,precipitation_probability,windspeed_10m,weathercode"
+            "&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,"
+            "windspeed_10m_max,weathercode,sunrise,sunset"
+            "&temperature_unit=fahrenheit&windspeed_unit=mph"
+            "&precipitation_unit=inch&timezone=auto&forecast_days=1"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "weathervalet/1.0"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[brief-forecast] fetch failed for ({lat},{lng}): {e}", flush=True)
+        return None
+
+
+def _weather_code_label(code: int) -> str:
+    """Open-Meteo WMO weather code → short human label."""
+    if code == 0: return "Clear"
+    if code in (1, 2): return "Mostly clear"
+    if code == 3: return "Overcast"
+    if code in (45, 48): return "Fog"
+    if code in (51, 53, 55): return "Drizzle"
+    if code in (61, 63, 65): return "Rain"
+    if code in (66, 67): return "Freezing rain"
+    if code in (71, 73, 75, 77): return "Snow"
+    if code in (80, 81, 82): return "Rain showers"
+    if code in (85, 86): return "Snow showers"
+    if code in (95, 96, 99): return "Thunderstorms"
+    return "Mixed conditions"
+
+
+def _generate_ai_brief(location_label: str, forecast: dict) -> tuple[str, str, str]:
+    """Generate a daily brief paragraph.
+
+    Returns (verdict, snippet, full_body):
+      verdict — "clear" | "caution" | "risk"
+      snippet — first ~140 chars suitable for SMS preview / portal card
+      full_body — the full 2-4 sentence brief
+
+    For now this is a rules-based generator that reads the day's
+    high/low/precip/wind from the forecast and writes a deterministic
+    summary. Future: swap to Gemini/Decision Engine for richer prose.
+    """
+    if not forecast or "daily" not in forecast:
+        body = f"Your morning brief for {location_label}: forecast unavailable right now. We'll retry on the next interval."
+        return ("caution", body[:140], body)
+
+    daily = forecast["daily"]
+    high = (daily.get("temperature_2m_max") or [None])[0]
+    low = (daily.get("temperature_2m_min") or [None])[0]
+    precip = (daily.get("precipitation_sum") or [0])[0] or 0
+    wind = (daily.get("windspeed_10m_max") or [0])[0] or 0
+    code = (daily.get("weathercode") or [0])[0] or 0
+    conditions = _weather_code_label(int(code))
+
+    # Verdict logic — conservative thresholds suitable for a "should I
+    # do my outdoor thing today" brief
+    if precip >= 0.5 or wind >= 30 or code in (95, 96, 99):
+        verdict = "risk"
+    elif precip >= 0.1 or wind >= 20 or code in (51, 53, 55, 61, 63, 65, 80, 81):
+        verdict = "caution"
+    else:
+        verdict = "clear"
+
+    # Compose the brief — 2-3 sentences that read naturally
+    parts = []
+    parts.append(f"Good morning. Your {location_label} brief:")
+    parts.append(f"{conditions}, high {int(high) if high else '?'}°F, low {int(low) if low else '?'}°F.")
+    if precip >= 0.05:
+        parts.append(f"Expect {precip:.2f}\" of precipitation through the day.")
+    if wind >= 15:
+        parts.append(f"Winds gusting to {int(wind)} mph at peak.")
+    if verdict == "clear":
+        parts.append("Solid day for outdoor plans.")
+    elif verdict == "caution":
+        parts.append("Plan around the weather, but you can work today.")
+    else:
+        parts.append("Heads up — conditions are unfavorable for sensitive outdoor work.")
+
+    full_body = " ".join(parts)
+    snippet = full_body[:140]
+    return (verdict, snippet, full_body)
+
+
+def _send_brief_email(email: str, subject: str, body_text: str) -> bool:
+    """Send a daily brief via Resend. Mirrors _send_magic_link_email but
+    for plain text brief content. Stub mode (no API key) logs to console.
+    """
+    api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    from_addr = os.environ.get("EMAIL_FROM", "").strip()
+
+    if not api_key or not from_addr:
+        print(f"[brief-email-stub] To: {email}\nSubject: {subject}\n{body_text}\n", flush=True)
+        return True
+
+    # Simple HTML wrap so the email isn't a wall of plain text.
+    html_body = (
+        '<div style="font-family:Inter,system-ui,sans-serif;font-size:15px;color:#0E1116;'
+        'max-width:560px;margin:0 auto;padding:24px;line-height:1.55;">'
+        '<h2 style="font-size:18px;margin:0 0 14px;">' + subject + '</h2>'
+        '<p style="margin:0;">' + body_text.replace("\n", "<br>") + '</p>'
+        '<hr style="border:none;border-top:1px solid #eee;margin:24px 0 12px;">'
+        '<p style="font-size:11px;color:#888;margin:0;">'
+        'WeatherValet daily brief. Manage preferences in your '
+        '<a href="https://weathervalet.ai">subscriber portal</a>.</p>'
+        '</div>'
+    )
+
+    payload = json.dumps({
+        "from": from_addr,
+        "to": [email],
+        "subject": subject,
+        "html": html_body,
+        "text": body_text,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "WeatherValet-Backend/1.0 (+https://weathervalet.ai)",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return 200 <= resp.status < 300
+    except Exception as e:
+        print(f"[brief-email] FAILED to={email}: {type(e).__name__}: {e}", flush=True)
+        return False
+
+
+def _time_in_window(now_hour: int, now_min: int, start_str: str, end_str: str) -> bool:
+    """Is the current HH:MM within the [start_str, end_str] window?
+
+    Both strings are 'HH:MM'. Handles windows that cross midnight
+    (e.g. quiet hours 21:00 → 05:00) by checking start <= now OR now <= end.
+    """
+    try:
+        sh, sm = int(start_str[:2]), int(start_str[3:])
+        eh, em = int(end_str[:2]), int(end_str[3:])
+    except (ValueError, TypeError, IndexError):
+        return False
+    now_minutes = now_hour * 60 + now_min
+    start_minutes = sh * 60 + sm
+    end_minutes = eh * 60 + em
+    if start_minutes <= end_minutes:
+        return start_minutes <= now_minutes <= end_minutes
+    # Window crosses midnight
+    return now_minutes >= start_minutes or now_minutes <= end_minutes
+
+
+def _already_sent_today(user_id: int, brief_type: str) -> bool:
+    """Check if this user has received a brief of the given type today.
+
+    'Today' is wall-clock UTC midnight to now. If the user is in another
+    timezone, this is approximate — they may get yesterday's evening
+    brief plus today's morning brief in a UTC window. Acceptable for v1.
+    """
+    today_start_ms = int(datetime.now(timezone.utc)
+                         .replace(hour=0, minute=0, second=0, microsecond=0)
+                         .timestamp() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT COUNT(*) AS n FROM brief_history
+                   WHERE user_id = %s AND brief_type = %s AND delivered_at >= %s""",
+                (user_id, brief_type, today_start_ms),
+            )
+            row = cur.fetchone()
+    return (row["n"] or 0) > 0 if row else False
+
+
+def _record_brief_delivery(user_id: int, brief_type: str, verdict: str,
+                            snippet: str, full_body: str, delivery_status: str,
+                            channels_used: str, is_met_touched: bool = False,
+                            met_name: Optional[str] = None) -> None:
+    """Insert a brief_history row."""
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO brief_history
+                   (user_id, brief_type, delivered_at, verdict, snippet,
+                    full_body, delivery_status, channels_used,
+                    is_met_touched, met_name)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (user_id, brief_type, now_ms, verdict, snippet, full_body,
+                 delivery_status, channels_used, is_met_touched, met_name),
+            )
+
+
+def _process_pending_briefs() -> None:
+    """Called once per scheduler tick (every 60s). Finds subscribers whose
+    morning window matches the current time, generates + sends their brief.
+
+    Pro-tier briefs are flagged but NOT sent — Chunk 3B handles Met review.
+    Hobbyist (and any tier not requiring review) gets the full automated
+    flow.
+    """
+    now = datetime.now(timezone.utc)
+    # We use UTC time for the window check, matching how preferences are
+    # stored. Future: respect each user's timezone (needs a tz column).
+    now_hour = now.hour
+    now_min = now.minute
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                # Find subscribers with morning brief enabled, in window,
+                # and not yet sent today. JOIN user → preferences → primary location.
+                cur.execute(
+                    """SELECT
+                          u.id AS user_id,
+                          u.email,
+                          u.phone,
+                          u.name,
+                          u.subscription_tier,
+                          bp.morning_window_start,
+                          bp.morning_window_end,
+                          bp.channels,
+                          loc.label AS loc_label,
+                          loc.address_text AS loc_address,
+                          loc.lat AS loc_lat,
+                          loc.lng AS loc_lng
+                       FROM users u
+                       JOIN brief_preferences bp ON bp.user_id = u.id
+                       LEFT JOIN saved_locations loc
+                            ON loc.user_id = u.id AND loc.is_primary = TRUE
+                       WHERE u.is_active = TRUE
+                         AND bp.morning_enabled = TRUE
+                         AND EXISTS (
+                           SELECT 1 FROM user_roles ur
+                            WHERE ur.user_id = u.id AND ur.role = 'subscriber'
+                         )"""
+                )
+                candidates = cur.fetchall()
+    except Exception as e:
+        print(f"[brief-scheduler] query failed: {e}", flush=True)
+        return
+
+    for c in candidates:
+        try:
+            if not _time_in_window(now_hour, now_min,
+                                   c["morning_window_start"],
+                                   c["morning_window_end"]):
+                continue
+            if _already_sent_today(c["user_id"], "morning"):
+                continue
+            if not c["loc_lat"] or not c["loc_lng"]:
+                # No primary location set — skip silently. Subscriber should
+                # add one in the portal; we don't pester them with an error.
+                continue
+
+            # Pro-tier check — skip auto-send, leave for Met review (Chunk 3B).
+            tier = c["subscription_tier"] or "hobbyist"
+            if tier in ("pro_single", "pro_multi", "pro_enterprise"):
+                # Don't generate or send; just log so we know we saw them.
+                print(
+                    f"[brief-scheduler] pro tier subscriber user_id={c['user_id']} "
+                    f"skipped — Chunk 3B handles Met review",
+                    flush=True,
+                )
+                continue
+
+            # ── Generate the brief ──
+            location_label = c["loc_label"] or c["loc_address"] or "your location"
+            forecast = _fetch_forecast(float(c["loc_lat"]), float(c["loc_lng"]))
+            verdict, snippet, full_body = _generate_ai_brief(location_label, forecast or {})
+
+            # ── Send via channels ──
+            channels = [ch for ch in (c["channels"] or "").split(",") if ch]
+            channels_used = []
+            any_success = False
+            for ch in channels:
+                if ch == "sms" and c["phone"]:
+                    ok = send_sms(c["phone"], snippet + "\n\nFull brief: " + full_body[:1200])
+                    if ok:
+                        channels_used.append("sms")
+                        any_success = True
+                elif ch == "email" and c["email"]:
+                    subject = f"Your WeatherValet brief — {location_label}"
+                    ok = _send_brief_email(c["email"], subject, full_body)
+                    if ok:
+                        channels_used.append("email")
+                        any_success = True
+                # 'push' not yet wired; skip silently
+            delivery_status = "sent" if any_success else "failed"
+
+            _record_brief_delivery(
+                user_id=c["user_id"],
+                brief_type="morning",
+                verdict=verdict,
+                snippet=snippet,
+                full_body=full_body,
+                delivery_status=delivery_status,
+                channels_used=",".join(channels_used),
+                is_met_touched=False,
+                met_name=None,
+            )
+            print(
+                f"[brief-scheduler] delivered user_id={c['user_id']} tier={tier} "
+                f"channels={channels_used} verdict={verdict}",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[brief-scheduler] FAILED for user_id={c.get('user_id')}: {e!r}", flush=True)
+
+
+def _brief_scheduler_loop() -> None:
+    """Main scheduler loop — runs in a daemon thread. Ticks every 60s."""
+    print("[brief-scheduler] started", flush=True)
+    # Initial small delay so the app fully boots before our first tick.
+    time.sleep(15)
+    while True:
+        try:
+            _process_pending_briefs()
+        except Exception as e:
+            # Never let an exception kill the scheduler loop.
+            print(f"[brief-scheduler] tick failed: {e!r}", flush=True)
+        time.sleep(60)
+
+
+def _ensure_brief_scheduler_started() -> None:
+    """Start the scheduler thread exactly once per process lifetime.
+
+    Called from before_request so it kicks off after the app is serving
+    requests (avoids race with init_db on cold boot). Idempotent + thread-safe.
+    """
+    global _BRIEF_SCHEDULER_STARTED
+    if _BRIEF_SCHEDULER_STARTED:
+        return
+    with _BRIEF_SCHEDULER_LOCK:
+        if _BRIEF_SCHEDULER_STARTED:
+            return
+        # Only start if not in test/debug short-circuit modes
+        if os.environ.get("WV_DISABLE_SCHEDULER") == "1":
+            print("[brief-scheduler] disabled via env var", flush=True)
+            _BRIEF_SCHEDULER_STARTED = True
+            return
+        t = threading.Thread(target=_brief_scheduler_loop, daemon=True, name="brief-scheduler")
+        t.start()
+        _BRIEF_SCHEDULER_STARTED = True
+
+
+# Admin / debug endpoint — manually trigger one tick. Useful for the
+# launch-day smoke test ("does the scheduler actually do anything?").
+# Requires admin role to prevent abuse (someone hammering this could
+# DOS the Open-Meteo / Twilio / Resend rate limits).
+@app.route("/api/v1/admin/brief/run-now", methods=["OPTIONS"])
+def _brief_run_now_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/brief/run-now")
+def admin_brief_run_now():
+    """Manually fire one scheduler tick. Admin-only."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    try:
+        _process_pending_briefs()
+        return jsonify({"ok": True, "message": "tick fired — check Render logs for delivery results"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# Hook the scheduler start into Flask's request lifecycle. Flask 3.x
+# removed before_first_request, so we use a flag + before_request.
+@app.before_request
+def _scheduler_kickstart():
+    _ensure_brief_scheduler_started()
 
 
 if __name__ == "__main__":
