@@ -132,6 +132,29 @@ except ImportError:
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 
+# ── Stripe Price IDs for subscription tiers (Phase 10 C2) ──
+# Each Stripe Product has a separate monthly and yearly price; for the
+# May 24 launch we only sell monthly. Annual toggle ships later.
+#
+# These Price IDs are TEST MODE. When we flip to live mode, the Price
+# IDs change (Stripe regenerates them per environment) — set new env
+# vars or replace these values when the live products are created.
+#
+# Pro Enterprise is intentionally absent — it's a custom-quoted tier
+# sold via a "Talk to us" email handoff, not self-serve Stripe Checkout.
+TIER_PRICE_MAP = {
+    "hobbyist":   os.environ.get("STRIPE_PRICE_HOBBYIST_MONTHLY",
+                                 "price_1TVyScGeHM6pFDnVjhT3r2o2"),
+    "pro_single": os.environ.get("STRIPE_PRICE_PRO_SINGLE_MONTHLY",
+                                 "price_1TVyYuGeHM6pFDnVJRHGYjT7"),
+    "pro_multi":  os.environ.get("STRIPE_PRICE_PRO_MULTI_MONTHLY",
+                                 "price_1TVycGGeHM6pFDnVjIHuTMQR"),
+}
+
+# Reverse lookup: Price ID → tier key. Used by webhook to know which
+# tier was purchased from the line_items in checkout.session.completed.
+TIER_BY_PRICE_ID = {v: k for k, v in TIER_PRICE_MAP.items()}
+
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER", "")  # Twilio number we send from
@@ -418,6 +441,13 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS password_must_change BOOLEAN NOT NULL
 -- Indexed for the cancellation webhook's user lookup.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_users_stripe_customer ON users(stripe_customer_id) WHERE stripe_customer_id IS NOT NULL;
+
+-- ── Subscription tier (Phase 10 Chunk C2) ──
+-- Which tier the user is currently subscribed to. Set by the
+-- subscription-checkout webhook handler when checkout completes.
+-- Null = no active subscription (free user).
+-- Values: 'hobbyist' | 'pro_single' | 'pro_multi' | 'pro_enterprise'
+ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_tier TEXT;
 
 -- ── User roles — many-to-many; a user can hold several roles ──
 -- Roles: 'subscriber', 'crew', 'met', 'admin'
@@ -3625,13 +3655,21 @@ def _revoke_subscriber_role(user_id: int, conn) -> bool:
     Other roles (admin, crew, met) are untouched — a Met who happened
     to also be a subscriber doesn't lose their Met access when they
     cancel their subscription.
+
+    Also clears subscription_tier on the users row (Phase 10 C2) so
+    /api/v1/me/subscription correctly reports the user as free.
     """
     with conn.cursor() as cur:
         cur.execute(
             "DELETE FROM user_roles WHERE user_id = %s AND role = %s",
             (user_id, "subscriber"),
         )
-        return cur.rowcount > 0
+        removed = cur.rowcount > 0
+        cur.execute(
+            "UPDATE users SET subscription_tier = NULL WHERE id = %s",
+            (user_id,),
+        )
+        return removed
 
 
 def _find_user_for_stripe_customer(stripe_customer_id: str, email_fallback: Optional[str] = None) -> Optional[int]:
@@ -3827,6 +3865,26 @@ def stripe_webhook_v2():
                                 "UPDATE users SET stripe_customer_id = %s WHERE id = %s",
                                 (stripe_customer_id, user_id),
                             )
+
+                    # Phase 10 C2: capture the subscription tier. We set
+                    # the tier key in checkout session metadata when creating
+                    # the session. If for some reason metadata is missing,
+                    # we fall back to "hobbyist" (cheapest tier — most
+                    # forgiving fallback) and log loudly.
+                    session_metadata = session.get("metadata") or {}
+                    tier_key = (session_metadata.get("wv_tier") or "").strip()
+                    if tier_key not in ("hobbyist", "pro_single", "pro_multi"):
+                        print(
+                            f"[stripe-webhook] missing/invalid wv_tier in metadata "
+                            f"(got '{tier_key}') — defaulting to hobbyist",
+                            flush=True,
+                        )
+                        tier_key = "hobbyist"
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE users SET subscription_tier = %s WHERE id = %s",
+                            (tier_key, user_id),
+                        )
 
                     # Grant subscriber role
                     newly_granted = _grant_subscriber_role(user_id, conn)
@@ -7136,7 +7194,8 @@ def me_subscription():
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """SELECT id, created_at, is_active, stripe_customer_id
+                """SELECT id, created_at, is_active, stripe_customer_id,
+                          subscription_tier
                    FROM users WHERE id = %s""",
                 (user["id"],),
             )
@@ -7145,19 +7204,29 @@ def me_subscription():
     if row is None:
         return jsonify({"ok": False, "error": "user-not-found"}), 404
 
-    # Determine plan from roles + Stripe data. For now, anyone with the
-    # 'subscriber' role is on Hobbyist by default; tier-specific lookups
-    # require querying Stripe directly. That's a Chunk C job (cancel +
-    # change plan need real Stripe API anyway).
+    # Determine plan tier. Prefer the stored subscription_tier (set by
+    # the webhook on successful checkout). Falls back to "hobbyist" for
+    # legacy subscribers (granted role before C2 shipped the column),
+    # and "free" for everyone else.
     roles = user.get("roles") or []
-    if "subscriber" in roles:
-        plan = "hobbyist"
-        plan_display = "Hobbyist"
-        price_display = "$30 / month"
+    tier_key = row.get("subscription_tier")
+    has_subscriber_role = "subscriber" in roles
+
+    TIER_DISPLAY = {
+        "hobbyist":   ("hobbyist",   "Hobbyist",       "$30 / month"),
+        "pro_single": ("pro_single", "Pro Single",     "$400 / month"),
+        "pro_multi":  ("pro_multi",  "Pro Multi",      "$1,200 / month"),
+        "pro_enterprise": ("pro_enterprise", "Pro Enterprise", "Custom"),
+    }
+
+    if tier_key and tier_key in TIER_DISPLAY:
+        plan, plan_display, price_display = TIER_DISPLAY[tier_key]
+    elif has_subscriber_role:
+        # Legacy: role granted before tier was tracked. Default to Hobbyist
+        # since pre-C2 only Hobbyist signups existed.
+        plan, plan_display, price_display = TIER_DISPLAY["hobbyist"]
     else:
-        plan = "free"
-        plan_display = "Free"
-        price_display = "Free"
+        plan, plan_display, price_display = "free", "Free", "Free"
 
     # Next billing date: we don't have it stored locally yet. Chunk C
     # will query Stripe for the actual subscription period_end. For now,
@@ -8197,6 +8266,114 @@ def me_saved_locations_delete(loc_id):
                     )
 
     return jsonify({"ok": True})
+
+
+# ════════════════════════════════════════════════════════════════════
+# Subscription signup via Stripe Checkout (Phase 10 Chunk C2)
+# ════════════════════════════════════════════════════════════════════
+#
+# Creates a Stripe Checkout Session in 'subscription' mode for the chosen
+# tier. Returns the checkout URL; the frontend redirects to it.
+#
+# On successful checkout, Stripe fires checkout.session.completed →
+# the existing webhook (see stripe_webhook_v1) handles user creation,
+# subscriber role grant, tier capture, and welcome magic link.
+#
+# Anonymous checkout is supported (option B from the May 14 plan):
+# the user need NOT be signed in. Stripe collects their email at
+# checkout; the webhook finds-or-creates the user from that email.
+# For signed-in users, we pre-fill the email so the existing user gets
+# their subscription linked correctly.
+
+@app.route("/api/v1/subscribe", methods=["OPTIONS"])
+def _subscribe_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/subscribe")
+def subscribe_create_checkout():
+    """Create a Stripe Checkout Session for a subscription tier.
+
+    Request body:
+        {
+          "tier": "hobbyist" | "pro_single" | "pro_multi"
+        }
+
+    Returns:
+        200 {"ok": true, "url": "https://checkout.stripe.com/c/pay/..."}
+        400 invalid tier
+        503 Stripe not configured
+    """
+    if stripe is None or not STRIPE_SECRET_KEY:
+        return jsonify({"ok": False, "error": "stripe-not-configured"}), 503
+
+    data = request.get_json(silent=True) or {}
+    tier_key = (data.get("tier") or "").strip()
+    if tier_key not in TIER_PRICE_MAP:
+        return jsonify({"ok": False, "error": "invalid-tier"}), 400
+
+    price_id = TIER_PRICE_MAP[tier_key]
+
+    # If the requester is signed in, pre-fill their email and link to
+    # their existing Stripe customer if one exists. If they're cold
+    # (anonymous on pricing page), Stripe collects the email at checkout.
+    customer_email = None
+    existing_stripe_customer = None
+    user = _get_current_user()
+    if user:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT email, stripe_customer_id FROM users WHERE id = %s",
+                    (user["id"],),
+                )
+                row = cur.fetchone()
+        if row:
+            customer_email = row.get("email")
+            existing_stripe_customer = row.get("stripe_customer_id")
+
+    # Build the success/cancel URLs. We send them back to the home page
+    # with a query flag so the frontend knows to celebrate or apologize.
+    success_url = f"{FRONTEND_BASE_URL}/?subscribed=1&tier={tier_key}&session={{CHECKOUT_SESSION_ID}}"
+    cancel_url = f"{FRONTEND_BASE_URL}/?subscribe_cancelled=1&tier={tier_key}"
+
+    # Build the Checkout Session params. If we have an existing Stripe
+    # customer (this user previously subscribed and cancelled, for
+    # example), pass `customer=` instead of `customer_email=` so the new
+    # subscription is linked to the same customer record.
+    session_params = {
+        "mode": "subscription",
+        "payment_method_types": ["card"],
+        "line_items": [{"price": price_id, "quantity": 1}],
+        "metadata": {
+            "wv_tier": tier_key,
+        },
+        # Also attach the tier to the subscription itself, so we can
+        # read it back later via subscription metadata if needed.
+        "subscription_data": {
+            "metadata": {"wv_tier": tier_key},
+        },
+        "success_url": success_url,
+        "cancel_url": cancel_url,
+        "allow_promotion_codes": True,
+    }
+    if existing_stripe_customer:
+        session_params["customer"] = existing_stripe_customer
+    elif customer_email:
+        session_params["customer_email"] = customer_email
+    # else: Stripe collects email at checkout (anonymous flow)
+
+    try:
+        session = stripe.checkout.Session.create(**session_params)
+    except Exception as e:
+        print(f"[subscribe] checkout session create failed: {e}", flush=True)
+        return jsonify({
+            "ok": False,
+            "error": "stripe-error",
+            "message": "Couldn't start checkout. Please try again.",
+        }), 500
+
+    return jsonify({"ok": True, "url": session.url})
 
 
 # ════════════════════════════════════════════════════════════════════
