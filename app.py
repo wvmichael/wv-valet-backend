@@ -8199,6 +8199,92 @@ def me_saved_locations_delete(loc_id):
     return jsonify({"ok": True})
 
 
+# ════════════════════════════════════════════════════════════════════
+# Stripe Customer Portal session (Phase 10 Chunk C1)
+# ════════════════════════════════════════════════════════════════════
+#
+# Creates a Stripe billing portal session for the current user and
+# returns the URL the frontend should redirect to. Stripe hosts the
+# portal UI — they handle plan changes, cancellation, payment method
+# updates, and invoice history. On exit, the user is redirected back
+# to our subscriber portal.
+#
+# Pre-requisites for this to work in production:
+#   1. STRIPE_SECRET_KEY set in env (already configured)
+#   2. The user must have a stripe_customer_id (set when they signed
+#      up via checkout — populated by the existing webhook handler)
+#   3. The Stripe Customer Portal must be CONFIGURED in the Stripe
+#      Dashboard → Settings → Billing → Customer portal. Enable the
+#      features you want customers to self-serve (cancel, change plan,
+#      update payment method). Both Test Mode and Live Mode have
+#      separate configs — set up both.
+
+@app.route("/api/v1/me/stripe-portal-session", methods=["OPTIONS"])
+def _me_stripe_portal_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/me/stripe-portal-session")
+def me_stripe_portal_session():
+    """Create a Stripe billing portal session for the current user.
+
+    Returns:
+        200 {"ok": true, "url": "https://billing.stripe.com/p/session/..."}
+        400 {"ok": false, "error": "no-stripe-customer"}  user has no Stripe
+            customer record (likely a free user or pre-Stripe-launch user)
+        401 not authenticated
+        500 Stripe API error
+        503 Stripe not configured on server
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    if stripe is None or not STRIPE_SECRET_KEY:
+        return jsonify({"ok": False, "error": "stripe-not-configured"}), 503
+
+    # Pull the user's stripe_customer_id from the DB. Phase 2 populated
+    # this field via webhook when the user first paid; if it's NULL,
+    # they have no Stripe customer record and can't open a portal.
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT stripe_customer_id FROM users WHERE id = %s",
+                (user["id"],),
+            )
+            row = cur.fetchone()
+
+    stripe_customer_id = row.get("stripe_customer_id") if row else None
+    if not stripe_customer_id:
+        return jsonify({
+            "ok": False,
+            "error": "no-stripe-customer",
+            "message": "No active subscription found. Subscribe to a plan to access billing settings.",
+        }), 400
+
+    # Return-URL: where Stripe sends them after they're done. We send
+    # them back to the subscriber portal so they pick up right where
+    # they left off.
+    return_url = f"{FRONTEND_BASE_URL}/?portal=back"
+
+    try:
+        session = stripe.billing_portal.Session.create(
+            customer=stripe_customer_id,
+            return_url=return_url,
+        )
+    except Exception as e:
+        # Stripe SDK throws stripe.error.* exceptions; we catch broadly
+        # to avoid leaking implementation details to the client.
+        print(f"[stripe-portal] session create failed for user={user['id']}: {e}", flush=True)
+        return jsonify({
+            "ok": False,
+            "error": "stripe-error",
+            "message": "Couldn't open billing portal. Please try again or contact support.",
+        }), 500
+
+    return jsonify({"ok": True, "url": session.url})
+
+
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 8080))
