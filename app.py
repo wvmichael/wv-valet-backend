@@ -5596,6 +5596,125 @@ def admin_deactivate_user(user_id):
     return jsonify({"ok": True})
 
 
+# ── Multi-role helpers (additive — don't replace existing roles) ──
+# The PATCH /api/v1/admin/users/<id> endpoint replaces ALL roles when
+# 'role' is in the payload. That's the conservative single-primary-role
+# model. These two endpoints are additive — useful for admins testing
+# multiple workspaces, or for upgrading a subscriber to also have crew
+# without losing their subscriber role.
+
+@app.route("/api/v1/admin/users/<int:user_id>/roles", methods=["OPTIONS"])
+def _admin_user_roles_preflight(user_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/users/<int:user_id>/roles")
+@require_role("admin")
+def admin_add_user_role(user_id):
+    """Add a role to a user WITHOUT removing their existing roles.
+
+    Request body: {"role": "meteorologist|crew|admin|subscriber"}
+
+    Idempotent — adding a role the user already has is a no-op and
+    returns 200 with the unchanged role list.
+    """
+    import time as _time
+
+    data = request.get_json(silent=True) or {}
+    role_input = (data.get("role") or "").strip().lower()
+    role_map = {"meteorologist": "met", "met": "met", "crew": "crew",
+                "admin": "admin", "subscriber": "subscriber"}
+    role = role_map.get(role_input)
+    if not role:
+        return jsonify({"ok": False, "error": "invalid-role"}), 400
+
+    try:
+        with db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM users WHERE id = %s", (user_id,))
+            if not cur.fetchone():
+                return jsonify({"ok": False, "error": "no-such-user"}), 404
+
+            # ON CONFLICT DO NOTHING — idempotent
+            cur.execute(
+                """INSERT INTO user_roles (user_id, role, granted_at)
+                   VALUES (%s, %s, %s)
+                   ON CONFLICT DO NOTHING""",
+                (user_id, role, int(_time.time())),
+            )
+
+            # Return fresh user shape
+            cur.execute("""
+                SELECT u.id, u.email, u.name, u.created_at, u.last_login_at, u.is_active,
+                       ARRAY_REMOVE(ARRAY_AGG(ur.role ORDER BY ur.role), NULL) AS roles
+                FROM users u
+                LEFT JOIN user_roles ur ON ur.user_id = u.id
+                WHERE u.id = %s
+                GROUP BY u.id
+            """, (user_id,))
+            row = cur.fetchone()
+    except Exception as e:
+        print(f"[admin_add_user_role] failed: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"ok": False, "error": "add-role-failed"}), 500
+
+    return jsonify({"ok": True, "member": _serialize_user_for_admin(row)})
+
+
+@app.route("/api/v1/admin/users/<int:user_id>/roles/<role>", methods=["OPTIONS"])
+def _admin_user_role_remove_preflight(user_id, role):
+    return ("", 204)
+
+
+@app.delete("/api/v1/admin/users/<int:user_id>/roles/<role>")
+@require_role("admin")
+def admin_remove_user_role(user_id, role):
+    """Remove a single role from a user, leaving their other roles intact.
+
+    The role path param uses the backend's internal names: met, crew,
+    admin, subscriber. (Frontend may convert meteorologist→met before
+    calling.)
+
+    If removing the role would leave the user with zero roles, we still
+    allow it — the frontend can show that user as "no workspaces" and
+    they'll see the account-pending screen on next login. This matches
+    the semantics of the create-user endpoint (which can't create a
+    user without granting at least one role, but a user CAN end up with
+    zero roles via this endpoint).
+    """
+    role_map = {"meteorologist": "met", "met": "met", "crew": "crew",
+                "admin": "admin", "subscriber": "subscriber"}
+    role_clean = role_map.get(role.strip().lower())
+    if not role_clean:
+        return jsonify({"ok": False, "error": "invalid-role"}), 400
+
+    try:
+        with db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM users WHERE id = %s", (user_id,))
+            if not cur.fetchone():
+                return jsonify({"ok": False, "error": "no-such-user"}), 404
+
+            cur.execute(
+                "DELETE FROM user_roles WHERE user_id = %s AND role = %s",
+                (user_id, role_clean),
+            )
+
+            cur.execute("""
+                SELECT u.id, u.email, u.name, u.created_at, u.last_login_at, u.is_active,
+                       ARRAY_REMOVE(ARRAY_AGG(ur.role ORDER BY ur.role), NULL) AS roles
+                FROM users u
+                LEFT JOIN user_roles ur ON ur.user_id = u.id
+                WHERE u.id = %s
+                GROUP BY u.id
+            """, (user_id,))
+            row = cur.fetchone()
+    except Exception as e:
+        print(f"[admin_remove_user_role] failed: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"ok": False, "error": "remove-role-failed"}), 500
+
+    return jsonify({"ok": True, "member": _serialize_user_for_admin(row)})
+
+
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 8080))
