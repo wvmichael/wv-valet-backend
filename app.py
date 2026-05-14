@@ -845,6 +845,83 @@ CREATE INDEX IF NOT EXISTS idx_mission_notifications_crew
     ON mission_notifications(crew_user_id, sent_at DESC);
 CREATE INDEX IF NOT EXISTS idx_mission_notifications_token
     ON mission_notifications(response_token);
+
+-- ── Admin audit log (Phase 10 Admin Tools) ──
+-- Every admin action writes a row. Lets the admin screen show a real
+-- audit trail and gives us accountability for sensitive actions like
+-- approving Crew, deactivating users, issuing refunds. Never deleted —
+-- this is the source of truth for "who did what when."
+--
+-- action examples:
+--   'crew.approve'     — approved a pending Crew application
+--   'crew.reject'      — rejected a pending Crew application
+--   'user.deactivate'  — soft-deleted a user
+--   'user.reactivate'  — restored a deactivated user
+--   'payment.refund'   — refunded a Stripe charge
+--   'mission.approve'  — approved a severe mission (already audited
+--                        via approved_by_user_id; logged here too for
+--                        unified audit-trail browsing)
+--
+-- target_type + target_id let us link to whatever was acted on:
+--   ('crew_application', 42) → application 42 was approved
+--   ('user', 17)             → user 17 was deactivated
+--   ('verification_request', 8) → review 8 was refunded
+--
+-- details_json holds free-form context as a JSON string (reason for
+-- rejection, refund amount, etc.). The admin reviewing the audit log
+-- can decode it.
+CREATE TABLE IF NOT EXISTS admin_audit_log (
+    id              SERIAL PRIMARY KEY,
+    actor_user_id   INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    actor_name      TEXT,                    -- snapshot at action time
+    action          TEXT NOT NULL,
+    target_type     TEXT,
+    target_id       INTEGER,
+    details_json    TEXT,
+    created_at      BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_admin_audit_created
+    ON admin_audit_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_admin_audit_actor
+    ON admin_audit_log(actor_user_id, created_at DESC);
+
+-- ── Crew applications (Phase 10 Admin Tools) ──
+-- Submitted by the Crew register form. Pending status until an admin
+-- approves (creates the user + grants 'crew' role + sets home base) or
+-- rejects (records rejection reason).
+--
+-- We DON'T create a user row at apply time — applicants haven't been
+-- vetted yet. Only on approval does a user row appear. This keeps the
+-- users table clean (only actual members) and avoids the awkward "you
+-- have an account but no role" state during the approval wait.
+--
+-- email is UNIQUE so accidental double-submissions update the existing
+-- row rather than creating two pending applications.
+--
+-- status values:
+--   'pending'  — submitted, waiting on admin review
+--   'approved' — admin approved; user row + role created
+--   'rejected' — admin rejected; rejection_reason populated
+CREATE TABLE IF NOT EXISTS crew_applications (
+    id                  SERIAL PRIMARY KEY,
+    created_at          BIGINT NOT NULL,
+    updated_at          BIGINT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'pending',
+    name                TEXT NOT NULL,
+    handle              TEXT,
+    email               TEXT UNIQUE NOT NULL,
+    phone               TEXT,
+    county              TEXT,
+    mission_interests   TEXT,        -- comma-separated keys: storms,hail,wind,rain,winter,general
+    hours               TEXT,        -- all|weekdays-day|weekdays-evening|weekends|custom
+    notify              TEXT,        -- sms|email|both
+    reviewed_at         BIGINT,
+    reviewed_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    rejection_reason    TEXT,
+    created_user_id     INTEGER REFERENCES users(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_crew_applications_status
+    ON crew_applications(status, created_at DESC);
 """
 
 
@@ -8737,6 +8814,56 @@ def _format_tier_label(tier_key: str) -> str:
 
 
 # ════════════════════════════════════════════════════════════════════
+# Admin audit log (Phase 10 Admin Tools)
+# ════════════════════════════════════════════════════════════════════
+
+def _audit_log(actor_user_id: Optional[int], actor_name: Optional[str],
+               action: str, target_type: Optional[str] = None,
+               target_id: Optional[int] = None,
+               details: Optional[dict] = None) -> None:
+    """Write a row to admin_audit_log. Best-effort — failures are logged
+    but never raised, since auditing must not block the real action.
+
+    Pass `details` as a dict; we serialize it to JSON. Keep payloads
+    small (under a few KB) — this isn't event storage, it's a
+    "what changed" trail.
+    """
+    try:
+        details_json = json.dumps(details) if details is not None else None
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO admin_audit_log
+                       (actor_user_id, actor_name, action,
+                        target_type, target_id, details_json, created_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                    (actor_user_id, actor_name, action,
+                     target_type, target_id, details_json,
+                     int(time.time() * 1000)),
+                )
+    except Exception as e:
+        print(f"[audit] log write failed action={action}: {e!r}", flush=True)
+
+
+def _require_admin():
+    """Helper: returns (user, error_response). If error_response is not
+    None, the caller should return it immediately. Otherwise `user` is
+    the authenticated admin user dict.
+
+    Used as a one-liner gate in admin endpoints:
+        user, err = _require_admin()
+        if err: return err
+    """
+    user = _get_current_user()
+    if user is None:
+        return (None, (jsonify({"ok": False, "error": "not-authenticated"}), 401))
+    roles = user.get("roles") or []
+    if "admin" not in roles:
+        return (None, (jsonify({"ok": False, "error": "forbidden"}), 403))
+    return (user, None)
+
+
+# ════════════════════════════════════════════════════════════════════
 # User profile updates (Phase 10 Item #3 — supporting infra)
 # ════════════════════════════════════════════════════════════════════
 #
@@ -10147,6 +10274,370 @@ def missions_respond_submit(response_token: str):
     )
 
     return jsonify({"ok": True, "first_response": is_first_response})
+
+
+# ════════════════════════════════════════════════════════════════════
+# Crew applications — public submit + admin review (Phase 10 Admin Tools)
+# ════════════════════════════════════════════════════════════════════
+#
+# Public-facing endpoint for the Crew register form (no auth required).
+# Anyone can apply; admin approval gates whether they actually become Crew.
+
+@app.route("/api/v1/crew/apply", methods=["OPTIONS"])
+def _crew_apply_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/crew/apply")
+def crew_apply_submit():
+    """Submit a Crew application. Public — no auth required.
+
+    Body:
+      {
+        "name": "Sarah Indianapolis",
+        "handle": "@sarah_indy",
+        "email": "sarah@example.com",
+        "phone": "317-555-0123",
+        "county": "Marion County, IN",
+        "mission_interests": ["storms","hail","wind"],
+        "hours": "all",
+        "notify": "sms"
+      }
+
+    Returns:
+        200 {"ok": true, "application_id": N}
+        400 invalid input (missing required, bad email, etc.)
+        409 email already has a pending or approved application
+    """
+    data = request.get_json(silent=True) or {}
+
+    name = (data.get("name") or "").strip()
+    email = (data.get("email") or "").strip().lower()
+    if not name:
+        return jsonify({"ok": False, "error": "name-required"}), 400
+    if not email or not is_valid_email(email):
+        return jsonify({"ok": False, "error": "valid-email-required"}), 400
+
+    handle = (data.get("handle") or "").strip() or None
+    phone_raw = (data.get("phone") or "").strip()
+    phone = normalize_phone(phone_raw) if phone_raw else None
+    county = (data.get("county") or "").strip() or None
+
+    interests_list = data.get("mission_interests") or []
+    if isinstance(interests_list, str):
+        # Accept comma-separated string too
+        interests_list = [x.strip() for x in interests_list.split(",") if x.strip()]
+    valid_interests = {"storms", "hail", "wind", "rain", "winter", "general"}
+    mission_interests = ",".join(
+        x for x in interests_list if x in valid_interests
+    ) or None
+
+    hours = (data.get("hours") or "all").strip()
+    if hours not in ("all", "weekdays-day", "weekdays-evening", "weekends", "custom"):
+        hours = "all"
+
+    notify = (data.get("notify") or "sms").strip()
+    if notify not in ("sms", "email", "both"):
+        notify = "sms"
+
+    now_ms = int(time.time() * 1000)
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                # Check for existing application
+                cur.execute(
+                    "SELECT id, status FROM crew_applications WHERE email = %s",
+                    (email,),
+                )
+                existing = cur.fetchone()
+                if existing:
+                    if existing["status"] == "approved":
+                        return jsonify({
+                            "ok": False,
+                            "error": "already-approved",
+                            "message": "You're already a Crew member. Sign in to access your workspace.",
+                        }), 409
+                    if existing["status"] == "pending":
+                        # Update the existing pending row rather than create a duplicate
+                        cur.execute(
+                            """UPDATE crew_applications
+                               SET name = %s, handle = %s, phone = %s, county = %s,
+                                   mission_interests = %s, hours = %s, notify = %s,
+                                   updated_at = %s
+                               WHERE id = %s""",
+                            (name, handle, phone, county, mission_interests, hours,
+                             notify, now_ms, existing["id"]),
+                        )
+                        return jsonify({
+                            "ok": True,
+                            "application_id": existing["id"],
+                            "updated": True,
+                        })
+                    # 'rejected' — allow them to re-apply by clearing rejection
+                    cur.execute(
+                        """UPDATE crew_applications
+                           SET status='pending', name=%s, handle=%s, phone=%s, county=%s,
+                               mission_interests=%s, hours=%s, notify=%s,
+                               updated_at=%s, rejection_reason=NULL,
+                               reviewed_at=NULL, reviewed_by_user_id=NULL
+                           WHERE id=%s""",
+                        (name, handle, phone, county, mission_interests, hours,
+                         notify, now_ms, existing["id"]),
+                    )
+                    return jsonify({
+                        "ok": True,
+                        "application_id": existing["id"],
+                        "reapplied": True,
+                    })
+
+                # New application
+                cur.execute(
+                    """INSERT INTO crew_applications
+                       (created_at, updated_at, status, name, handle, email, phone,
+                        county, mission_interests, hours, notify)
+                       VALUES (%s, %s, 'pending', %s, %s, %s, %s, %s, %s, %s, %s)
+                       RETURNING id""",
+                    (now_ms, now_ms, name, handle, email, phone, county,
+                     mission_interests, hours, notify),
+                )
+                row = cur.fetchone()
+
+        print(f"[crew-apply] new application id={row['id']} email={email}", flush=True)
+        return jsonify({"ok": True, "application_id": row["id"]})
+    except Exception as e:
+        print(f"[crew-apply] insert failed for {email}: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "internal-error"}), 500
+
+
+# ════════════════════════════════════════════════════════════════════
+# Admin endpoints — Crew approval queue
+# ════════════════════════════════════════════════════════════════════
+
+@app.route("/api/v1/admin/crew/applications", methods=["OPTIONS"])
+def _admin_crew_apps_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/crew/applications")
+def admin_crew_apps_list():
+    """List Crew applications. Defaults to pending; ?status=all|approved|rejected
+    overrides."""
+    user, err = _require_admin()
+    if err:
+        return err
+
+    status_filter = (request.args.get("status") or "pending").strip()
+    with db() as conn:
+        with conn.cursor() as cur:
+            if status_filter == "all":
+                cur.execute(
+                    """SELECT * FROM crew_applications
+                       ORDER BY created_at DESC LIMIT 100"""
+                )
+            else:
+                cur.execute(
+                    """SELECT * FROM crew_applications
+                       WHERE status = %s
+                       ORDER BY created_at DESC LIMIT 100""",
+                    (status_filter,),
+                )
+            rows = cur.fetchall()
+
+    apps = [
+        {
+            "id": r["id"],
+            "created_at": r["created_at"],
+            "status": r["status"],
+            "name": r["name"],
+            "handle": r["handle"],
+            "email": r["email"],
+            "phone": r["phone"],
+            "county": r["county"],
+            "mission_interests": r["mission_interests"],
+            "hours": r["hours"],
+            "notify": r["notify"],
+            "reviewed_at": r["reviewed_at"],
+            "rejection_reason": r["rejection_reason"],
+        }
+        for r in rows
+    ]
+    return jsonify({"ok": True, "applications": apps})
+
+
+@app.route("/api/v1/admin/crew/applications/<int:app_id>/approve", methods=["OPTIONS"])
+def _admin_crew_approve_preflight(app_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/crew/applications/<int:app_id>/approve")
+def admin_crew_approve(app_id):
+    """Approve a pending Crew application.
+
+    This:
+      1. Creates (or finds) a user row matching the application email
+      2. Sets the user's phone if the application provided one
+      3. Grants the 'crew' role
+      4. Stamps the application as approved + links to created_user_id
+      5. Audit log entry
+      6. Sends a welcome magic-link email so they can set their password
+
+    Returns:
+        200 {"ok": true, "user_id": N, "application_id": app_id}
+    """
+    user, err = _require_admin()
+    if err:
+        return err
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM crew_applications WHERE id = %s",
+                (app_id,),
+            )
+            app_row = cur.fetchone()
+    if not app_row:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    if app_row["status"] != "pending":
+        return jsonify({
+            "ok": False,
+            "error": "not-pending",
+            "message": f"Application is already {app_row['status']}.",
+        }), 409
+
+    email = app_row["email"]
+    now_ms = int(time.time() * 1000)
+
+    try:
+        with db() as conn:
+            # 1. Find or create user
+            user_id = _get_or_create_user(email, conn)
+
+            # 2. Fill in name + phone if user has none
+            with conn.cursor() as cur:
+                if app_row["name"]:
+                    cur.execute(
+                        """UPDATE users SET name = %s
+                           WHERE id = %s AND (name IS NULL OR name = '')""",
+                        (app_row["name"], user_id),
+                    )
+                if app_row["phone"]:
+                    cur.execute(
+                        "UPDATE users SET phone = %s WHERE id = %s",
+                        (app_row["phone"], user_id),
+                    )
+
+                # 3. Grant crew role (idempotent)
+                cur.execute(
+                    """INSERT INTO user_roles (user_id, role, granted_at)
+                       VALUES (%s, 'crew', %s)
+                       ON CONFLICT (user_id, role) DO NOTHING""",
+                    (user_id, now_ms),
+                )
+
+                # 4. Stamp the application as approved
+                cur.execute(
+                    """UPDATE crew_applications
+                       SET status='approved', reviewed_at=%s,
+                           reviewed_by_user_id=%s, created_user_id=%s,
+                           updated_at=%s
+                       WHERE id=%s""",
+                    (now_ms, user["id"], user_id, now_ms, app_id),
+                )
+
+        # 5. Audit
+        _audit_log(
+            actor_user_id=user["id"],
+            actor_name=user.get("name") or user.get("email"),
+            action="crew.approve",
+            target_type="crew_application",
+            target_id=app_id,
+            details={"email": email, "created_user_id": user_id},
+        )
+
+        # 6. Send welcome magic link so they can set password
+        base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai")
+        raw_token = new_secure_token()
+        token_hash = hash_token(raw_token)
+        now_sec = now_ts()  # seconds — magic_link_tokens uses seconds
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO magic_link_tokens
+                       (token_hash, user_id, created_at, expires_at, ip_requested)
+                       VALUES (%s, %s, %s, %s, %s)""",
+                    (token_hash, user_id, now_sec,
+                     now_sec + MAGIC_LINK_TTL_SECONDS, "crew-approval"),
+                )
+        magic_link_url = f"{base}/?auth=verify&token={raw_token}&intent=new-account"
+        _send_magic_link_email(email, magic_link_url, intent="new-account")
+
+        print(f"[crew-approve] application={app_id} user={user_id} approved by admin={user['id']}", flush=True)
+        return jsonify({"ok": True, "user_id": user_id, "application_id": app_id})
+
+    except Exception as e:
+        print(f"[crew-approve] FAILED application={app_id}: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "internal-error"}), 500
+
+
+@app.route("/api/v1/admin/crew/applications/<int:app_id>/reject", methods=["OPTIONS"])
+def _admin_crew_reject_preflight(app_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/crew/applications/<int:app_id>/reject")
+def admin_crew_reject(app_id):
+    """Reject a pending Crew application.
+
+    Body:
+        {"reason": "Outside our coverage area"}  (optional but recommended)
+    """
+    user, err = _require_admin()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    reason = (data.get("reason") or "").strip() or None
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, status, email FROM crew_applications WHERE id = %s",
+                (app_id,),
+            )
+            app_row = cur.fetchone()
+    if not app_row:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    if app_row["status"] != "pending":
+        return jsonify({
+            "ok": False,
+            "error": "not-pending",
+            "message": f"Application is already {app_row['status']}.",
+        }), 409
+
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE crew_applications
+                   SET status='rejected', reviewed_at=%s,
+                       reviewed_by_user_id=%s, rejection_reason=%s,
+                       updated_at=%s
+                   WHERE id=%s""",
+                (now_ms, user["id"], reason, now_ms, app_id),
+            )
+
+    _audit_log(
+        actor_user_id=user["id"],
+        actor_name=user.get("name") or user.get("email"),
+        action="crew.reject",
+        target_type="crew_application",
+        target_id=app_id,
+        details={"email": app_row["email"], "reason": reason},
+    )
+
+    print(f"[crew-reject] application={app_id} rejected by admin={user['id']}", flush=True)
+    return jsonify({"ok": True})
 
 
 if __name__ == "__main__":
