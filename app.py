@@ -80,7 +80,8 @@ import urllib.parse
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Optional
 
@@ -485,6 +486,13 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS crew_active BOOLEAN NOT NULL DEFAULT 
 -- first-login welcome card in their workspace. NULL = hasn't seen/dismissed
 -- yet (show the card); timestamp = already dismissed (hide).
 ALTER TABLE users ADD COLUMN IF NOT EXISTS met_onboarded_at BIGINT;
+
+-- Phase 10 timezone support: every user has a timezone (IANA name like
+-- "America/Indiana/Indianapolis"). Used by the brief scheduler to deliver
+-- in the subscriber's local time, not UTC. Defaults to Indianapolis
+-- since that's our launch market; auto-detected from primary saved
+-- location's lat/lng on save.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS timezone TEXT NOT NULL DEFAULT 'America/Indiana/Indianapolis';
 
 -- Phase 10 Met tips: track which Met completed each verification + a
 -- customer-facing token for the review/tip page (separate from Met's
@@ -8707,6 +8715,17 @@ def me_saved_locations_create():
             )
             new_row = cur.fetchone()
 
+            # Phase 10 timezone foundation: if this is becoming the
+            # user's primary location, update their timezone too.
+            # Brief scheduler uses this to deliver at 7 AM subscriber-
+            # local instead of 7 AM UTC.
+            if is_primary:
+                detected_tz = _timezone_for_latlng(lat, lng)
+                cur.execute(
+                    "UPDATE users SET timezone = %s WHERE id = %s",
+                    (detected_tz, user["id"]),
+                )
+
     return jsonify({
         "ok": True,
         "location": {
@@ -9839,6 +9858,48 @@ def _send_brief_email(email: str, subject: str, body_text: str) -> bool:
         return False
 
 
+def _timezone_for_latlng(lat: float, lng: float) -> str:
+    """Best-effort IANA timezone for a US lat/lng.
+
+    Uses longitude bands — accurate for the continental US except at
+    a few state boundary edge cases (TN/KY, FL panhandle, parts of ID,
+    AZ which doesn't observe DST). For nationwide launch we should
+    upgrade to the `timezonefinder` library; this is good enough for
+    Indianapolis-area testing and early nationwide subscribers.
+
+    Returns an IANA name like "America/Indiana/Indianapolis" so it
+    survives ZoneInfo lookups.
+    """
+    try:
+        lat = float(lat)
+        lng = float(lng)
+    except (ValueError, TypeError):
+        return "America/Indiana/Indianapolis"
+
+    # Alaska / Hawaii / outlying — coarse handling
+    if lat > 50 and lng < -130:
+        return "America/Anchorage"
+    if 18 < lat < 23 and -161 < lng < -154:
+        return "Pacific/Honolulu"
+
+    # Continental US — longitude bands
+    if lng >= -85:
+        return "America/New_York"
+    if lng >= -100:
+        return "America/Chicago"
+    if lng >= -114:
+        return "America/Denver"
+    return "America/Los_Angeles"
+
+
+def _local_now_for_user(user_timezone: str) -> datetime:
+    """Current datetime in the user's local timezone."""
+    try:
+        return datetime.now(ZoneInfo(user_timezone))
+    except Exception:
+        return datetime.now(ZoneInfo("America/Indiana/Indianapolis"))
+
+
 def _time_in_window(now_hour: int, now_min: int, start_str: str, end_str: str) -> bool:
     """Is the current HH:MM within the [start_str, end_str] window?
 
@@ -9859,16 +9920,21 @@ def _time_in_window(now_hour: int, now_min: int, start_str: str, end_str: str) -
     return now_minutes >= start_minutes or now_minutes <= end_minutes
 
 
-def _already_sent_today(user_id: int, brief_type: str) -> bool:
+def _already_sent_today(user_id: int, brief_type: str, user_timezone: str = None) -> bool:
     """Check if this user has received a brief of the given type today.
 
-    'Today' is wall-clock UTC midnight to now. If the user is in another
-    timezone, this is approximate — they may get yesterday's evening
-    brief plus today's morning brief in a UTC window. Acceptable for v1.
+    "Today" means today in the subscriber's local timezone. Defaults to
+    Indianapolis time if no timezone passed (preserves prior behavior
+    for older callers).
     """
-    today_start_ms = int(datetime.now(timezone.utc)
-                         .replace(hour=0, minute=0, second=0, microsecond=0)
-                         .timestamp() * 1000)
+    tz = user_timezone or "America/Indiana/Indianapolis"
+    try:
+        local_now = _local_now_for_user(tz)
+    except Exception:
+        local_now = datetime.now(timezone.utc)
+    today_start_local = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start_ms = int(today_start_local.timestamp() * 1000)
+
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -9901,18 +9967,20 @@ def _record_brief_delivery(user_id: int, brief_type: str, verdict: str,
 
 def _process_pending_briefs() -> None:
     """Called once per scheduler tick (every 60s). Finds subscribers whose
-    morning window matches the current time, generates + sends their brief.
+    morning window matches the current time in THEIR local timezone,
+    generates + sends their brief.
 
     Pro-tier briefs are flagged but NOT sent — Chunk 3B handles Met review.
     Hobbyist (and any tier not requiring review) gets the full automated
     flow.
-    """
-    now = datetime.now(timezone.utc)
-    # We use UTC time for the window check, matching how preferences are
-    # stored. Future: respect each user's timezone (needs a tz column).
-    now_hour = now.hour
-    now_min = now.minute
 
+    Phase 10 timezone foundation: each subscriber has u.timezone. We
+    compute "what time is it in THEIR timezone right now" and compare
+    against their morning_window_start/end (which are stored as local
+    HH:MM strings). This is what makes nationwide delivery work — a
+    California subscriber's 6 AM window fires at 9 AM Eastern when
+    the scheduler ticks during Indianapolis morning.
+    """
     try:
         with db() as conn:
             with conn.cursor() as cur:
@@ -9925,6 +9993,7 @@ def _process_pending_briefs() -> None:
                           u.phone,
                           u.name,
                           u.subscription_tier,
+                          u.timezone,
                           bp.morning_window_start,
                           bp.morning_window_end,
                           bp.channels,
@@ -9950,11 +10019,17 @@ def _process_pending_briefs() -> None:
 
     for c in candidates:
         try:
+            # Compute "now" in THIS subscriber's local timezone
+            user_tz = c.get("timezone") or "America/Indiana/Indianapolis"
+            local_now = _local_now_for_user(user_tz)
+            now_hour = local_now.hour
+            now_min = local_now.minute
+
             if not _time_in_window(now_hour, now_min,
                                    c["morning_window_start"],
                                    c["morning_window_end"]):
                 continue
-            if _already_sent_today(c["user_id"], "morning"):
+            if _already_sent_today(c["user_id"], "morning", user_tz):
                 continue
             if not c["loc_lat"] or not c["loc_lng"]:
                 # No primary location set — skip silently. Subscriber should
@@ -10087,11 +10162,13 @@ def _process_pending_briefs() -> None:
 def _brief_scheduler_loop() -> None:
     """Main scheduler loop — runs in a daemon thread. Ticks every 60s.
 
-    Each tick runs TWO independent jobs:
+    Each tick runs three independent jobs:
       1. _process_pending_briefs — daily brief delivery
       2. _process_severe_alerts  — NWS severe alert detection + Met paging
+      3. _check_missed_pro_briefs — alert admin + Met when a Pro brief
+                                    was supposed to send but didn't
 
-    Failures in one don't stop the other.
+    Failures in one don't stop the others.
     """
     print("[brief-scheduler] started", flush=True)
     # Initial small delay so the app fully boots before our first tick.
@@ -10105,7 +10182,143 @@ def _brief_scheduler_loop() -> None:
             _process_severe_alerts()
         except Exception as e:
             print(f"[nws-scheduler] tick failed: {e!r}", flush=True)
+        try:
+            _check_missed_pro_briefs()
+        except Exception as e:
+            print(f"[missed-brief-check] tick failed: {e!r}", flush=True)
         time.sleep(60)
+
+
+def _check_missed_pro_briefs() -> None:
+    """Detect Pro subscribers whose morning brief window has closed
+    without a brief being sent. SMS admin + the Met team so someone
+    can catch up.
+
+    Runs every 60s. Dedupes via a daily marker so we don't spam.
+    A "missed" alert fires once: at 5 minutes past window end.
+    """
+    # We track which (user_id, local_date) combos we've already alerted
+    # for, to avoid repeating. Use brief_history with a special
+    # brief_type='missed_alert' marker so dedup persists across restarts.
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT
+                          u.id AS user_id, u.email, u.name, u.timezone,
+                          u.subscription_tier,
+                          bp.morning_window_start, bp.morning_window_end
+                       FROM users u
+                       JOIN brief_preferences bp ON bp.user_id = u.id
+                       WHERE u.is_active = TRUE
+                         AND bp.morning_enabled = TRUE
+                         AND u.subscription_tier IN ('pro_single','pro_multi','pro_enterprise')
+                         AND EXISTS (
+                           SELECT 1 FROM user_roles ur
+                           WHERE ur.user_id = u.id AND ur.role = 'subscriber'
+                         )"""
+                )
+                pro_subs = cur.fetchall()
+    except Exception as e:
+        print(f"[missed-brief-check] query failed: {e}", flush=True)
+        return
+
+    for c in pro_subs:
+        try:
+            user_tz = c.get("timezone") or "America/Indiana/Indianapolis"
+            try:
+                tz = ZoneInfo(user_tz)
+            except Exception:
+                tz = ZoneInfo("America/Indiana/Indianapolis")
+            local_now = datetime.now(tz)
+
+            # Parse window end and add 5-minute grace
+            try:
+                end_h = int(c["morning_window_end"][:2])
+                end_m = int(c["morning_window_end"][3:])
+            except (ValueError, TypeError, IndexError):
+                continue
+
+            window_end_today = local_now.replace(
+                hour=end_h, minute=end_m, second=0, microsecond=0
+            )
+            check_after = window_end_today + timedelta(minutes=5)
+
+            # Only check after the grace period
+            if local_now < check_after:
+                continue
+            # Only check if it's still the same day (don't fire stale alerts)
+            if (local_now - check_after).total_seconds() > 7200:
+                # Window ended >2hr ago — too late, skip
+                continue
+
+            # Already sent the brief? Skip.
+            if _already_sent_today(c["user_id"], "morning", user_tz):
+                continue
+            # Already alerted about this miss today? Skip.
+            if _already_sent_today(c["user_id"], "missed_alert", user_tz):
+                continue
+
+            # Fire alerts: admin + Met team
+            sub_name = (c.get("name") or "").strip() or c["email"]
+            msg = (
+                f"WeatherValet: Pro brief for {sub_name} missed window today. "
+                f"Subscriber is paying for daily Met-touched briefs — "
+                f"please send manually or check the workspace."
+            )
+
+            # Met team SMS
+            met_phone = os.environ.get("METEOROLOGIST_PHONE", "").strip()
+            if met_phone:
+                try:
+                    send_sms(met_phone, msg)
+                except Exception as e:
+                    print(f"[missed-brief-check] met SMS failed: {e}", flush=True)
+
+            # Admin SMS: lookup admin users with phones
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """SELECT u.phone FROM users u
+                               WHERE u.is_active = TRUE
+                                 AND u.phone IS NOT NULL AND u.phone != ''
+                                 AND EXISTS (
+                                   SELECT 1 FROM user_roles ur
+                                   WHERE ur.user_id = u.id AND ur.role = 'admin'
+                                 )
+                               LIMIT 5"""
+                        )
+                        admin_rows = cur.fetchall()
+                for a in admin_rows:
+                    try:
+                        send_sms(a["phone"], msg)
+                    except Exception as e:
+                        print(f"[missed-brief-check] admin SMS failed: {e}", flush=True)
+            except Exception as e:
+                print(f"[missed-brief-check] admin lookup failed: {e}", flush=True)
+
+            # Record the alert so we don't repeat
+            now_ms = int(time.time() * 1000)
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """INSERT INTO brief_history
+                               (user_id, brief_type, delivered_at, channels_used,
+                                delivery_status)
+                               VALUES (%s, 'missed_alert', %s, 'sms', 'sent')""",
+                            (c["user_id"], now_ms),
+                        )
+            except Exception as e:
+                print(f"[missed-brief-check] dedup-write failed: {e}", flush=True)
+
+            print(
+                f"[missed-brief-check] alerted on missed brief user_id={c['user_id']} ({sub_name})",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[missed-brief-check] per-sub error user_id={c.get('user_id')}: {e!r}", flush=True)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -12795,6 +13008,143 @@ def met_thread_mark_read(thread_id):
 
 
 # ════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════
+# Met-initiated Pro Threads — Met opens a new conversation
+# ════════════════════════════════════════════════════════════════════
+#
+# Subscriber-initiated threads already work. This adds the inverse:
+# Met sees a Pro subscriber's situation, wants to proactively message
+# (e.g. cell approaching the roofer's location, advance heads-up before
+# severe weather hits).
+#
+# Two endpoints:
+#   GET  /api/v1/met/pro-subscribers — list Pro subscribers for picker UI
+#   POST /api/v1/met/threads/new      — open a thread with a chosen subscriber
+#                                        (idempotent: if thread already exists,
+#                                        returns existing thread_id)
+#
+# After creating, the existing POST /api/v1/met/threads/<id>/messages
+# endpoint handles the actual message send.
+
+@app.route("/api/v1/met/pro-subscribers", methods=["OPTIONS"])
+def _met_pro_subscribers_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/pro-subscribers")
+def met_pro_subscribers_list():
+    """Returns all Pro-tier subscribers (active subscriptions) so the Met
+    can pick one to message. Includes name, email, phone, current tier,
+    and primary location label for context.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "met" not in (user.get("roles") or []) and "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.email, u.name, u.phone, u.subscription_tier,
+                          loc.label AS loc_label, loc.address_text AS loc_address
+                   FROM users u
+                   LEFT JOIN saved_locations loc
+                          ON loc.user_id = u.id AND loc.is_primary = TRUE
+                   WHERE u.is_active = TRUE
+                     AND u.subscription_tier IN ('pro_single', 'pro_multi', 'pro_enterprise')
+                     AND EXISTS (
+                       SELECT 1 FROM user_roles ur
+                       WHERE ur.user_id = u.id AND ur.role = 'subscriber'
+                     )
+                   ORDER BY u.name, u.email"""
+            )
+            rows = cur.fetchall()
+
+    subscribers = [
+        {
+            "user_id": r["id"],
+            "email": r["email"],
+            "name": (r.get("name") or "").strip() or None,
+            "phone": r.get("phone") or None,
+            "tier": r.get("subscription_tier"),
+            "loc_label": r.get("loc_label"),
+            "loc_address": r.get("loc_address"),
+        }
+        for r in rows
+    ]
+    return jsonify({"ok": True, "subscribers": subscribers})
+
+
+@app.route("/api/v1/met/threads/new", methods=["OPTIONS"])
+def _met_new_thread_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/met/threads/new")
+def met_new_thread():
+    """Met opens a new Pro Thread with a chosen Pro subscriber.
+
+    Body: {"subscriber_user_id": 42}
+
+    Returns the thread (existing or newly created). The Met then uses
+    the existing POST /api/v1/met/threads/<id>/messages to send the
+    first message — this keeps the message-send code path single-purpose.
+    """
+    actor = _get_current_user()
+    if actor is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "met" not in (actor.get("roles") or []) and "admin" not in (actor.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    try:
+        subscriber_user_id = int(data.get("subscriber_user_id") or 0)
+    except (ValueError, TypeError):
+        subscriber_user_id = 0
+    if not subscriber_user_id:
+        return jsonify({"ok": False, "error": "missing-subscriber-id"}), 400
+
+    # Verify the target is actually a Pro subscriber. We don't let the
+    # Met open threads with Hobbyist users — that's deliberate, since
+    # Pro Threads is a Pro-tier feature.
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, email, name, subscription_tier FROM users
+                   WHERE id = %s AND is_active = TRUE""",
+                (subscriber_user_id,),
+            )
+            sub = cur.fetchone()
+    if not sub:
+        return jsonify({"ok": False, "error": "subscriber-not-found"}), 404
+    if sub.get("subscription_tier") not in ("pro_single", "pro_multi", "pro_enterprise"):
+        return jsonify({
+            "ok": False,
+            "error": "not-pro-subscriber",
+            "message": "Pro Threads are only available for Pro-tier subscribers."
+        }), 409
+
+    # Get-or-create — idempotent
+    thread = _get_or_create_thread_for_subscriber(subscriber_user_id)
+
+    print(
+        f"[met-new-thread] met={actor['id']} opened thread={thread['id']} "
+        f"with subscriber={subscriber_user_id} ({sub['email']})",
+        flush=True,
+    )
+    return jsonify({
+        "ok": True,
+        "thread": {
+            "id": thread["id"],
+            "subscriber_user_id": subscriber_user_id,
+            "subscriber_email": sub["email"],
+            "subscriber_name": (sub.get("name") or "").strip() or None,
+        },
+    })
+
+
+# ════════════════════════════════════════════════════════════════════
 # Met tips — customer "like button" tips for $19 reviews
 # ════════════════════════════════════════════════════════════════════
 #
@@ -13191,6 +13541,293 @@ def me_met_history():
         })
 
     return jsonify({"ok": True, "reviews": reviews})
+
+
+# ════════════════════════════════════════════════════════════════════
+# Admin payroll dashboard — monthly Met earnings breakdown
+# ════════════════════════════════════════════════════════════════════
+#
+# On the 1st of each month, admin pulls per-Met earnings for the prior
+# month, enters into payroll.
+#
+# Earnings model:
+#   1. $19 reviews: 65% of the price_cents goes to whichever Met
+#      completed it (via verification_requests.completed_by_user_id).
+#   2. Subscription revenue: attributed per-day based on who sent the
+#      morning brief. Pro Single = $400/month → $400/days_in_month per day.
+#      Pro Multi = $1,200/month → $1200/days_in_month per day. Whoever
+#      sent that subscriber's brief on a given day gets the day's share.
+#      Hobbyist briefs are auto-AI (no Met touched) → revenue stays with
+#      the house, no attribution.
+#   3. Tips: 100% to the Met who got the tip
+#      (completed met_tips for that month).
+#
+# Missed briefs: if a Pro subscriber didn't get a brief on day X, that
+# day's prorated revenue stays with the house (no Met attribution).
+# Notification of the miss happens separately in the scheduler.
+
+PRO_TIER_MONTHLY_CENTS = {
+    "pro_single": 40000,         # $400
+    "pro_multi": 120000,         # $1,200
+    "pro_enterprise": 200000,    # $2,000 default — real number set per-contract
+}
+
+
+def _compute_payroll_for_month(year: int, month: int) -> dict:
+    """Computes per-Met earnings + house revenue for the given month
+    in Eastern Time. Returns a dict ready for JSON serialization.
+
+    Shared by:
+      - admin payroll endpoint (returns all Mets)
+      - Met self-earnings endpoint (filters to one Met)
+    """
+    # Define the month period in Eastern Time (where the business is).
+    ET = ZoneInfo("America/New_York")
+    period_start = datetime(year, month, 1, 0, 0, 0, tzinfo=ET)
+    if month == 12:
+        period_end = datetime(year + 1, 1, 1, 0, 0, 0, tzinfo=ET)
+    else:
+        period_end = datetime(year, month + 1, 1, 0, 0, 0, tzinfo=ET)
+    period_start_ms = int(period_start.timestamp() * 1000)
+    period_end_ms = int(period_end.timestamp() * 1000)
+    days_in_month = (period_end - period_start).days
+
+    # ──────────────────────────────────────────────────────────────────
+    # 1. Collect all Mets (for pre-populating zero rows even if no work)
+    # ──────────────────────────────────────────────────────────────────
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.name, u.email FROM users u
+                   WHERE EXISTS (
+                       SELECT 1 FROM user_roles ur
+                       WHERE ur.user_id = u.id AND ur.role = 'met'
+                   )
+                   ORDER BY u.name, u.email"""
+            )
+            met_rows = cur.fetchall()
+    mets_by_id = {
+        r["id"]: {
+            "user_id": r["id"],
+            "name": (r.get("name") or "").strip() or r["email"],
+            "email": r["email"],
+            "review_cents": 0, "review_count": 0,
+            "brief_cents": 0, "brief_count": 0,
+            "tip_cents": 0, "tip_count": 0,
+        }
+        for r in met_rows
+    }
+
+    # ──────────────────────────────────────────────────────────────────
+    # 2. $19 review attribution — 65% of price_cents
+    # ──────────────────────────────────────────────────────────────────
+    MET_REVIEW_SHARE = 0.65
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT completed_by_user_id, price_cents
+                   FROM verification_requests
+                   WHERE status = 'completed'
+                     AND completed_at IS NOT NULL
+                     AND completed_at >= %s AND completed_at < %s
+                     AND completed_by_user_id IS NOT NULL""",
+                (period_start_ms, period_end_ms),
+            )
+            review_rows = cur.fetchall()
+    for r in review_rows:
+        met_id = r["completed_by_user_id"]
+        if met_id not in mets_by_id:
+            continue
+        share = int((r["price_cents"] or 1900) * MET_REVIEW_SHARE)
+        mets_by_id[met_id]["review_cents"] += share
+        mets_by_id[met_id]["review_count"] += 1
+
+    # ──────────────────────────────────────────────────────────────────
+    # 3. Subscription brief attribution (per-day, per-subscriber)
+    # ──────────────────────────────────────────────────────────────────
+    unattributed_pro_cents = 0
+    hobbyist_revenue_cents = 0
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id AS user_id, u.subscription_tier, u.timezone
+                   FROM users u
+                   WHERE u.subscription_tier IS NOT NULL
+                     AND u.subscription_tier != ''
+                     AND EXISTS (
+                       SELECT 1 FROM user_roles ur
+                       WHERE ur.user_id = u.id AND ur.role = 'subscriber'
+                     )"""
+            )
+            subs = cur.fetchall()
+
+    for sub in subs:
+        tier = sub["subscription_tier"]
+        if tier == "hobbyist":
+            hobbyist_revenue_cents += 3000  # $30/month flat
+            continue
+        if tier not in PRO_TIER_MONTHLY_CENTS:
+            continue
+
+        monthly_cents = PRO_TIER_MONTHLY_CENTS[tier]
+        daily_cents = monthly_cents // days_in_month
+
+        user_tz = sub.get("timezone") or "America/Indiana/Indianapolis"
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT sent_at, sent_by_user_id
+                       FROM pro_brief_drafts
+                       WHERE user_id = %s
+                         AND status = 'sent'
+                         AND sent_at IS NOT NULL
+                         AND sent_at >= %s AND sent_at < %s
+                       ORDER BY sent_at ASC""",
+                    (sub["user_id"], period_start_ms, period_end_ms),
+                )
+                brief_rows = cur.fetchall()
+
+        # Bucket briefs by local date
+        briefs_by_local_date = {}
+        try:
+            sub_zone = ZoneInfo(user_tz)
+        except Exception:
+            sub_zone = ZoneInfo("America/Indiana/Indianapolis")
+        for b in brief_rows:
+            sent_dt = datetime.fromtimestamp(b["sent_at"] / 1000, tz=timezone.utc).astimezone(sub_zone)
+            local_date = sent_dt.date()
+            if local_date not in briefs_by_local_date:
+                briefs_by_local_date[local_date] = b["sent_by_user_id"]
+
+        # Walk every day; attribute or send to house
+        current_dt = period_start
+        while current_dt < period_end:
+            local_date = current_dt.astimezone(sub_zone).date()
+            sent_by = briefs_by_local_date.get(local_date)
+            if sent_by and sent_by in mets_by_id:
+                mets_by_id[sent_by]["brief_cents"] += daily_cents
+                mets_by_id[sent_by]["brief_count"] += 1
+            else:
+                unattributed_pro_cents += daily_cents
+            current_dt += timedelta(days=1)
+
+    # ──────────────────────────────────────────────────────────────────
+    # 4. Tips — 100% to recipient Met
+    # ──────────────────────────────────────────────────────────────────
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT met_user_id, amount_cents
+                   FROM met_tips
+                   WHERE status = 'completed'
+                     AND completed_at IS NOT NULL
+                     AND completed_at >= %s AND completed_at < %s
+                     AND met_user_id IS NOT NULL""",
+                (period_start_ms, period_end_ms),
+            )
+            tip_rows = cur.fetchall()
+    for r in tip_rows:
+        met_id = r["met_user_id"]
+        if met_id not in mets_by_id:
+            continue
+        mets_by_id[met_id]["tip_cents"] += int(r["amount_cents"] or 0)
+        mets_by_id[met_id]["tip_count"] += 1
+
+    # ──────────────────────────────────────────────────────────────────
+    # 5. Totals
+    # ──────────────────────────────────────────────────────────────────
+    mets_list = []
+    for met in mets_by_id.values():
+        met["total_cents"] = met["review_cents"] + met["brief_cents"] + met["tip_cents"]
+        mets_list.append(met)
+    mets_list.sort(key=lambda m: m["total_cents"], reverse=True)
+
+    month_label = period_start.strftime("%B %Y")
+    return {
+        "month": month_label,
+        "period": {
+            "start_ms": period_start_ms,
+            "end_ms": period_end_ms,
+            "days": days_in_month,
+        },
+        "mets": mets_list,
+        "house": {
+            "hobbyist_revenue_cents": hobbyist_revenue_cents,
+            "unattributed_pro_cents": unattributed_pro_cents,
+            "total_cents": hobbyist_revenue_cents + unattributed_pro_cents,
+        },
+    }
+
+
+@app.route("/api/v1/admin/payroll/<int:year>/<int:month>", methods=["OPTIONS"])
+def _admin_payroll_preflight(year, month):
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/payroll/<int:year>/<int:month>")
+def admin_payroll(year: int, month: int):
+    """Return per-Met earnings for the given month, in Eastern Time.
+
+    Path params: /YYYY/MM (e.g. /2026/5 for May 2026)
+    """
+    actor, err = _require_admin()
+    if err:
+        return err
+
+    if month < 1 or month > 12:
+        return jsonify({"ok": False, "error": "invalid-month"}), 400
+    if year < 2020 or year > 2100:
+        return jsonify({"ok": False, "error": "invalid-year"}), 400
+
+    result = _compute_payroll_for_month(year, month)
+    result["ok"] = True
+    return jsonify(result)
+
+
+@app.route("/api/v1/me/earnings/<int:year>/<int:month>", methods=["OPTIONS"])
+def _me_earnings_preflight(year, month):
+    return ("", 204)
+
+
+@app.get("/api/v1/me/earnings/<int:year>/<int:month>")
+def me_earnings(year: int, month: int):
+    """Return MY earnings for the given month (Met-self version).
+
+    Filters the payroll computation to just the calling Met. Returns
+    the same structure (review_cents, brief_cents, tip_cents, total_cents,
+    counts).
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "met" not in (user.get("roles") or []) and "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    if month < 1 or month > 12:
+        return jsonify({"ok": False, "error": "invalid-month"}), 400
+    if year < 2020 or year > 2100:
+        return jsonify({"ok": False, "error": "invalid-year"}), 400
+
+    full = _compute_payroll_for_month(year, month)
+    my_row = next((m for m in full["mets"] if m["user_id"] == user["id"]), None)
+    if not my_row:
+        # Met exists but has no work in this period — return zeros
+        my_row = {
+            "user_id": user["id"],
+            "name": (user.get("name") or "").strip() or user.get("email"),
+            "email": user.get("email"),
+            "review_cents": 0, "review_count": 0,
+            "brief_cents": 0, "brief_count": 0,
+            "tip_cents": 0, "tip_count": 0,
+            "total_cents": 0,
+        }
+    return jsonify({
+        "ok": True,
+        "month": full["month"],
+        "period": full["period"],
+        "earnings": my_row,
+    })
 
 
 if __name__ == "__main__":
