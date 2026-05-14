@@ -7417,6 +7417,408 @@ def me_brief_history():
     return jsonify({"ok": True, "history": history})
 
 
+# ════════════════════════════════════════════════════════════════════
+# Subscriber portal — write endpoints (Phase 10 Chunk B1)
+# ════════════════════════════════════════════════════════════════════
+#
+# PATCH brief preferences, plus CRUD for threshold alerts.
+# Saved-location writes come in Chunk B2 (needs geocoding helper).
+
+@app.patch("/api/v1/me/brief-preferences")
+def me_brief_preferences_update():
+    """Patch the current user's brief delivery preferences.
+
+    Accepts a partial body — only the fields present in the request
+    are updated. The rest stay as-is. Returns the full updated row.
+
+    Validates time strings as HH:MM and channels as a list of allowed
+    values ('sms', 'email', 'push'). Rejects unknown fields silently.
+
+    Request body (all optional):
+        {
+          "morning_enabled": true,
+          "morning_window_start": "05:30",
+          "morning_window_end":   "07:00",
+          "evening_enabled": false,
+          "evening_window_start": "17:30",
+          "evening_window_end":   "18:30",
+          "quiet_start": "21:00",
+          "quiet_end":   "05:00",
+          "channels": ["sms", "email"]
+        }
+
+    Returns:
+        200 {"ok": true, "preferences": {...}}  (full updated row)
+        400 {"ok": false, "error": "invalid-..."}
+        401 not authenticated
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    data = request.get_json(silent=True) or {}
+    now_ms = int(time.time() * 1000)
+
+    # Validate time strings as HH:MM (00-23 : 00-59)
+    def _valid_time(s):
+        if not isinstance(s, str): return False
+        if len(s) != 5 or s[2] != ':': return False
+        try:
+            h, m = int(s[:2]), int(s[3:])
+            return 0 <= h <= 23 and 0 <= m <= 59
+        except (ValueError, TypeError):
+            return False
+
+    # Build dynamic SET clause from present fields
+    set_clauses = []
+    params = []
+
+    if "morning_enabled" in data:
+        set_clauses.append("morning_enabled = %s")
+        params.append(bool(data["morning_enabled"]))
+
+    if "morning_window_start" in data:
+        if not _valid_time(data["morning_window_start"]):
+            return jsonify({"ok": False, "error": "invalid-morning-start"}), 400
+        set_clauses.append("morning_window_start = %s")
+        params.append(data["morning_window_start"])
+
+    if "morning_window_end" in data:
+        if not _valid_time(data["morning_window_end"]):
+            return jsonify({"ok": False, "error": "invalid-morning-end"}), 400
+        set_clauses.append("morning_window_end = %s")
+        params.append(data["morning_window_end"])
+
+    if "evening_enabled" in data:
+        set_clauses.append("evening_enabled = %s")
+        params.append(bool(data["evening_enabled"]))
+
+    if "evening_window_start" in data:
+        v = data["evening_window_start"]
+        if v is None or v == "":
+            set_clauses.append("evening_window_start = NULL")
+        elif _valid_time(v):
+            set_clauses.append("evening_window_start = %s")
+            params.append(v)
+        else:
+            return jsonify({"ok": False, "error": "invalid-evening-start"}), 400
+
+    if "evening_window_end" in data:
+        v = data["evening_window_end"]
+        if v is None or v == "":
+            set_clauses.append("evening_window_end = NULL")
+        elif _valid_time(v):
+            set_clauses.append("evening_window_end = %s")
+            params.append(v)
+        else:
+            return jsonify({"ok": False, "error": "invalid-evening-end"}), 400
+
+    if "quiet_start" in data:
+        if not _valid_time(data["quiet_start"]):
+            return jsonify({"ok": False, "error": "invalid-quiet-start"}), 400
+        set_clauses.append("quiet_start = %s")
+        params.append(data["quiet_start"])
+
+    if "quiet_end" in data:
+        if not _valid_time(data["quiet_end"]):
+            return jsonify({"ok": False, "error": "invalid-quiet-end"}), 400
+        set_clauses.append("quiet_end = %s")
+        params.append(data["quiet_end"])
+
+    if "channels" in data:
+        ch = data["channels"]
+        if not isinstance(ch, list):
+            return jsonify({"ok": False, "error": "invalid-channels"}), 400
+        ALLOWED = {"sms", "email", "push"}
+        clean = [c for c in ch if isinstance(c, str) and c in ALLOWED]
+        if not clean:
+            return jsonify({"ok": False, "error": "no-valid-channels"}), 400
+        set_clauses.append("channels = %s")
+        params.append(",".join(clean))
+
+    if not set_clauses:
+        return jsonify({"ok": False, "error": "no-fields-to-update"}), 400
+
+    # Always bump updated_at
+    set_clauses.append("updated_at = %s")
+    params.append(now_ms)
+
+    # Ensure row exists first (auto-create with defaults), then update
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO brief_preferences (user_id, updated_at)
+                   VALUES (%s, %s)
+                   ON CONFLICT (user_id) DO NOTHING""",
+                (user["id"], now_ms),
+            )
+            params.append(user["id"])
+            cur.execute(
+                f"UPDATE brief_preferences SET {', '.join(set_clauses)} "
+                f"WHERE user_id = %s",
+                tuple(params),
+            )
+            cur.execute(
+                """SELECT user_id, morning_enabled, morning_window_start,
+                          morning_window_end, evening_enabled,
+                          evening_window_start, evening_window_end,
+                          quiet_start, quiet_end, channels, updated_at
+                   FROM brief_preferences WHERE user_id = %s""",
+                (user["id"],),
+            )
+            row = cur.fetchone()
+
+    return jsonify({
+        "ok": True,
+        "preferences": {
+            "morning_enabled":      row["morning_enabled"],
+            "morning_window_start": row["morning_window_start"],
+            "morning_window_end":   row["morning_window_end"],
+            "evening_enabled":      row["evening_enabled"],
+            "evening_window_start": row["evening_window_start"],
+            "evening_window_end":   row["evening_window_end"],
+            "quiet_start":          row["quiet_start"],
+            "quiet_end":            row["quiet_end"],
+            "channels":             [c for c in (row["channels"] or "").split(",") if c],
+            "updated_at":           row["updated_at"],
+        },
+    })
+
+
+@app.post("/api/v1/me/threshold-alerts")
+def me_threshold_alerts_create():
+    """Create a new threshold alert for the current user.
+
+    Request body:
+        {
+          "metric": "wind" | "temp_low" | "temp_high" | "precip_chance" | "humidity",
+          "comparator": "gt" | "lt" | "gte" | "lte" | "eq",
+          "threshold_value": 25,
+          "units": "mph" | "F" | "C" | "pct",
+          "channels": ["sms", "email"],   (optional, defaults to ["sms","email"])
+          "enabled": true                  (optional, defaults to true)
+        }
+
+    Returns:
+        200 {"ok": true, "alert": {...}}
+        400 invalid field
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    data = request.get_json(silent=True) or {}
+
+    ALLOWED_METRICS = {"wind", "temp_low", "temp_high", "precip_chance", "humidity"}
+    ALLOWED_COMPS = {"gt", "lt", "gte", "lte", "eq"}
+    ALLOWED_UNITS = {"mph", "F", "C", "pct"}
+    ALLOWED_CHANNELS = {"sms", "email", "push"}
+
+    metric = (data.get("metric") or "").strip()
+    if metric not in ALLOWED_METRICS:
+        return jsonify({"ok": False, "error": "invalid-metric"}), 400
+
+    comparator = (data.get("comparator") or "").strip()
+    if comparator not in ALLOWED_COMPS:
+        return jsonify({"ok": False, "error": "invalid-comparator"}), 400
+
+    try:
+        threshold_value = float(data.get("threshold_value"))
+    except (ValueError, TypeError):
+        return jsonify({"ok": False, "error": "invalid-threshold-value"}), 400
+
+    units = (data.get("units") or "").strip()
+    if units not in ALLOWED_UNITS:
+        return jsonify({"ok": False, "error": "invalid-units"}), 400
+
+    channels_raw = data.get("channels") or ["sms", "email"]
+    if not isinstance(channels_raw, list):
+        return jsonify({"ok": False, "error": "invalid-channels"}), 400
+    channels = [c for c in channels_raw if isinstance(c, str) and c in ALLOWED_CHANNELS]
+    if not channels:
+        return jsonify({"ok": False, "error": "no-valid-channels"}), 400
+
+    enabled = bool(data.get("enabled", True))
+    now_ms = int(time.time() * 1000)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO threshold_alerts
+                   (user_id, metric, comparator, threshold_value, units,
+                    channels, enabled, created_at, updated_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   RETURNING id, metric, comparator, threshold_value, units,
+                             channels, enabled, created_at, updated_at""",
+                (user["id"], metric, comparator, threshold_value, units,
+                 ",".join(channels), enabled, now_ms, now_ms),
+            )
+            row = cur.fetchone()
+
+    return jsonify({
+        "ok": True,
+        "alert": {
+            "id": row["id"],
+            "metric": row["metric"],
+            "comparator": row["comparator"],
+            "threshold_value": row["threshold_value"],
+            "units": row["units"],
+            "channels": [c for c in (row["channels"] or "").split(",") if c],
+            "enabled": row["enabled"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        },
+    })
+
+
+@app.route("/api/v1/me/threshold-alerts/<int:alert_id>", methods=["OPTIONS"])
+def _me_threshold_alert_id_preflight(alert_id):
+    return ("", 204)
+
+
+@app.patch("/api/v1/me/threshold-alerts/<int:alert_id>")
+def me_threshold_alerts_update(alert_id):
+    """Update an existing threshold alert.
+
+    Same field validation as create. All fields optional (partial update).
+    Only the alert's owner can update it.
+
+    Returns:
+        200 {"ok": true, "alert": {...}}
+        404 alert not found or not owned by current user
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    data = request.get_json(silent=True) or {}
+
+    ALLOWED_METRICS = {"wind", "temp_low", "temp_high", "precip_chance", "humidity"}
+    ALLOWED_COMPS = {"gt", "lt", "gte", "lte", "eq"}
+    ALLOWED_UNITS = {"mph", "F", "C", "pct"}
+    ALLOWED_CHANNELS = {"sms", "email", "push"}
+
+    set_clauses = []
+    params = []
+
+    if "metric" in data:
+        if data["metric"] not in ALLOWED_METRICS:
+            return jsonify({"ok": False, "error": "invalid-metric"}), 400
+        set_clauses.append("metric = %s")
+        params.append(data["metric"])
+
+    if "comparator" in data:
+        if data["comparator"] not in ALLOWED_COMPS:
+            return jsonify({"ok": False, "error": "invalid-comparator"}), 400
+        set_clauses.append("comparator = %s")
+        params.append(data["comparator"])
+
+    if "threshold_value" in data:
+        try:
+            v = float(data["threshold_value"])
+            set_clauses.append("threshold_value = %s")
+            params.append(v)
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "error": "invalid-threshold-value"}), 400
+
+    if "units" in data:
+        if data["units"] not in ALLOWED_UNITS:
+            return jsonify({"ok": False, "error": "invalid-units"}), 400
+        set_clauses.append("units = %s")
+        params.append(data["units"])
+
+    if "channels" in data:
+        ch = data["channels"]
+        if not isinstance(ch, list):
+            return jsonify({"ok": False, "error": "invalid-channels"}), 400
+        clean = [c for c in ch if isinstance(c, str) and c in ALLOWED_CHANNELS]
+        if not clean:
+            return jsonify({"ok": False, "error": "no-valid-channels"}), 400
+        set_clauses.append("channels = %s")
+        params.append(",".join(clean))
+
+    if "enabled" in data:
+        set_clauses.append("enabled = %s")
+        params.append(bool(data["enabled"]))
+
+    if not set_clauses:
+        return jsonify({"ok": False, "error": "no-fields-to-update"}), 400
+
+    set_clauses.append("updated_at = %s")
+    now_ms = int(time.time() * 1000)
+    params.append(now_ms)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            # Verify ownership first
+            cur.execute(
+                "SELECT user_id FROM threshold_alerts WHERE id = %s",
+                (alert_id,),
+            )
+            existing = cur.fetchone()
+            if existing is None or existing["user_id"] != user["id"]:
+                return jsonify({"ok": False, "error": "not-found"}), 404
+
+            params.extend([alert_id, user["id"]])
+            cur.execute(
+                f"UPDATE threshold_alerts SET {', '.join(set_clauses)} "
+                f"WHERE id = %s AND user_id = %s",
+                tuple(params),
+            )
+            cur.execute(
+                """SELECT id, metric, comparator, threshold_value, units,
+                          channels, enabled, created_at, updated_at
+                   FROM threshold_alerts WHERE id = %s""",
+                (alert_id,),
+            )
+            row = cur.fetchone()
+
+    return jsonify({
+        "ok": True,
+        "alert": {
+            "id": row["id"],
+            "metric": row["metric"],
+            "comparator": row["comparator"],
+            "threshold_value": row["threshold_value"],
+            "units": row["units"],
+            "channels": [c for c in (row["channels"] or "").split(",") if c],
+            "enabled": row["enabled"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        },
+    })
+
+
+@app.delete("/api/v1/me/threshold-alerts/<int:alert_id>")
+def me_threshold_alerts_delete(alert_id):
+    """Delete a threshold alert. Only the owner can delete.
+
+    Returns:
+        200 {"ok": true}
+        404 not found or not owned
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT user_id FROM threshold_alerts WHERE id = %s",
+                (alert_id,),
+            )
+            row = cur.fetchone()
+            if row is None or row["user_id"] != user["id"]:
+                return jsonify({"ok": False, "error": "not-found"}), 404
+
+            cur.execute(
+                "DELETE FROM threshold_alerts WHERE id = %s AND user_id = %s",
+                (alert_id, user["id"]),
+            )
+
+    return jsonify({"ok": True})
+
+
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 8080))
