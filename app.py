@@ -350,7 +350,11 @@ CREATE TABLE IF NOT EXISTS verification_requests (
     claimed_at          BIGINT,
     completed_at        BIGINT,
     meteorologist_verdict   TEXT,
-    meteorologist_notes     TEXT
+    meteorologist_notes     TEXT,
+    -- Tip system (Phase 10 — Met tips)
+    completed_by_user_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    completed_by_name       TEXT,                -- snapshot — Met can leave, tip still attributes
+    customer_review_token   TEXT UNIQUE          -- token-authed review/tip page URL
 );
 CREATE INDEX IF NOT EXISTS idx_status_created ON verification_requests(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_claim_token ON verification_requests(claim_token);
@@ -476,6 +480,14 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS crew_home_lat DOUBLE PRECISION;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS crew_home_lng DOUBLE PRECISION;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS crew_home_label TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS crew_active BOOLEAN NOT NULL DEFAULT TRUE;
+
+-- Phase 10 Met tips: track which Met completed each verification + a
+-- customer-facing token for the review/tip page (separate from Met's
+-- claim_token so we can give customers a URL that doesn't expose
+-- Met-only paths).
+ALTER TABLE verification_requests ADD COLUMN IF NOT EXISTS completed_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE verification_requests ADD COLUMN IF NOT EXISTS completed_by_name TEXT;
+ALTER TABLE verification_requests ADD COLUMN IF NOT EXISTS customer_review_token TEXT UNIQUE;
 
 -- ── User roles — many-to-many; a user can hold several roles ──
 -- Roles: 'subscriber', 'crew', 'met', 'admin'
@@ -1067,6 +1079,49 @@ CREATE TABLE IF NOT EXISTS pro_thread_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_pro_thread_messages_thread
     ON pro_thread_messages(thread_id, created_at ASC);
+
+-- ── Met tips (Phase 10 — Customer tips for $19 review Met) ──
+-- After a Met delivers a $19 verification, the customer can tip the Met
+-- via a "like" button on the delivered-review page. All money flows
+-- through WeatherValet's Stripe account; Mets see tip earnings in their
+-- workspace and get paid via payroll on payday.
+--
+-- Two payment paths:
+--   1. Logged-in subscriber → off-session charge to saved payment method
+--      (one-tap, no redirect)
+--   2. Non-subscriber (paid $19, no account) → Stripe Checkout session
+--      (full payment form, redirect back to thank-you)
+--
+-- status:
+--   'pending'   — Checkout session created, customer hasn't paid yet
+--   'completed' — Stripe charge succeeded
+--   'failed'    — Stripe charge failed (insufficient funds, card declined)
+--
+-- Linking: every tip references the verification_request that originated
+-- it, plus the Met user (snapshot at tip time — Met can leave the team
+-- later, but the tip is still theirs).
+CREATE TABLE IF NOT EXISTS met_tips (
+    id              SERIAL PRIMARY KEY,
+    created_at      BIGINT NOT NULL,
+    verification_request_id INTEGER REFERENCES verification_requests(id) ON DELETE SET NULL,
+    met_user_id     INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    met_name        TEXT,                          -- snapshot
+    customer_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,  -- null for anon
+    customer_email  TEXT,                          -- snapshot
+    customer_phone  TEXT,                          -- snapshot
+    amount_cents    INTEGER NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    stripe_payment_intent_id TEXT,
+    stripe_session_id        TEXT,
+    completed_at    BIGINT,
+    note            TEXT                           -- optional customer thank-you note
+);
+CREATE INDEX IF NOT EXISTS idx_met_tips_met
+    ON met_tips(met_user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_met_tips_verification
+    ON met_tips(verification_request_id);
+CREATE INDEX IF NOT EXISTS idx_met_tips_session
+    ON met_tips(stripe_session_id);
 """
 
 
@@ -4274,6 +4329,44 @@ def stripe_webhook_v2():
             #   - SMSes the customer their standby confirmation
             #   - SMSes the meteorologist with the claim link + AI brief
             session_metadata = session.get("metadata") or {}
+
+            # Phase 10 Met tips: tip-mode checkout? Routed by metadata.
+            # wv_tip_for_review is the verification_request_id, not a tip_id —
+            # we look up by stripe_session_id (which we stored at tip creation).
+            tip_review_id = session_metadata.get("wv_tip_for_review")
+            if tip_review_id:
+                session_id = session.get("id")
+                payment_intent = session.get("payment_intent")
+                now_ms = int(time.time() * 1000)
+                try:
+                    with db() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """UPDATE met_tips
+                                   SET status = 'completed', completed_at = %s,
+                                       stripe_payment_intent_id = %s
+                                   WHERE stripe_session_id = %s AND status = 'pending'
+                                   RETURNING id, met_user_id, amount_cents""",
+                                (now_ms, payment_intent, session_id),
+                            )
+                            updated = cur.fetchone()
+                    if updated:
+                        print(
+                            f"[stripe-webhook] met tip completed tip_id={updated['id']} "
+                            f"met={updated['met_user_id']} amount=${updated['amount_cents']/100:.2f}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[stripe-webhook] met tip session not found or already completed: {session_id}",
+                            flush=True,
+                        )
+                except Exception as e:
+                    print(f"[stripe-webhook] FAILED to complete met tip session={session_id}: {e!r}", flush=True)
+                    return jsonify({"error": "internal-error"}), 500
+                _stripe_event_record(event_id, event_type, payload)
+                return jsonify({"received": True, "handled": True, "mode": "payment", "type": "met-tip"}), 200
+
             try:
                 request_id = int(session_metadata.get("wv_request_id", 0))
             except (ValueError, TypeError):
@@ -4600,23 +4693,43 @@ def meteorologist_complete(claim_token: str):
             return jsonify({"ok": False, "error": "verdict-required"}), 400
         abort(400)
 
+    # Phase 10 Met tips: snapshot the Met's user_id + name on completion
+    # so we can attribute future tips to them. If no logged-in user
+    # (legacy claim-link flow), these stay null and the tip link won't
+    # know who to credit — that's acceptable for the rare legacy path.
+    actor = _get_current_user()
+    completed_by_user_id = actor["id"] if actor else None
+    completed_by_name = (
+        (actor.get("name") if actor else None)
+        or (actor.get("email") if actor else None)
+        or "Your meteorologist"
+    )
+
+    # Generate the customer review token (separate from claim_token —
+    # this is what we share with the customer in the delivered-review SMS).
+    customer_review_token = new_secure_token()
+
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """UPDATE verification_requests
                    SET status='completed', completed_at=%s, updated_at=%s,
-                       meteorologist_verdict=%s, meteorologist_notes=%s
+                       meteorologist_verdict=%s, meteorologist_notes=%s,
+                       completed_by_user_id=%s, completed_by_name=%s,
+                       customer_review_token=%s
                    WHERE id=%s""",
-                (now_ts(), now_ts(), verdict, notes, row["id"]),
+                (now_ts(), now_ts(), verdict, notes,
+                 completed_by_user_id, completed_by_name,
+                 customer_review_token, row["id"]),
             )
 
-    # Customer SMS — verdict ready. We don't dump the full text into SMS
-    # because that gets unwieldy; we link them back to the standby page
-    # which will now show the verdict.
+    # Customer SMS — verdict ready. We link to the customer review page
+    # which shows the verdict + a "thank your meteorologist" tip button.
     customer_msg = (
         f"WeatherValet: Your meteorologist's call is ready. "
         f"{verdict[:120]}{'…' if len(verdict) > 120 else ''} "
-        f"View full brief: {FRONTEND_BASE_URL}/verification/standby?rid={row['id']}"
+        f"View full brief + thank {completed_by_name}: "
+        f"{FRONTEND_BASE_URL}/?review={customer_review_token}"
     )
     send_sms(row["customer_phone"], customer_msg)
 
@@ -12544,6 +12657,338 @@ def met_thread_mark_read(thread_id):
             )
 
     return jsonify({"ok": True})
+
+
+# ════════════════════════════════════════════════════════════════════
+# Met tips — customer "like button" tips for $19 reviews
+# ════════════════════════════════════════════════════════════════════
+#
+# The $19 customer gets an SMS after their review delivers:
+#   "View full brief + thank Michael: weathervalet.ai/?review=<token>"
+#
+# The page (built in TIP-B) shows the verdict + tip buttons ($3, $5, $10,
+# Custom). When clicked, customer hits POST /api/v1/reviews/<token>/tip.
+#
+# Payment paths:
+#   - Logged-in subscriber: charge their saved Stripe payment method
+#     off-session, return success. One-tap.
+#   - Anonymous customer: create a Stripe Checkout session and return
+#     the checkout URL; client redirects. Standard $19-style flow.
+#
+# The Stripe webhook (existing /api/v1/stripe/webhook) handles the
+# checkout.session.completed event and marks the tip 'completed'.
+
+@app.route("/api/v1/reviews/<review_token>", methods=["OPTIONS"])
+def _review_get_preflight(review_token):
+    return ("", 204)
+
+
+@app.get("/api/v1/reviews/<review_token>")
+def review_get(review_token: str):
+    """Fetch a delivered review by customer_review_token. Returns the
+    verdict + Met name. Public — token IS the auth."""
+    if not review_token or len(review_token) < 10:
+        return jsonify({"ok": False, "error": "invalid-token"}), 400
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, status, plan_text, plan_location, plan_window,
+                          meteorologist_verdict, meteorologist_notes,
+                          completed_at, completed_by_user_id, completed_by_name,
+                          customer_email
+                   FROM verification_requests
+                   WHERE customer_review_token = %s""",
+                (review_token,),
+            )
+            r = cur.fetchone()
+
+    if not r:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    if r["status"] != "completed":
+        return jsonify({"ok": False, "error": "not-completed", "status": r["status"]}), 409
+
+    return jsonify({
+        "ok": True,
+        "review": {
+            "verification_request_id": r["id"],
+            "plan_text": r["plan_text"],
+            "plan_location": r["plan_location"],
+            "plan_window": r["plan_window"],
+            "verdict": r["meteorologist_verdict"],
+            "notes": r["meteorologist_notes"],
+            "completed_at": r["completed_at"],
+            "met_name": r.get("completed_by_name") or "your meteorologist",
+            "met_user_id": r.get("completed_by_user_id"),
+            "tip_eligible": bool(r.get("completed_by_user_id")),
+        },
+    })
+
+
+@app.route("/api/v1/reviews/<review_token>/tip", methods=["OPTIONS"])
+def _review_tip_preflight(review_token):
+    return ("", 204)
+
+
+@app.post("/api/v1/reviews/<review_token>/tip")
+def review_tip(review_token: str):
+    """Customer tips the Met who delivered their $19 review.
+
+    Body:
+      {"amount_cents": 500, "note": "Saved my wedding day!"}
+
+    Returns:
+      Subscriber (off-session charge succeeded):
+        {"ok": true, "tip_id": N, "status": "completed", "amount_cents": 500}
+
+      Anonymous customer (or off-session not possible):
+        {"ok": true, "tip_id": N, "status": "pending",
+         "checkout_url": "https://checkout.stripe.com/..."}
+    """
+    if not review_token or len(review_token) < 10:
+        return jsonify({"ok": False, "error": "invalid-token"}), 400
+
+    if stripe is None or not STRIPE_SECRET_KEY:
+        return jsonify({"ok": False, "error": "stripe-not-configured"}), 503
+
+    data = request.get_json(silent=True) or {}
+    try:
+        amount_cents = int(data.get("amount_cents") or 0)
+    except (ValueError, TypeError):
+        amount_cents = 0
+    if amount_cents < 100 or amount_cents > 10000:
+        return jsonify({"ok": False, "error": "invalid-amount",
+                        "message": "Tips must be between $1 and $100."}), 400
+
+    note = (data.get("note") or "").strip() or None
+    if note and len(note) > 500:
+        note = note[:500]
+
+    # Look up the review
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, status, customer_email, customer_phone,
+                          completed_by_user_id, completed_by_name
+                   FROM verification_requests
+                   WHERE customer_review_token = %s""",
+                (review_token,),
+            )
+            r = cur.fetchone()
+
+    if not r:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    if r["status"] != "completed":
+        return jsonify({"ok": False, "error": "not-completed"}), 409
+    if not r.get("completed_by_user_id"):
+        return jsonify({
+            "ok": False,
+            "error": "no-met-attributed",
+            "message": "This review was delivered before tipping was enabled.",
+        }), 409
+
+    actor = _get_current_user()
+    now_ms = int(time.time() * 1000)
+
+    # Subscriber path — off-session charge to saved payment method
+    if actor and actor.get("stripe_customer_id"):
+        try:
+            # Get the default payment method for the customer
+            customer = stripe.Customer.retrieve(actor["stripe_customer_id"])
+            default_pm = (customer.get("invoice_settings") or {}).get("default_payment_method")
+            if default_pm:
+                # Off-session charge
+                intent = stripe.PaymentIntent.create(
+                    amount=amount_cents,
+                    currency="usd",
+                    customer=actor["stripe_customer_id"],
+                    payment_method=default_pm,
+                    off_session=True,
+                    confirm=True,
+                    description=f"Tip for WV review #{r['id']}",
+                    metadata={
+                        "wv_tip_for_review": str(r["id"]),
+                        "wv_met_user_id": str(r["completed_by_user_id"]),
+                        "wv_customer_user_id": str(actor["id"]),
+                    },
+                )
+
+                # Record the tip as completed
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """INSERT INTO met_tips
+                               (created_at, verification_request_id, met_user_id, met_name,
+                                customer_user_id, customer_email, customer_phone,
+                                amount_cents, status, stripe_payment_intent_id,
+                                completed_at, note)
+                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s,
+                                       'completed', %s, %s, %s)
+                               RETURNING id""",
+                            (now_ms, r["id"], r["completed_by_user_id"],
+                             r.get("completed_by_name"),
+                             actor["id"], r["customer_email"], r["customer_phone"],
+                             amount_cents, intent.id, now_ms, note),
+                        )
+                        tip_id = cur.fetchone()["id"]
+
+                print(f"[met-tip] off-session charge succeeded tip_id={tip_id} amount=${amount_cents/100:.2f}", flush=True)
+                return jsonify({
+                    "ok": True,
+                    "tip_id": tip_id,
+                    "status": "completed",
+                    "amount_cents": amount_cents,
+                })
+        except stripe.error.CardError as e:
+            # Card declined — fall through to checkout
+            print(f"[met-tip] off-session declined: {e}", flush=True)
+        except Exception as e:
+            print(f"[met-tip] off-session error: {e}", flush=True)
+            # Fall through to checkout
+
+    # Anonymous path (or subscriber off-session failed) — Stripe Checkout
+    try:
+        base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+        success_url = f"{base}/?review={review_token}&tip=thanks"
+        cancel_url = f"{base}/?review={review_token}"
+
+        session_params = {
+            "mode": "payment",
+            "line_items": [{
+                "price_data": {
+                    "currency": "usd",
+                    "unit_amount": amount_cents,
+                    "product_data": {
+                        "name": f"Tip for {r.get('completed_by_name') or 'your meteorologist'}",
+                        "description": "Thank-you for your WeatherValet review",
+                    },
+                },
+                "quantity": 1,
+            }],
+            "success_url": success_url,
+            "cancel_url": cancel_url,
+            "metadata": {
+                "wv_tip_for_review": str(r["id"]),
+                "wv_met_user_id": str(r["completed_by_user_id"]),
+            },
+        }
+        # Pre-fill customer_email if we know it
+        if r.get("customer_email"):
+            session_params["customer_email"] = r["customer_email"]
+
+        session = stripe.checkout.Session.create(**session_params)
+
+        # Insert tip as pending; webhook will flip to completed on success
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO met_tips
+                       (created_at, verification_request_id, met_user_id, met_name,
+                        customer_user_id, customer_email, customer_phone,
+                        amount_cents, status, stripe_session_id, note)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s)
+                       RETURNING id""",
+                    (now_ms, r["id"], r["completed_by_user_id"],
+                     r.get("completed_by_name"),
+                     actor["id"] if actor else None,
+                     r["customer_email"], r["customer_phone"],
+                     amount_cents, session.id, note),
+                )
+                tip_id = cur.fetchone()["id"]
+
+        return jsonify({
+            "ok": True,
+            "tip_id": tip_id,
+            "status": "pending",
+            "checkout_url": session.url,
+        })
+    except Exception as e:
+        print(f"[met-tip] checkout creation failed: {e}", flush=True)
+        return jsonify({"ok": False, "error": "stripe-error",
+                        "message": str(e)[:200]}), 500
+
+
+# ─── Met side: earnings summary ───────────────────────────────────────
+
+@app.route("/api/v1/me/met-tips", methods=["OPTIONS"])
+def _me_met_tips_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/met-tips")
+def me_met_tips():
+    """Met views their tip earnings. Returns this-month total + recent tips."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "met" not in (user.get("roles") or []) and "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    # Compute "this month" cutoff (UTC start of current month)
+    now_utc = datetime.now(timezone.utc)
+    month_start_dt = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    month_start_ms = int(month_start_dt.timestamp() * 1000)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            # This-month earnings (completed tips only)
+            cur.execute(
+                """SELECT COALESCE(SUM(amount_cents), 0) AS month_cents,
+                          COUNT(*) AS month_count
+                   FROM met_tips
+                   WHERE met_user_id = %s AND status = 'completed'
+                     AND completed_at >= %s""",
+                (user["id"], month_start_ms),
+            )
+            month = cur.fetchone()
+
+            # All-time
+            cur.execute(
+                """SELECT COALESCE(SUM(amount_cents), 0) AS lifetime_cents,
+                          COUNT(*) AS lifetime_count
+                   FROM met_tips
+                   WHERE met_user_id = %s AND status = 'completed'""",
+                (user["id"],),
+            )
+            lifetime = cur.fetchone()
+
+            # Recent 20 tips
+            cur.execute(
+                """SELECT mt.id, mt.created_at, mt.completed_at, mt.amount_cents,
+                          mt.note, mt.status, mt.customer_email,
+                          vr.plan_text AS review_plan
+                   FROM met_tips mt
+                   LEFT JOIN verification_requests vr ON vr.id = mt.verification_request_id
+                   WHERE mt.met_user_id = %s
+                   ORDER BY mt.created_at DESC LIMIT 20""",
+                (user["id"],),
+            )
+            rows = cur.fetchall()
+
+    tips = [
+        {
+            "id": r["id"],
+            "created_at": r["created_at"],
+            "completed_at": r["completed_at"],
+            "amount_cents": r["amount_cents"],
+            "status": r["status"],
+            "note": r["note"],
+            "customer_email": r.get("customer_email") or "(anonymous)",
+            "review_plan": r.get("review_plan"),
+        }
+        for r in rows
+    ]
+
+    return jsonify({
+        "ok": True,
+        "summary": {
+            "this_month_cents": int(month["month_cents"] or 0),
+            "this_month_count": int(month["month_count"] or 0),
+            "lifetime_cents": int(lifetime["lifetime_cents"] or 0),
+            "lifetime_count": int(lifetime["lifetime_count"] or 0),
+        },
+        "tips": tips,
+    })
 
 
 if __name__ == "__main__":
