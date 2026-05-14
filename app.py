@@ -12991,6 +12991,73 @@ def me_met_tips():
     })
 
 
+# ════════════════════════════════════════════════════════════════════
+# Met history — completed reviews for the logged-in Met
+# ════════════════════════════════════════════════════════════════════
+#
+# Used by the Met workspace History tab to show "your last N reviews".
+# Replaces hardcoded mock data. Pulls verification_requests where the
+# logged-in Met is the one who completed them.
+
+@app.route("/api/v1/me/met-history", methods=["OPTIONS"])
+def _me_met_history_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/met-history")
+def me_met_history():
+    """Returns the logged-in Met's recent completed reviews."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "met" not in (user.get("roles") or []) and "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    try:
+        limit = min(int(request.args.get("limit") or 20), 100)
+    except (ValueError, TypeError):
+        limit = 20
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, customer_email, customer_phone,
+                          plan_text, plan_location, plan_window,
+                          meteorologist_verdict, status,
+                          completed_at, claimed_at, price_cents
+                   FROM verification_requests
+                   WHERE completed_by_user_id = %s AND status = 'completed'
+                   ORDER BY completed_at DESC LIMIT %s""",
+                (user["id"], limit),
+            )
+            rows = cur.fetchall()
+
+    # Met earnings split — for v1, Met gets ~65% of $19 ($12.35).
+    # This is a snapshot; real revenue share rules can be applied
+    # in a future ledger system. We show it here so the Met sees
+    # what they'll be paid out, not what the customer paid.
+    MET_REVENUE_SHARE = 0.65
+
+    reviews = []
+    for r in rows:
+        amount_cents_to_met = int((r["price_cents"] or 1900) * MET_REVENUE_SHARE)
+        reviews.append({
+            "request_id": r["id"],
+            "customer_email": r["customer_email"],
+            "customer_phone": r["customer_phone"],
+            "plan_text": r["plan_text"],
+            "plan_location": r["plan_location"],
+            "plan_window": r["plan_window"],
+            "verdict": r["meteorologist_verdict"],
+            "verdict_class": _classify_meteorologist_verdict(r["meteorologist_verdict"] or ""),
+            "completed_at": r["completed_at"],
+            "claimed_at": r["claimed_at"],
+            "amount_cents": amount_cents_to_met,
+        })
+
+    return jsonify({"ok": True, "reviews": reviews})
+
+
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 8080))
