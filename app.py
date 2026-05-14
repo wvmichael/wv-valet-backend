@@ -749,6 +749,50 @@ CREATE TABLE IF NOT EXISTS brief_history (
     met_name        TEXT                 -- snapshot of the Met's name if touched
 );
 CREATE INDEX IF NOT EXISTS idx_brief_history_user ON brief_history(user_id, delivered_at DESC);
+
+-- ── Mission deployments (Phase 10 Item #4) ──
+-- One row per mission fired (or queued for approval) by a Met.
+-- A "mission" is a directed prompt sent to Crew members in a polygon
+-- target area — e.g. "Look at the flag at Lebanon HS — how is it
+-- behaving?" The mission template defines the format; the deployment
+-- records the specific firing.
+--
+-- status field:
+--   'fired'             — sent to Crew immediately (normal mission)
+--   'pending-approval'  — severe mission, awaiting admin sign-off
+--   'completed'         — all Crew have responded (or auto-closed)
+--   'cancelled'         — admin rejected or Met cancelled
+--
+-- polygon_geojson stores the targeting polygon as a JSON string. Empty
+-- means "all Crew in coverage area." Useful for re-firing the same
+-- target later, plus for auditing.
+--
+-- audience_estimate is the number of Crew matched at fire time. Stored
+-- as a snapshot because Crew availability shifts; the historical number
+-- is what's useful (not "Crew currently in this polygon").
+CREATE TABLE IF NOT EXISTS mission_deployments (
+    id                  SERIAL PRIMARY KEY,
+    fired_at            BIGINT NOT NULL,
+    fired_by_user_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    fired_by_name       TEXT,                    -- snapshot of name at fire time
+    template_id         TEXT NOT NULL,           -- 'flag-check' | 'visibility-check' | etc
+    template_name       TEXT NOT NULL,           -- human label, snapshot
+    prompt              TEXT NOT NULL,
+    polygon_geojson     TEXT,                    -- JSON string of GeoJSON Feature; NULL = "all Crew"
+    polygon_label       TEXT,                    -- "Boone County, IN" or "Indianapolis venue"
+    is_severe           BOOLEAN NOT NULL DEFAULT FALSE,
+    status              TEXT NOT NULL DEFAULT 'fired',
+    audience_estimate   INTEGER NOT NULL DEFAULT 0,
+    crew_responded      INTEGER NOT NULL DEFAULT 0,
+    crew_cited          INTEGER NOT NULL DEFAULT 0,
+    completed_at        BIGINT,
+    approved_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    approved_at         BIGINT
+);
+CREATE INDEX IF NOT EXISTS idx_mission_deployments_fired_by
+    ON mission_deployments(fired_by_user_id, fired_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mission_deployments_status
+    ON mission_deployments(status, fired_at DESC);
 """
 
 
@@ -9168,6 +9212,381 @@ def admin_brief_run_now():
 @app.before_request
 def _scheduler_kickstart():
     _ensure_brief_scheduler_started()
+
+
+# ════════════════════════════════════════════════════════════════════
+# Mission deployments (Item #4)
+# ════════════════════════════════════════════════════════════════════
+#
+# CRUD for missions fired by Mets. The frontend's Mission tab calls
+# these to persist deployments and read them back. Real Crew SMS
+# (Item #5) and Crew location matching (Item #6) build on top.
+
+@app.route("/api/v1/missions/deployments", methods=["OPTIONS"])
+def _missions_deployments_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/missions/deployments")
+def missions_list():
+    """List recent mission deployments fired by the current Met.
+
+    Returns the 20 most recent deployments. Admin role sees everyone's;
+    Met role sees only their own.
+
+    Returns:
+        200 {"ok": true, "deployments": [...]}
+        401 not authenticated
+        403 not a Met or admin
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    is_admin = "admin" in roles
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            if is_admin:
+                cur.execute(
+                    """SELECT * FROM mission_deployments
+                       ORDER BY fired_at DESC LIMIT 20"""
+                )
+            else:
+                cur.execute(
+                    """SELECT * FROM mission_deployments
+                       WHERE fired_by_user_id = %s
+                       ORDER BY fired_at DESC LIMIT 20""",
+                    (user["id"],),
+                )
+            rows = cur.fetchall()
+
+    deployments = [
+        {
+            "id": r["id"],
+            "fired_at": r["fired_at"],
+            "fired_by_name": r["fired_by_name"],
+            "template_id": r["template_id"],
+            "template_name": r["template_name"],
+            "prompt": r["prompt"],
+            "polygon_geojson": r["polygon_geojson"],
+            "polygon_label": r["polygon_label"],
+            "is_severe": r["is_severe"],
+            "status": r["status"],
+            "audience_estimate": r["audience_estimate"],
+            "crew_responded": r["crew_responded"],
+            "crew_cited": r["crew_cited"],
+            "completed_at": r["completed_at"],
+        }
+        for r in rows
+    ]
+    return jsonify({"ok": True, "deployments": deployments})
+
+
+@app.post("/api/v1/missions/deployments")
+def missions_create():
+    """Fire a new mission. Met or admin role required.
+
+    Body:
+        {
+          "template_id": "flag-check",
+          "template_name": "Flag check (wind)",
+          "prompt": "Look at the flag at Lebanon HS...",
+          "polygon_geojson": "..." (optional, JSON-stringified GeoJSON),
+          "polygon_label": "Boone County, IN" (optional),
+          "is_severe": false,
+          "audience_estimate": 4
+        }
+
+    Severe missions land in status 'pending-approval' awaiting admin
+    sign-off. Normal missions go straight to 'fired'.
+
+    Returns:
+        200 {"ok": true, "deployment": {...}}
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+
+    template_id = (data.get("template_id") or "").strip()
+    template_name = (data.get("template_name") or "").strip()
+    prompt = (data.get("prompt") or "").strip()
+
+    if not template_id:
+        return jsonify({"ok": False, "error": "missing-template-id"}), 400
+    if not template_name:
+        return jsonify({"ok": False, "error": "missing-template-name"}), 400
+    if not prompt:
+        return jsonify({"ok": False, "error": "missing-prompt"}), 400
+    if len(prompt) > 4000:
+        return jsonify({"ok": False, "error": "prompt-too-long"}), 400
+
+    polygon_geojson = data.get("polygon_geojson") or None
+    polygon_label = (data.get("polygon_label") or "").strip() or None
+    is_severe = bool(data.get("is_severe", False))
+    try:
+        audience_estimate = int(data.get("audience_estimate") or 0)
+    except (ValueError, TypeError):
+        audience_estimate = 0
+
+    # Severe missions are queued for approval; normal fire immediately.
+    status = "pending-approval" if is_severe else "fired"
+    now_ms = int(time.time() * 1000)
+
+    fired_by_name = user.get("name") or (user.get("email") or "").split("@")[0]
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO mission_deployments
+                   (fired_at, fired_by_user_id, fired_by_name, template_id,
+                    template_name, prompt, polygon_geojson, polygon_label,
+                    is_severe, status, audience_estimate)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   RETURNING *""",
+                (now_ms, user["id"], fired_by_name, template_id, template_name,
+                 prompt, polygon_geojson, polygon_label, is_severe, status,
+                 audience_estimate),
+            )
+            r = cur.fetchone()
+
+    # NOTE: this is where we WILL invoke Crew SMS in Item #5. The mission
+    # gets persisted now; real Crew notification builds on Items #5 + #6
+    # (crew lat/lng tracking + polygon-to-crew matching). For now, we just
+    # log so it's visible in Render logs that the mission fired.
+    print(
+        f"[mission] fired id={r['id']} template={template_id} "
+        f"by user_id={user['id']} status={status} estimated_audience={audience_estimate}",
+        flush=True,
+    )
+
+    return jsonify({
+        "ok": True,
+        "deployment": {
+            "id": r["id"],
+            "fired_at": r["fired_at"],
+            "fired_by_name": r["fired_by_name"],
+            "template_id": r["template_id"],
+            "template_name": r["template_name"],
+            "prompt": r["prompt"],
+            "polygon_geojson": r["polygon_geojson"],
+            "polygon_label": r["polygon_label"],
+            "is_severe": r["is_severe"],
+            "status": r["status"],
+            "audience_estimate": r["audience_estimate"],
+            "crew_responded": r["crew_responded"],
+            "crew_cited": r["crew_cited"],
+            "completed_at": r["completed_at"],
+        },
+    })
+
+
+@app.route("/api/v1/missions/deployments/<int:dep_id>", methods=["OPTIONS"])
+def _missions_deployment_id_preflight(dep_id):
+    return ("", 204)
+
+
+@app.get("/api/v1/missions/deployments/<int:dep_id>")
+def missions_get_one(dep_id):
+    """Return a single deployment. Only the firing Met or an admin can read.
+
+    Returns:
+        200 {"ok": true, "deployment": {...}}
+        403 not your deployment
+        404 not found
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM mission_deployments WHERE id = %s",
+                (dep_id,),
+            )
+            r = cur.fetchone()
+
+    if not r:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+
+    roles = user.get("roles") or []
+    is_owner = r["fired_by_user_id"] == user["id"]
+    is_admin = "admin" in roles
+    if not (is_owner or is_admin):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    return jsonify({
+        "ok": True,
+        "deployment": {
+            "id": r["id"],
+            "fired_at": r["fired_at"],
+            "fired_by_name": r["fired_by_name"],
+            "template_id": r["template_id"],
+            "template_name": r["template_name"],
+            "prompt": r["prompt"],
+            "polygon_geojson": r["polygon_geojson"],
+            "polygon_label": r["polygon_label"],
+            "is_severe": r["is_severe"],
+            "status": r["status"],
+            "audience_estimate": r["audience_estimate"],
+            "crew_responded": r["crew_responded"],
+            "crew_cited": r["crew_cited"],
+            "completed_at": r["completed_at"],
+        },
+    })
+
+
+@app.patch("/api/v1/missions/deployments/<int:dep_id>")
+def missions_update(dep_id):
+    """Update a deployment's status (admin approval, cancellation, completion).
+
+    Body:
+        {"status": "fired" | "cancelled" | "completed",
+         "crew_responded": 3, "crew_cited": 2}
+
+    Approval flow: severe mission lands in 'pending-approval'. Admin
+    PATCHes status='fired' which records approved_by_user_id + approved_at.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    data = request.get_json(silent=True) or {}
+    roles = user.get("roles") or []
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM mission_deployments WHERE id = %s",
+                (dep_id,),
+            )
+            r = cur.fetchone()
+    if not r:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+
+    is_owner = r["fired_by_user_id"] == user["id"]
+    is_admin = "admin" in roles
+
+    set_clauses = []
+    params = []
+    now_ms = int(time.time() * 1000)
+
+    if "status" in data:
+        new_status = (data["status"] or "").strip()
+        if new_status not in ("fired", "cancelled", "completed", "pending-approval"):
+            return jsonify({"ok": False, "error": "invalid-status"}), 400
+
+        # Approval: pending-approval → fired requires admin
+        if r["status"] == "pending-approval" and new_status == "fired":
+            if not is_admin:
+                return jsonify({"ok": False, "error": "admin-required"}), 403
+            set_clauses.append("approved_by_user_id = %s")
+            params.append(user["id"])
+            set_clauses.append("approved_at = %s")
+            params.append(now_ms)
+        elif not (is_owner or is_admin):
+            return jsonify({"ok": False, "error": "forbidden"}), 403
+
+        set_clauses.append("status = %s")
+        params.append(new_status)
+        if new_status == "completed":
+            set_clauses.append("completed_at = %s")
+            params.append(now_ms)
+
+    if "crew_responded" in data and (is_owner or is_admin):
+        try:
+            set_clauses.append("crew_responded = %s")
+            params.append(int(data["crew_responded"]))
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "error": "invalid-crew-responded"}), 400
+
+    if "crew_cited" in data and (is_owner or is_admin):
+        try:
+            set_clauses.append("crew_cited = %s")
+            params.append(int(data["crew_cited"]))
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "error": "invalid-crew-cited"}), 400
+
+    if not set_clauses:
+        return jsonify({"ok": False, "error": "no-fields-to-update"}), 400
+
+    params.append(dep_id)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE mission_deployments SET {', '.join(set_clauses)} "
+                f"WHERE id = %s",
+                tuple(params),
+            )
+            cur.execute(
+                "SELECT * FROM mission_deployments WHERE id = %s",
+                (dep_id,),
+            )
+            r2 = cur.fetchone()
+
+    return jsonify({
+        "ok": True,
+        "deployment": {
+            "id": r2["id"],
+            "fired_at": r2["fired_at"],
+            "fired_by_name": r2["fired_by_name"],
+            "template_id": r2["template_id"],
+            "template_name": r2["template_name"],
+            "prompt": r2["prompt"],
+            "polygon_geojson": r2["polygon_geojson"],
+            "polygon_label": r2["polygon_label"],
+            "is_severe": r2["is_severe"],
+            "status": r2["status"],
+            "audience_estimate": r2["audience_estimate"],
+            "crew_responded": r2["crew_responded"],
+            "crew_cited": r2["crew_cited"],
+            "completed_at": r2["completed_at"],
+        },
+    })
+
+
+@app.delete("/api/v1/missions/deployments/<int:dep_id>")
+def missions_delete(dep_id):
+    """Delete a deployment. Owner or admin only."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT fired_by_user_id FROM mission_deployments WHERE id = %s",
+                (dep_id,),
+            )
+            r = cur.fetchone()
+    if not r:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+
+    roles = user.get("roles") or []
+    is_owner = r["fired_by_user_id"] == user["id"]
+    is_admin = "admin" in roles
+    if not (is_owner or is_admin):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM mission_deployments WHERE id = %s",
+                (dep_id,),
+            )
+
+    return jsonify({"ok": True})
 
 
 if __name__ == "__main__":
