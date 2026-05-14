@@ -922,6 +922,64 @@ CREATE TABLE IF NOT EXISTS crew_applications (
 );
 CREATE INDEX IF NOT EXISTS idx_crew_applications_status
     ON crew_applications(status, created_at DESC);
+
+-- ── Pro brief drafts (Phase 10 Item #3 Chunk B) ──
+-- When the daily-brief scheduler ticks and matches a Pro-tier subscriber,
+-- it generates an AI draft and inserts a row here for Met review. The Met
+-- workspace surfaces pending drafts; the Met edits and presses "Send"
+-- which moves the brief to brief_history and dispatches it.
+--
+-- status:
+--   'pending-review' — scheduler created it, awaiting Met
+--   'claimed'        — Met opened it (claimed_at set)
+--   'sent'           — Met sent it (sent_at set, brief_history row created)
+--   'expired'        — outside the user's window, never reviewed
+--
+-- ai_* fields are the scheduler's initial output. met_* fields are the
+-- Met's edited version (defaulted to ai_* if Met didn't touch them).
+-- final_body is what actually went out — captured at send time so we
+-- have an exact record even if met_body is later edited (which it
+-- shouldn't be after send, but defense in depth).
+CREATE TABLE IF NOT EXISTS pro_brief_drafts (
+    id              SERIAL PRIMARY KEY,
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    brief_type      TEXT NOT NULL,           -- 'morning' (more later)
+    created_at      BIGINT NOT NULL,
+    window_end_at   BIGINT NOT NULL,         -- after this, the draft is too late to send
+    status          TEXT NOT NULL DEFAULT 'pending-review',
+
+    -- Snapshot of subscriber context at scheduler time
+    user_tier       TEXT,                    -- pro_single|pro_multi|pro_enterprise
+    location_label  TEXT,
+    location_lat    DOUBLE PRECISION,
+    location_lng    DOUBLE PRECISION,
+    channels        TEXT,                    -- comma-sep snapshot
+
+    -- AI draft (scheduler-generated)
+    ai_verdict      TEXT,                    -- clear|caution|risk
+    ai_snippet      TEXT,
+    ai_body         TEXT,
+
+    -- Met-edited version (defaults to AI version)
+    met_verdict     TEXT,
+    met_snippet     TEXT,
+    met_body        TEXT,
+    met_notes       TEXT,                    -- internal Met notes (NOT sent)
+
+    -- Claim + send
+    claimed_at      BIGINT,
+    claimed_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    sent_at         BIGINT,
+    sent_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    sent_by_name    TEXT,
+    final_verdict   TEXT,
+    final_body      TEXT,
+    history_id      INTEGER REFERENCES brief_history(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pro_brief_drafts_status
+    ON pro_brief_drafts(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pro_brief_drafts_user
+    ON pro_brief_drafts(user_id, created_at DESC);
 """
 
 
@@ -9427,15 +9485,83 @@ def _process_pending_briefs() -> None:
                 # add one in the portal; we don't pester them with an error.
                 continue
 
-            # Pro-tier check — skip auto-send, leave for Met review (Chunk 3B).
+            # Pro-tier path: generate the AI draft, insert a pro_brief_drafts
+            # row for Met review. Don't send via channels here — that happens
+            # when the Met sends via the workspace endpoint. Idempotency note:
+            # _already_sent_today checks brief_history. If a draft was created
+            # but not yet sent, the next tick would re-create it. To prevent
+            # that, we also check pro_brief_drafts for a pending row.
             tier = c["subscription_tier"] or "hobbyist"
             if tier in ("pro_single", "pro_multi", "pro_enterprise"):
-                # Don't generate or send; just log so we know we saw them.
-                print(
-                    f"[brief-scheduler] pro tier subscriber user_id={c['user_id']} "
-                    f"skipped — Chunk 3B handles Met review",
-                    flush=True,
-                )
+                # Has a pending draft for today already? If so, skip.
+                today_start_ms = int(datetime.now(timezone.utc)
+                                     .replace(hour=0, minute=0, second=0, microsecond=0)
+                                     .timestamp() * 1000)
+                try:
+                    with db() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """SELECT id FROM pro_brief_drafts
+                                   WHERE user_id = %s AND brief_type = 'morning'
+                                     AND created_at >= %s
+                                     AND status IN ('pending-review','claimed','sent')
+                                   LIMIT 1""",
+                                (c["user_id"], today_start_ms),
+                            )
+                            existing = cur.fetchone()
+                except Exception as e:
+                    print(f"[brief-scheduler] pro draft lookup failed: {e}", flush=True)
+                    continue
+                if existing:
+                    continue
+
+                # Generate the AI draft using the same generator hobbyists get
+                location_label = c["loc_label"] or c["loc_address"] or "your location"
+                forecast = _fetch_forecast(float(c["loc_lat"]), float(c["loc_lng"]))
+                ai_verdict, ai_snippet, ai_body = _generate_ai_brief(location_label, forecast or {})
+
+                # Compute window_end_at — the scheduler shouldn't send a
+                # "morning brief" at 2pm. Use the user's window_end as the
+                # cutoff; after that, the draft is too stale.
+                try:
+                    eh, em = int(c["morning_window_end"][:2]), int(c["morning_window_end"][3:])
+                    window_end_dt = now.replace(hour=eh, minute=em, second=0, microsecond=0)
+                    if window_end_dt < now:
+                        # Window ended already (shouldn't happen if we got here, but defend)
+                        window_end_dt = now
+                    window_end_ms = int(window_end_dt.timestamp() * 1000)
+                except (ValueError, TypeError, IndexError):
+                    # Default cutoff: 4 hours from now
+                    window_end_ms = int(time.time() * 1000) + 4 * 60 * 60 * 1000
+
+                now_ms = int(time.time() * 1000)
+                try:
+                    with db() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """INSERT INTO pro_brief_drafts
+                                   (user_id, brief_type, created_at, window_end_at, status,
+                                    user_tier, location_label, location_lat, location_lng,
+                                    channels, ai_verdict, ai_snippet, ai_body,
+                                    met_verdict, met_snippet, met_body)
+                                   VALUES (%s, 'morning', %s, %s, 'pending-review',
+                                           %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                   RETURNING id""",
+                                (c["user_id"], now_ms, window_end_ms,
+                                 tier, location_label,
+                                 float(c["loc_lat"]), float(c["loc_lng"]),
+                                 c["channels"] or "",
+                                 ai_verdict, ai_snippet, ai_body,
+                                 ai_verdict, ai_snippet, ai_body),
+                            )
+                            new_id = cur.fetchone()["id"]
+                    print(
+                        f"[brief-scheduler] pro draft created id={new_id} user_id={c['user_id']} "
+                        f"tier={tier} verdict={ai_verdict}",
+                        flush=True,
+                    )
+                except Exception as e:
+                    print(f"[brief-scheduler] pro draft insert failed: {e}", flush=True)
                 continue
 
             # ── Generate the brief ──
@@ -10933,6 +11059,296 @@ def admin_audit_log_list():
         })
 
     return jsonify({"ok": True, "entries": entries})
+
+
+# ════════════════════════════════════════════════════════════════════
+# Pro-tier brief drafts (Phase 10 Item #3 Chunk B)
+# ════════════════════════════════════════════════════════════════════
+#
+# Met workspace surface: list pending drafts, claim, edit, send.
+# A draft is created by the scheduler when a Pro-tier subscriber's
+# brief window opens. Met reviews the AI draft, edits, sends. Sending
+# pushes the brief through send_sms + _send_brief_email and records a
+# brief_history row (is_met_touched=TRUE).
+
+@app.route("/api/v1/met/pro-briefs", methods=["OPTIONS"])
+def _met_pro_briefs_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/pro-briefs")
+def met_pro_briefs_list():
+    """List pending + recently-sent pro brief drafts for the Met workspace.
+
+    Met sees all drafts (single-Met operation for launch). Admin sees same.
+
+    Returns drafts with subscriber email/name attached for context,
+    sorted: pending-review first (oldest first to fight the queue),
+    then claimed (by anyone), then recently sent.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "met" not in (user.get("roles") or []) and "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT d.*, u.email AS subscriber_email, u.name AS subscriber_name,
+                          u.phone AS subscriber_phone
+                   FROM pro_brief_drafts d
+                   JOIN users u ON u.id = d.user_id
+                   WHERE d.status IN ('pending-review', 'claimed')
+                      OR (d.status = 'sent' AND d.sent_at >= %s)
+                   ORDER BY
+                     CASE d.status
+                       WHEN 'pending-review' THEN 0
+                       WHEN 'claimed' THEN 1
+                       ELSE 2
+                     END,
+                     d.created_at ASC""",
+                (int(time.time() * 1000) - 24 * 60 * 60 * 1000,),  # show today's sent for 24h
+            )
+            rows = cur.fetchall()
+
+    drafts = [
+        {
+            "id": r["id"],
+            "user_id": r["user_id"],
+            "subscriber_email": r["subscriber_email"],
+            "subscriber_name": r.get("subscriber_name") or "",
+            "subscriber_phone": r.get("subscriber_phone") or "",
+            "user_tier": r["user_tier"],
+            "location_label": r["location_label"],
+            "channels": r["channels"],
+            "created_at": r["created_at"],
+            "window_end_at": r["window_end_at"],
+            "status": r["status"],
+            "ai_verdict": r["ai_verdict"],
+            "ai_snippet": r["ai_snippet"],
+            "ai_body": r["ai_body"],
+            "met_verdict": r["met_verdict"],
+            "met_snippet": r["met_snippet"],
+            "met_body": r["met_body"],
+            "met_notes": r["met_notes"],
+            "claimed_at": r["claimed_at"],
+            "claimed_by_user_id": r["claimed_by_user_id"],
+            "sent_at": r["sent_at"],
+            "sent_by_name": r["sent_by_name"],
+            "final_verdict": r["final_verdict"],
+        }
+        for r in rows
+    ]
+    return jsonify({"ok": True, "drafts": drafts})
+
+
+@app.route("/api/v1/met/pro-briefs/<int:draft_id>", methods=["OPTIONS"])
+def _met_pro_brief_id_preflight(draft_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/met/pro-briefs/<int:draft_id>/claim")
+def met_pro_brief_claim(draft_id):
+    """Claim a draft for editing. Sets claimed_at + claimed_by_user_id.
+    Idempotent if already claimed by current Met.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "met" not in (user.get("roles") or []) and "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, status, claimed_by_user_id FROM pro_brief_drafts WHERE id = %s",
+                (draft_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    if row["status"] not in ("pending-review", "claimed"):
+        return jsonify({"ok": False, "error": "not-claimable", "status": row["status"]}), 409
+
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE pro_brief_drafts
+                   SET status = 'claimed', claimed_at = COALESCE(claimed_at, %s),
+                       claimed_by_user_id = %s
+                   WHERE id = %s""",
+                (now_ms, user["id"], draft_id),
+            )
+    return jsonify({"ok": True})
+
+
+@app.patch("/api/v1/met/pro-briefs/<int:draft_id>")
+def met_pro_brief_update(draft_id):
+    """Edit met_verdict / met_snippet / met_body / met_notes. Does NOT send."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "met" not in (user.get("roles") or []) and "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    set_clauses = []
+    params: list = []
+
+    if "met_verdict" in data:
+        v = (data["met_verdict"] or "").strip()
+        if v not in ("clear", "caution", "risk"):
+            return jsonify({"ok": False, "error": "invalid-verdict"}), 400
+        set_clauses.append("met_verdict = %s")
+        params.append(v)
+    if "met_snippet" in data:
+        s = (data["met_snippet"] or "").strip()
+        if len(s) > 280:
+            return jsonify({"ok": False, "error": "snippet-too-long"}), 400
+        set_clauses.append("met_snippet = %s")
+        params.append(s)
+    if "met_body" in data:
+        b = (data["met_body"] or "").strip()
+        if len(b) > 4000:
+            return jsonify({"ok": False, "error": "body-too-long"}), 400
+        set_clauses.append("met_body = %s")
+        params.append(b)
+    if "met_notes" in data:
+        n = (data["met_notes"] or "").strip()
+        if len(n) > 2000:
+            return jsonify({"ok": False, "error": "notes-too-long"}), 400
+        set_clauses.append("met_notes = %s")
+        params.append(n)
+
+    if not set_clauses:
+        return jsonify({"ok": False, "error": "no-fields-to-update"}), 400
+
+    params.append(draft_id)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE pro_brief_drafts SET {', '.join(set_clauses)} "
+                f"WHERE id = %s AND status IN ('pending-review','claimed')",
+                tuple(params),
+            )
+            if cur.rowcount == 0:
+                return jsonify({"ok": False, "error": "not-editable"}), 409
+
+    return jsonify({"ok": True})
+
+
+@app.post("/api/v1/met/pro-briefs/<int:draft_id>/send")
+def met_pro_brief_send(draft_id):
+    """Send the Met's edited brief to the subscriber. Marks status='sent',
+    records brief_history row (is_met_touched=TRUE), dispatches via SMS+email.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "met" not in (user.get("roles") or []) and "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT d.*, u.email AS sub_email, u.phone AS sub_phone
+                   FROM pro_brief_drafts d
+                   JOIN users u ON u.id = d.user_id
+                   WHERE d.id = %s""",
+                (draft_id,),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    if row["status"] not in ("pending-review", "claimed"):
+        return jsonify({"ok": False, "error": "already-sent-or-expired", "status": row["status"]}), 409
+
+    # Use met_* fields (which default to ai_* values from scheduler).
+    final_verdict = (row["met_verdict"] or row["ai_verdict"] or "caution").strip()
+    final_snippet = (row["met_snippet"] or row["ai_snippet"] or "").strip()
+    final_body = (row["met_body"] or row["ai_body"] or "").strip()
+
+    if not final_body:
+        return jsonify({"ok": False, "error": "empty-body"}), 400
+
+    # Dispatch through the channels the subscriber configured (snapshot)
+    channels = [ch for ch in (row["channels"] or "").split(",") if ch]
+    channels_used = []
+    any_success = False
+    met_name = user.get("name") or "Your meteorologist"
+    location_label = row["location_label"] or "your location"
+
+    # Add Met signature to the body so the subscriber knows it was reviewed
+    body_with_sig = final_body + f"\n\n— {met_name}, WeatherValet"
+
+    for ch in channels:
+        if ch == "sms" and row["sub_phone"]:
+            sms_text = (final_snippet or final_body[:140]) + f"\n— {met_name}\nFull: {body_with_sig[:900]}"
+            try:
+                if send_sms(row["sub_phone"], sms_text):
+                    channels_used.append("sms")
+                    any_success = True
+            except Exception as e:
+                print(f"[pro-brief-send] SMS failed user={row['user_id']}: {e}", flush=True)
+        elif ch == "email" and row["sub_email"]:
+            subject = f"Your WeatherValet brief — {location_label}"
+            try:
+                if _send_brief_email(row["sub_email"], subject, body_with_sig):
+                    channels_used.append("email")
+                    any_success = True
+            except Exception as e:
+                print(f"[pro-brief-send] email failed user={row['user_id']}: {e}", flush=True)
+
+    delivery_status = "sent" if any_success else "failed"
+    now_ms = int(time.time() * 1000)
+
+    # Write brief_history row + capture id, then update the draft
+    history_id = None
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO brief_history
+                       (user_id, brief_type, delivered_at, verdict, snippet,
+                        full_body, delivery_status, channels_used,
+                        is_met_touched, met_name)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s)
+                       RETURNING id""",
+                    (row["user_id"], row["brief_type"], now_ms, final_verdict,
+                     final_snippet or final_body[:140], body_with_sig,
+                     delivery_status, ",".join(channels_used), met_name),
+                )
+                history_id = cur.fetchone()["id"]
+    except Exception as e:
+        print(f"[pro-brief-send] history insert failed: {e}", flush=True)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE pro_brief_drafts
+                   SET status = 'sent', sent_at = %s, sent_by_user_id = %s,
+                       sent_by_name = %s, final_verdict = %s, final_body = %s,
+                       history_id = %s
+                   WHERE id = %s""",
+                (now_ms, user["id"], met_name, final_verdict, body_with_sig,
+                 history_id, draft_id),
+            )
+
+    print(
+        f"[pro-brief-send] draft={draft_id} sent by met={user['id']} "
+        f"channels={channels_used} status={delivery_status}",
+        flush=True,
+    )
+
+    return jsonify({
+        "ok": True,
+        "channels_used": channels_used,
+        "delivery_status": delivery_status,
+        "history_id": history_id,
+    })
 
 
 if __name__ == "__main__":
