@@ -457,6 +457,25 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_tier TEXT;
 -- subscribers may prefer email-only.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT;
 
+-- ── Crew home base (Phase 10 Item #6) ──
+-- For users with the 'crew' role: their primary geographic location,
+-- used to target mission SMS deliveries by polygon. Set at registration
+-- and editable from the Crew Profile screen.
+--
+-- Design note: we use a static home base rather than live geolocation
+-- tracking for both privacy and simplicity. Crew members are inherently
+-- local — a Lebanon Crew member is in Lebanon. If they travel, they
+-- wouldn't respond to a Boone County mission anyway. Live tracking can
+-- be added later as an opt-in enhancement.
+--
+-- crew_active toggles whether this Crew member gets mission SMS at all.
+-- Used for "I'm out of town this week, hold my pages" without losing
+-- their account. Default TRUE — opt-in by default.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS crew_home_lat DOUBLE PRECISION;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS crew_home_lng DOUBLE PRECISION;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS crew_home_label TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS crew_active BOOLEAN NOT NULL DEFAULT TRUE;
+
 -- ── User roles — many-to-many; a user can hold several roles ──
 -- Roles: 'subscriber', 'crew', 'met', 'admin'
 -- A subscriber who is also Crew has two rows here.
@@ -793,6 +812,39 @@ CREATE INDEX IF NOT EXISTS idx_mission_deployments_fired_by
     ON mission_deployments(fired_by_user_id, fired_at DESC);
 CREATE INDEX IF NOT EXISTS idx_mission_deployments_status
     ON mission_deployments(status, fired_at DESC);
+
+-- ── Mission notifications (Phase 10 Item #5) ──
+-- One row per Crew member notified per mission. Created when a mission
+-- fires; updated when the Crew member responds (tap link in SMS, submit
+-- their observation). Drives the "X of Y responded" counter on the
+-- mission deployment.
+--
+-- delivery_status:
+--   'sent'     — Twilio accepted the message
+--   'stubbed'  — no Twilio configured (dev/test mode)
+--   'failed'   — Twilio rejected (bad number, opt-out, etc.)
+--
+-- responded_at is NULL until Crew taps the link. response_text is what
+-- they sent back (typed observation, photo URL, etc.). cited is whether
+-- the Met used the response in their brief (filled later by Met action).
+CREATE TABLE IF NOT EXISTS mission_notifications (
+    id              SERIAL PRIMARY KEY,
+    mission_id      INTEGER NOT NULL REFERENCES mission_deployments(id) ON DELETE CASCADE,
+    crew_user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    sent_at         BIGINT NOT NULL,
+    delivery_status TEXT NOT NULL,
+    twilio_sid      TEXT,
+    response_token  TEXT UNIQUE NOT NULL,    -- short URL secret for the response page
+    responded_at    BIGINT,
+    response_text   TEXT,
+    cited           BOOLEAN NOT NULL DEFAULT FALSE
+);
+CREATE INDEX IF NOT EXISTS idx_mission_notifications_mission
+    ON mission_notifications(mission_id);
+CREATE INDEX IF NOT EXISTS idx_mission_notifications_crew
+    ON mission_notifications(crew_user_id, sent_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mission_notifications_token
+    ON mission_notifications(response_token);
 """
 
 
@@ -8801,6 +8853,127 @@ def me_profile_update():
 
 
 # ════════════════════════════════════════════════════════════════════
+# Crew location (Phase 10 Item #6)
+# ════════════════════════════════════════════════════════════════════
+#
+# Crew members have a "home base" location used to target mission SMS
+# by polygon. Set at Crew registration or via the Crew Profile screen.
+# Requires the crew role to read/write.
+
+@app.route("/api/v1/me/crew-location", methods=["OPTIONS"])
+def _me_crew_location_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/crew-location")
+def me_crew_location_get():
+    """Return the current user's Crew home base (lat/lng/label) and
+    active toggle. Returns 403 if user isn't a Crew member."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "crew" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT crew_home_lat, crew_home_lng, crew_home_label,
+                          crew_active
+                   FROM users WHERE id = %s""",
+                (user["id"],),
+            )
+            row = cur.fetchone()
+
+    return jsonify({
+        "ok": True,
+        "crew_location": {
+            "lat": row.get("crew_home_lat"),
+            "lng": row.get("crew_home_lng"),
+            "label": row.get("crew_home_label") or "",
+            "active": row.get("crew_active") if row.get("crew_active") is not None else True,
+        }
+    })
+
+
+@app.patch("/api/v1/me/crew-location")
+def me_crew_location_update():
+    """Update the current user's Crew home base.
+
+    Accepts:
+      {
+        "lat": 40.0481,        (optional)
+        "lng": -86.4694,       (optional, but if lat present must also be)
+        "label": "Lebanon, IN" (optional human label)
+        "active": true         (optional toggle)
+      }
+
+    Returns:
+        200 {"ok": true, "crew_location": {...}}
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "crew" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    set_clauses = []
+    params = []
+
+    if "lat" in data or "lng" in data:
+        try:
+            lat = float(data["lat"])
+            lng = float(data["lng"])
+        except (KeyError, ValueError, TypeError):
+            return jsonify({"ok": False, "error": "invalid-coords"}), 400
+        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+            return jsonify({"ok": False, "error": "invalid-coords"}), 400
+        set_clauses.append("crew_home_lat = %s")
+        params.append(lat)
+        set_clauses.append("crew_home_lng = %s")
+        params.append(lng)
+
+    if "label" in data:
+        label = (data["label"] or "").strip()
+        if len(label) > 200:
+            return jsonify({"ok": False, "error": "label-too-long"}), 400
+        set_clauses.append("crew_home_label = %s")
+        params.append(label or None)
+
+    if "active" in data:
+        set_clauses.append("crew_active = %s")
+        params.append(bool(data["active"]))
+
+    if not set_clauses:
+        return jsonify({"ok": False, "error": "no-fields-to-update"}), 400
+
+    params.append(user["id"])
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE users SET {', '.join(set_clauses)} WHERE id = %s",
+                tuple(params),
+            )
+            cur.execute(
+                """SELECT crew_home_lat, crew_home_lng, crew_home_label, crew_active
+                   FROM users WHERE id = %s""",
+                (user["id"],),
+            )
+            row = cur.fetchone()
+
+    return jsonify({
+        "ok": True,
+        "crew_location": {
+            "lat": row.get("crew_home_lat"),
+            "lng": row.get("crew_home_lng"),
+            "label": row.get("crew_home_label") or "",
+            "active": row.get("crew_active") if row.get("crew_active") is not None else True,
+        }
+    })
+
+
+# ════════════════════════════════════════════════════════════════════
 # Daily brief delivery (Item #3 — Chunk 3A)
 # ════════════════════════════════════════════════════════════════════
 #
@@ -9222,6 +9395,195 @@ def _scheduler_kickstart():
 # these to persist deployments and read them back. Real Crew SMS
 # (Item #5) and Crew location matching (Item #6) build on top.
 
+# ─── Polygon match helpers (Item #6) ──────────────────────────────
+# Standard ray-casting point-in-polygon. Pure Python, no dependencies.
+
+def _point_in_ring(lat: float, lng: float, ring: list) -> bool:
+    """Ray-casting point-in-polygon. ring is a list of [lng, lat] pairs.
+
+    Returns True if the point is inside. Boundary cases are imprecise
+    (the algorithm is good enough for "is this Crew member roughly in
+    this county-sized polygon" — not for legal property boundaries).
+    """
+    inside = False
+    n = len(ring)
+    if n < 3:
+        return False
+    j = n - 1
+    for i in range(n):
+        xi, yi = ring[i][0], ring[i][1]  # lng, lat
+        xj, yj = ring[j][0], ring[j][1]
+        # Standard ray cast: does horizontal ray from (lng, lat) cross
+        # edge from (xi, yi) to (xj, yj)?
+        intersect = ((yi > lat) != (yj > lat)) and \
+                    (lng < (xj - xi) * (lat - yi) / ((yj - yi) or 1e-12) + xi)
+        if intersect:
+            inside = not inside
+        j = i
+    return inside
+
+
+def _point_in_polygon_geojson(lat: float, lng: float, geojson_str: str) -> bool:
+    """Test whether (lat, lng) is inside the polygon encoded in geojson_str.
+
+    Accepts:
+      - A Feature with geometry.type 'Polygon' or 'MultiPolygon'
+      - A bare geometry object
+      - A FeatureCollection (uses the first polygon feature)
+
+    Returns False on parse errors — safer to skip than crash a Crew
+    dispatch loop.
+    """
+    if not geojson_str:
+        return False
+    try:
+        obj = json.loads(geojson_str) if isinstance(geojson_str, str) else geojson_str
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(obj, dict):
+        return False
+
+    # Extract a geometry from whatever shape we got
+    geometry = None
+    if obj.get("type") == "FeatureCollection":
+        features = obj.get("features") or []
+        for f in features:
+            g = (f or {}).get("geometry")
+            if g and g.get("type") in ("Polygon", "MultiPolygon"):
+                geometry = g
+                break
+    elif obj.get("type") == "Feature":
+        geometry = obj.get("geometry")
+    elif obj.get("type") in ("Polygon", "MultiPolygon"):
+        geometry = obj
+    if not geometry:
+        return False
+
+    gtype = geometry.get("type")
+    coords = geometry.get("coordinates") or []
+
+    if gtype == "Polygon":
+        # coords[0] is the outer ring; coords[1:] are holes. We treat any
+        # point in the outer ring as inside (ignoring holes — close enough
+        # for Crew targeting, which doesn't deal with donut-shaped areas).
+        if not coords:
+            return False
+        return _point_in_ring(lat, lng, coords[0])
+    if gtype == "MultiPolygon":
+        for poly in coords:
+            if poly and _point_in_ring(lat, lng, poly[0]):
+                return True
+        return False
+    return False
+
+
+def _find_crew_for_mission(polygon_geojson: Optional[str]) -> list:
+    """Return all active Crew members matching the mission's target area.
+
+    If polygon_geojson is empty/None, returns ALL active Crew (mission
+    targets "all Crew in coverage area"). If a polygon is provided,
+    returns only Crew whose crew_home location is inside it.
+
+    Each row includes id, name, phone, crew_home_lat/lng so the SMS
+    dispatcher has everything it needs without further DB hits.
+    """
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.name, u.email, u.phone,
+                          u.crew_home_lat, u.crew_home_lng, u.crew_home_label
+                   FROM users u
+                   JOIN user_roles ur ON ur.user_id = u.id
+                   WHERE ur.role = 'crew'
+                     AND u.is_active = TRUE
+                     AND u.crew_active = TRUE
+                     AND u.phone IS NOT NULL AND u.phone <> ''"""
+            )
+            all_crew = cur.fetchall()
+
+    if not polygon_geojson:
+        # No polygon = broadcast to all Crew
+        return list(all_crew)
+
+    matching = []
+    for c in all_crew:
+        if c["crew_home_lat"] is None or c["crew_home_lng"] is None:
+            continue  # Crew member hasn't set location — can't target them
+        if _point_in_polygon_geojson(c["crew_home_lat"], c["crew_home_lng"], polygon_geojson):
+            matching.append(c)
+    return matching
+
+
+def _dispatch_mission_sms(mission_id: int, prompt: str, polygon_geojson: Optional[str],
+                          template_name: str) -> tuple[int, int]:
+    """Find matching Crew + send SMS to each. Returns (total_matched, sent_count).
+
+    Creates a mission_notifications row per Crew member so we have an
+    audit trail of who got pinged. Failures are logged but don't stop
+    the dispatch loop — one bad number shouldn't block the rest.
+    """
+    crew_list = _find_crew_for_mission(polygon_geojson)
+    if not crew_list:
+        print(f"[mission-sms] no matching Crew for mission_id={mission_id}", flush=True)
+        return (0, 0)
+
+    base_url = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+    sent = 0
+    now_ms = int(time.time() * 1000)
+
+    for c in crew_list:
+        # Generate a per-notification response token. Lets us identify
+        # which Crew member responded without sticking their user_id in
+        # a URL (privacy + idempotence).
+        resp_token = new_secure_token()
+        response_url = f"{base_url}/?mission={resp_token}"
+
+        # Compose the SMS. Short, scannable, with the prompt and a link.
+        # 160-char SMS limit is generous; we keep messages tight but
+        # don't artificially truncate the prompt.
+        sms_body = (
+            f"WeatherValet mission ({template_name}):\n"
+            f"{prompt[:300]}{'…' if len(prompt) > 300 else ''}\n\n"
+            f"Respond: {response_url}\n"
+            f"Reply STOP to opt out."
+        )
+
+        delivery_status = "stubbed"
+        twilio_sid = None
+        try:
+            ok = send_sms(c["phone"], sms_body)
+            delivery_status = "sent" if ok else "failed"
+        except Exception as e:
+            print(f"[mission-sms] send failed crew_id={c['id']}: {e}", flush=True)
+            delivery_status = "failed"
+
+        # Record the notification regardless of send outcome — we want
+        # the audit trail even for failures.
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO mission_notifications
+                           (mission_id, crew_user_id, sent_at, delivery_status,
+                            twilio_sid, response_token)
+                           VALUES (%s, %s, %s, %s, %s, %s)""",
+                        (mission_id, c["id"], now_ms, delivery_status,
+                         twilio_sid, resp_token),
+                    )
+        except Exception as e:
+            print(f"[mission-sms] notification record failed crew_id={c['id']}: {e}", flush=True)
+
+        if delivery_status in ("sent", "stubbed"):
+            sent += 1
+
+    print(
+        f"[mission-sms] mission_id={mission_id} dispatched: "
+        f"matched={len(crew_list)} sent={sent}",
+        flush=True,
+    )
+    return (len(crew_list), sent)
+
+
 @app.route("/api/v1/missions/deployments", methods=["OPTIONS"])
 def _missions_deployments_preflight():
     return ("", 204)
@@ -9360,13 +9722,45 @@ def missions_create():
             )
             r = cur.fetchone()
 
-    # NOTE: this is where we WILL invoke Crew SMS in Item #5. The mission
-    # gets persisted now; real Crew notification builds on Items #5 + #6
-    # (crew lat/lng tracking + polygon-to-crew matching). For now, we just
-    # log so it's visible in Render logs that the mission fired.
+    # ── Item #5: Dispatch Crew SMS for non-severe missions ──
+    # Only fire SMS when status is 'fired' — severe missions wait in
+    # 'pending-approval' until an admin approves them (which is when
+    # the PATCH endpoint should call this same dispatcher).
+    #
+    # We update audience_estimate with the REAL matched count returned
+    # by _dispatch_mission_sms, overriding the modal's estimate. This
+    # is the truth — the modal estimate is a UI hint; the matched count
+    # is what actually got pinged.
+    real_matched = 0
+    real_sent = 0
+    if status == "fired":
+        try:
+            real_matched, real_sent = _dispatch_mission_sms(
+                r["id"], prompt, polygon_geojson, template_name
+            )
+            # Update audience_estimate to reflect reality. If the modal
+            # said "4 Crew" but only 2 matched the polygon, the row should
+            # show 2 — that's what got pinged.
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE mission_deployments SET audience_estimate = %s WHERE id = %s",
+                        (real_matched, r["id"]),
+                    )
+            audience_estimate = real_matched
+        except Exception as e:
+            # Don't fail the mission create if SMS dispatch hits a snag —
+            # the mission row is persisted, dispatch can be retried by
+            # an admin later. Log loudly so we notice.
+            print(
+                f"[mission-sms] dispatch failed for mission_id={r['id']}: {e!r}",
+                flush=True,
+            )
+
     print(
         f"[mission] fired id={r['id']} template={template_id} "
-        f"by user_id={user['id']} status={status} estimated_audience={audience_estimate}",
+        f"by user_id={user['id']} status={status} "
+        f"matched={real_matched} sent={real_sent}",
         flush=True,
     )
 
@@ -9383,10 +9777,12 @@ def missions_create():
             "polygon_label": r["polygon_label"],
             "is_severe": r["is_severe"],
             "status": r["status"],
-            "audience_estimate": r["audience_estimate"],
+            "audience_estimate": audience_estimate,
             "crew_responded": r["crew_responded"],
             "crew_cited": r["crew_cited"],
             "completed_at": r["completed_at"],
+            "matched_crew_count": real_matched,
+            "sms_sent_count": real_sent,
         },
     })
 
@@ -9495,14 +9891,22 @@ def missions_update(dep_id):
             params.append(user["id"])
             set_clauses.append("approved_at = %s")
             params.append(now_ms)
+            # Flag that we should dispatch SMS after the UPDATE commits.
+            # We can't dispatch here because the update hasn't happened
+            # yet — and if it fails, we don't want to have already SMSed.
+            is_approval_transition = True
         elif not (is_owner or is_admin):
             return jsonify({"ok": False, "error": "forbidden"}), 403
+        else:
+            is_approval_transition = False
 
         set_clauses.append("status = %s")
         params.append(new_status)
         if new_status == "completed":
             set_clauses.append("completed_at = %s")
             params.append(now_ms)
+    else:
+        is_approval_transition = False
 
     if "crew_responded" in data and (is_owner or is_admin):
         try:
@@ -9534,6 +9938,33 @@ def missions_update(dep_id):
                 (dep_id,),
             )
             r2 = cur.fetchone()
+
+    # ── Item #5: dispatch SMS now that admin has approved a severe mission.
+    # Same flow as initial fire for non-severe missions: find Crew in
+    # polygon, send SMS, update real audience count.
+    if is_approval_transition:
+        try:
+            real_matched, real_sent = _dispatch_mission_sms(
+                r2["id"], r2["prompt"], r2["polygon_geojson"], r2["template_name"]
+            )
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE mission_deployments SET audience_estimate = %s WHERE id = %s",
+                        (real_matched, r2["id"]),
+                    )
+            r2 = dict(r2)
+            r2["audience_estimate"] = real_matched
+            print(
+                f"[mission-approval] mission_id={r2['id']} approved by user_id={user['id']} "
+                f"— matched={real_matched} sent={real_sent}",
+                flush=True,
+            )
+        except Exception as e:
+            print(
+                f"[mission-approval] dispatch failed for mission_id={r2['id']}: {e!r}",
+                flush=True,
+            )
 
     return jsonify({
         "ok": True,
@@ -9587,6 +10018,135 @@ def missions_delete(dep_id):
             )
 
     return jsonify({"ok": True})
+
+
+# ════════════════════════════════════════════════════════════════════
+# Mission response — Crew tap SMS link to submit their observation
+# (Phase 10 Item #5)
+# ════════════════════════════════════════════════════════════════════
+#
+# When _dispatch_mission_sms sends an SMS to a Crew member, the link
+# in that SMS points at /?mission=<token>. The frontend shows a response
+# page; the Crew member types their observation + submits → POST to
+# this endpoint with the token. We record the response, increment
+# mission counters.
+#
+# Authentication: the response_token IS the authentication. It's
+# generated per-Crew, per-mission, unguessable, and stored once in
+# mission_notifications. No login required — the Crew member identifies
+# themselves by possessing the token (sent only to their phone).
+
+@app.route("/api/v1/missions/respond/<response_token>", methods=["OPTIONS"])
+def _missions_respond_preflight(response_token):
+    return ("", 204)
+
+
+@app.get("/api/v1/missions/respond/<response_token>")
+def missions_respond_get(response_token: str):
+    """Return mission context for the response page.
+
+    The frontend calls this when the Crew member opens the SMS link.
+    Returns the mission prompt + template name so the page can render
+    "Mission: Flag check — Look at the flag at Lebanon HS, how is it
+    behaving?" with a textarea + submit.
+    """
+    if not response_token or len(response_token) < 10:
+        return jsonify({"ok": False, "error": "invalid-token"}), 400
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT mn.id AS notification_id, mn.responded_at, mn.response_text,
+                          md.id AS mission_id, md.template_name, md.prompt,
+                          md.fired_by_name, md.status
+                   FROM mission_notifications mn
+                   JOIN mission_deployments md ON md.id = mn.mission_id
+                   WHERE mn.response_token = %s""",
+                (response_token,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    return jsonify({
+        "ok": True,
+        "mission": {
+            "template_name": row["template_name"],
+            "prompt": row["prompt"],
+            "fired_by_name": row["fired_by_name"],
+            "status": row["status"],
+            "already_responded": bool(row["responded_at"]),
+            "previous_response": row["response_text"] or "",
+        }
+    })
+
+
+@app.post("/api/v1/missions/respond/<response_token>")
+def missions_respond_submit(response_token: str):
+    """Submit a Crew response to a mission.
+
+    Body: {"response_text": "Flag flapping pretty hard, NW direction..."}
+
+    Idempotency: if already responded, returns the existing response
+    (doesn't accept a re-submission). Crew can call submit-again with
+    overwrite=true to update.
+    """
+    if not response_token or len(response_token) < 10:
+        return jsonify({"ok": False, "error": "invalid-token"}), 400
+
+    data = request.get_json(silent=True) or {}
+    response_text = (data.get("response_text") or "").strip()
+    overwrite = bool(data.get("overwrite", False))
+
+    if not response_text:
+        return jsonify({"ok": False, "error": "empty-response"}), 400
+    if len(response_text) > 4000:
+        return jsonify({"ok": False, "error": "response-too-long"}), 400
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, mission_id, responded_at
+                   FROM mission_notifications
+                   WHERE response_token = %s""",
+                (response_token,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+
+    is_first_response = (row["responded_at"] is None)
+    if not is_first_response and not overwrite:
+        return jsonify({
+            "ok": False,
+            "error": "already-responded",
+            "message": "You've already responded. Send ?overwrite=true to update.",
+        }), 409
+
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE mission_notifications
+                   SET response_text = %s, responded_at = %s
+                   WHERE id = %s""",
+                (response_text, now_ms, row["id"]),
+            )
+            # On first response, bump the mission's crew_responded counter.
+            # On overwrite, don't double-count.
+            if is_first_response:
+                cur.execute(
+                    """UPDATE mission_deployments
+                       SET crew_responded = crew_responded + 1
+                       WHERE id = %s""",
+                    (row["mission_id"],),
+                )
+
+    print(
+        f"[mission-respond] notification_id={row['id']} mission_id={row['mission_id']} "
+        f"first_response={is_first_response}",
+        flush=True,
+    )
+
+    return jsonify({"ok": True, "first_response": is_first_response})
 
 
 if __name__ == "__main__":
