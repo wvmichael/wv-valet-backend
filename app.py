@@ -76,6 +76,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, asdict
@@ -980,6 +981,50 @@ CREATE INDEX IF NOT EXISTS idx_pro_brief_drafts_status
     ON pro_brief_drafts(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_pro_brief_drafts_user
     ON pro_brief_drafts(user_id, created_at DESC);
+
+-- ── NWS severe alert pages (Phase 10 Item #7) ──
+-- One row per NWS alert that affected at least one Pro subscriber.
+-- Created by the scheduler when polling NWS detects a new alert whose
+-- polygon contains a subscriber's primary location. Triggers an SMS to
+-- the on-duty Met with a link to /?nws-page=<token>.
+--
+-- Dedupe: NWS alert IDs are stable (like "urn:oid:2.49.0.1.840.0.abc123").
+-- We index on nws_alert_id and skip insertion if we've already paged
+-- for that alert. If the alert is updated (new polygon, severity bump),
+-- we'd need a separate flow — out of scope for v1.
+--
+-- status:
+--   'paged'      — SMS sent to Met, awaiting their review
+--   'confirmed'  — Met opened the page and decided to alert subscribers
+--   'dismissed'  — Met reviewed and decided not to alert (false alarm /
+--                  already-known / out-of-scope)
+--   'expired'    — alert window passed without Met action
+CREATE TABLE IF NOT EXISTS nws_alert_pages (
+    id              SERIAL PRIMARY KEY,
+    created_at      BIGINT NOT NULL,
+    nws_alert_id    TEXT UNIQUE NOT NULL,
+    event           TEXT NOT NULL,           -- "Tornado Warning", etc.
+    severity        TEXT,                    -- NWS severity field
+    headline        TEXT,
+    description     TEXT,
+    instruction     TEXT,
+    area_desc       TEXT,
+    polygon_geojson TEXT,
+    expires_at      BIGINT,
+    response_token  TEXT UNIQUE NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'paged',
+    affected_user_ids TEXT,                  -- comma-separated user ids matching the polygon
+    met_paged_phone TEXT,                    -- which Met phone we paged
+    reviewed_at     BIGINT,
+    reviewed_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    reviewed_by_name TEXT,
+    subscriber_message TEXT,                 -- what the Met sent to subscribers
+    subscribers_notified INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_nws_alert_pages_status
+    ON nws_alert_pages(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_nws_alert_pages_token
+    ON nws_alert_pages(response_token);
 """
 
 
@@ -9609,7 +9654,14 @@ def _process_pending_briefs() -> None:
 
 
 def _brief_scheduler_loop() -> None:
-    """Main scheduler loop — runs in a daemon thread. Ticks every 60s."""
+    """Main scheduler loop — runs in a daemon thread. Ticks every 60s.
+
+    Each tick runs TWO independent jobs:
+      1. _process_pending_briefs — daily brief delivery
+      2. _process_severe_alerts  — NWS severe alert detection + Met paging
+
+    Failures in one don't stop the other.
+    """
     print("[brief-scheduler] started", flush=True)
     # Initial small delay so the app fully boots before our first tick.
     time.sleep(15)
@@ -9617,9 +9669,245 @@ def _brief_scheduler_loop() -> None:
         try:
             _process_pending_briefs()
         except Exception as e:
-            # Never let an exception kill the scheduler loop.
             print(f"[brief-scheduler] tick failed: {e!r}", flush=True)
+        try:
+            _process_severe_alerts()
+        except Exception as e:
+            print(f"[nws-scheduler] tick failed: {e!r}", flush=True)
         time.sleep(60)
+
+
+# ════════════════════════════════════════════════════════════════════
+# NWS severe alert detection + Met paging (Phase 10 Item #7)
+# ════════════════════════════════════════════════════════════════════
+#
+# Each scheduler tick:
+#   1. Fetch active NWS alerts (events we care about)
+#   2. For each alert, check if its polygon contains any Pro subscriber's
+#      primary saved location
+#   3. If yes, dedupe against nws_alert_pages (by nws_alert_id) — skip
+#      if already paged
+#   4. Insert a new row, page the on-duty Met via SMS with a link
+#
+# This runs every 60s; NWS alerts can have <20min lead time so a 1-min
+# detection latency is acceptable. Tighter polling adds little value
+# and risks NWS rate limits.
+
+# Severe events we page Mets for. Other NWS event types (Special Weather
+# Statement, Hydrologic Outlook, etc.) are informational and don't warrant
+# waking the on-duty Met. We can expand this list over time.
+_NWS_SEVERE_EVENTS = (
+    "Tornado Warning",
+    "Severe Thunderstorm Warning",
+    "Flash Flood Warning",
+    "Tornado Watch",
+    "Flood Warning",
+)
+
+
+def _fetch_active_nws_alerts() -> list:
+    """Fetch active NWS alerts via the api.weather.gov /alerts/active endpoint.
+
+    Returns a list of normalized alert dicts. Empty list on any error —
+    we never want a transient NWS hiccup to break the scheduler.
+
+    Note: NWS API requires a User-Agent header identifying the app.
+    """
+    try:
+        # Filter to severe events only (server-side filtering reduces
+        # response size + processing time)
+        events_param = ",".join(_NWS_SEVERE_EVENTS)
+        url = (
+            "https://api.weather.gov/alerts/active"
+            f"?event={urllib.parse.quote(events_param)}"
+            "&status=actual"
+        )
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "WeatherValet/1.0 (+https://weathervalet.ai)",
+            "Accept": "application/geo+json",
+        })
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[nws-fetch] failed: {e}", flush=True)
+        return []
+
+    features = data.get("features") or []
+    out = []
+    for f in features:
+        props = f.get("properties") or {}
+        geom = f.get("geometry")
+        nws_id = props.get("id") or f.get("id")  # the urn:oid alert ID
+        if not nws_id:
+            continue
+        if not geom or geom.get("type") not in ("Polygon", "MultiPolygon"):
+            # Some NWS alerts come without a geometry (county-based);
+            # those need a different match path. Skip for v1 — we'll
+            # add SAME-code matching later if needed.
+            continue
+        expires_str = props.get("expires") or props.get("ends")
+        expires_ms = None
+        if expires_str:
+            try:
+                from datetime import datetime as _dt
+                expires_ms = int(_dt.fromisoformat(
+                    expires_str.replace("Z", "+00:00")
+                ).timestamp() * 1000)
+            except (ValueError, TypeError):
+                pass
+        out.append({
+            "nws_id": nws_id,
+            "event": props.get("event") or "",
+            "severity": props.get("severity") or "",
+            "headline": props.get("headline") or "",
+            "description": props.get("description") or "",
+            "instruction": props.get("instruction") or "",
+            "area_desc": props.get("areaDesc") or "",
+            "geometry": geom,
+            "expires_at": expires_ms,
+        })
+    return out
+
+
+def _find_pro_subscribers_in_polygon(geom: dict) -> list:
+    """Find Pro-tier subscribers whose primary saved_location is inside
+    the alert polygon. Returns list of dicts with user info needed for
+    later notification (id, name, email, phone, location).
+    """
+    # Stringify geometry once so _point_in_polygon_geojson can parse it
+    geom_str = json.dumps(geom)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.name, u.email, u.phone,
+                          u.subscription_tier,
+                          loc.label AS loc_label, loc.lat, loc.lng
+                   FROM users u
+                   JOIN saved_locations loc
+                     ON loc.user_id = u.id AND loc.is_primary = TRUE
+                   WHERE u.is_active = TRUE
+                     AND u.subscription_tier IN ('pro_single','pro_multi','pro_enterprise')
+                     AND EXISTS (
+                       SELECT 1 FROM user_roles ur
+                        WHERE ur.user_id = u.id AND ur.role = 'subscriber'
+                     )"""
+            )
+            rows = cur.fetchall()
+
+    matching = []
+    for r in rows:
+        if r["lat"] is None or r["lng"] is None:
+            continue
+        if _point_in_polygon_geojson(float(r["lat"]), float(r["lng"]), geom_str):
+            matching.append({
+                "user_id": r["id"],
+                "name": r.get("name") or "",
+                "email": r["email"],
+                "phone": r.get("phone") or "",
+                "tier": r["subscription_tier"],
+                "loc_label": r["loc_label"],
+            })
+    return matching
+
+
+def _page_met_for_alert(alert: dict, affected: list, page_token: str) -> bool:
+    """SMS the on-duty Met about a new severe alert. Returns True on
+    successful send (or stub mode), False on Twilio failure.
+
+    The SMS includes the event name, area, # of affected subscribers, and
+    a link to the review page. Met reviews, decides to confirm or dismiss.
+    """
+    if not METEOROLOGIST_PHONE:
+        print("[nws-page] METEOROLOGIST_PHONE not set — can't page", flush=True)
+        return False
+
+    base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+    page_url = f"{base}/?nws-page={page_token}"
+
+    body = (
+        f"WV NWS PAGE: {alert['event']}\n"
+        f"Area: {(alert.get('area_desc') or '')[:80]}\n"
+        f"Affected Pro subs: {len(affected)}\n"
+        f"Review: {page_url}\n"
+        f"Reply STOP to opt out."
+    )
+    try:
+        return send_sms(METEOROLOGIST_PHONE, body)
+    except Exception as e:
+        print(f"[nws-page] SMS failed: {e}", flush=True)
+        return False
+
+
+def _process_severe_alerts() -> None:
+    """One scheduler tick: fetch alerts, match against subscribers, page Met."""
+    alerts = _fetch_active_nws_alerts()
+    if not alerts:
+        return
+
+    for alert in alerts:
+        nws_id = alert["nws_id"]
+
+        # Dedupe — have we already paged for this alert?
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id FROM nws_alert_pages WHERE nws_alert_id = %s",
+                        (nws_id,),
+                    )
+                    if cur.fetchone():
+                        continue  # already paged
+        except Exception as e:
+            print(f"[nws-process] dedupe check failed: {e}", flush=True)
+            continue
+
+        # Find affected Pro subscribers
+        affected = _find_pro_subscribers_in_polygon(alert["geometry"])
+        if not affected:
+            # No Pro subscribers in this alert's area; don't page, don't
+            # record. (We could record for analytics but it'd pile up
+            # quickly — every NWS alert nationally would create a row.)
+            continue
+
+        # Insert the page row + send the Met SMS
+        page_token = new_secure_token()
+        now_ms = int(time.time() * 1000)
+        affected_ids_csv = ",".join(str(a["user_id"]) for a in affected)
+
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO nws_alert_pages
+                           (created_at, nws_alert_id, event, severity, headline,
+                            description, instruction, area_desc, polygon_geojson,
+                            expires_at, response_token, status, affected_user_ids,
+                            met_paged_phone)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                   'paged', %s, %s)
+                           RETURNING id""",
+                        (now_ms, nws_id, alert["event"], alert["severity"],
+                         alert["headline"], alert["description"],
+                         alert["instruction"], alert["area_desc"],
+                         json.dumps(alert["geometry"]),
+                         alert["expires_at"], page_token,
+                         affected_ids_csv, METEOROLOGIST_PHONE),
+                    )
+                    new_row = cur.fetchone()
+        except Exception as e:
+            # Unique constraint violation = race with another worker.
+            # Anything else = unexpected; log loud.
+            print(f"[nws-process] insert failed for {nws_id}: {e}", flush=True)
+            continue
+
+        # Send the SMS — fire-and-forget; failure logged inside.
+        _page_met_for_alert(alert, affected, page_token)
+        print(
+            f"[nws-process] paged Met for alert={alert['event']!r} "
+            f"id={new_row['id']} affected={len(affected)}",
+            flush=True,
+        )
 
 
 def _ensure_brief_scheduler_started() -> None:
@@ -11349,6 +11637,321 @@ def met_pro_brief_send(draft_id):
         "delivery_status": delivery_status,
         "history_id": history_id,
     })
+
+
+# ════════════════════════════════════════════════════════════════════
+# NWS severe alert page review (Phase 10 Item #7)
+# ════════════════════════════════════════════════════════════════════
+#
+# Met taps the SMS link, lands on /?nws-page=<token>. Frontend calls
+# GET to load context. Met decides:
+#   - Confirm → POST /confirm with custom subscriber message →
+#     subscribers get SMS + email
+#   - Dismiss → POST /dismiss (false alarm / not actionable)
+#
+# Auth model is the same as the Crew mission response page: the token
+# IS the authentication. It was sent only to the Met's phone via SMS.
+
+@app.route("/api/v1/nws/page/<response_token>", methods=["OPTIONS"])
+def _nws_page_preflight(response_token):
+    return ("", 204)
+
+
+@app.get("/api/v1/nws/page/<response_token>")
+def nws_page_get(response_token: str):
+    """Return the alert details + list of affected subscribers for the
+    Met to review. No auth required — the token is the auth.
+    """
+    if not response_token or len(response_token) < 10:
+        return jsonify({"ok": False, "error": "invalid-token"}), 400
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT * FROM nws_alert_pages WHERE response_token = %s""",
+                (response_token,),
+            )
+            page = cur.fetchone()
+    if not page:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+
+    # Resolve affected user info from the CSV
+    affected_user_ids = []
+    if page["affected_user_ids"]:
+        try:
+            affected_user_ids = [
+                int(x) for x in page["affected_user_ids"].split(",") if x.strip()
+            ]
+        except ValueError:
+            affected_user_ids = []
+
+    subscribers = []
+    if affected_user_ids:
+        placeholders = ",".join(["%s"] * len(affected_user_ids))
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""SELECT u.id, u.name, u.email, u.phone,
+                              u.subscription_tier,
+                              loc.label AS loc_label
+                       FROM users u
+                       LEFT JOIN saved_locations loc
+                         ON loc.user_id = u.id AND loc.is_primary = TRUE
+                       WHERE u.id IN ({placeholders})""",
+                    tuple(affected_user_ids),
+                )
+                rows = cur.fetchall()
+        for r in rows:
+            subscribers.append({
+                "id": r["id"],
+                "name": r.get("name") or "",
+                "email": r["email"],
+                "phone": r.get("phone") or "",
+                "tier": r["subscription_tier"],
+                "location": r.get("loc_label") or "",
+            })
+
+    return jsonify({
+        "ok": True,
+        "page": {
+            "id": page["id"],
+            "created_at": page["created_at"],
+            "event": page["event"],
+            "severity": page["severity"],
+            "headline": page["headline"],
+            "description": page["description"],
+            "instruction": page["instruction"],
+            "area_desc": page["area_desc"],
+            "expires_at": page["expires_at"],
+            "status": page["status"],
+            "reviewed_at": page["reviewed_at"],
+            "reviewed_by_name": page["reviewed_by_name"],
+            "subscriber_message": page["subscriber_message"],
+            "subscribers_notified": page["subscribers_notified"],
+        },
+        "subscribers": subscribers,
+    })
+
+
+@app.post("/api/v1/nws/page/<response_token>/confirm")
+def nws_page_confirm(response_token: str):
+    """Met confirms the alert and sends a custom message to all affected
+    Pro subscribers via SMS + email.
+
+    Body:
+      {
+        "message": "Tornado Warning active for Lebanon area until 4:30pm. Get to interior shelter NOW.",
+        "met_name": "Michael Reynolds"  (optional override; defaults to "On-duty Met")
+      }
+
+    Auth: requires the response_token in URL. The Met doesn't need to be
+    logged in (they tapped the SMS link from their phone), but we use
+    their logged-in name if available.
+    """
+    if not response_token or len(response_token) < 10:
+        return jsonify({"ok": False, "error": "invalid-token"}), 400
+
+    data = request.get_json(silent=True) or {}
+    message = (data.get("message") or "").strip()
+    if not message:
+        return jsonify({"ok": False, "error": "message-required"}), 400
+    if len(message) > 1000:
+        return jsonify({"ok": False, "error": "message-too-long"}), 400
+
+    # If signed in, use their real name + user_id for audit
+    actor = _get_current_user()
+    met_name = (
+        (data.get("met_name") or "").strip()
+        or (actor.get("name") if actor else None)
+        or "On-duty meteorologist"
+    )
+    met_user_id = actor["id"] if actor else None
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM nws_alert_pages WHERE response_token = %s",
+                (response_token,),
+            )
+            page = cur.fetchone()
+    if not page:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    if page["status"] not in ("paged",):
+        return jsonify({
+            "ok": False,
+            "error": "already-handled",
+            "status": page["status"],
+        }), 409
+
+    # Resolve affected subscribers
+    affected_user_ids = []
+    if page["affected_user_ids"]:
+        try:
+            affected_user_ids = [
+                int(x) for x in page["affected_user_ids"].split(",") if x.strip()
+            ]
+        except ValueError:
+            pass
+
+    if not affected_user_ids:
+        # Nothing to send — mark confirmed but with 0 sent
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE nws_alert_pages
+                       SET status = 'confirmed', reviewed_at = %s,
+                           reviewed_by_user_id = %s, reviewed_by_name = %s,
+                           subscriber_message = %s, subscribers_notified = 0
+                       WHERE id = %s""",
+                    (int(time.time() * 1000), met_user_id, met_name, message, page["id"]),
+                )
+        return jsonify({"ok": True, "subscribers_notified": 0})
+
+    # Fetch contact info for each affected user
+    placeholders = ",".join(["%s"] * len(affected_user_ids))
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""SELECT u.id, u.name, u.email, u.phone
+                   FROM users u
+                   WHERE u.id IN ({placeholders}) AND u.is_active = TRUE""",
+                tuple(affected_user_ids),
+            )
+            subs = cur.fetchall()
+
+    # Compose the SMS body (160-char-friendly) and the email body
+    sms_body = (
+        f"WeatherValet ALERT ({page['event']}): {message}\n"
+        f"\u2014 {met_name}\n"
+        f"Reply STOP to opt out."
+    )
+    email_subject = f"WeatherValet alert: {page['event']}"
+    email_body = (
+        f"{page['event']}\n\n"
+        f"{message}\n\n"
+        f"— {met_name}\n"
+        f"WeatherValet on-duty meteorologist\n\n"
+        f"Affected area: {page['area_desc']}\n"
+        f"NWS headline: {page['headline']}\n"
+    )
+
+    sent_count = 0
+    for s in subs:
+        any_channel = False
+        if s.get("phone"):
+            try:
+                if send_sms(s["phone"], sms_body):
+                    any_channel = True
+            except Exception as e:
+                print(f"[nws-confirm] SMS failed user={s['id']}: {e}", flush=True)
+        if s.get("email"):
+            try:
+                if _send_brief_email(s["email"], email_subject, email_body):
+                    any_channel = True
+            except Exception as e:
+                print(f"[nws-confirm] email failed user={s['id']}: {e}", flush=True)
+        if any_channel:
+            sent_count += 1
+
+    # Mark page as confirmed
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE nws_alert_pages
+                   SET status = 'confirmed', reviewed_at = %s,
+                       reviewed_by_user_id = %s, reviewed_by_name = %s,
+                       subscriber_message = %s, subscribers_notified = %s
+                   WHERE id = %s""",
+                (int(time.time() * 1000), met_user_id, met_name,
+                 message, sent_count, page["id"]),
+            )
+
+    # Audit log if we have a logged-in actor
+    if actor:
+        try:
+            _audit_log(
+                actor_user_id=met_user_id, actor_name=met_name,
+                action="nws.confirm", target_type="nws_alert_page",
+                target_id=page["id"],
+                details={
+                    "event": page["event"],
+                    "subscribers_notified": sent_count,
+                    "affected_total": len(affected_user_ids),
+                },
+            )
+        except Exception:
+            pass
+
+    print(
+        f"[nws-confirm] page_id={page['id']} confirmed by met={met_name} "
+        f"sent={sent_count}/{len(affected_user_ids)}",
+        flush=True,
+    )
+    return jsonify({"ok": True, "subscribers_notified": sent_count})
+
+
+@app.post("/api/v1/nws/page/<response_token>/dismiss")
+def nws_page_dismiss(response_token: str):
+    """Met dismisses the alert (false alarm, already-known, out-of-scope).
+    No subscriber notification.
+
+    Body:
+      {"reason": "Already escalated by NWS via Wireless Emergency Alerts"}
+    """
+    if not response_token or len(response_token) < 10:
+        return jsonify({"ok": False, "error": "invalid-token"}), 400
+
+    data = request.get_json(silent=True) or {}
+    reason = (data.get("reason") or "").strip() or None
+
+    actor = _get_current_user()
+    met_name = (
+        (actor.get("name") if actor else None)
+        or "On-duty meteorologist"
+    )
+    met_user_id = actor["id"] if actor else None
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, status FROM nws_alert_pages WHERE response_token = %s",
+                (response_token,),
+            )
+            page = cur.fetchone()
+    if not page:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    if page["status"] not in ("paged",):
+        return jsonify({
+            "ok": False,
+            "error": "already-handled",
+            "status": page["status"],
+        }), 409
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE nws_alert_pages
+                   SET status = 'dismissed', reviewed_at = %s,
+                       reviewed_by_user_id = %s, reviewed_by_name = %s,
+                       subscriber_message = %s
+                   WHERE id = %s""",
+                (int(time.time() * 1000), met_user_id, met_name,
+                 reason, page["id"]),
+            )
+
+    if actor:
+        try:
+            _audit_log(
+                actor_user_id=met_user_id, actor_name=met_name,
+                action="nws.dismiss", target_type="nws_alert_page",
+                target_id=page["id"],
+                details={"reason": reason},
+            )
+        except Exception:
+            pass
+
+    print(f"[nws-dismiss] page_id={page['id']} dismissed by met={met_name}", flush=True)
+    return jsonify({"ok": True})
 
 
 if __name__ == "__main__":
