@@ -1329,6 +1329,82 @@ def get_user_agent() -> str:
     return ua[:500]
 
 
+def _email_shell(content_html: str, preheader: str = "") -> str:
+    """Wraps content HTML in a consistent branded shell — header with
+    WeatherValet wordmark, footer with company info and support link.
+    All transactional emails (magic links, briefs, alerts) use this so
+    they feel like part of the same product.
+
+    `preheader` is hidden preview text that email clients show in inbox
+    list views (right after the subject). Keep under 100 chars. Most
+    email clients (Gmail, Apple Mail, Outlook) render this between the
+    subject and body when previewing.
+    """
+    preheader_block = (
+        '<div style="display:none;font-size:1px;color:#fff;'
+        'line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden;'
+        'mso-hide:all;">' + preheader + '</div>'
+    ) if preheader else ''
+
+    return (
+        '<!DOCTYPE html>'
+        '<html><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<title>WeatherValet</title>'
+        '</head>'
+        '<body style="margin:0;padding:0;background:#F4F5F7;'
+        'font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,sans-serif;'
+        'color:#0E1116;">'
+        + preheader_block +
+        '<table role="presentation" cellpadding="0" cellspacing="0" '
+        'width="100%" style="background:#F4F5F7;">'
+        '<tr><td align="center" style="padding:32px 16px;">'
+
+        # Outer card
+        '<table role="presentation" cellpadding="0" cellspacing="0" '
+        'width="100%" style="max-width:560px;background:#fff;'
+        'border-radius:14px;overflow:hidden;'
+        'box-shadow:0 1px 3px rgba(15,17,22,0.06);">'
+
+        # Header bar with brand
+        '<tr><td style="padding:22px 28px 18px;border-bottom:1px solid #ECEEF1;">'
+        '<table role="presentation" cellpadding="0" cellspacing="0" width="100%">'
+        '<tr>'
+        '<td align="left" style="font-size:18px;font-weight:700;color:#0E1116;'
+        'letter-spacing:-0.01em;">'
+        '<span style="display:inline-block;width:10px;height:10px;background:#2E4FB8;'
+        'border-radius:50%;margin-right:8px;vertical-align:middle;"></span>'
+        'WeatherValet'
+        '</td>'
+        '<td align="right" style="font-size:11px;color:#8B8F96;'
+        'text-transform:uppercase;letter-spacing:0.08em;font-weight:600;">'
+        'Decision-grade weather'
+        '</td>'
+        '</tr></table>'
+        '</td></tr>'
+
+        # Content
+        '<tr><td style="padding:28px;font-size:15px;line-height:1.55;'
+        'color:#0E1116;">'
+        + content_html +
+        '</td></tr>'
+
+        # Footer
+        '<tr><td style="padding:20px 28px;background:#FAFBFC;'
+        'border-top:1px solid #ECEEF1;font-size:11.5px;color:#8B8F96;'
+        'line-height:1.5;">'
+        'WeatherValet \u00b7 Indianapolis, IN<br>'
+        'Questions? Reply to this email and a human will read it.<br>'
+        '<a href="https://weathervalet.ai" '
+        'style="color:#2E4FB8;text-decoration:none;">weathervalet.ai</a>'
+        '</td></tr>'
+
+        '</table>'
+        '</td></tr></table>'
+        '</body></html>'
+    )
+
+
 def _send_magic_link_email(email: str, magic_link_url: str, intent: str = "sign-in") -> bool:
     """Send a magic-link email to the user.
 
@@ -1417,31 +1493,33 @@ def _send_magic_link_email(email: str, magic_link_url: str, intent: str = "sign-
             "the link above."
         )
 
-    html_body = (
-        '<div style="font-family: -apple-system, BlinkMacSystemFont, '
-        '\'Segoe UI\', Roboto, sans-serif; max-width: 480px; margin: 0 auto; '
-        'padding: 24px;">'
-        f'<h2 style="color: #0E1116; font-size: 20px; margin: 0 0 16px;">'
-        f'{heading_text}</h2>'
-        f'<p style="color: rgba(15,17,22,0.75); font-size: 15px; line-height: 1.5;">'
+    html_body_inner = (
+        f'<h1 style="color:#0E1116;font-size:22px;margin:0 0 14px;'
+        f'font-weight:600;letter-spacing:-0.01em;">{heading_text}</h1>'
+        f'<p style="color:#3D4148;font-size:15px;line-height:1.6;margin:0 0 24px;">'
         f'{body_text}</p>'
-        f'<p style="margin: 28px 0;"><a href="{magic_link_url}" '
-        'style="display: inline-block; background: #4169E1; color: #fff; '
-        'padding: 12px 24px; border-radius: 8px; text-decoration: none; '
-        f'font-weight: 600;">{button_text}</a></p>'
-        '<p style="color: rgba(15,17,22,0.55); font-size: 13px; line-height: 1.5;">'
+        f'<p style="margin:0 0 28px;"><a href="{magic_link_url}" '
+        'style="display:inline-block;background:#2E4FB8;color:#fff;'
+        'padding:13px 28px;border-radius:8px;text-decoration:none;'
+        f'font-weight:600;font-size:15px;">{button_text}</a></p>'
+        '<p style="color:#6B7280;font-size:12.5px;line-height:1.5;margin:0 0 20px;">'
         'If the button doesn\'t work, copy and paste this link into your browser:'
-        f'<br><span style="word-break: break-all;">{magic_link_url}</span></p>'
-        '<p style="color: rgba(15,17,22,0.45); font-size: 12px; '
-        'margin-top: 32px; border-top: 1px solid rgba(15,17,22,0.08); padding-top: 16px;">'
+        f'<br><span style="word-break:break-all;color:#2E4FB8;">{magic_link_url}</span></p>'
+        '<p style="color:#8B8F96;font-size:12px;line-height:1.5;margin:24px 0 0;'
+        'padding-top:18px;border-top:1px solid #ECEEF1;">'
         f'{safety_text}</p>'
-        '</div>'
     )
+    preheader_text = body_text[:90] + "..." if len(body_text) > 90 else body_text
+    html_body = _email_shell(html_body_inner, preheader=preheader_text)
+
     text_body = (
         f"{heading_text}\n\n"
         f"{body_text}\n\n"
         f"{magic_link_url}\n\n"
-        f"{safety_text}"
+        f"{safety_text}\n\n"
+        f"---\n"
+        f"WeatherValet \u00b7 Indianapolis, IN\n"
+        f"weathervalet.ai"
     )
 
     payload = json.dumps({
@@ -9665,18 +9743,36 @@ def _send_brief_email(email: str, subject: str, body_text: str) -> bool:
         print(f"[brief-email-stub] To: {email}\nSubject: {subject}\n{body_text}\n", flush=True)
         return True
 
-    # Simple HTML wrap so the email isn't a wall of plain text.
-    html_body = (
-        '<div style="font-family:Inter,system-ui,sans-serif;font-size:15px;color:#0E1116;'
-        'max-width:560px;margin:0 auto;padding:24px;line-height:1.55;">'
-        '<h2 style="font-size:18px;margin:0 0 14px;">' + subject + '</h2>'
-        '<p style="margin:0;">' + body_text.replace("\n", "<br>") + '</p>'
-        '<hr style="border:none;border-top:1px solid #eee;margin:24px 0 12px;">'
-        '<p style="font-size:11px;color:#888;margin:0;">'
-        'WeatherValet daily brief. Manage preferences in your '
-        '<a href="https://weathervalet.ai">subscriber portal</a>.</p>'
-        '</div>'
+    # Build a nicely-structured HTML body inside the shared email shell.
+    # The brief text typically has paragraphs separated by blank lines —
+    # we preserve those by converting \n\n to paragraph breaks and single
+    # \n to <br>.
+    body_html = ''
+    paragraphs = body_text.split('\n\n')
+    for i, para in enumerate(paragraphs):
+        if not para.strip():
+            continue
+        # Single newlines within a paragraph become <br>
+        para_html = para.replace('\n', '<br>')
+        margin = '0 0 14px' if i < len(paragraphs) - 1 else '0'
+        body_html += (
+            f'<p style="color:#0E1116;font-size:15px;line-height:1.6;'
+            f'margin:{margin};">{para_html}</p>'
+        )
+
+    html_body_inner = (
+        f'<h1 style="color:#0E1116;font-size:20px;margin:0 0 18px;'
+        f'font-weight:600;letter-spacing:-0.01em;">{subject}</h1>'
+        + body_html +
+        '<p style="color:#8B8F96;font-size:12px;line-height:1.5;margin:24px 0 0;'
+        'padding-top:18px;border-top:1px solid #ECEEF1;">'
+        'Adjust your brief preferences or threshold alerts in your '
+        '<a href="https://weathervalet.ai/?portal=1" '
+        'style="color:#2E4FB8;text-decoration:none;">subscriber portal</a>.</p>'
     )
+    # Preheader: first ~90 chars of brief body so inbox preview is useful
+    preheader_text = body_text.replace('\n', ' ').strip()[:90]
+    html_body = _email_shell(html_body_inner, preheader=preheader_text)
 
     payload = json.dumps({
         "from": from_addr,
