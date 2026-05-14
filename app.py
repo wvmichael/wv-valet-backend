@@ -517,6 +517,26 @@ CREATE TABLE IF NOT EXISTS stripe_events (
     payload_kb      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_stripe_events_type ON stripe_events(event_type, processed_at DESC);
+
+-- ── Crew field-notebook entries (confessionals) ──
+-- Private notes a Crew member writes after completing a mission.
+-- Visible only to the author (and optionally the platform if the
+-- "quoteable" flag is set, in which case future Met briefs may pull
+-- from them). Schema mirrors the frontend client_id pattern so the
+-- frontend can keep its existing id format ("c-<base36-timestamp>").
+--
+-- Phase 4a (May 14): replace localStorage with real persistence.
+CREATE TABLE IF NOT EXISTS confessionals (
+    id              TEXT PRIMARY KEY,            -- client-generated, e.g. "c-l8x7y2"
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    text            TEXT NOT NULL,
+    quoteable       BOOLEAN NOT NULL DEFAULT FALSE,
+    mission_id      TEXT,                        -- nullable; the mission that prompted it
+    mission_label   TEXT,                        -- nullable; human-readable label
+    answer_label    TEXT,                        -- nullable; what the Crew answered
+    created_at      BIGINT NOT NULL              -- ms since epoch
+);
+CREATE INDEX IF NOT EXISTS idx_confessionals_user ON confessionals(user_id, created_at DESC);
 """
 
 
@@ -5962,6 +5982,189 @@ def admin_remove_user_role(user_id, role):
         return jsonify({"ok": False, "error": "remove-role-failed"}), 500
 
     return jsonify({"ok": True, "member": _serialize_user_for_admin(row)})
+
+
+# ════════════════════════════════════════════════════════════════════
+# Crew confessionals (Phase 4a — May 14)
+# ════════════════════════════════════════════════════════════════════
+#
+# Replaces localStorage-only persistence of Field Notebook entries.
+# Each row belongs to a specific user (Crew member); only they can
+# read or write their own confessionals.
+#
+# Endpoints:
+#   GET  /api/v1/confessionals      — list current user's confessionals
+#   POST /api/v1/confessionals      — create a new confessional
+#   DELETE /api/v1/confessionals/<id> — delete (within 1 hour of creation)
+#
+# Auth: session cookie required. No public access.
+
+@app.route("/api/v1/confessionals", methods=["OPTIONS"])
+def _confessionals_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/confessionals")
+def confessionals_list():
+    """Return the current user's confessionals, newest first.
+
+    Returns:
+        200 {"ok": true, "confessionals": [...]}
+        401 {"ok": false, "error": "not-authenticated"}
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, text, quoteable, mission_id, mission_label,
+                          answer_label, created_at
+                   FROM confessionals
+                   WHERE user_id = %s
+                   ORDER BY created_at DESC""",
+                (user["id"],),
+            )
+            rows = cur.fetchall()
+
+    # Map to the same shape the frontend was using under localStorage,
+    # so we can swap fetch for localStorage with minimal frontend code change.
+    items = [
+        {
+            "id": r["id"],
+            "text": r["text"],
+            "quoteable": bool(r["quoteable"]),
+            "missionId": r["mission_id"],
+            "missionLabel": r["mission_label"],
+            "answerLabel": r["answer_label"],
+            # Frontend's localStorage stored ISO strings as `timestamp`.
+            # We stored ms-since-epoch in the DB; convert back to ISO so
+            # the frontend's existing date formatting still works.
+            "timestamp": datetime.fromtimestamp(r["created_at"] / 1000, tz=timezone.utc).isoformat(),
+        }
+        for r in rows
+    ]
+    return jsonify({"ok": True, "confessionals": items})
+
+
+@app.post("/api/v1/confessionals")
+def confessionals_create():
+    """Create a new confessional for the current user.
+
+    Request body:
+        {
+          "id": "c-l8x7y2",              # client-generated, optional
+          "text": "...",                 # required, non-empty after trim
+          "quoteable": false,            # optional, defaults to false
+          "missionId": "flag-check",     # optional
+          "missionLabel": "Flag check",  # optional
+          "answerLabel": "Calm"          # optional
+        }
+
+    Returns:
+        200 {"ok": true, "confessional": {...}}
+        400 {"ok": false, "error": "missing-text"}
+        401 {"ok": false, "error": "not-authenticated"}
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"ok": False, "error": "missing-text"}), 400
+
+    # Sanity cap on length to prevent abuse (matches the frontend's
+    # ~600 char soft limit). Keep slack room for unicode counts.
+    if len(text) > 4000:
+        text = text[:4000]
+
+    # Use client-supplied id if present (preserves the c-<base36> format
+    # the frontend has been using), else generate one server-side.
+    entry_id = (data.get("id") or "").strip()
+    if not entry_id:
+        entry_id = "c-" + secrets.token_hex(6)
+
+    quoteable = bool(data.get("quoteable", False))
+    mission_id = (data.get("missionId") or "").strip() or None
+    mission_label = (data.get("missionLabel") or "").strip() or None
+    answer_label = (data.get("answerLabel") or "").strip() or None
+    # Store created_at in ms since epoch (matches frontend Date.now() semantics)
+    created_at_ms = int(time.time() * 1000)
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO confessionals
+                       (id, user_id, text, quoteable, mission_id, mission_label,
+                        answer_label, created_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                       ON CONFLICT (id) DO NOTHING""",
+                    (entry_id, user["id"], text, quoteable, mission_id,
+                     mission_label, answer_label, created_at_ms),
+                )
+    except Exception as e:
+        print(f"[confessionals_create] failed: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"ok": False, "error": "create-failed"}), 500
+
+    return jsonify({"ok": True, "confessional": {
+        "id": entry_id,
+        "text": text,
+        "quoteable": quoteable,
+        "missionId": mission_id,
+        "missionLabel": mission_label,
+        "answerLabel": answer_label,
+        "timestamp": datetime.fromtimestamp(created_at_ms / 1000, tz=timezone.utc).isoformat(),
+    }})
+
+
+@app.route("/api/v1/confessionals/<entry_id>", methods=["OPTIONS"])
+def _confessionals_delete_preflight(entry_id):
+    return ("", 204)
+
+
+@app.delete("/api/v1/confessionals/<entry_id>")
+def confessionals_delete(entry_id):
+    """Delete a confessional. Only allowed within 1 hour of creation —
+    after that the entry is "set in stone" by design (it's a journal
+    entry, not a chat message). This matches the product spec where
+    confessionals are editable for a short window after writing.
+
+    Returns:
+        200 {"ok": true}
+        401 {"ok": false, "error": "not-authenticated"}
+        404 {"ok": false, "error": "not-found"}
+        403 {"ok": false, "error": "edit-window-closed"}
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    now_ms = int(time.time() * 1000)
+    edit_window_ms = 60 * 60 * 1000  # 1 hour
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT user_id, created_at FROM confessionals WHERE id = %s",
+                (entry_id,),
+            )
+            row = cur.fetchone()
+
+            if row is None or row["user_id"] != user["id"]:
+                # Either no such entry, or it belongs to a different user.
+                # Don't distinguish — same 404 either way (no info leak).
+                return jsonify({"ok": False, "error": "not-found"}), 404
+
+            if now_ms - row["created_at"] > edit_window_ms:
+                return jsonify({"ok": False, "error": "edit-window-closed"}), 403
+
+            cur.execute("DELETE FROM confessionals WHERE id = %s", (entry_id,))
+
+    return jsonify({"ok": True})
 
 
 if __name__ == "__main__":
