@@ -729,9 +729,15 @@ def _send_magic_link_email(email: str, magic_link_url: str, intent: str = "sign-
     early testing continue to work even before Resend is wired up, and
     gives us a clean rollback if Resend has a transient outage.
 
-    The `intent` argument toggles the email subject and body framing:
-      "sign-in"        → "Sign in to WeatherValet"
-      "password-reset" → "Reset your WeatherValet password"
+    The `intent` argument toggles the email subject and body framing.
+    All three intents share the same delivery path and visual style;
+    only the wording changes:
+      "sign-in"        → "Sign in to WeatherValet" (magic-link sign-in)
+      "password-reset" → "Reset your WeatherValet password" (forgot password)
+      "new-account"    → "Welcome to WeatherValet — set your password"
+                         (new subscriber from Stripe webhook)
+
+    Unknown intents fall back to "sign-in" framing.
 
     Returns True on success (or successful stub print), False on send
     failure. The auth flow does not block on this return value — a
@@ -740,19 +746,6 @@ def _send_magic_link_email(email: str, magic_link_url: str, intent: str = "sign-
     """
     api_key = os.environ.get("RESEND_API_KEY", "").strip()
     from_addr = os.environ.get("EMAIL_FROM", "").strip()
-
-    # Diagnostic logging — shows enough to know if env vars are read
-    # at send time, without leaking the full API key. Remove or quiet
-    # this block after email delivery is confirmed working in prod.
-    api_key_preview = (
-        f"{api_key[:4]}...{api_key[-3:]} (len={len(api_key)})"
-        if api_key else "EMPTY"
-    )
-    print(
-        f"[MAGIC LINK DIAG] api_key={api_key_preview} from='{from_addr}' "
-        f"intent={intent} recipient={email}",
-        flush=True,
-    )
 
     # Stub fallback — no API key configured, just log the link.
     if not api_key or not from_addr:
@@ -765,29 +758,50 @@ def _send_magic_link_email(email: str, magic_link_url: str, intent: str = "sign-
         return True
 
     # Subject + body adapt based on the intent. The visual style of the
-    # email is identical; only the wording changes.
-    is_reset = (intent == "password-reset")
-    subject = (
-        "Reset your WeatherValet password" if is_reset
-        else "Sign in to WeatherValet"
-    )
-    heading_text = "Reset your password" if is_reset else "Sign in to WeatherValet"
-    button_text = "Set a new password" if is_reset else "Sign in to WeatherValet"
-    body_text = (
-        "Tap the button below to set a new password. This link expires "
-        "in 15 minutes and can only be used once."
-        if is_reset
-        else "Tap the button below to sign in. This link expires in 15 "
-             "minutes and can only be used once."
-    )
-    safety_text = (
-        "If you didn't request this password reset, you can safely "
-        "ignore this email \u2014 your password won't change."
-        if is_reset
-        else "If you didn't request this sign-in link, you can safely "
-             "ignore this email \u2014 no one can sign in without "
-             "clicking the link above."
-    )
+    # email is identical across all intents; only the wording changes.
+    # Picking each piece independently (subject/heading/button/body/safety)
+    # keeps the copy obvious and prevents accidental cross-wiring when
+    # we later add new intents.
+    if intent == "new-account":
+        subject = "Welcome to WeatherValet \u2014 set your password"
+        heading_text = "Welcome to WeatherValet"
+        button_text = "Set your password"
+        body_text = (
+            "Thanks for subscribing. Tap the button below to set your "
+            "password and access your account. This link expires in "
+            "15 minutes and can only be used once."
+        )
+        safety_text = (
+            "If you didn't sign up for WeatherValet, please reply to this "
+            "email so we can look into it \u2014 no charges have been finalized "
+            "until your account is activated."
+        )
+    elif intent == "password-reset":
+        subject = "Reset your WeatherValet password"
+        heading_text = "Reset your password"
+        button_text = "Set a new password"
+        body_text = (
+            "Tap the button below to set a new password. This link expires "
+            "in 15 minutes and can only be used once."
+        )
+        safety_text = (
+            "If you didn't request this password reset, you can safely "
+            "ignore this email \u2014 your password won't change."
+        )
+    else:
+        # Default: "sign-in" (magic-link login)
+        subject = "Sign in to WeatherValet"
+        heading_text = "Sign in to WeatherValet"
+        button_text = "Sign in to WeatherValet"
+        body_text = (
+            "Tap the button below to sign in. This link expires in 15 "
+            "minutes and can only be used once."
+        )
+        safety_text = (
+            "If you didn't request this sign-in link, you can safely "
+            "ignore this email \u2014 no one can sign in without clicking "
+            "the link above."
+        )
 
     html_body = (
         '<div style="font-family: -apple-system, BlinkMacSystemFont, '
@@ -2145,7 +2159,7 @@ def auth_request_magic_link():
     # AFTER verify (just sign in vs. show set-password form).
     # Acceptable values: "sign-in" (default), "password-reset".
     intent = (data.get("intent") or "sign-in").strip()
-    if intent not in ("sign-in", "password-reset"):
+    if intent not in ("sign-in", "password-reset", "new-account"):
         intent = "sign-in"
 
     if not is_valid_email(email):
@@ -3191,8 +3205,8 @@ def _mark_paid_and_notify(request_id: int, *, payment_id: Optional[str] = None,
 #   3. If session.mode == 'subscription':
 #        a. Find or create the user matching session.customer_details.email
 #        b. Grant them the 'subscriber' role (if not already)
-#        c. Send them a magic-link email with intent=password-reset so
-#           they can set their initial password
+#        c. Send them a magic-link email with intent=new-account so
+#           they can set their initial password (welcome-framed copy)
 #   4. If session.mode == 'payment' (one-time $19 purchase):
 #        a. Log it but don't create an account (per product decision —
 #           $19 is a transactional purchase, not an account-creation event)
@@ -3467,8 +3481,8 @@ def stripe_webhook_v2():
                            VALUES (%s, %s, %s, %s, %s)""",
                         (token_hash, user_id, now, now + MAGIC_LINK_TTL_SECONDS, "stripe-webhook"),
                     )
-            magic_link_url = f"{base}/?auth=verify&token={raw_token}&intent=password-reset"
-            _send_magic_link_email(email, magic_link_url, intent="password-reset")
+            magic_link_url = f"{base}/?auth=verify&token={raw_token}&intent=new-account"
+            _send_magic_link_email(email, magic_link_url, intent="new-account")
 
             print(
                 f"[stripe-webhook] subscription provisioned: "
