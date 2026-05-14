@@ -1025,6 +1025,48 @@ CREATE INDEX IF NOT EXISTS idx_nws_alert_pages_status
     ON nws_alert_pages(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_nws_alert_pages_token
     ON nws_alert_pages(response_token);
+
+-- ── Pro Threads (Phase 10 — Met<>Subscriber DMs) ──
+-- One thread per subscriber, holding their conversation with the Met
+-- team. Simpler than per-topic threading: subscribers see one continuous
+-- conversation; Mets see a queue of threads to attend to.
+--
+-- last_message_at + last_message_preview let the Met queue render fast
+-- without joining to messages on every list call. Updated whenever a
+-- new message is inserted.
+--
+-- unread_for_met / unread_for_subscriber counters bump on the other
+-- side's writes and decrement when "mark as read" fires.
+CREATE TABLE IF NOT EXISTS pro_threads (
+    id                  SERIAL PRIMARY KEY,
+    subscriber_user_id  INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+    created_at          BIGINT NOT NULL,
+    last_message_at     BIGINT,
+    last_message_preview TEXT,
+    last_message_from   TEXT,                 -- 'subscriber' | 'met'
+    unread_for_met      INTEGER NOT NULL DEFAULT 0,
+    unread_for_subscriber INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_pro_threads_subscriber
+    ON pro_threads(subscriber_user_id);
+CREATE INDEX IF NOT EXISTS idx_pro_threads_last_message
+    ON pro_threads(last_message_at DESC NULLS LAST);
+
+-- ── Pro Thread Messages ──
+-- One row per message. sender_role identifies who sent it ('subscriber'
+-- or 'met'). sender_user_id is the actual user — useful for Met audit
+-- (which Met responded?). Body is plain text (no markdown for v1).
+CREATE TABLE IF NOT EXISTS pro_thread_messages (
+    id              SERIAL PRIMARY KEY,
+    thread_id       INTEGER NOT NULL REFERENCES pro_threads(id) ON DELETE CASCADE,
+    created_at      BIGINT NOT NULL,
+    sender_role     TEXT NOT NULL,            -- 'subscriber' | 'met'
+    sender_user_id  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    sender_name     TEXT,                     -- snapshot
+    body            TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pro_thread_messages_thread
+    ON pro_thread_messages(thread_id, created_at ASC);
 """
 
 
@@ -12092,6 +12134,415 @@ def nws_page_dismiss(response_token: str):
             pass
 
     print(f"[nws-dismiss] page_id={page['id']} dismissed by met={met_name}", flush=True)
+    return jsonify({"ok": True})
+
+
+# ════════════════════════════════════════════════════════════════════
+# Pro Threads — Met<>Subscriber DMs (Phase 10)
+# ════════════════════════════════════════════════════════════════════
+#
+# Subscriber endpoints (require subscriber role + Pro tier):
+#   GET  /api/v1/me/thread                    — get my thread + recent messages
+#   POST /api/v1/me/thread/messages           — send a message
+#   POST /api/v1/me/thread/mark-read          — reset my unread counter
+#
+# Met endpoints (require met or admin role):
+#   GET  /api/v1/met/threads                  — list all threads (queue)
+#   GET  /api/v1/met/threads/<id>             — get one thread + messages
+#   POST /api/v1/met/threads/<id>/messages    — send a message
+#   POST /api/v1/met/threads/<id>/mark-read   — reset Met's unread counter
+
+# ─── Subscriber side ────────────────────────────────────────────────
+
+def _get_or_create_thread_for_subscriber(user_id: int):
+    """Find or create the single thread for a subscriber. Returns the
+    thread row. Idempotent — same subscriber always gets same thread."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM pro_threads WHERE subscriber_user_id = %s",
+                (user_id,),
+            )
+            row = cur.fetchone()
+            if row:
+                return row
+            cur.execute(
+                """INSERT INTO pro_threads (subscriber_user_id, created_at)
+                   VALUES (%s, %s) RETURNING *""",
+                (user_id, int(time.time() * 1000)),
+            )
+            return cur.fetchone()
+
+
+def _is_pro_subscriber(user: dict) -> bool:
+    """True if the user is a Pro-tier subscriber. Pro Threads is a Pro
+    feature; Hobbyists can't access it."""
+    if not user:
+        return False
+    if "subscriber" not in (user.get("roles") or []):
+        return False
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT subscription_tier FROM users WHERE id = %s",
+                (user["id"],),
+            )
+            row = cur.fetchone()
+    tier = (row or {}).get("subscription_tier") or ""
+    return tier in ("pro_single", "pro_multi", "pro_enterprise")
+
+
+@app.route("/api/v1/me/thread", methods=["OPTIONS"])
+def _me_thread_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/thread")
+def me_thread_get():
+    """Return the subscriber's thread + last 50 messages."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if not _is_pro_subscriber(user):
+        return jsonify({
+            "ok": False,
+            "error": "pro-tier-required",
+            "message": "Pro Threads is available on Pro Single, Pro Multi, and Pro Enterprise plans.",
+        }), 403
+
+    thread = _get_or_create_thread_for_subscriber(user["id"])
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, created_at, sender_role, sender_name, body
+                   FROM pro_thread_messages
+                   WHERE thread_id = %s
+                   ORDER BY created_at DESC LIMIT 50""",
+                (thread["id"],),
+            )
+            recent = cur.fetchall()
+
+    # Reverse so frontend gets oldest-first (chronological reading order)
+    messages = [
+        {
+            "id": m["id"],
+            "created_at": m["created_at"],
+            "sender_role": m["sender_role"],
+            "sender_name": m["sender_name"],
+            "body": m["body"],
+        }
+        for m in reversed(recent)
+    ]
+
+    return jsonify({
+        "ok": True,
+        "thread": {
+            "id": thread["id"],
+            "created_at": thread["created_at"],
+            "last_message_at": thread["last_message_at"],
+            "unread_for_subscriber": thread["unread_for_subscriber"],
+        },
+        "messages": messages,
+    })
+
+
+@app.post("/api/v1/me/thread/messages")
+def me_thread_send():
+    """Subscriber sends a message. Pages the Met via SMS so they know."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if not _is_pro_subscriber(user):
+        return jsonify({"ok": False, "error": "pro-tier-required"}), 403
+
+    data = request.get_json(silent=True) or {}
+    body = (data.get("body") or "").strip()
+    if not body:
+        return jsonify({"ok": False, "error": "empty-message"}), 400
+    if len(body) > 4000:
+        return jsonify({"ok": False, "error": "message-too-long"}), 400
+
+    thread = _get_or_create_thread_for_subscriber(user["id"])
+    sender_name = user.get("name") or (user.get("email") or "").split("@")[0]
+    now_ms = int(time.time() * 1000)
+    preview = body[:120]
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO pro_thread_messages
+                   (thread_id, created_at, sender_role, sender_user_id,
+                    sender_name, body)
+                   VALUES (%s, %s, 'subscriber', %s, %s, %s)
+                   RETURNING id""",
+                (thread["id"], now_ms, user["id"], sender_name, body),
+            )
+            msg_id = cur.fetchone()["id"]
+            cur.execute(
+                """UPDATE pro_threads
+                   SET last_message_at = %s,
+                       last_message_preview = %s,
+                       last_message_from = 'subscriber',
+                       unread_for_met = unread_for_met + 1
+                   WHERE id = %s""",
+                (now_ms, preview, thread["id"]),
+            )
+
+    # Page the on-duty Met by SMS (fire-and-forget)
+    try:
+        if METEOROLOGIST_PHONE:
+            base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+            sms_body = (
+                f"WV Pro Thread from {sender_name}:\n"
+                f"{preview}\n\n"
+                f"Reply in workspace: {base}/?screen=met"
+            )
+            send_sms(METEOROLOGIST_PHONE, sms_body)
+    except Exception as e:
+        print(f"[pro-thread] Met SMS notify failed: {e}", flush=True)
+
+    return jsonify({
+        "ok": True,
+        "message_id": msg_id,
+        "created_at": now_ms,
+    })
+
+
+@app.post("/api/v1/me/thread/mark-read")
+def me_thread_mark_read():
+    """Subscriber acknowledges they've read the Met's messages.
+    Resets their unread counter to 0."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if not _is_pro_subscriber(user):
+        return jsonify({"ok": False, "error": "pro-tier-required"}), 403
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE pro_threads
+                   SET unread_for_subscriber = 0
+                   WHERE subscriber_user_id = %s""",
+                (user["id"],),
+            )
+
+    return jsonify({"ok": True})
+
+
+# ─── Met side ───────────────────────────────────────────────────────
+
+@app.route("/api/v1/met/threads", methods=["OPTIONS"])
+def _met_threads_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/threads")
+def met_threads_list():
+    """List all Pro Threads, sorted by most recent activity. Met workspace
+    surface — Met sees the queue of conversations.
+
+    Unread threads (unread_for_met > 0) sort to the top regardless of
+    last message time. Within each group, most recent first.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "met" not in (user.get("roles") or []) and "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT t.*, u.email AS subscriber_email, u.name AS subscriber_name,
+                          u.subscription_tier AS subscriber_tier
+                   FROM pro_threads t
+                   JOIN users u ON u.id = t.subscriber_user_id
+                   WHERE u.is_active = TRUE
+                     AND u.subscription_tier IN ('pro_single','pro_multi','pro_enterprise')
+                   ORDER BY
+                     CASE WHEN t.unread_for_met > 0 THEN 0 ELSE 1 END,
+                     COALESCE(t.last_message_at, t.created_at) DESC
+                   LIMIT 100"""
+            )
+            rows = cur.fetchall()
+
+    threads = [
+        {
+            "id": r["id"],
+            "subscriber_user_id": r["subscriber_user_id"],
+            "subscriber_email": r["subscriber_email"],
+            "subscriber_name": r.get("subscriber_name") or "",
+            "subscriber_tier": r.get("subscriber_tier"),
+            "created_at": r["created_at"],
+            "last_message_at": r["last_message_at"],
+            "last_message_preview": r["last_message_preview"],
+            "last_message_from": r["last_message_from"],
+            "unread_for_met": r["unread_for_met"],
+        }
+        for r in rows
+    ]
+    return jsonify({"ok": True, "threads": threads})
+
+
+@app.route("/api/v1/met/threads/<int:thread_id>", methods=["OPTIONS"])
+def _met_thread_id_preflight(thread_id):
+    return ("", 204)
+
+
+@app.get("/api/v1/met/threads/<int:thread_id>")
+def met_thread_get(thread_id):
+    """Met opens a thread — returns thread + last 100 messages."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "met" not in (user.get("roles") or []) and "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT t.*, u.email AS subscriber_email, u.name AS subscriber_name,
+                          u.phone AS subscriber_phone,
+                          u.subscription_tier AS subscriber_tier
+                   FROM pro_threads t
+                   JOIN users u ON u.id = t.subscriber_user_id
+                   WHERE t.id = %s""",
+                (thread_id,),
+            )
+            thread = cur.fetchone()
+    if not thread:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, created_at, sender_role, sender_name, body
+                   FROM pro_thread_messages
+                   WHERE thread_id = %s
+                   ORDER BY created_at DESC LIMIT 100""",
+                (thread_id,),
+            )
+            recent = cur.fetchall()
+
+    messages = [
+        {
+            "id": m["id"],
+            "created_at": m["created_at"],
+            "sender_role": m["sender_role"],
+            "sender_name": m["sender_name"],
+            "body": m["body"],
+        }
+        for m in reversed(recent)
+    ]
+
+    return jsonify({
+        "ok": True,
+        "thread": {
+            "id": thread["id"],
+            "subscriber_user_id": thread["subscriber_user_id"],
+            "subscriber_email": thread["subscriber_email"],
+            "subscriber_name": thread.get("subscriber_name") or "",
+            "subscriber_phone": thread.get("subscriber_phone") or "",
+            "subscriber_tier": thread.get("subscriber_tier"),
+            "unread_for_met": thread["unread_for_met"],
+        },
+        "messages": messages,
+    })
+
+
+@app.post("/api/v1/met/threads/<int:thread_id>/messages")
+def met_thread_send(thread_id):
+    """Met replies to a thread. Notifies subscriber by SMS if they have a phone."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "met" not in (user.get("roles") or []) and "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    body = (data.get("body") or "").strip()
+    if not body:
+        return jsonify({"ok": False, "error": "empty-message"}), 400
+    if len(body) > 4000:
+        return jsonify({"ok": False, "error": "message-too-long"}), 400
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT t.id, t.subscriber_user_id, u.phone AS sub_phone
+                   FROM pro_threads t
+                   JOIN users u ON u.id = t.subscriber_user_id
+                   WHERE t.id = %s""",
+                (thread_id,),
+            )
+            thread = cur.fetchone()
+    if not thread:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+
+    sender_name = user.get("name") or "Your meteorologist"
+    now_ms = int(time.time() * 1000)
+    preview = body[:120]
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO pro_thread_messages
+                   (thread_id, created_at, sender_role, sender_user_id,
+                    sender_name, body)
+                   VALUES (%s, %s, 'met', %s, %s, %s)
+                   RETURNING id""",
+                (thread_id, now_ms, user["id"], sender_name, body),
+            )
+            msg_id = cur.fetchone()["id"]
+            cur.execute(
+                """UPDATE pro_threads
+                   SET last_message_at = %s,
+                       last_message_preview = %s,
+                       last_message_from = 'met',
+                       unread_for_subscriber = unread_for_subscriber + 1
+                   WHERE id = %s""",
+                (now_ms, preview, thread_id),
+            )
+
+    # Notify subscriber by SMS so they know to check
+    try:
+        if thread.get("sub_phone"):
+            base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+            sms_body = (
+                f"WeatherValet: {sender_name} replied to your thread.\n"
+                f"{preview}\n\n"
+                f"View: {base}/?portal=threads"
+            )
+            send_sms(thread["sub_phone"], sms_body)
+    except Exception as e:
+        print(f"[pro-thread] subscriber SMS notify failed: {e}", flush=True)
+
+    return jsonify({
+        "ok": True,
+        "message_id": msg_id,
+        "created_at": now_ms,
+    })
+
+
+@app.post("/api/v1/met/threads/<int:thread_id>/mark-read")
+def met_thread_mark_read(thread_id):
+    """Met acknowledges they've read the subscriber's messages. Resets
+    Met's unread counter for this thread to 0."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "met" not in (user.get("roles") or []) and "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE pro_threads SET unread_for_met = 0 WHERE id = %s",
+                (thread_id,),
+            )
+
     return jsonify({"ok": True})
 
 
