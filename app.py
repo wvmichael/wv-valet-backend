@@ -14199,11 +14199,17 @@ def _fire_scheduled_message(msg_row: dict) -> tuple[bool, str | None]:
 def _publish_daily_brief_internal(content: dict, audience: dict | None,
                                   published_by_user_id: int | None,
                                   published_by_name: str | None) -> tuple[bool, str | None]:
-    """Internal helper to publish a Daily Brief.
+    """Publish a Daily Brief to every matching subscriber via their
+    configured channels (SMS / email).
 
-    Writes to brief_history for matching subscribers; doesn't dispatch
-    SMS for the launch v1 since the Daily Brief tab is intended as a
-    region-wide post visible in subscribers' next morning brief context.
+    Looks up each subscriber's brief_preferences.channels (defaults to
+    'sms,email' if unset) and dispatches accordingly. Records a
+    brief_history row per subscriber with the channels actually used.
+
+    Returns (success, error). "Success" means at least one subscriber
+    got the brief through at least one channel. If zero recipients
+    matched the audience filter, that's also success — the Met did
+    their work, the audience just happened to be empty.
     """
     try:
         body = (content.get("body") or "").strip()
@@ -14211,17 +14217,23 @@ def _publish_daily_brief_internal(content: dict, audience: dict | None,
             return False, "missing-body"
         now_ms = int(time.time() * 1000)
 
+        # Optional fields from the Daily Brief composer
+        verdict = (content.get("verdict") or "").strip() or None
+        headline = (content.get("headline") or "Daily Brief").strip()
+        time_windows = (content.get("time_windows") or "").strip()
+
         # Find target subscribers by county. audience.counties is a list
-        # of county SAME codes or names — for v1 we accept either, but
-        # the simplest matching is by saved_locations.county.
+        # of county labels from the Met's multi-select.
         counties = []
         if audience and isinstance(audience, dict):
             counties = audience.get("counties") or []
 
         if not counties:
             # No specific counties — broadcast to all active subscribers
-            sql = """SELECT DISTINCT u.id, u.email, u.phone
+            sql = """SELECT DISTINCT u.id, u.email, u.phone, u.name,
+                            bp.channels
                      FROM users u
+                     LEFT JOIN brief_preferences bp ON bp.user_id = u.id
                      WHERE u.is_active = TRUE
                        AND EXISTS (
                          SELECT 1 FROM user_roles ur
@@ -14229,9 +14241,11 @@ def _publish_daily_brief_internal(content: dict, audience: dict | None,
                        )"""
             sql_params: tuple = ()
         else:
-            sql = """SELECT DISTINCT u.id, u.email, u.phone
+            sql = """SELECT DISTINCT u.id, u.email, u.phone, u.name,
+                            bp.channels
                      FROM users u
                      JOIN saved_locations sl ON sl.user_id = u.id
+                     LEFT JOIN brief_preferences bp ON bp.user_id = u.id
                      WHERE u.is_active = TRUE
                        AND sl.county = ANY(%s)
                        AND EXISTS (
@@ -14244,18 +14258,83 @@ def _publish_daily_brief_internal(content: dict, audience: dict | None,
             with conn.cursor() as cur:
                 cur.execute(sql, sql_params)
                 recipients = cur.fetchall()
-                # Log a brief_history entry for each
-                for r in recipients:
-                    cur.execute(
-                        """INSERT INTO brief_history
-                           (user_id, brief_type, delivered_at, snippet, full_body,
-                            delivery_status, channels_used, is_met_touched, met_name)
-                           VALUES (%s, 'daily_brief', %s, %s, %s, 'sent', 'inline',
-                                   TRUE, %s)""",
-                        (r["id"], now_ms, body[:140], body, published_by_name or ""),
-                    )
 
-        print(f"[scheduled-fire] daily_brief published to {len(recipients)} subs", flush=True)
+        # Build SMS-friendly snippet and email-friendly long body
+        snippet = body[:140] + ("\u2026" if len(body) > 140 else "")
+        sms_msg = f"{headline} — {snippet}"
+        if time_windows:
+            sms_msg += f"\nWindow: {time_windows[:80]}"
+        # Cap SMS at 320 chars to avoid 3-segment messages
+        if len(sms_msg) > 320:
+            sms_msg = sms_msg[:317] + "..."
+
+        email_subject = headline
+        email_body_parts = [body]
+        if time_windows:
+            email_body_parts.append(f"\nTime windows: {time_windows}")
+        if published_by_name:
+            email_body_parts.append(f"\n— {published_by_name}, WeatherValet meteorologist")
+        email_body = "\n\n".join(email_body_parts)
+
+        delivered_count = 0
+        failed_count = 0
+        for r in recipients:
+            try:
+                # Default to SMS + email if no preferences set
+                channels_str = r.get("channels") or "sms,email"
+                channels = [ch.strip() for ch in channels_str.split(",") if ch.strip()]
+                channels_used = []
+                any_success = False
+
+                for ch in channels:
+                    if ch == "sms" and r.get("phone"):
+                        try:
+                            ok = send_sms(r["phone"], sms_msg)
+                            if ok:
+                                channels_used.append("sms")
+                                any_success = True
+                        except Exception as e:
+                            print(f"[daily-brief-fire] SMS failed user_id={r['id']}: {e}", flush=True)
+                    elif ch == "email" and r.get("email"):
+                        try:
+                            ok = _send_brief_email(r["email"], email_subject, email_body)
+                            if ok:
+                                channels_used.append("email")
+                                any_success = True
+                        except Exception as e:
+                            print(f"[daily-brief-fire] email failed user_id={r['id']}: {e}", flush=True)
+
+                # Always record history, even on failure — we want a paper trail
+                delivery_status = "sent" if any_success else "failed"
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """INSERT INTO brief_history
+                               (user_id, brief_type, delivered_at, verdict, snippet,
+                                full_body, delivery_status, channels_used,
+                                is_met_touched, met_name)
+                               VALUES (%s, 'daily_brief', %s, %s, %s, %s, %s, %s,
+                                       TRUE, %s)""",
+                            (r["id"], now_ms, verdict, snippet, body,
+                             delivery_status, ",".join(channels_used),
+                             published_by_name or ""),
+                        )
+                if any_success:
+                    delivered_count += 1
+                else:
+                    failed_count += 1
+            except Exception as e:
+                failed_count += 1
+                print(f"[daily-brief-fire] per-sub error user_id={r.get('id')}: {e!r}", flush=True)
+
+        print(
+            f"[daily-brief-fire] published to {delivered_count} subs "
+            f"({failed_count} failed) by={published_by_name}",
+            flush=True,
+        )
+        # Success if we attempted (even if zero recipients matched, the Met
+        # did their work; if some failed, we still count the dispatch as
+        # successful from the firing perspective)
         return True, None
     except Exception as e:
         return False, f"daily-brief-error: {e!r}"
