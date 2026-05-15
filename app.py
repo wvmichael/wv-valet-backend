@@ -13125,6 +13125,99 @@ def met_pro_subscribers_list():
     return jsonify({"ok": True, "subscribers": subscribers})
 
 
+@app.route("/api/v1/met/my-subscribers", methods=["OPTIONS"])
+def _met_my_subscribers_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/my-subscribers")
+def met_my_subscribers():
+    """Returns ALL subscribers (Hobbyist + Pro) with full operational
+    context so the Met can keep track of who needs what.
+
+    For each: name, email, phone, tier, primary location, brief prefs
+    (morning window, evening flag, channels), threshold alerts.
+
+    This is the "My Subscribers" tab data — built so the Met can answer
+    questions like "Is the athletic director getting what he needs?"
+    "Is the roofing company on a Wind > 20mph alert?"
+
+    For v1, all Mets see all subscribers. Region-scoping comes later
+    when we have Met-to-region assignments.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "met" not in (user.get("roles") or []) and "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.email, u.name, u.phone, u.subscription_tier,
+                          u.timezone,
+                          loc.label AS loc_label,
+                          loc.address_text AS loc_address,
+                          loc.county AS loc_county,
+                          bp.morning_enabled, bp.morning_window_start,
+                          bp.morning_window_end, bp.evening_enabled,
+                          bp.channels
+                   FROM users u
+                   LEFT JOIN saved_locations loc
+                          ON loc.user_id = u.id AND loc.is_primary = TRUE
+                   LEFT JOIN brief_preferences bp ON bp.user_id = u.id
+                   WHERE u.is_active = TRUE
+                     AND EXISTS (
+                       SELECT 1 FROM user_roles ur
+                       WHERE ur.user_id = u.id AND ur.role = 'subscriber'
+                     )
+                   ORDER BY u.subscription_tier DESC NULLS LAST,
+                            u.name, u.email"""
+            )
+            sub_rows = cur.fetchall()
+
+            # Threshold alerts — one query, group by user
+            cur.execute(
+                """SELECT user_id, metric, comparator, threshold_value, unit, is_enabled
+                   FROM threshold_alerts
+                   ORDER BY user_id, created_at"""
+            )
+            threshold_rows = cur.fetchall()
+
+    thresholds_by_user = {}
+    for t in threshold_rows:
+        thresholds_by_user.setdefault(t["user_id"], []).append({
+            "metric": t["metric"],
+            "comparator": t["comparator"],
+            "threshold_value": t["threshold_value"],
+            "unit": t["unit"],
+            "is_enabled": bool(t["is_enabled"]),
+        })
+
+    subscribers = []
+    for r in sub_rows:
+        subscribers.append({
+            "user_id": r["id"],
+            "email": r["email"],
+            "name": (r.get("name") or "").strip() or None,
+            "phone": r.get("phone") or None,
+            "tier": r.get("subscription_tier") or "free",
+            "timezone": r.get("timezone"),
+            "loc_label": r.get("loc_label"),
+            "loc_address": r.get("loc_address"),
+            "loc_county": r.get("loc_county"),
+            "brief_prefs": {
+                "morning_enabled": bool(r.get("morning_enabled")) if r.get("morning_enabled") is not None else None,
+                "morning_window_start": r.get("morning_window_start"),
+                "morning_window_end": r.get("morning_window_end"),
+                "evening_enabled": bool(r.get("evening_enabled")) if r.get("evening_enabled") is not None else None,
+                "channels": r.get("channels") or "sms,email",
+            },
+            "thresholds": thresholds_by_user.get(r["id"], []),
+        })
+    return jsonify({"ok": True, "subscribers": subscribers})
+
+
 @app.route("/api/v1/met/threads/new", methods=["OPTIONS"])
 def _met_new_thread_preflight():
     return ("", 204)
