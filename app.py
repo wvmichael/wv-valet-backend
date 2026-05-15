@@ -502,6 +502,51 @@ ALTER TABLE verification_requests ADD COLUMN IF NOT EXISTS completed_by_user_id 
 ALTER TABLE verification_requests ADD COLUMN IF NOT EXISTS completed_by_name TEXT;
 ALTER TABLE verification_requests ADD COLUMN IF NOT EXISTS customer_review_token TEXT UNIQUE;
 
+-- ── Scheduled messages (Phase 10 — Met scheduling) ──
+-- One table for Daily Brief / Pro Brief / Crew Post scheduling.
+-- The scheduler tick (60s) sweeps for pending items where
+-- scheduled_for_ms <= now and fires them.
+--
+-- type values:
+--   'daily_brief'  — county-wide regional brief (DailyBrief tab)
+--   'pro_brief'    — per-subscriber Pro tier brief (PrBriefs tab)
+--   'crew_post'    — Crew feed post (Send to Crew feed modal)
+--
+-- content_payload holds whatever the firing logic needs:
+--   daily_brief: { body, counties[], mode, state, ... }
+--   pro_brief:   { draft_id, final_body, final_verdict }
+--   crew_post:   { body, pin_lat, pin_lng, ... }
+--
+-- status flow:
+--   'pending'   — waiting for scheduled time
+--   'sent'      — fired successfully
+--   'cancelled' — Met cancelled it before firing
+--   'failed'    — fire attempt threw an error (see fire_error)
+--
+-- Scheduling rule: scheduled_for_ms is computed in UTC at submission
+-- time. The Met's UI shows the time in their chosen timezone, but the
+-- DB stores UTC so the scheduler doesn't need TZ logic at fire time.
+CREATE TABLE IF NOT EXISTS scheduled_messages (
+    id              SERIAL PRIMARY KEY,
+    type            TEXT NOT NULL,             -- 'daily_brief' | 'pro_brief' | 'crew_post'
+    scheduled_for_ms BIGINT NOT NULL,
+    scheduled_tz    TEXT,                       -- IANA name for display ("America/New_York")
+    scheduled_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    scheduled_by_name TEXT,                     -- snapshot
+    status          TEXT NOT NULL DEFAULT 'pending',
+    content_payload TEXT NOT NULL,              -- JSON-encoded
+    target_audience TEXT,                       -- JSON: counties[], subscriber_user_id, etc
+    fired_at        BIGINT,
+    fire_error      TEXT,
+    created_at      BIGINT NOT NULL,
+    updated_at      BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sched_msg_pending
+    ON scheduled_messages(status, scheduled_for_ms ASC)
+    WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_sched_msg_by_user
+    ON scheduled_messages(scheduled_by_user_id, created_at DESC);
+
 -- ── User roles — many-to-many; a user can hold several roles ──
 -- Roles: 'subscriber', 'crew', 'met', 'admin'
 -- A subscriber who is also Crew has two rows here.
@@ -10186,6 +10231,10 @@ def _brief_scheduler_loop() -> None:
             _check_missed_pro_briefs()
         except Exception as e:
             print(f"[missed-brief-check] tick failed: {e!r}", flush=True)
+        try:
+            _process_scheduled_messages()
+        except Exception as e:
+            print(f"[scheduled-msg-tick] tick failed: {e!r}", flush=True)
         time.sleep(60)
 
 
@@ -13828,6 +13877,512 @@ def me_earnings(year: int, month: int):
         "period": full["period"],
         "earnings": my_row,
     })
+
+
+# ════════════════════════════════════════════════════════════════════
+# Scheduled messages (Phase 10 — Met scheduling)
+# ════════════════════════════════════════════════════════════════════
+#
+# Endpoints for the Met to schedule Daily Briefs, Pro Briefs, and
+# Crew Posts for future delivery. The scheduler tick (in
+# _brief_scheduler_loop) fires due-now items.
+
+import json as _json_sched
+
+
+@app.route("/api/v1/me/scheduled-messages", methods=["OPTIONS"])
+def _me_scheduled_messages_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/me/scheduled-messages")
+def me_schedule_message():
+    """Create a new scheduled message.
+
+    Body:
+      {
+        "type": "daily_brief" | "pro_brief" | "crew_post",
+        "scheduled_for_ms": 1748786400000,    // UTC ms when to fire
+        "scheduled_tz": "America/New_York",   // for display only
+        "content_payload": {...},             // type-specific
+        "target_audience": {...}              // optional, type-specific
+      }
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "met" not in (user.get("roles") or []) and "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    msg_type = (data.get("type") or "").strip()
+    if msg_type not in ("daily_brief", "pro_brief", "crew_post"):
+        return jsonify({"ok": False, "error": "invalid-type"}), 400
+
+    try:
+        scheduled_for_ms = int(data.get("scheduled_for_ms") or 0)
+    except (ValueError, TypeError):
+        scheduled_for_ms = 0
+    now_ms = int(time.time() * 1000)
+    if scheduled_for_ms < now_ms + 30_000:
+        # Must be at least 30 seconds in the future — avoids races
+        return jsonify({
+            "ok": False,
+            "error": "scheduled-time-too-soon",
+            "message": "Pick a time at least a minute in the future."
+        }), 400
+    if scheduled_for_ms > now_ms + 365 * 24 * 3600 * 1000:
+        return jsonify({
+            "ok": False,
+            "error": "scheduled-time-too-far",
+            "message": "Can't schedule more than 1 year in advance."
+        }), 400
+
+    scheduled_tz = (data.get("scheduled_tz") or "").strip() or None
+
+    content = data.get("content_payload")
+    if not content:
+        return jsonify({"ok": False, "error": "missing-content"}), 400
+    content_json = _json_sched.dumps(content)
+
+    target_audience = data.get("target_audience")
+    target_json = _json_sched.dumps(target_audience) if target_audience else None
+
+    actor_name = (user.get("name") or "").strip() or user.get("email")
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO scheduled_messages
+                   (type, scheduled_for_ms, scheduled_tz,
+                    scheduled_by_user_id, scheduled_by_name,
+                    status, content_payload, target_audience,
+                    created_at, updated_at)
+                   VALUES (%s, %s, %s, %s, %s, 'pending', %s, %s, %s, %s)
+                   RETURNING id""",
+                (msg_type, scheduled_for_ms, scheduled_tz,
+                 user["id"], actor_name, content_json, target_json,
+                 now_ms, now_ms),
+            )
+            new_id = cur.fetchone()["id"]
+
+    print(
+        f"[scheduled-msg] created id={new_id} type={msg_type} by={user['id']} "
+        f"for={datetime.fromtimestamp(scheduled_for_ms/1000, tz=timezone.utc).isoformat()}",
+        flush=True,
+    )
+    return jsonify({"ok": True, "id": new_id, "scheduled_for_ms": scheduled_for_ms})
+
+
+@app.get("/api/v1/me/scheduled-messages")
+def me_list_scheduled_messages():
+    """List the calling Met's scheduled messages.
+
+    Query: ?status=pending (default) | sent | cancelled | failed | all
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "met" not in (user.get("roles") or []) and "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    status_filter = (request.args.get("status") or "pending").strip()
+    where = ["scheduled_by_user_id = %s"]
+    params: list = [user["id"]]
+    if status_filter != "all":
+        where.append("status = %s")
+        params.append(status_filter)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""SELECT id, type, scheduled_for_ms, scheduled_tz,
+                          status, content_payload, target_audience,
+                          fired_at, fire_error, created_at, updated_at
+                   FROM scheduled_messages
+                   WHERE {' AND '.join(where)}
+                   ORDER BY scheduled_for_ms ASC
+                   LIMIT 100""",
+                tuple(params),
+            )
+            rows = cur.fetchall()
+
+    items = []
+    for r in rows:
+        try:
+            content = _json_sched.loads(r["content_payload"]) if r["content_payload"] else {}
+        except Exception:
+            content = {}
+        try:
+            audience = _json_sched.loads(r["target_audience"]) if r["target_audience"] else None
+        except Exception:
+            audience = None
+        items.append({
+            "id": r["id"],
+            "type": r["type"],
+            "scheduled_for_ms": r["scheduled_for_ms"],
+            "scheduled_tz": r["scheduled_tz"],
+            "status": r["status"],
+            "content_payload": content,
+            "target_audience": audience,
+            "fired_at": r["fired_at"],
+            "fire_error": r["fire_error"],
+            "created_at": r["created_at"],
+        })
+    return jsonify({"ok": True, "items": items})
+
+
+@app.route("/api/v1/me/scheduled-messages/<int:msg_id>", methods=["OPTIONS"])
+def _me_scheduled_message_one_preflight(msg_id):
+    return ("", 204)
+
+
+@app.patch("/api/v1/me/scheduled-messages/<int:msg_id>")
+def me_update_scheduled_message(msg_id: int):
+    """Edit a scheduled message (only while still pending).
+
+    Body can include: scheduled_for_ms, scheduled_tz, content_payload,
+    target_audience. Only provided fields are updated.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, status, scheduled_by_user_id FROM scheduled_messages WHERE id = %s",
+                (msg_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    is_admin = "admin" in (user.get("roles") or [])
+    if row["scheduled_by_user_id"] != user["id"] and not is_admin:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    if row["status"] != "pending":
+        return jsonify({"ok": False, "error": "not-pending", "status": row["status"]}), 409
+
+    data = request.get_json(silent=True) or {}
+    set_clauses = []
+    params: list = []
+    now_ms = int(time.time() * 1000)
+
+    if "scheduled_for_ms" in data:
+        try:
+            new_for = int(data["scheduled_for_ms"])
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "error": "invalid-scheduled-for"}), 400
+        if new_for < now_ms + 30_000:
+            return jsonify({"ok": False, "error": "scheduled-time-too-soon"}), 400
+        set_clauses.append("scheduled_for_ms = %s")
+        params.append(new_for)
+    if "scheduled_tz" in data:
+        set_clauses.append("scheduled_tz = %s")
+        params.append(data["scheduled_tz"] or None)
+    if "content_payload" in data:
+        set_clauses.append("content_payload = %s")
+        params.append(_json_sched.dumps(data["content_payload"]))
+    if "target_audience" in data:
+        ta = data["target_audience"]
+        set_clauses.append("target_audience = %s")
+        params.append(_json_sched.dumps(ta) if ta else None)
+
+    if not set_clauses:
+        return jsonify({"ok": False, "error": "no-updates"}), 400
+
+    set_clauses.append("updated_at = %s")
+    params.append(now_ms)
+    params.append(msg_id)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE scheduled_messages SET {', '.join(set_clauses)} WHERE id = %s",
+                tuple(params),
+            )
+    return jsonify({"ok": True})
+
+
+@app.delete("/api/v1/me/scheduled-messages/<int:msg_id>")
+def me_cancel_scheduled_message(msg_id: int):
+    """Cancel a pending scheduled message."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, status, scheduled_by_user_id FROM scheduled_messages WHERE id = %s",
+                (msg_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    is_admin = "admin" in (user.get("roles") or [])
+    if row["scheduled_by_user_id"] != user["id"] and not is_admin:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    if row["status"] != "pending":
+        return jsonify({"ok": False, "error": "not-pending", "status": row["status"]}), 409
+
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE scheduled_messages
+                   SET status = 'cancelled', updated_at = %s
+                   WHERE id = %s""",
+                (now_ms, msg_id),
+            )
+    return jsonify({"ok": True})
+
+
+# ─── Firing scheduled messages — called from scheduler tick ────────────
+
+def _fire_scheduled_message(msg_row: dict) -> tuple[bool, str | None]:
+    """Fire a single scheduled message. Returns (success, error_str).
+
+    Routes to the right send path based on type. Wraps everything in
+    try/except so one bad item doesn't stop the scheduler tick.
+    """
+    msg_type = msg_row["type"]
+    try:
+        content = _json_sched.loads(msg_row["content_payload"])
+    except Exception as e:
+        return False, f"bad-content-payload: {e!r}"
+
+    if msg_type == "daily_brief":
+        # Daily brief: publish to brief_history for all users in the
+        # specified counties. Reuses the same publish path the immediate
+        # Publish button uses (see _publish_daily_brief helper below).
+        try:
+            audience = _json_sched.loads(msg_row.get("target_audience") or "null")
+        except Exception:
+            audience = None
+        return _publish_daily_brief_internal(
+            content=content,
+            audience=audience,
+            published_by_user_id=msg_row["scheduled_by_user_id"],
+            published_by_name=msg_row.get("scheduled_by_name"),
+        )
+
+    if msg_type == "pro_brief":
+        # Pro brief: take a pro_brief_drafts row and mark it sent,
+        # dispatch the SMS/email. Content payload carries draft_id +
+        # final_body + final_verdict.
+        try:
+            draft_id = int(content.get("draft_id") or 0)
+        except (ValueError, TypeError):
+            return False, "missing-draft-id"
+        if not draft_id:
+            return False, "missing-draft-id"
+        return _fire_pro_brief_draft(
+            draft_id=draft_id,
+            final_body=content.get("final_body"),
+            final_verdict=content.get("final_verdict"),
+            sent_by_user_id=msg_row["scheduled_by_user_id"],
+            sent_by_name=msg_row.get("scheduled_by_name"),
+        )
+
+    if msg_type == "crew_post":
+        # Crew post: publish to the Crew feed.
+        return _publish_crew_post_internal(
+            content=content,
+            posted_by_user_id=msg_row["scheduled_by_user_id"],
+            posted_by_name=msg_row.get("scheduled_by_name"),
+        )
+
+    return False, f"unknown-type: {msg_type}"
+
+
+def _publish_daily_brief_internal(content: dict, audience: dict | None,
+                                  published_by_user_id: int | None,
+                                  published_by_name: str | None) -> tuple[bool, str | None]:
+    """Internal helper to publish a Daily Brief.
+
+    Writes to brief_history for matching subscribers; doesn't dispatch
+    SMS for the launch v1 since the Daily Brief tab is intended as a
+    region-wide post visible in subscribers' next morning brief context.
+    """
+    try:
+        body = (content.get("body") or "").strip()
+        if not body:
+            return False, "missing-body"
+        now_ms = int(time.time() * 1000)
+
+        # Find target subscribers by county. audience.counties is a list
+        # of county SAME codes or names — for v1 we accept either, but
+        # the simplest matching is by saved_locations.county.
+        counties = []
+        if audience and isinstance(audience, dict):
+            counties = audience.get("counties") or []
+
+        if not counties:
+            # No specific counties — broadcast to all active subscribers
+            sql = """SELECT DISTINCT u.id, u.email, u.phone
+                     FROM users u
+                     WHERE u.is_active = TRUE
+                       AND EXISTS (
+                         SELECT 1 FROM user_roles ur
+                         WHERE ur.user_id = u.id AND ur.role = 'subscriber'
+                       )"""
+            sql_params: tuple = ()
+        else:
+            sql = """SELECT DISTINCT u.id, u.email, u.phone
+                     FROM users u
+                     JOIN saved_locations sl ON sl.user_id = u.id
+                     WHERE u.is_active = TRUE
+                       AND sl.county = ANY(%s)
+                       AND EXISTS (
+                         SELECT 1 FROM user_roles ur
+                         WHERE ur.user_id = u.id AND ur.role = 'subscriber'
+                       )"""
+            sql_params = (counties,)
+
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, sql_params)
+                recipients = cur.fetchall()
+                # Log a brief_history entry for each
+                for r in recipients:
+                    cur.execute(
+                        """INSERT INTO brief_history
+                           (user_id, brief_type, delivered_at, snippet, full_body,
+                            delivery_status, channels_used, is_met_touched, met_name)
+                           VALUES (%s, 'daily_brief', %s, %s, %s, 'sent', 'inline',
+                                   TRUE, %s)""",
+                        (r["id"], now_ms, body[:140], body, published_by_name or ""),
+                    )
+
+        print(f"[scheduled-fire] daily_brief published to {len(recipients)} subs", flush=True)
+        return True, None
+    except Exception as e:
+        return False, f"daily-brief-error: {e!r}"
+
+
+def _fire_pro_brief_draft(draft_id: int, final_body: str | None,
+                          final_verdict: str | None,
+                          sent_by_user_id: int | None,
+                          sent_by_name: str | None) -> tuple[bool, str | None]:
+    """Fire a previously-drafted Pro brief now."""
+    try:
+        now_ms = int(time.time() * 1000)
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, user_id, status FROM pro_brief_drafts WHERE id = %s",
+                    (draft_id,),
+                )
+                draft = cur.fetchone()
+        if not draft:
+            return False, f"draft-not-found: {draft_id}"
+        if draft["status"] == "sent":
+            return False, "draft-already-sent"
+
+        # Mark sent
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE pro_brief_drafts
+                       SET status = 'sent', sent_at = %s, sent_by_user_id = %s,
+                           sent_by_name = %s, final_body = COALESCE(%s, final_body),
+                           final_verdict = COALESCE(%s, final_verdict)
+                       WHERE id = %s""",
+                    (now_ms, sent_by_user_id, sent_by_name,
+                     final_body, final_verdict, draft_id),
+                )
+                # Also record in brief_history so subscriber's portal sees it
+                cur.execute(
+                    """SELECT email, phone FROM users WHERE id = %s""",
+                    (draft["user_id"],),
+                )
+                sub = cur.fetchone()
+                if sub:
+                    body_for_history = (final_body or "")[:140]
+                    cur.execute(
+                        """INSERT INTO brief_history
+                           (user_id, brief_type, delivered_at, snippet, full_body,
+                            delivery_status, channels_used, is_met_touched, met_name)
+                           VALUES (%s, 'morning', %s, %s, %s, 'sent',
+                                   'sms,email', TRUE, %s)""",
+                        (draft["user_id"], now_ms, body_for_history,
+                         final_body or "", sent_by_name or ""),
+                    )
+        # SMS dispatch
+        try:
+            if sub and sub.get("phone"):
+                send_sms(sub["phone"], (final_body or "")[:480])
+        except Exception as e:
+            print(f"[scheduled-fire] pro_brief SMS failed: {e}", flush=True)
+        return True, None
+    except Exception as e:
+        return False, f"pro-brief-error: {e!r}"
+
+
+def _publish_crew_post_internal(content: dict,
+                                posted_by_user_id: int | None,
+                                posted_by_name: str | None) -> tuple[bool, str | None]:
+    """Publish a Crew post. For v1 — log to brief_history-like store.
+
+    The Crew feed is currently mostly frontend-driven; we record the
+    intent so it can be surfaced in admin tools / audit. Real Crew
+    feed wiring exists separately.
+    """
+    try:
+        body = (content.get("body") or "").strip()
+        if not body:
+            return False, "missing-body"
+        print(f"[scheduled-fire] crew_post fired by={posted_by_user_id}: {body[:100]}", flush=True)
+        # NOTE: The "Send to Crew feed" path on the immediate-send side
+        # is frontend-driven in v1. When that gets wired to a real
+        # backend store, this should call the same function. For now,
+        # we just log success.
+        return True, None
+    except Exception as e:
+        return False, f"crew-post-error: {e!r}"
+
+
+def _process_scheduled_messages() -> None:
+    """Scheduler tick — check for due-now scheduled messages and fire them."""
+    try:
+        now_ms = int(time.time() * 1000)
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, type, scheduled_for_ms, content_payload,
+                              target_audience, scheduled_by_user_id, scheduled_by_name
+                       FROM scheduled_messages
+                       WHERE status = 'pending'
+                         AND scheduled_for_ms <= %s
+                       ORDER BY scheduled_for_ms ASC LIMIT 20""",
+                    (now_ms,),
+                )
+                due = cur.fetchall()
+    except Exception as e:
+        print(f"[scheduled-msg-tick] query failed: {e}", flush=True)
+        return
+
+    for row in due:
+        success, err = _fire_scheduled_message(dict(row))
+        new_status = "sent" if success else "failed"
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """UPDATE scheduled_messages
+                           SET status = %s, fired_at = %s, fire_error = %s,
+                               updated_at = %s
+                           WHERE id = %s""",
+                        (new_status, int(time.time() * 1000), err,
+                         int(time.time() * 1000), row["id"]),
+                    )
+        except Exception as e:
+            print(f"[scheduled-msg-tick] failed to mark id={row['id']}: {e}", flush=True)
+        if success:
+            print(f"[scheduled-msg-tick] fired id={row['id']} type={row['type']}", flush=True)
+        else:
+            print(f"[scheduled-msg-tick] FAILED id={row['id']} type={row['type']}: {err}", flush=True)
 
 
 if __name__ == "__main__":
