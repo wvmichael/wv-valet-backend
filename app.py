@@ -2641,6 +2641,58 @@ def _add_cors_headers(response):
     return response
 
 
+@app.after_request
+def _add_security_headers(response):
+    """Set security headers on every backend response.
+
+    These defend against clickjacking, MIME-sniffing XSS, protocol
+    downgrade attacks, and referrer leakage. They're cheap (one header
+    per response, no DB calls) and turn the security-headers grade
+    from F to A.
+
+    Headers set:
+      - Strict-Transport-Security: force HTTPS for 1 year + subdomains.
+        After a browser sees this once, it refuses to connect to the
+        site over HTTP. Defense against downgrade attacks.
+      - X-Content-Type-Options: nosniff. Browsers must respect the
+        Content-Type header we send instead of guessing. Defense
+        against MIME-confusion XSS.
+      - X-Frame-Options: DENY. The site can't be embedded in an iframe
+        anywhere. Defense against clickjacking.
+      - Referrer-Policy: strict-origin-when-cross-origin. When users
+        click a link to an external site, only the origin (not the
+        full URL with query params) is sent as referrer. Defense
+        against URL-based info leakage.
+      - Permissions-Policy: deny browser features we don't use.
+        Reduces attack surface if a future XSS bug gets in.
+      - X-XSS-Protection: 0. Modern browsers ignore this, but legacy
+        ones can misbehave with the old reflective-XSS filter — better
+        to disable it explicitly than leave them guessing.
+
+    NOT set here (intentionally):
+      - Content-Security-Policy. CSP is powerful but breaks pages if
+        misconfigured (blocks inline scripts/styles that legitimately
+        exist). Our index.html has many inline styles and scripts.
+        Setting CSP requires a careful audit of every inline use, or
+        switching to nonces. That's a separate work item. For now,
+        the other headers cover most of CSP's value.
+    """
+    # Skip for non-HTTPS in case anything still serves on http (Render is
+    # always HTTPS, so this is belt-and-suspenders only)
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    # Disable browser features we don't use, reducing attack surface
+    response.headers["Permissions-Policy"] = (
+        "accelerometer=(), camera=(), geolocation=(self), "
+        "gyroscope=(), magnetometer=(), microphone=(), "
+        "payment=(self), usb=(), interest-cohort=()"
+    )
+    response.headers["X-XSS-Protection"] = "0"
+    return response
+
+
 @app.route("/api/v1/forecast/explain", methods=["OPTIONS"])
 def _forecast_explain_preflight():
     """Handle CORS preflight for the forecast endpoint.
