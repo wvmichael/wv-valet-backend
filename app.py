@@ -759,6 +759,37 @@ CREATE INDEX IF NOT EXISTS idx_dbt_assigned ON daily_brief_tasks(assigned_met_id
 CREATE INDEX IF NOT EXISTS idx_dbt_due ON daily_brief_tasks(status, due_at_ms);
 
 
+-- ──────────────────────────────────────────────────────────────────────
+-- Storm Shelter activations (Met-pay event, $25 per activation)
+-- ──────────────────────────────────────────────────────────────────────
+-- When NWS issues a tornado/severe-thunderstorm warning that affects
+-- one or more Pro subscribers, a Met can "open" a Storm Shelter
+-- activation — meaning they're actively monitoring the situation and
+-- ready to push updates to affected subscribers. They earn $25 once
+-- the activation closes (either Met closes it manually or the NWS
+-- warning expires and cron auto-closes).
+--
+-- One activation per (Met, region) at a time. The region is a
+-- free-text label the Met enters (e.g. "Central Kansas" or "Boone
+-- County, IN") — we don't yet pin it to a strict geography. Tracking
+-- evolves with usage.
+CREATE TABLE IF NOT EXISTS storm_shelter_activations (
+    id                  SERIAL PRIMARY KEY,
+    met_user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    region_label        TEXT NOT NULL,
+    nws_event           TEXT,                 -- the triggering NWS event name (snapshot)
+    affected_count      INTEGER,              -- Pro subscribers in scope (snapshot at open)
+    opened_at_ms        BIGINT NOT NULL,
+    closed_at_ms        BIGINT,
+    close_reason        TEXT,                 -- 'manual'|'warning_expired'|'admin_closed'
+    payout_cents        INTEGER NOT NULL DEFAULT 2500,
+    notes               TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ssa_met ON storm_shelter_activations(met_user_id);
+CREATE INDEX IF NOT EXISTS idx_ssa_open ON storm_shelter_activations(met_user_id, closed_at_ms);
+CREATE INDEX IF NOT EXISTS idx_ssa_closed ON storm_shelter_activations(closed_at_ms);
+
+
 
 
 
@@ -10841,6 +10872,10 @@ def _brief_scheduler_loop() -> None:
             _coverage_check_escalations()
         except Exception as e:
             print(f"[coverage-tasks] escalation check failed: {e!r}", flush=True)
+        try:
+            _coverage_auto_close_storm_shelters()
+        except Exception as e:
+            print(f"[storm-shelter] auto-close tick failed: {e!r}", flush=True)
         time.sleep(60)
 
 
@@ -14452,6 +14487,237 @@ def met_task_complete(task_id: int):
     return jsonify({"ok": True})
 
 
+# ──────────────────────────────────────────────────────────────────
+# Storm Shelter activations — Met opens, manages, and closes a
+# regional Storm Shelter event when NWS issues a severe warning.
+# Met earns $25 per activation. Auto-close when the triggering NWS
+# warning expires (cron-based, every 60s).
+# ──────────────────────────────────────────────────────────────────
+
+@app.route("/api/v1/met/storm-shelter/open", methods=["OPTIONS"])
+def _met_ss_open_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/met/storm-shelter/open")
+def met_storm_shelter_open():
+    """Met opens a Storm Shelter activation.
+    Body: { region_label: "...", nws_event?: "...", affected_count?: N }
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    region = (data.get("region_label") or "").strip()
+    if not region:
+        return jsonify({"ok": False, "error": "region-required"}), 400
+    if len(region) > 200:
+        region = region[:200]
+    nws_event = (data.get("nws_event") or "").strip()[:200] or None
+    affected = data.get("affected_count")
+    try:
+        affected = int(affected) if affected is not None else None
+    except (TypeError, ValueError):
+        affected = None
+
+    now_ms = int(time.time() * 1000)
+    # Prevent duplicate open activations for same Met + region
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id FROM storm_shelter_activations
+                   WHERE met_user_id = %s
+                     AND region_label = %s
+                     AND closed_at_ms IS NULL""",
+                (user["id"], region),
+            )
+            existing = cur.fetchone()
+            if existing:
+                return jsonify({
+                    "ok": False, "error": "already-open",
+                    "activation_id": existing["id"],
+                }), 409
+            cur.execute(
+                """INSERT INTO storm_shelter_activations
+                   (met_user_id, region_label, nws_event, affected_count,
+                    opened_at_ms, payout_cents)
+                   VALUES (%s, %s, %s, %s, %s, %s)
+                   RETURNING id""",
+                (user["id"], region, nws_event, affected, now_ms,
+                 STORM_SHELTER_PAYOUT_CENTS),
+            )
+            row = cur.fetchone()
+    print(f"[storm-shelter] OPEN met={user['id']} region={region!r} event={nws_event!r}", flush=True)
+    return jsonify({"ok": True, "activation_id": row["id"]})
+
+
+@app.route("/api/v1/met/storm-shelter/<int:activation_id>/close", methods=["OPTIONS"])
+def _met_ss_close_preflight(activation_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/met/storm-shelter/<int:activation_id>/close")
+def met_storm_shelter_close(activation_id: int):
+    """Met manually closes an activation. They earn the payout."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    is_admin = "admin" in roles
+
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            # Met can only close their own; admin can close anyone's
+            if is_admin:
+                cur.execute(
+                    """UPDATE storm_shelter_activations
+                       SET closed_at_ms = %s, close_reason = 'admin_closed'
+                       WHERE id = %s AND closed_at_ms IS NULL
+                       RETURNING id, met_user_id""",
+                    (now_ms, activation_id),
+                )
+            else:
+                cur.execute(
+                    """UPDATE storm_shelter_activations
+                       SET closed_at_ms = %s, close_reason = 'manual'
+                       WHERE id = %s AND met_user_id = %s AND closed_at_ms IS NULL
+                       RETURNING id""",
+                    (now_ms, activation_id, user["id"]),
+                )
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "not-found-or-already-closed"}), 404
+    print(f"[storm-shelter] CLOSE id={activation_id} by user={user['id']}", flush=True)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/v1/met/storm-shelter/active", methods=["OPTIONS"])
+def _met_ss_active_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/storm-shelter/active")
+def met_storm_shelter_active():
+    """Returns the current Met's open activations + their most recent
+    closed ones (for the workspace tile)."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, region_label, nws_event, affected_count,
+                          opened_at_ms, closed_at_ms, close_reason, payout_cents
+                   FROM storm_shelter_activations
+                   WHERE met_user_id = %s
+                     AND (closed_at_ms IS NULL OR closed_at_ms >= %s)
+                   ORDER BY opened_at_ms DESC
+                   LIMIT 20""",
+                (user["id"], int(time.time() * 1000) - 30 * 24 * 60 * 60 * 1000),
+            )
+            rows = cur.fetchall()
+
+    return jsonify({
+        "ok": True,
+        "activations": [
+            {
+                "id": r["id"],
+                "region_label": r["region_label"],
+                "nws_event": r["nws_event"],
+                "affected_count": r["affected_count"],
+                "opened_at_ms": r["opened_at_ms"],
+                "closed_at_ms": r["closed_at_ms"],
+                "close_reason": r["close_reason"],
+                "payout_cents": r["payout_cents"],
+                "is_open": r["closed_at_ms"] is None,
+            }
+            for r in rows
+        ],
+    })
+
+
+def _coverage_auto_close_storm_shelters() -> None:
+    """Auto-close Storm Shelter activations where the triggering NWS
+    event is no longer active. Runs on the main scheduler tick.
+
+    Logic: if the nws_event was set when opened and that event name
+    is no longer in the active alerts list, close with reason
+    'warning_expired'. We don't try to spatially match — Met enters
+    a region label and we trust them to close manually if NWS
+    geometry changes. This auto-close is for the simple case where
+    the entire event is gone.
+
+    If activation has no nws_event recorded, it stays open until
+    manually closed (or 12 hours, whichever comes first — sanity cap
+    so a forgotten activation doesn't pile up indefinitely).
+    """
+    now_ms = int(time.time() * 1000)
+    twelve_hours_ms = 12 * 60 * 60 * 1000
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, met_user_id, region_label, nws_event, opened_at_ms
+                   FROM storm_shelter_activations
+                   WHERE closed_at_ms IS NULL"""
+            )
+            opens = cur.fetchall()
+
+    if not opens:
+        return
+
+    # Pull active NWS event names once
+    try:
+        active_alerts = _get_cached_nws_alerts()
+    except Exception as e:
+        print(f"[storm-shelter] cron: NWS fetch failed: {e}", flush=True)
+        active_alerts = []
+    active_events = set()
+    for a in active_alerts:
+        props = (a or {}).get("properties") or {}
+        ev = (props.get("event") or "").strip()
+        if ev:
+            active_events.add(ev.lower())
+
+    for o in opens:
+        ev = (o.get("nws_event") or "").strip().lower()
+        age_ms = now_ms - o["opened_at_ms"]
+        should_close = False
+        reason = None
+
+        if ev and ev not in active_events:
+            should_close = True
+            reason = "warning_expired"
+        elif age_ms > twelve_hours_ms:
+            should_close = True
+            reason = "warning_expired"  # 12h sanity cap, same status as expired
+
+        if should_close:
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """UPDATE storm_shelter_activations
+                               SET closed_at_ms = %s, close_reason = %s
+                               WHERE id = %s AND closed_at_ms IS NULL""",
+                            (now_ms, reason, o["id"]),
+                        )
+                print(f"[storm-shelter] AUTO-CLOSE id={o['id']} met={o['met_user_id']} reason={reason}", flush=True)
+            except Exception as e:
+                print(f"[storm-shelter] auto-close failed id={o['id']}: {e}", flush=True)
+
+
 # Get current Met's own recurring schedule (read-only convenience)
 @app.route("/api/v1/met/my-schedule", methods=["OPTIONS"])
 def _met_my_schedule_preflight():
@@ -15740,6 +16006,10 @@ MET_PRO_BRIEF_SHARE = 0.50
 # Used in both payroll calculation and the Met-facing review history.
 MET_REVIEW_SHARE_PCT = 0.65
 
+# Storm Shelter activation payout — flat $25 to the Met who opens
+# and runs the activation. Per-activation, not per-subscriber.
+STORM_SHELTER_PAYOUT_CENTS = 2500
+
 
 def _compute_payroll_for_month(year: int, month: int) -> dict:
     """Computes per-Met earnings + house revenue for the given month
@@ -15782,6 +16052,7 @@ def _compute_payroll_for_month(year: int, month: int) -> dict:
             "review_cents": 0, "review_count": 0,
             "brief_cents": 0, "brief_count": 0,
             "tip_cents": 0, "tip_count": 0,
+            "shelter_cents": 0, "shelter_count": 0,
         }
         for r in met_rows
     }
@@ -15911,11 +16182,39 @@ def _compute_payroll_for_month(year: int, month: int) -> dict:
         mets_by_id[met_id]["tip_count"] += 1
 
     # ──────────────────────────────────────────────────────────────────
+    # 4.5. Storm Shelter activations — $25 per closed activation,
+    # using payout_cents from each row (default $25, can be overridden
+    # per-row if we ever bump for special events). Only CLOSED activations
+    # count for payroll — open ones haven't earned yet.
+    # ──────────────────────────────────────────────────────────────────
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT met_user_id, payout_cents
+                   FROM storm_shelter_activations
+                   WHERE closed_at_ms IS NOT NULL
+                     AND closed_at_ms >= %s AND closed_at_ms < %s""",
+                (period_start_ms, period_end_ms),
+            )
+            shelter_rows = cur.fetchall()
+    for r in shelter_rows:
+        met_id = r["met_user_id"]
+        if met_id not in mets_by_id:
+            continue
+        mets_by_id[met_id]["shelter_cents"] += int(r["payout_cents"] or 0)
+        mets_by_id[met_id]["shelter_count"] += 1
+
+    # ──────────────────────────────────────────────────────────────────
     # 5. Totals
     # ──────────────────────────────────────────────────────────────────
     mets_list = []
     for met in mets_by_id.values():
-        met["total_cents"] = met["review_cents"] + met["brief_cents"] + met["tip_cents"]
+        met["total_cents"] = (
+            met["review_cents"]
+            + met["brief_cents"]
+            + met["tip_cents"]
+            + met["shelter_cents"]
+        )
         mets_list.append(met)
     mets_list.sort(key=lambda m: m["total_cents"], reverse=True)
 
@@ -15996,6 +16295,7 @@ def me_earnings(year: int, month: int):
             "review_cents": 0, "review_count": 0,
             "brief_cents": 0, "brief_count": 0,
             "tip_cents": 0, "tip_count": 0,
+            "shelter_cents": 0, "shelter_count": 0,
             "total_cents": 0,
         }
     return jsonify({
