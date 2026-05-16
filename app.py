@@ -705,7 +705,16 @@ CREATE INDEX IF NOT EXISTS idx_mrs_setowner ON met_recurring_shifts(set_owner_me
 -- for subscriber shifts, US Eastern for review_pool).
 CREATE TABLE IF NOT EXISTS met_shift_overrides (
     id                   SERIAL PRIMARY KEY,
-    met_user_id          INTEGER REFERENCES users(id) ON DELETE CASCADE,  -- null = unclaimed/dropped
+    -- met_user_id meaning depends on override_kind:
+    --   'drop'   : the Met who is dropping this shift (excluded from coverage)
+    --   'claim'  : the Met picking up the shift
+    --   'assign' : the Met being assigned by admin
+    -- In all CURRENT code paths this is non-null. Schema allows NULL for
+    -- backward-compat with rows created before May 17 (early test data
+    -- where drop stored NULL); the resolver explicitly skips rows with
+    -- met_user_id IS NULL to avoid the "one Met's drop blocks everyone"
+    -- bug those legacy rows would otherwise cause.
+    met_user_id          INTEGER REFERENCES users(id) ON DELETE CASCADE,
     shift_date           TEXT NOT NULL,                                    -- YYYY-MM-DD
     scope_kind           TEXT NOT NULL CHECK (scope_kind IN ('subscriber','subscriber_set','review_pool')),
     subscriber_user_id   INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -10897,14 +10906,14 @@ def _coverage_generate_pending_tasks() -> None:
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT u.id AS user_id, u.name, u.email,
+                          u.subscription_tier AS tier,
                           sc.primary_met_id, sc.backup_met_id,
                           sc.daily_brief_time, sc.daily_brief_timezone
                    FROM users u
                    JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'subscriber'
-                   LEFT JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active'
                    LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
                    WHERE u.is_active = TRUE
-                     AND s.tier IN ('pro_single','pro_multi','pro_enterprise')"""
+                     AND u.subscription_tier IN ('pro_single','pro_multi','pro_enterprise')"""
             )
             subs = cur.fetchall()
 
@@ -10933,6 +10942,7 @@ def _coverage_generate_pending_tasks() -> None:
 
     now_ms = int(time.time() * 1000)
     created_count = 0
+    inserts = []  # batched (subscriber_id, date, met_id, due_at_ms) tuples
 
     for sub in subs:
         tz_name = sub.get("daily_brief_timezone") or "America/New_York"
@@ -10972,10 +10982,21 @@ def _coverage_generate_pending_tasks() -> None:
                 recurring, overrides, scope="subscriber"
             )
             assigned_met_id = assigned["met_id"] if assigned else None
+            # Stash for batched insert below — one DB round-trip per
+            # subscriber instead of per-(subscriber, day).
+            inserts.append((sub["user_id"], local_date_str, assigned_met_id, due_at_ms))
 
-            try:
-                with db() as conn:
-                    with conn.cursor() as cur:
+    # Batched insert — one transaction for all rows generated this tick.
+    # ON CONFLICT preserves any existing assignment: if a task row was
+    # created earlier with assigned_met_id=X, we don't overwrite X even
+    # if the resolver would now return Y. This protects work-in-progress
+    # from getting reassigned mid-day. Admin can manually reassign by
+    # updating the row directly if needed.
+    if inserts:
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    for row_args in inserts:
                         cur.execute(
                             """INSERT INTO daily_brief_tasks
                                (subscriber_user_id, task_date, assigned_met_id,
@@ -10986,14 +11007,13 @@ def _coverage_generate_pending_tasks() -> None:
                                                               EXCLUDED.assigned_met_id),
                                    due_at_ms = EXCLUDED.due_at_ms
                                RETURNING (xmax = 0) AS inserted""",
-                            (sub["user_id"], local_date_str, assigned_met_id,
-                             due_at_ms),
+                            row_args,
                         )
-                        row = cur.fetchone()
-                        if row and row.get("inserted"):
+                        r = cur.fetchone()
+                        if r and r.get("inserted"):
                             created_count += 1
-            except Exception as e:
-                print(f"[coverage-tasks] insert failed for user={sub['user_id']} date={local_date_str}: {e}", flush=True)
+        except Exception as e:
+            print(f"[coverage-tasks] batch insert failed: {e}", flush=True)
 
     if created_count:
         print(f"[coverage-tasks] generated {created_count} new task rows", flush=True)
@@ -14403,12 +14423,11 @@ def met_my_tasks():
                           dbt.started_at_ms, dbt.sent_at_ms,
                           dbt.escalated_at_ms, dbt.escalated_admin_at_ms,
                           su.name AS subscriber_name, su.email AS subscriber_email,
-                          sc.daily_brief_time, sc.daily_brief_timezone,
-                          s.tier
+                          su.subscription_tier AS tier,
+                          sc.daily_brief_time, sc.daily_brief_timezone
                    FROM daily_brief_tasks dbt
                    JOIN users su ON su.id = dbt.subscriber_user_id
                    LEFT JOIN subscriber_coverage sc ON sc.user_id = dbt.subscriber_user_id
-                   LEFT JOIN subscriptions s ON s.user_id = dbt.subscriber_user_id AND s.status = 'active'
                    WHERE dbt.assigned_met_id = %s
                      AND dbt.due_at_ms >= %s
                      AND dbt.due_at_ms <= %s
@@ -14890,6 +14909,11 @@ def met_create_recurring_shift():
     return jsonify({"ok": True, "id": (row["id"] if row else None)})
 
 
+@app.route("/api/v1/met/recurring-shifts/<int:shift_id>", methods=["OPTIONS"])
+def _met_recurring_shift_delete_preflight(shift_id):
+    return ("", 204)
+
+
 @app.delete("/api/v1/met/recurring-shifts/<int:shift_id>")
 def met_delete_recurring_shift(shift_id: int):
     user = _get_current_user()
@@ -14969,14 +14993,16 @@ def met_create_shift_override():
     if scope == "subscriber_set" and not set_owner_id:
         return jsonify({"ok": False, "error": "set-owner-required"}), 400
 
-    # drop: met_user_id is the current user (or admin-specified target)
-    # claim: met_user_id is the current user
+    # drop: met_user_id is the dropping Met (whose shift is being dropped)
+    # claim: met_user_id is the current user (who's picking up the slot)
     # assign: admin specifies met_user_id in body
     if override_kind == "assign":
         met_id = data.get("met_user_id")
         if not met_id:
             return jsonify({"ok": False, "error": "met-required"}), 400
     elif override_kind == "drop":
+        # For "drop", record WHICH Met is dropping. The resolver needs
+        # this to exclude only that Met from coverage — not everyone.
         met_id = user["id"]
     else:  # claim
         met_id = user["id"]
@@ -14993,8 +15019,7 @@ def met_create_shift_override():
                     override_kind, created_at, notes)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                    RETURNING id""",
-                (met_id if override_kind != "drop" else None,
-                 shift_date, scope, subscriber_id, set_owner_id,
+                (met_id, shift_date, scope, subscriber_id, set_owner_id,
                  override_kind, now_ms, notes),
             )
             row = cur.fetchone()
@@ -15126,19 +15151,18 @@ def admin_coverage_dashboard():
             # Get all Pro subscribers with their coverage
             cur.execute(
                 """SELECT u.id, u.name, u.email,
+                          u.subscription_tier AS tier,
                           sc.primary_met_id, sc.backup_met_id,
                           sc.daily_brief_time, sc.daily_brief_timezone,
                           pm.name AS primary_met_name,
-                          bm.name AS backup_met_name,
-                          s.tier
+                          bm.name AS backup_met_name
                    FROM users u
                    JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'subscriber'
-                   LEFT JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active'
                    LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
                    LEFT JOIN users pm ON pm.id = sc.primary_met_id
                    LEFT JOIN users bm ON bm.id = sc.backup_met_id
                    WHERE u.is_active = TRUE
-                     AND s.tier IN ('pro_single','pro_multi','pro_enterprise')
+                     AND u.subscription_tier IN ('pro_single','pro_multi','pro_enterprise')
                    ORDER BY u.name""",
             )
             subscribers = cur.fetchall()
@@ -15249,15 +15273,20 @@ def _resolve_coverage_for_day(date_str, day_of_week, subscriber_id, primary_met_
       3. subscriber_set recurring for set_owner = primary_met
       4. subscriber_coverage.primary_met_id fallback
     """
-    # Drops first — they invalidate later resolutions
-    has_drop_primary = any(
-        o["shift_date"] == date_str
-        and o["scope_kind"] == "subscriber"
-        and o["subscriber_user_id"] == subscriber_id
-        and o["override_kind"] == "drop"
-        and o["met_user_id"] is None
-        for o in all_overrides
-    )
+    # Drops first — they invalidate later resolutions.
+    # A "drop" is a Met saying "I'm not covering this on this date."
+    # met_user_id on the override row identifies WHICH Met dropped.
+    # For subscriber scope: drop applies if the primary Met dropped this
+    # subscriber's brief. We collect the set of "dropped by" met ids.
+    drop_met_ids_for_subscriber = set()
+    for o in all_overrides:
+        if (o["shift_date"] == date_str
+            and o["scope_kind"] == "subscriber"
+            and o["subscriber_user_id"] == subscriber_id
+            and o["override_kind"] == "drop"
+            and o["met_user_id"] is not None):
+            drop_met_ids_for_subscriber.add(o["met_user_id"])
+    has_drop_primary = (primary_met_id in drop_met_ids_for_subscriber) if primary_met_id else False
 
     # 1. Override claim/assign for this specific subscriber + date
     for o in all_overrides:
@@ -15268,13 +15297,15 @@ def _resolve_coverage_for_day(date_str, day_of_week, subscriber_id, primary_met_
             and o["met_user_id"] is not None):
             return {"met_id": o["met_user_id"], "met_name": o["met_name"], "via": "override"}
 
-    # Check subscriber_set drops (Chris dropped all his KS for this date)
+    # Check subscriber_set drops. A drop on a "subscriber_set" override
+    # means: "I (met_user_id) am not covering my own (or set_owner_met_id's)
+    # set on this date." Since dropping your own set is the common case,
+    # we collect the set owners whose set has been dropped.
     set_drops = set()
     for o in all_overrides:
         if (o["shift_date"] == date_str
             and o["scope_kind"] == "subscriber_set"
             and o["override_kind"] == "drop"
-            and o["met_user_id"] is None
             and o["set_owner_met_id"] is not None):
             set_drops.add(o["set_owner_met_id"])
 
@@ -15346,16 +15377,16 @@ def _resolve_review_pool_for_day(date_str, day_of_week, all_recurring, all_overr
             seen.add(o["met_user_id"])
 
     # Drops for this date — exclude from recurring
+    # Drops for this date — exclude the dropping Met from recurring.
+    # Each drop row carries met_user_id (the Met who said "not me").
+    # We exclude only that Met, not everyone with a recurring shift.
     drops = set()
     for o in all_overrides:
         if (o["shift_date"] == date_str
             and o["scope_kind"] == "review_pool"
-            and o["override_kind"] == "drop"):
-            # Drop is keyed by met — anyone matching is excluded
-            for r in all_recurring:
-                if (r["day_of_week"] == day_of_week
-                    and r["scope_kind"] == "review_pool"):
-                    drops.add(r["met_user_id"])
+            and o["override_kind"] == "drop"
+            and o["met_user_id"] is not None):
+            drops.add(o["met_user_id"])
 
     # 2. Recurring (minus drops)
     for r in all_recurring:
