@@ -72,6 +72,7 @@ import hmac
 import html as _html_module
 import json
 import os
+import re
 import secrets
 import sys
 import time
@@ -634,6 +635,130 @@ CREATE TABLE IF NOT EXISTS mission_templates_user (
 );
 CREATE INDEX IF NOT EXISTS idx_mtu_status
     ON mission_templates_user(status);
+
+
+-- ──────────────────────────────────────────────────────────────────────
+-- Coverage scheduler (Phase 11, May 17)
+-- ──────────────────────────────────────────────────────────────────────
+-- Mets sign up to cover (1) Pro subscriber daily briefs and (2) the
+-- Review Pool (national $19 reviews). The system tracks:
+--   - Primary Met assignment per Pro subscriber (admin-set)
+--   - Daily brief delivery time preference per subscriber
+--   - Recurring weekly schedule per Met
+--   - One-off shift claims (cover for someone)
+--   - Real-time "available right now" via login heartbeat
+--
+-- Hobbyists are NOT in this system — their AI-only briefs need no Met.
+
+
+-- Coverage assignments per subscriber (Pro tiers only).
+-- Hobbyist subscribers don't get a row here. One row per Pro subscriber.
+CREATE TABLE IF NOT EXISTS subscriber_coverage (
+    user_id              INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    primary_met_id       INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    backup_met_id        INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    daily_brief_time     TEXT NOT NULL DEFAULT '07:00',  -- HH:MM 24h, subscriber's local
+    daily_brief_timezone TEXT NOT NULL DEFAULT 'America/New_York',
+    next_br_due          BIGINT,                          -- ms epoch; quarterly/monthly review
+    notes                TEXT,
+    updated_at           BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_subcov_primary ON subscriber_coverage(primary_met_id);
+CREATE INDEX IF NOT EXISTS idx_subcov_backup  ON subscriber_coverage(backup_met_id);
+
+
+-- Met recurring weekly schedule. One row per Met per day of week per scope.
+-- scope_kind: 'subscriber' (covers a specific Pro subscriber's brief)
+--             'subscriber_set' (covers all of another Met's subscribers — "I'm covering Chris's KS today")
+--             'review_pool' (covers the national $19 reviews)
+--
+-- day_of_week: 0=Sun, 1=Mon, ... 6=Sat
+--
+-- Mets create + edit their own rows. A Met can claim shifts for any day,
+-- including covering for another Met's "subscriber_set".
+CREATE TABLE IF NOT EXISTS met_recurring_shifts (
+    id                   SERIAL PRIMARY KEY,
+    met_user_id          INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    day_of_week          INTEGER NOT NULL CHECK (day_of_week >= 0 AND day_of_week <= 6),
+    scope_kind           TEXT NOT NULL CHECK (scope_kind IN ('subscriber','subscriber_set','review_pool')),
+    -- For 'subscriber' scope: which subscriber this covers
+    subscriber_user_id   INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    -- For 'subscriber_set' scope: whose subscribers this covers (e.g. Chris's whole KS)
+    set_owner_met_id     INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    -- 'review_pool' uses neither subscriber_user_id nor set_owner_met_id.
+    created_at           BIGINT NOT NULL,
+    UNIQUE (met_user_id, day_of_week, scope_kind, subscriber_user_id, set_owner_met_id)
+);
+CREATE INDEX IF NOT EXISTS idx_mrs_met ON met_recurring_shifts(met_user_id);
+CREATE INDEX IF NOT EXISTS idx_mrs_day ON met_recurring_shifts(day_of_week);
+CREATE INDEX IF NOT EXISTS idx_mrs_subscriber ON met_recurring_shifts(subscriber_user_id);
+CREATE INDEX IF NOT EXISTS idx_mrs_setowner ON met_recurring_shifts(set_owner_met_id);
+
+
+-- One-off shift overrides for a specific date (NOT a recurring day-of-week).
+-- Used when:
+--   - A Met drops a shift for one day ("I can't do Tuesday this week")
+--   - A Met picks up a shift another Met dropped
+--   - A new Pro subscriber's first day needs coverage that wasn't in the recurring set
+--
+-- shift_date is the actual calendar date in YYYY-MM-DD format (subscriber's TZ
+-- for subscriber shifts, US Eastern for review_pool).
+CREATE TABLE IF NOT EXISTS met_shift_overrides (
+    id                   SERIAL PRIMARY KEY,
+    met_user_id          INTEGER REFERENCES users(id) ON DELETE CASCADE,  -- null = unclaimed/dropped
+    shift_date           TEXT NOT NULL,                                    -- YYYY-MM-DD
+    scope_kind           TEXT NOT NULL CHECK (scope_kind IN ('subscriber','subscriber_set','review_pool')),
+    subscriber_user_id   INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    set_owner_met_id     INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    override_kind        TEXT NOT NULL CHECK (override_kind IN ('drop','claim','assign')),
+    created_at           BIGINT NOT NULL,
+    notes                TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_mso_date ON met_shift_overrides(shift_date);
+CREATE INDEX IF NOT EXISTS idx_mso_met ON met_shift_overrides(met_user_id);
+CREATE INDEX IF NOT EXISTS idx_mso_subscriber ON met_shift_overrides(subscriber_user_id);
+
+
+-- Met "available right now" heartbeat.
+-- The frontend pings this every 60 seconds while a Met has the workspace open.
+-- Admin dashboard reads this to show who's actually around (vs scheduled).
+-- For Review Pool routing, the SMS dispatcher picks from Mets with recent
+-- heartbeat AND a review_pool shift active today.
+CREATE TABLE IF NOT EXISTS met_heartbeat (
+    met_user_id          INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    last_seen_at         BIGINT NOT NULL,
+    user_agent           TEXT
+);
+
+
+-- Brief task tracking. One row per (subscriber, date) for Pro subscribers.
+-- Created at midnight (UTC) by a cron job for each active Pro subscriber.
+-- assigned_met_id resolves at creation time from:
+--   1. shift override for this date+subscriber (if any)
+--   2. recurring shift for this day-of-week+subscriber (if any)
+--   3. recurring "subscriber_set" shift covering this subscriber's primary Met
+--   4. subscriber_coverage.primary_met_id (fallback)
+-- If all four fail, assigned_met_id is null and the task is a GAP.
+CREATE TABLE IF NOT EXISTS daily_brief_tasks (
+    id                   SERIAL PRIMARY KEY,
+    subscriber_user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    task_date            TEXT NOT NULL,                                    -- YYYY-MM-DD subscriber TZ
+    assigned_met_id      INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    due_at_ms            BIGINT NOT NULL,                                  -- absolute deadline UTC
+    status               TEXT NOT NULL DEFAULT 'pending'
+                           CHECK (status IN ('pending','in_progress','sent','overdue','cancelled')),
+    started_at_ms        BIGINT,
+    sent_at_ms           BIGINT,
+    escalated_at_ms      BIGINT,                                           -- when first SMS fired
+    escalated_admin_at_ms BIGINT,                                          -- when admin SMS fired
+    notes                TEXT,
+    UNIQUE (subscriber_user_id, task_date)
+);
+CREATE INDEX IF NOT EXISTS idx_dbt_date ON daily_brief_tasks(task_date);
+CREATE INDEX IF NOT EXISTS idx_dbt_assigned ON daily_brief_tasks(assigned_met_id, status);
+CREATE INDEX IF NOT EXISTS idx_dbt_due ON daily_brief_tasks(status, due_at_ms);
+
+
 
 
 
@@ -13824,6 +13949,683 @@ def met_mission_template_update(tmpl_id: int):
                     (reason, now_ms, tmpl_id),
                 )
     return jsonify({"ok": True})
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Coverage scheduler endpoints (Phase 11, May 17)
+# ──────────────────────────────────────────────────────────────────────
+
+# Heartbeat — frontend pings this every minute while workspace is open.
+# Used by admin dashboard to show "Mets available right now."
+@app.route("/api/v1/met/heartbeat", methods=["OPTIONS"])
+def _met_heartbeat_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/met/heartbeat")
+def met_heartbeat():
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    now_ms = int(time.time() * 1000)
+    ua = (request.headers.get("User-Agent") or "")[:200]
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO met_heartbeat (met_user_id, last_seen_at, user_agent)
+                   VALUES (%s, %s, %s)
+                   ON CONFLICT (met_user_id) DO UPDATE
+                   SET last_seen_at = EXCLUDED.last_seen_at,
+                       user_agent = EXCLUDED.user_agent""",
+                (user["id"], now_ms, ua),
+            )
+    return jsonify({"ok": True, "at": now_ms})
+
+
+# Get current Met's own recurring schedule (read-only convenience)
+@app.route("/api/v1/met/my-schedule", methods=["OPTIONS"])
+def _met_my_schedule_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/my-schedule")
+def met_my_schedule():
+    """Returns the current Met's recurring shifts + upcoming 14 days
+    of resolved coverage assignments (with overrides applied)."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            # Recurring shifts
+            cur.execute(
+                """SELECT mrs.id, mrs.day_of_week, mrs.scope_kind,
+                          mrs.subscriber_user_id, mrs.set_owner_met_id,
+                          su.name AS subscriber_name, su.email AS subscriber_email,
+                          so.name AS set_owner_name
+                   FROM met_recurring_shifts mrs
+                   LEFT JOIN users su ON su.id = mrs.subscriber_user_id
+                   LEFT JOIN users so ON so.id = mrs.set_owner_met_id
+                   WHERE mrs.met_user_id = %s
+                   ORDER BY mrs.day_of_week, mrs.scope_kind""",
+                (user["id"],),
+            )
+            recurring = cur.fetchall()
+            # Upcoming overrides next 14 days
+            today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            cur.execute(
+                """SELECT mso.id, mso.shift_date, mso.scope_kind,
+                          mso.subscriber_user_id, mso.set_owner_met_id,
+                          mso.override_kind,
+                          su.name AS subscriber_name, so.name AS set_owner_name
+                   FROM met_shift_overrides mso
+                   LEFT JOIN users su ON su.id = mso.subscriber_user_id
+                   LEFT JOIN users so ON so.id = mso.set_owner_met_id
+                   WHERE mso.met_user_id = %s
+                     AND mso.shift_date >= %s
+                   ORDER BY mso.shift_date""",
+                (user["id"], today_str),
+            )
+            overrides = cur.fetchall()
+
+    return jsonify({
+        "ok": True,
+        "recurring_shifts": [_serialize_recurring_shift(r) for r in recurring],
+        "overrides": [_serialize_shift_override(r) for r in overrides],
+    })
+
+
+def _serialize_recurring_shift(r):
+    return {
+        "id": r["id"],
+        "day_of_week": r["day_of_week"],
+        "scope_kind": r["scope_kind"],
+        "subscriber_user_id": r["subscriber_user_id"],
+        "set_owner_met_id": r["set_owner_met_id"],
+        "subscriber_name": r.get("subscriber_name"),
+        "set_owner_name": r.get("set_owner_name"),
+    }
+
+
+def _serialize_shift_override(r):
+    return {
+        "id": r["id"],
+        "shift_date": r["shift_date"],
+        "scope_kind": r["scope_kind"],
+        "subscriber_user_id": r["subscriber_user_id"],
+        "set_owner_met_id": r["set_owner_met_id"],
+        "override_kind": r["override_kind"],
+        "subscriber_name": r.get("subscriber_name"),
+        "set_owner_name": r.get("set_owner_name"),
+    }
+
+
+# Create / delete a recurring shift
+@app.route("/api/v1/met/recurring-shifts", methods=["OPTIONS"])
+def _met_recurring_shifts_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/met/recurring-shifts")
+def met_create_recurring_shift():
+    """Create a recurring weekly shift for the current Met.
+
+    Body: {
+      day_of_week: 0-6,
+      scope_kind: 'subscriber'|'subscriber_set'|'review_pool',
+      subscriber_user_id: int (required if scope='subscriber'),
+      set_owner_met_id:   int (required if scope='subscriber_set')
+    }
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    try:
+        dow = int(data.get("day_of_week", -1))
+    except (TypeError, ValueError):
+        dow = -1
+    if dow < 0 or dow > 6:
+        return jsonify({"ok": False, "error": "invalid-day"}), 400
+
+    scope = (data.get("scope_kind") or "").strip().lower()
+    if scope not in ("subscriber", "subscriber_set", "review_pool"):
+        return jsonify({"ok": False, "error": "invalid-scope"}), 400
+
+    subscriber_id = data.get("subscriber_user_id")
+    set_owner_id = data.get("set_owner_met_id")
+
+    if scope == "subscriber":
+        if not subscriber_id:
+            return jsonify({"ok": False, "error": "subscriber-required"}), 400
+        set_owner_id = None
+    elif scope == "subscriber_set":
+        if not set_owner_id:
+            return jsonify({"ok": False, "error": "set-owner-required"}), 400
+        subscriber_id = None
+    else:  # review_pool
+        subscriber_id = None
+        set_owner_id = None
+
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """INSERT INTO met_recurring_shifts
+                       (met_user_id, day_of_week, scope_kind,
+                        subscriber_user_id, set_owner_met_id, created_at)
+                       VALUES (%s, %s, %s, %s, %s, %s)
+                       ON CONFLICT DO NOTHING
+                       RETURNING id""",
+                    (user["id"], dow, scope, subscriber_id, set_owner_id, now_ms),
+                )
+                row = cur.fetchone()
+            except Exception as e:
+                print(f"[met-shift-create] error: {e!r}", flush=True)
+                return jsonify({"ok": False, "error": "db-error"}), 500
+    return jsonify({"ok": True, "id": (row["id"] if row else None)})
+
+
+@app.delete("/api/v1/met/recurring-shifts/<int:shift_id>")
+def met_delete_recurring_shift(shift_id: int):
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    is_admin = "admin" in roles
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            if is_admin:
+                cur.execute(
+                    "DELETE FROM met_recurring_shifts WHERE id = %s",
+                    (shift_id,),
+                )
+            else:
+                cur.execute(
+                    "DELETE FROM met_recurring_shifts WHERE id = %s AND met_user_id = %s",
+                    (shift_id, user["id"]),
+                )
+    return jsonify({"ok": True})
+
+
+# Per-date shift overrides — drop/claim
+@app.route("/api/v1/met/shift-overrides", methods=["OPTIONS"])
+def _met_shift_overrides_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/met/shift-overrides")
+def met_create_shift_override():
+    """Drop a shift for a specific date, OR claim an open one.
+
+    Body: {
+      shift_date: 'YYYY-MM-DD',
+      scope_kind: 'subscriber'|'subscriber_set'|'review_pool',
+      subscriber_user_id: int (if subscriber),
+      set_owner_met_id: int (if subscriber_set),
+      override_kind: 'drop'|'claim'|'assign'
+    }
+
+    drop: marks the current Met as off for this date for this scope.
+    claim: current Met picks up the shift for this date.
+    assign: admin-only, assigns to met_user_id in body.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    is_admin = "admin" in roles
+
+    data = request.get_json(silent=True) or {}
+    shift_date = (data.get("shift_date") or "").strip()
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", shift_date):
+        return jsonify({"ok": False, "error": "invalid-date"}), 400
+
+    scope = (data.get("scope_kind") or "").strip().lower()
+    if scope not in ("subscriber", "subscriber_set", "review_pool"):
+        return jsonify({"ok": False, "error": "invalid-scope"}), 400
+
+    override_kind = (data.get("override_kind") or "").strip().lower()
+    if override_kind not in ("drop", "claim", "assign"):
+        return jsonify({"ok": False, "error": "invalid-override"}), 400
+
+    if override_kind == "assign" and not is_admin:
+        return jsonify({"ok": False, "error": "admin-only"}), 403
+
+    subscriber_id = data.get("subscriber_user_id") if scope == "subscriber" else None
+    set_owner_id = data.get("set_owner_met_id") if scope == "subscriber_set" else None
+
+    if scope == "subscriber" and not subscriber_id:
+        return jsonify({"ok": False, "error": "subscriber-required"}), 400
+    if scope == "subscriber_set" and not set_owner_id:
+        return jsonify({"ok": False, "error": "set-owner-required"}), 400
+
+    # drop: met_user_id is the current user (or admin-specified target)
+    # claim: met_user_id is the current user
+    # assign: admin specifies met_user_id in body
+    if override_kind == "assign":
+        met_id = data.get("met_user_id")
+        if not met_id:
+            return jsonify({"ok": False, "error": "met-required"}), 400
+    elif override_kind == "drop":
+        met_id = user["id"]
+    else:  # claim
+        met_id = user["id"]
+
+    now_ms = int(time.time() * 1000)
+    notes = (data.get("notes") or "").strip() or None
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO met_shift_overrides
+                   (met_user_id, shift_date, scope_kind,
+                    subscriber_user_id, set_owner_met_id,
+                    override_kind, created_at, notes)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                   RETURNING id""",
+                (met_id if override_kind != "drop" else None,
+                 shift_date, scope, subscriber_id, set_owner_id,
+                 override_kind, now_ms, notes),
+            )
+            row = cur.fetchone()
+    return jsonify({"ok": True, "id": row["id"] if row else None})
+
+
+# Subscriber's own delivery time preference (called from subscriber portal)
+@app.route("/api/v1/me/brief-delivery-time", methods=["OPTIONS"])
+def _me_brief_delivery_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/brief-delivery-time")
+def me_get_brief_delivery():
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT daily_brief_time, daily_brief_timezone
+                   FROM subscriber_coverage WHERE user_id = %s""",
+                (user["id"],),
+            )
+            r = cur.fetchone()
+    if not r:
+        return jsonify({"ok": True, "delivery_time": "07:00",
+                       "delivery_timezone": "America/New_York",
+                       "configured": False})
+    return jsonify({
+        "ok": True,
+        "delivery_time": r["daily_brief_time"],
+        "delivery_timezone": r["daily_brief_timezone"],
+        "configured": True,
+    })
+
+
+@app.patch("/api/v1/me/brief-delivery-time")
+def me_set_brief_delivery():
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    data = request.get_json(silent=True) or {}
+    new_time = (data.get("delivery_time") or "").strip()
+    new_tz = (data.get("delivery_timezone") or "America/New_York").strip()
+    if not re.match(r"^\d{2}:\d{2}$", new_time):
+        return jsonify({"ok": False, "error": "invalid-time"}), 400
+    # Basic timezone validation — accept anything that looks like an IANA name
+    if not re.match(r"^[A-Za-z_]+/[A-Za-z_/]+$", new_tz):
+        return jsonify({"ok": False, "error": "invalid-timezone"}), 400
+
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO subscriber_coverage
+                   (user_id, daily_brief_time, daily_brief_timezone, updated_at)
+                   VALUES (%s, %s, %s, %s)
+                   ON CONFLICT (user_id) DO UPDATE
+                   SET daily_brief_time = EXCLUDED.daily_brief_time,
+                       daily_brief_timezone = EXCLUDED.daily_brief_timezone,
+                       updated_at = EXCLUDED.updated_at""",
+                (user["id"], new_time, new_tz, now_ms),
+            )
+    return jsonify({"ok": True})
+
+
+# Admin: assign primary Met to a Pro subscriber
+@app.route("/api/v1/admin/subscriber-coverage/<int:subscriber_id>", methods=["OPTIONS"])
+def _admin_subcov_preflight(subscriber_id):
+    return ("", 204)
+
+
+@app.patch("/api/v1/admin/subscriber-coverage/<int:subscriber_id>")
+@require_role("admin")
+def admin_set_subscriber_coverage(subscriber_id):
+    """Admin sets primary/backup Met for a Pro subscriber."""
+    data = request.get_json(silent=True) or {}
+    primary_met_id = data.get("primary_met_id")  # null is OK (unassign)
+    backup_met_id = data.get("backup_met_id")
+    notes = (data.get("notes") or "").strip() or None
+    next_br_due = data.get("next_br_due")  # ms epoch or null
+
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO subscriber_coverage
+                   (user_id, primary_met_id, backup_met_id, notes, next_br_due, updated_at)
+                   VALUES (%s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (user_id) DO UPDATE
+                   SET primary_met_id = EXCLUDED.primary_met_id,
+                       backup_met_id = EXCLUDED.backup_met_id,
+                       notes = COALESCE(EXCLUDED.notes, subscriber_coverage.notes),
+                       next_br_due = EXCLUDED.next_br_due,
+                       updated_at = EXCLUDED.updated_at""",
+                (subscriber_id, primary_met_id, backup_met_id, notes, next_br_due, now_ms),
+            )
+    return jsonify({"ok": True})
+
+
+# Admin: 7-day coverage dashboard
+@app.route("/api/v1/admin/coverage-dashboard", methods=["OPTIONS"])
+def _admin_coverage_dashboard_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/coverage-dashboard")
+@require_role("admin")
+def admin_coverage_dashboard():
+    """Returns next-7-days coverage status:
+      - For each Pro subscriber: who's covering each day, or GAP
+      - For Review Pool: which Mets are covering each day, or GAP
+      - Live "available right now" Mets (heartbeat in last 5 min)
+    """
+    now = datetime.now(timezone.utc)
+    now_ms = int(now.timestamp() * 1000)
+    days = []
+    for i in range(7):
+        d = now + timedelta(days=i)
+        days.append({
+            "date": d.strftime("%Y-%m-%d"),
+            "day_of_week": d.weekday() if False else (d.weekday() + 1) % 7,
+            # Python's weekday() is 0=Mon; we use 0=Sun, so +1 mod 7
+        })
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            # Get all Pro subscribers with their coverage
+            cur.execute(
+                """SELECT u.id, u.name, u.email,
+                          sc.primary_met_id, sc.backup_met_id,
+                          sc.daily_brief_time, sc.daily_brief_timezone,
+                          pm.name AS primary_met_name,
+                          bm.name AS backup_met_name,
+                          s.tier
+                   FROM users u
+                   JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'subscriber'
+                   LEFT JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active'
+                   LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
+                   LEFT JOIN users pm ON pm.id = sc.primary_met_id
+                   LEFT JOIN users bm ON bm.id = sc.backup_met_id
+                   WHERE u.is_active = TRUE
+                     AND s.tier IN ('pro_single','pro_multi','pro_enterprise')
+                   ORDER BY u.name""",
+            )
+            subscribers = cur.fetchall()
+
+            # Get all recurring shifts grouped
+            cur.execute(
+                """SELECT mrs.*, u.name AS met_name
+                   FROM met_recurring_shifts mrs
+                   JOIN users u ON u.id = mrs.met_user_id
+                   WHERE u.is_active = TRUE"""
+            )
+            recurring = cur.fetchall()
+
+            # Get overrides in the date range
+            cur.execute(
+                """SELECT mso.*, u.name AS met_name
+                   FROM met_shift_overrides mso
+                   LEFT JOIN users u ON u.id = mso.met_user_id
+                   WHERE mso.shift_date >= %s
+                     AND mso.shift_date <= %s
+                   ORDER BY mso.created_at""",
+                (days[0]["date"], days[-1]["date"]),
+            )
+            overrides = cur.fetchall()
+
+            # Live heartbeat — Mets seen in last 5 minutes
+            five_min_ago = now_ms - 5 * 60 * 1000
+            cur.execute(
+                """SELECT mh.met_user_id, mh.last_seen_at, u.name
+                   FROM met_heartbeat mh
+                   JOIN users u ON u.id = mh.met_user_id
+                   WHERE mh.last_seen_at >= %s
+                     AND u.is_active = TRUE""",
+                (five_min_ago,),
+            )
+            live_mets = cur.fetchall()
+
+    # Build the per-subscriber coverage map
+    sub_coverage = []
+    for sub in subscribers:
+        days_status = []
+        for d in days:
+            assigned_met = _resolve_coverage_for_day(
+                d["date"], d["day_of_week"], sub["id"], sub["primary_met_id"],
+                recurring, overrides, scope="subscriber"
+            )
+            days_status.append({
+                "date": d["date"],
+                "day_of_week": d["day_of_week"],
+                "assigned_met_id": assigned_met["met_id"] if assigned_met else None,
+                "assigned_met_name": assigned_met["met_name"] if assigned_met else None,
+                "via": assigned_met["via"] if assigned_met else None,
+                "is_gap": assigned_met is None,
+            })
+        sub_coverage.append({
+            "subscriber_id": sub["id"],
+            "subscriber_name": sub["name"],
+            "subscriber_email": sub["email"],
+            "tier": sub["tier"],
+            "primary_met_id": sub["primary_met_id"],
+            "primary_met_name": sub["primary_met_name"],
+            "backup_met_id": sub["backup_met_id"],
+            "backup_met_name": sub["backup_met_name"],
+            "daily_brief_time": sub["daily_brief_time"] if sub["daily_brief_time"] else "07:00",
+            "daily_brief_timezone": sub["daily_brief_timezone"] if sub["daily_brief_timezone"] else "America/New_York",
+            "days": days_status,
+        })
+
+    # Review Pool per-day
+    pool_coverage = []
+    for d in days:
+        assigned = _resolve_review_pool_for_day(
+            d["date"], d["day_of_week"], recurring, overrides
+        )
+        pool_coverage.append({
+            "date": d["date"],
+            "day_of_week": d["day_of_week"],
+            "covering_mets": assigned,
+            "is_gap": len(assigned) == 0,
+        })
+
+    return jsonify({
+        "ok": True,
+        "days": days,
+        "subscriber_coverage": sub_coverage,
+        "review_pool_coverage": pool_coverage,
+        "live_mets": [
+            {"met_id": m["met_user_id"], "name": m["name"], "last_seen_at": m["last_seen_at"]}
+            for m in live_mets
+        ],
+        "generated_at_ms": now_ms,
+    })
+
+
+def _resolve_coverage_for_day(date_str, day_of_week, subscriber_id, primary_met_id,
+                              all_recurring, all_overrides, scope="subscriber"):
+    """Resolve who covers this subscriber's daily brief on this date.
+
+    Order:
+      1. Specific override for this exact (date, subscriber, claim)
+      2. Specific recurring shift for this (dow, subscriber)
+      3. subscriber_set recurring for set_owner = primary_met
+      4. subscriber_coverage.primary_met_id fallback
+    """
+    # Drops first — they invalidate later resolutions
+    has_drop_primary = any(
+        o["shift_date"] == date_str
+        and o["scope_kind"] == "subscriber"
+        and o["subscriber_user_id"] == subscriber_id
+        and o["override_kind"] == "drop"
+        and o["met_user_id"] is None
+        for o in all_overrides
+    )
+
+    # 1. Override claim/assign for this specific subscriber + date
+    for o in all_overrides:
+        if (o["shift_date"] == date_str
+            and o["scope_kind"] == "subscriber"
+            and o["subscriber_user_id"] == subscriber_id
+            and o["override_kind"] in ("claim", "assign")
+            and o["met_user_id"] is not None):
+            return {"met_id": o["met_user_id"], "met_name": o["met_name"], "via": "override"}
+
+    # Check subscriber_set drops (Chris dropped all his KS for this date)
+    set_drops = set()
+    for o in all_overrides:
+        if (o["shift_date"] == date_str
+            and o["scope_kind"] == "subscriber_set"
+            and o["override_kind"] == "drop"
+            and o["met_user_id"] is None
+            and o["set_owner_met_id"] is not None):
+            set_drops.add(o["set_owner_met_id"])
+
+    # 2. Recurring subscriber-specific shift
+    if not has_drop_primary:
+        for r in all_recurring:
+            if (r["day_of_week"] == day_of_week
+                and r["scope_kind"] == "subscriber"
+                and r["subscriber_user_id"] == subscriber_id):
+                return {"met_id": r["met_user_id"], "met_name": r["met_name"], "via": "recurring"}
+
+    # 3. subscriber_set coverage — someone covering Chris's set (when this
+    #    sub belongs to Chris). Skip if Chris dropped his set this date.
+    # 3a. First check: did anyone CLAIM Chris's set for this date?
+    for o in all_overrides:
+        if (o["shift_date"] == date_str
+            and o["scope_kind"] == "subscriber_set"
+            and o["set_owner_met_id"] == primary_met_id
+            and o["override_kind"] in ("claim", "assign")
+            and o["met_user_id"] is not None):
+            return {"met_id": o["met_user_id"], "met_name": o["met_name"], "via": "set-override"}
+
+    # 3b. Recurring set coverage (if primary didn't drop)
+    if primary_met_id not in set_drops and not has_drop_primary:
+        for r in all_recurring:
+            if (r["day_of_week"] == day_of_week
+                and r["scope_kind"] == "subscriber_set"
+                and r["set_owner_met_id"] == primary_met_id):
+                return {"met_id": r["met_user_id"], "met_name": r["met_name"], "via": "set-recurring"}
+
+    # 4. Primary Met fallback (the assigned met for this subscriber)
+    if primary_met_id and not has_drop_primary and primary_met_id not in set_drops:
+        # Did primary also have a recurring shift today?
+        for r in all_recurring:
+            if (r["day_of_week"] == day_of_week
+                and r["scope_kind"] == "subscriber"
+                and r["subscriber_user_id"] == subscriber_id
+                and r["met_user_id"] == primary_met_id):
+                return {"met_id": primary_met_id, "met_name": r["met_name"], "via": "primary"}
+        # No specific recurring shift, but primary is assigned. Whether
+        # they're "scheduled" or not, the brief needs writing — primary
+        # is responsible by default. Mark this as the primary fallback.
+        return {"met_id": primary_met_id, "met_name": None, "via": "primary-fallback"}
+
+    return None  # GAP
+
+
+def _resolve_review_pool_for_day(date_str, day_of_week, all_recurring, all_overrides):
+    """Returns list of {met_id, name, via} covering review pool that day."""
+    out = []
+    seen = set()
+
+    # 1. Overrides (claims) for this date
+    for o in all_overrides:
+        if (o["shift_date"] == date_str
+            and o["scope_kind"] == "review_pool"
+            and o["override_kind"] in ("claim", "assign")
+            and o["met_user_id"] is not None
+            and o["met_user_id"] not in seen):
+            out.append({"met_id": o["met_user_id"], "name": o["met_name"], "via": "override"})
+            seen.add(o["met_user_id"])
+
+    # Drops for this date — exclude from recurring
+    drops = set()
+    for o in all_overrides:
+        if (o["shift_date"] == date_str
+            and o["scope_kind"] == "review_pool"
+            and o["override_kind"] == "drop"):
+            # Drop is keyed by met — anyone matching is excluded
+            for r in all_recurring:
+                if (r["day_of_week"] == day_of_week
+                    and r["scope_kind"] == "review_pool"):
+                    drops.add(r["met_user_id"])
+
+    # 2. Recurring (minus drops)
+    for r in all_recurring:
+        if (r["day_of_week"] == day_of_week
+            and r["scope_kind"] == "review_pool"
+            and r["met_user_id"] not in seen
+            and r["met_user_id"] not in drops):
+            out.append({"met_id": r["met_user_id"], "name": r["met_name"], "via": "recurring"})
+            seen.add(r["met_user_id"])
+
+    return out
+
+
+# Admin: list of all active Mets (for assignment dropdowns)
+@app.route("/api/v1/admin/mets-list", methods=["OPTIONS"])
+def _admin_mets_list_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/mets-list")
+@require_role("admin")
+def admin_mets_list():
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.name, u.email
+                   FROM users u
+                   JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'met'
+                   WHERE u.is_active = TRUE
+                   ORDER BY u.name"""
+            )
+            rows = cur.fetchall()
+    return jsonify({
+        "ok": True,
+        "mets": [{"id": r["id"], "name": r["name"], "email": r["email"]} for r in rows],
+    })
 
 
 @app.route("/api/v1/met/pro-subscribers", methods=["OPTIONS"])
