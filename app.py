@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import html as _html_module
 import json
 import os
 import secrets
@@ -6725,6 +6726,23 @@ def admin_create_user():
         print(f"[admin_create_user] failed: {type(e).__name__}: {e}", flush=True)
         return jsonify({"ok": False, "error": "create-failed"}), 500
 
+    # Fire welcome email with temp password. Failures don't break the
+    # create — admin still sees the temp password in the response.
+    role_labels = {"met": "Meteorologist", "crew": "Valet Crew",
+                   "admin": "Admin", "subscriber": "Subscriber"}
+    role_label = role_labels.get(role, role.title())
+    try:
+        _send_welcome_email_with_temp_password(
+            email=email,
+            name=name,
+            temp_password=temp_password,
+            role_label=role_label,
+        )
+    except Exception as e:
+        # Log loudly but don't fail the create — the temp password is
+        # still in the response so admin can share it manually.
+        print(f"[admin_create_user] welcome email send failed: {e!r}", flush=True)
+
     return jsonify({
         "ok": True,
         "member": _serialize_user_for_admin(row),
@@ -10006,6 +10024,116 @@ def _generate_ai_brief(location_label: str, forecast: dict) -> tuple[str, str, s
     full_body = " ".join(parts)
     snippet = full_body[:140]
     return (verdict, snippet, full_body)
+
+
+def _html_escape(s):
+    """Escape user-supplied strings for safe inclusion in HTML email."""
+    return _html_module.escape(str(s or ""), quote=True)
+
+
+def _send_welcome_email_with_temp_password(email: str, name: str,
+                                            temp_password: str,
+                                            role_label: str) -> bool:
+    """Welcome email sent when admin creates a new Met/Crew/Admin account.
+    Includes a one-time temp password and instructions to change it on
+    first sign-in.
+
+    role_label is the human-readable role (e.g. "Meteorologist", "Valet
+    Crew", "Admin") — appears in the email body.
+
+    Returns True on send success (or stub-mode print), False on send fail.
+    """
+    api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    from_addr = os.environ.get("EMAIL_FROM", "").strip()
+    subject = f"Welcome to WeatherValet \u2014 your {role_label} account is ready"
+
+    # Stub fallback if Resend isn't configured (dev mode)
+    if not api_key or not from_addr:
+        print(
+            f"[welcome-email-stub] To: {email}\n"
+            f"Subject: {subject}\n"
+            f"Temp password: {temp_password}\n"
+            f"(no RESEND_API_KEY set; logging only)",
+            flush=True,
+        )
+        return True
+
+    first_name = (name.split()[0] if name else "there")
+    safe_name = first_name[:40]
+    sign_in_url = f"{FRONTEND_BASE_URL}/?signin=1"
+
+    # Plain-text fallback for email clients without HTML rendering
+    text_body = (
+        f"Welcome to WeatherValet, {safe_name}!\n\n"
+        f"Your {role_label} account has been created. Here's how to sign in:\n\n"
+        f"Email: {email}\n"
+        f"Temporary password: {temp_password}\n\n"
+        f"Sign in here: {sign_in_url}\n\n"
+        f"You'll be asked to set your own password on first sign-in. "
+        f"This temporary password expires after first use.\n\n"
+        f"If you weren't expecting this email, please contact Michael at "
+        f"michael@weathervalet.ai.\n\n"
+        f"\u2014 The WeatherValet team"
+    )
+
+    # HTML body inside the branded shell
+    html_inner = f"""
+    <h1 style="color:#0E1116;font-size:22px;margin:0 0 16px;font-weight:600;letter-spacing:-0.01em;">
+      Welcome to WeatherValet, {_html_escape(safe_name)}
+    </h1>
+    <p style="color:#0E1116;font-size:15px;line-height:1.6;margin:0 0 18px;">
+      Your <strong>{_html_escape(role_label)}</strong> account is ready. Here's how to sign in for the first time:
+    </p>
+    <div style="background:#F5F7FB;border:1px solid #E5E9F2;border-radius:8px;padding:18px;margin:0 0 22px;">
+      <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:#8B8F96;margin-bottom:4px;">Email</div>
+      <div style="font-size:14.5px;color:#0E1116;font-family:'JetBrains Mono',Menlo,monospace;margin-bottom:14px;">{_html_escape(email)}</div>
+      <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:#8B8F96;margin-bottom:4px;">Temporary password</div>
+      <div style="font-size:16px;color:#0E1116;font-family:'JetBrains Mono',Menlo,monospace;letter-spacing:0.5px;background:#fff;border:1px solid #E5E9F2;border-radius:6px;padding:10px 12px;">{_html_escape(temp_password)}</div>
+    </div>
+    <div style="margin:0 0 22px;">
+      <a href="{sign_in_url}" style="display:inline-block;background:#2E4FB8;color:#fff;text-decoration:none;padding:12px 22px;border-radius:8px;font-size:14.5px;font-weight:600;">Sign in to WeatherValet</a>
+    </div>
+    <p style="color:#5B6370;font-size:13px;line-height:1.55;margin:0 0 18px;">
+      On first sign-in, you'll be asked to set your own password. This temporary password expires after first use.
+    </p>
+    <p style="color:#8B8F96;font-size:12px;line-height:1.5;margin:24px 0 0;padding-top:18px;border-top:1px solid #ECEEF1;">
+      If you weren't expecting this email, contact Michael at
+      <a href="mailto:michael@weathervalet.ai" style="color:#2E4FB8;text-decoration:none;">michael@weathervalet.ai</a>.
+    </p>
+    """
+
+    html_body = _email_shell(
+        html_inner,
+        preheader=f"Your WeatherValet {role_label} account is ready. Sign in with the temporary password inside."
+    )
+
+    payload = json.dumps({
+        "from": from_addr,
+        "to": [email],
+        "subject": subject,
+        "html": html_body,
+        "text": text_body,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "WeatherValet-Backend/1.0 (+https://weathervalet.ai)",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            ok = 200 <= resp.status < 300
+            if ok:
+                print(f"[welcome-email] sent to={email}", flush=True)
+            return ok
+    except Exception as e:
+        print(f"[welcome-email] FAILED to={email}: {type(e).__name__}: {e}", flush=True)
+        return False
 
 
 def _send_brief_email(email: str, subject: str, body_text: str) -> bool:
