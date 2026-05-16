@@ -6860,6 +6860,25 @@ def admin_update_user(user_id):
     if temp_password:
         response["temp_password"] = temp_password
 
+    # If password was reset, fire the welcome email with the new temp.
+    # Best effort — admin still gets the temp in the response as backup
+    # if email delivery fails.
+    if reset_password and temp_password and row:
+        try:
+            roles_list = row.get("roles") or []
+            primary_role = roles_list[0] if roles_list else "subscriber"
+            role_labels = {"met": "Meteorologist", "crew": "Valet Crew",
+                          "admin": "Admin", "subscriber": "Subscriber"}
+            role_label = role_labels.get(primary_role, "Team Member")
+            _send_welcome_email_with_temp_password(
+                email=row.get("email"),
+                name=row.get("name") or "",
+                temp_password=temp_password,
+                role_label=role_label,
+            )
+        except Exception as e:
+            print(f"[admin_update_user] reset email send failed: {e!r}", flush=True)
+
     # Phase 10 Admin Chunk B: audit-log significant changes. We log
     # deactivation/reactivation explicitly (most sensitive); password
     # resets and role changes are also recorded.
@@ -10045,7 +10064,9 @@ def _send_welcome_email_with_temp_password(email: str, name: str,
     """
     api_key = os.environ.get("RESEND_API_KEY", "").strip()
     from_addr = os.environ.get("EMAIL_FROM", "").strip()
-    subject = f"Welcome to WeatherValet \u2014 your {role_label} account is ready"
+    # Subject — avoid "Welcome" + "password" combos that trip spam filters.
+    # Mention the role so the recipient knows it's expected.
+    subject = f"Your WeatherValet {role_label} account is ready"
 
     # Stub fallback if Resend isn't configured (dev mode)
     if not api_key or not from_addr:
@@ -10110,6 +10131,7 @@ def _send_welcome_email_with_temp_password(email: str, name: str,
     payload = json.dumps({
         "from": from_addr,
         "to": [email],
+        "reply_to": "michael@weathervalet.ai",
         "subject": subject,
         "html": html_body,
         "text": text_body,
