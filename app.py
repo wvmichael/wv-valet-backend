@@ -15679,15 +15679,13 @@ def me_met_history():
             )
             rows = cur.fetchall()
 
-    # Met earnings split — for v1, Met gets ~65% of $19 ($12.35).
-    # This is a snapshot; real revenue share rules can be applied
-    # in a future ledger system. We show it here so the Met sees
+    # Met earnings split — Met gets MET_REVIEW_SHARE_PCT (~65%) of the
+    # $19 review price (~$12.35). See module-level MET_REVIEW_SHARE_PCT
+    # for the single source of truth. We show it here so the Met sees
     # what they'll be paid out, not what the customer paid.
-    MET_REVENUE_SHARE = 0.65
-
     reviews = []
     for r in rows:
-        amount_cents_to_met = int((r["price_cents"] or 1900) * MET_REVENUE_SHARE)
+        amount_cents_to_met = int((r["price_cents"] or 1900) * MET_REVIEW_SHARE_PCT)
         reviews.append({
             "request_id": r["id"],
             "customer_email": r["customer_email"],
@@ -15713,14 +15711,14 @@ def me_met_history():
 # month, enters into payroll.
 #
 # Earnings model:
-#   1. $19 reviews: 65% of the price_cents goes to whichever Met
-#      completed it (via verification_requests.completed_by_user_id).
-#   2. Subscription revenue: attributed per-day based on who sent the
-#      morning brief. Pro Single = $400/month → $400/days_in_month per day.
-#      Pro Multi = $1,200/month → $1200/days_in_month per day. Whoever
-#      sent that subscriber's brief on a given day gets the day's share.
-#      Hobbyist briefs are auto-AI (no Met touched) → revenue stays with
-#      the house, no attribution.
+#   1. $19 reviews: Met gets 65% of price_cents (~$12.35 of $19).
+#      Tracked via verification_requests.completed_by_user_id.
+#   2. Pro subscription revenue: Met gets 50% of the daily prorated
+#      share for each day they sent the subscriber's brief.
+#      Pro Single = $400/month → $400/days_in_month/day, Met gets half.
+#      Pro Multi  = $1,200/month → same per-day prorate, Met gets half.
+#      Hobbyist briefs are auto-AI (no Met touched) → revenue stays
+#      with the house, no attribution.
 #   3. Tips: 100% to the Met who got the tip
 #      (completed met_tips for that month).
 #
@@ -15733,6 +15731,14 @@ PRO_TIER_MONTHLY_CENTS = {
     "pro_multi": 120000,         # $1,200
     "pro_enterprise": 200000,    # $2,000 default — real number set per-contract
 }
+
+# Met's share of Pro subscription revenue per day-of-brief.
+# 50% to Met, 50% to house. See earnings model above.
+MET_PRO_BRIEF_SHARE = 0.50
+
+# Met's share of a $19 review. 65% to Met (~$12.35), 35% to house.
+# Used in both payroll calculation and the Met-facing review history.
+MET_REVIEW_SHARE_PCT = 0.65
 
 
 def _compute_payroll_for_month(year: int, month: int) -> dict:
@@ -15781,9 +15787,8 @@ def _compute_payroll_for_month(year: int, month: int) -> dict:
     }
 
     # ──────────────────────────────────────────────────────────────────
-    # 2. $19 review attribution — 65% of price_cents
+    # 2. $19 review attribution — MET_REVIEW_SHARE_PCT (65%) of price_cents
     # ──────────────────────────────────────────────────────────────────
-    MET_REVIEW_SHARE = 0.65
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -15800,7 +15805,7 @@ def _compute_payroll_for_month(year: int, month: int) -> dict:
         met_id = r["completed_by_user_id"]
         if met_id not in mets_by_id:
             continue
-        share = int((r["price_cents"] or 1900) * MET_REVIEW_SHARE)
+        share = int((r["price_cents"] or 1900) * MET_REVIEW_SHARE_PCT)
         mets_by_id[met_id]["review_cents"] += share
         mets_by_id[met_id]["review_count"] += 1
 
@@ -15834,6 +15839,12 @@ def _compute_payroll_for_month(year: int, month: int) -> dict:
 
         monthly_cents = PRO_TIER_MONTHLY_CENTS[tier]
         daily_cents = monthly_cents // days_in_month
+        # Met's share per attributed day (50% of daily prorate).
+        # The remaining 50% accrues to the house, regardless of whether
+        # the brief was sent or missed. Missed-brief days contribute the
+        # FULL daily_cents to the house (no Met share).
+        daily_met_share = int(daily_cents * MET_PRO_BRIEF_SHARE)
+        daily_house_share = daily_cents - daily_met_share
 
         user_tz = sub.get("timezone") or "America/Indiana/Indianapolis"
         with db() as conn:
@@ -15868,9 +15879,12 @@ def _compute_payroll_for_month(year: int, month: int) -> dict:
             local_date = current_dt.astimezone(sub_zone).date()
             sent_by = briefs_by_local_date.get(local_date)
             if sent_by and sent_by in mets_by_id:
-                mets_by_id[sent_by]["brief_cents"] += daily_cents
+                # Met gets 50% of daily prorate, house keeps the other 50%
+                mets_by_id[sent_by]["brief_cents"] += daily_met_share
                 mets_by_id[sent_by]["brief_count"] += 1
+                unattributed_pro_cents += daily_house_share
             else:
+                # Missed brief — full daily prorate to house, no Met share
                 unattributed_pro_cents += daily_cents
             current_dt += timedelta(days=1)
 
@@ -16590,13 +16604,13 @@ def _process_scheduled_messages() -> None:
 REP_COMMISSION_PCT = 0.20
 REP_COMMISSION_WINDOW_MONTHS = 6
 
-# Subscription tier monthly cents (for commission calculation — what
-# the customer actually pays each month, not what they paid for month 0).
+# Subscription tier monthly cents for commission calculation.
+# Derived from PRO_TIER_MONTHLY_CENTS (Pro tiers) + hobbyist.
+# Centralizing here prevents drift: if a tier price changes, only
+# PRO_TIER_MONTHLY_CENTS needs updating and commissions adjust too.
 TIER_MONTHLY_CENTS_FOR_COMMISSION = {
-    "hobbyist": 3000,
-    "pro_single": 40000,
-    "pro_multi": 120000,
-    "pro_enterprise": 200000,
+    "hobbyist": 3000,  # $30 — only commissionable tier not in PRO_TIER_MONTHLY_CENTS
+    **PRO_TIER_MONTHLY_CENTS,
 }
 
 # Starter Month override — month 0 was $99. Commission on $99 only.
@@ -16783,16 +16797,20 @@ def _compute_commissions_for_month(year: int, month: int) -> dict:
         # If period is BEFORE signup, nothing to compute
         if delta_months < 0:
             continue
-        # If past the 6-month commission window (month 0 through 6 inclusive
-        # = 7 months on Starter; just month 1-6 for non-Starter)
-        # Per Michael's spec: Starter customers get 13 months total
-        # ($99 month + 12 × $400). Commission for "first 6 months" so:
-        #   Non-Starter: months 1-6 earn commission
-        #   Starter:     months 0 (= $99) + 1-6 (= $400) earn commission
+        # Commission window: rep earns commission for the first 6
+        # months of the customer's tenure, counting the signup month
+        # as month 0.
+        #
+        #   Non-Starter customer: months 0, 1, 2, 3, 4, 5 (6 months total)
+        #   Starter customer:     months 0 ($99 starter) + 1, 2, 3, 4, 5, 6
+        #                         on the $400 standard rate (7 months total)
+        #
+        # The extra month for Starter customers compensates the rep
+        # because month 0 is only $99 (a much smaller commission).
         if a["starter_used"]:
             commission_eligible = (0 <= delta_months <= 6)  # 7 months
         else:
-            commission_eligible = (0 <= delta_months <= 5)  # 6 months from month 0
+            commission_eligible = (0 <= delta_months <= 5)  # 6 months
 
         if not commission_eligible:
             continue
