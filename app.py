@@ -6726,22 +6726,25 @@ def admin_create_user():
         print(f"[admin_create_user] failed: {type(e).__name__}: {e}", flush=True)
         return jsonify({"ok": False, "error": "create-failed"}), 500
 
-    # Fire welcome email with temp password. Failures don't break the
-    # create — admin still sees the temp password in the response.
+    # Fire welcome email with temp password. Background-threaded so a
+    # slow Resend response doesn't block the create response.
     role_labels = {"met": "Meteorologist", "crew": "Valet Crew",
                    "admin": "Admin", "subscriber": "Subscriber"}
     role_label = role_labels.get(role, role.title())
     try:
-        _send_welcome_email_with_temp_password(
-            email=email,
-            name=name,
-            temp_password=temp_password,
-            role_label=role_label,
-        )
+        def _send_create_email():
+            try:
+                _send_welcome_email_with_temp_password(
+                    email=email,
+                    name=name,
+                    temp_password=temp_password,
+                    role_label=role_label,
+                )
+            except Exception as e:
+                print(f"[admin_create_user] welcome email send failed: {e!r}", flush=True)
+        threading.Thread(target=_send_create_email, daemon=True).start()
     except Exception as e:
-        # Log loudly but don't fail the create — the temp password is
-        # still in the response so admin can share it manually.
-        print(f"[admin_create_user] welcome email send failed: {e!r}", flush=True)
+        print(f"[admin_create_user] welcome email setup failed: {e!r}", flush=True)
 
     return jsonify({
         "ok": True,
@@ -6861,8 +6864,8 @@ def admin_update_user(user_id):
         response["temp_password"] = temp_password
 
     # If password was reset, fire the welcome email with the new temp.
-    # Best effort — admin still gets the temp in the response as backup
-    # if email delivery fails.
+    # Background-threaded so a slow Resend response doesn't block the
+    # PATCH response (which can cause browser network-error timeouts).
     if reset_password and temp_password and row:
         try:
             roles_list = row.get("roles") or []
@@ -6870,14 +6873,23 @@ def admin_update_user(user_id):
             role_labels = {"met": "Meteorologist", "crew": "Valet Crew",
                           "admin": "Admin", "subscriber": "Subscriber"}
             role_label = role_labels.get(primary_role, "Team Member")
-            _send_welcome_email_with_temp_password(
-                email=row.get("email"),
-                name=row.get("name") or "",
-                temp_password=temp_password,
-                role_label=role_label,
-            )
+            target_email = row.get("email")
+            target_name = row.get("name") or ""
+
+            def _send_in_background():
+                try:
+                    _send_welcome_email_with_temp_password(
+                        email=target_email,
+                        name=target_name,
+                        temp_password=temp_password,
+                        role_label=role_label,
+                    )
+                except Exception as e:
+                    print(f"[admin_update_user] reset email send failed: {e!r}", flush=True)
+
+            threading.Thread(target=_send_in_background, daemon=True).start()
         except Exception as e:
-            print(f"[admin_update_user] reset email send failed: {e!r}", flush=True)
+            print(f"[admin_update_user] reset email setup failed: {e!r}", flush=True)
 
     # Phase 10 Admin Chunk B: audit-log significant changes. We log
     # deactivation/reactivation explicitly (most sensitive); password
