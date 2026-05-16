@@ -3855,6 +3855,140 @@ def forecast_explain():
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# F-X3 (May 17): Polish writing — grammar + spelling check for Mets
+# ────────────────────────────────────────────────────────────────────────────
+# Mets write Pro Briefs under time pressure. A quick AI pass catches
+# typos, grammar slips, and unclear phrasing before the brief goes out.
+# Not a heavy-handed rewriter — flagging issues with one-line fixes,
+# leaving the Met in control.
+
+
+POLISH_SYSTEM_PROMPT = """You are a copy-editor for a meteorologist writing
+a weather brief for a paying customer. The Met writes under time pressure
+and wants a quick proofread.
+
+Find issues in their draft. Focus on:
+  - Spelling errors and typos
+  - Grammar mistakes (subject/verb agreement, wrong tense, etc.)
+  - Run-on or fragment sentences
+  - Confusing or unclear phrasing
+  - Missing punctuation that hurts readability
+
+Do NOT:
+  - Rewrite for "tone" or "voice" — the Met's voice is intentional
+  - Suggest stylistic preferences (e.g., serial commas, hyphens vs em-dashes)
+  - Restructure paragraphs
+  - Change meaning
+  - Add new information
+
+Return a JSON array of issues. Each issue is an object with:
+  - "original": the exact phrase from the text that has an issue (5-25 words)
+  - "suggestion": the corrected version (same length range)
+  - "reason": one short phrase explaining the issue (e.g. "typo", "grammar", "unclear")
+
+Return ONLY the JSON array. No prose, no markdown, no explanation. If the
+text has no issues, return [].
+
+Limit to 5 issues max — prioritize the most important. If a sentence has
+multiple issues, fix all of them in a single suggestion."""
+
+
+def _call_gemini_polish(body_text: str) -> list:
+    """Run Gemini polish pass. Returns list of {original, suggestion, reason}.
+    Empty list on success-with-no-issues OR on any failure (best effort)."""
+    if not body_text or not body_text.strip():
+        return []
+    if len(body_text) > 6000:
+        body_text = body_text[:6000]
+
+    raw = _call_gemini(POLISH_SYSTEM_PROMPT, body_text, timeout_s=15)
+    if not raw:
+        return []
+
+    # Strip code fences if Gemini ignored the "no markdown" instruction
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        # ```json\n[...]\n```  or  ```\n[...]\n```
+        first_newline = cleaned.find("\n")
+        if first_newline > 0:
+            cleaned = cleaned[first_newline+1:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        cleaned = cleaned.strip()
+
+    try:
+        parsed = json.loads(cleaned)
+    except Exception as e:
+        print(f"[polish] could not parse Gemini JSON: {e!r} raw[:200]={cleaned[:200]}", flush=True)
+        return []
+
+    if not isinstance(parsed, list):
+        return []
+
+    # Validate + sanitize each issue
+    out = []
+    for item in parsed[:8]:  # extra safety cap
+        if not isinstance(item, dict):
+            continue
+        orig = (item.get("original") or "").strip()
+        sugg = (item.get("suggestion") or "").strip()
+        reason = (item.get("reason") or "").strip()
+        if not orig or not sugg or orig == sugg:
+            continue
+        # Make sure original is actually in the body text — Gemini sometimes
+        # paraphrases. If it's not a verbatim substring, we can't apply the
+        # fix safely, so skip.
+        if orig not in body_text:
+            # Try a permissive match (lowercase, collapsed whitespace)
+            norm_body = " ".join(body_text.lower().split())
+            norm_orig = " ".join(orig.lower().split())
+            if norm_orig not in norm_body:
+                continue
+        out.append({
+            "original": orig[:200],
+            "suggestion": sugg[:200],
+            "reason": reason[:60] or "polish"
+        })
+    return out
+
+
+@app.route("/api/v1/met/polish-text", methods=["OPTIONS"])
+def _met_polish_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/met/polish-text")
+def met_polish_text():
+    """Run a polish pass over a chunk of text. Met-only endpoint.
+
+    Body: { text: "..." }
+    Returns: { ok: true, suggestions: [{original, suggestion, reason}, ...] }
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"ok": True, "suggestions": []})
+    if len(text) < 20:
+        # Too short to bother — also avoids weird outputs on stub headlines
+        return jsonify({"ok": True, "suggestions": []})
+
+    try:
+        suggestions = _call_gemini_polish(text)
+    except Exception as e:
+        print(f"[polish] unexpected error: {e!r}", flush=True)
+        suggestions = []
+
+    return jsonify({"ok": True, "suggestions": suggestions})
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # Customer flow: create checkout
 # ────────────────────────────────────────────────────────────────────────────
 
