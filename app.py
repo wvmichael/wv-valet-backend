@@ -2459,7 +2459,7 @@ def _add_cors_headers(response):
     # Allow it during prototype testing — remove before production.
     if origin in ALLOWED_ORIGINS or origin == "null":
         response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = "Content-Type"
         # Allow the browser to send/receive cookies on cross-origin requests.
         # Required for the auth flow: frontend (weathervalet.ai) calls
@@ -6730,6 +6730,11 @@ def admin_create_user():
         "member": _serialize_user_for_admin(row),
         "temp_password": temp_password,
     })
+
+
+@app.route("/api/v1/admin/users/<int:user_id>", methods=["OPTIONS"])
+def _admin_users_single_preflight(user_id):
+    return ("", 204)
 
 
 @app.patch("/api/v1/admin/users/<int:user_id>")
@@ -13628,7 +13633,7 @@ def met_my_subscribers():
 
             # Threshold alerts — one query, group by user
             cur.execute(
-                """SELECT user_id, metric, comparator, threshold_value, unit, is_enabled
+                """SELECT user_id, metric, comparator, threshold_value, units, enabled
                    FROM threshold_alerts
                    ORDER BY user_id, created_at"""
             )
@@ -13640,8 +13645,8 @@ def met_my_subscribers():
             "metric": t["metric"],
             "comparator": t["comparator"],
             "threshold_value": t["threshold_value"],
-            "unit": t["unit"],
-            "is_enabled": bool(t["is_enabled"]),
+            "unit": t["units"],
+            "is_enabled": bool(t["enabled"]),
         })
 
     subscribers = []
