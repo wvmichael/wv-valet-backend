@@ -158,6 +158,23 @@ TIER_PRICE_MAP = {
 # tier was purchased from the line_items in checkout.session.completed.
 TIER_BY_PRICE_ID = {v: k for k, v in TIER_PRICE_MAP.items()}
 
+# ─── $99 Starter Month coupon (sales funnel entry point) ───
+#
+# This is the coupon ID for the Stripe coupon that drops Pro Single's
+# first month from $400 to $99. Created in the Stripe dashboard with:
+#   - Coupon ID: STARTER99
+#   - Type: Amount off
+#   - Amount: $301.00 USD
+#   - Duration: Once (applies to first invoice only)
+#   - Redemption limit: 1 per customer (prevents repeat use)
+#   - Applies to: Pro Single price ID only
+#
+# We pass coupon=STARTER99 into Stripe Checkout for /starter signups.
+# Stripe automatically applies the $301 discount to the first month,
+# then bills at $400 for every subsequent month until the customer
+# cancels.
+STARTER_COUPON_ID = os.environ.get("STRIPE_STARTER_COUPON_ID", "STARTER99")
+
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER", "")  # Twilio number we send from
@@ -546,6 +563,46 @@ CREATE INDEX IF NOT EXISTS idx_sched_msg_pending
     WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS idx_sched_msg_by_user
     ON scheduled_messages(scheduled_by_user_id, created_at DESC);
+
+-- ── Sales reps & commission attribution (Starter Month sales funnel) ──
+--
+-- Salespeople pitch the $99 Starter Month and earn 20% of the actual
+-- subscription cash received for 6 months from each customer's signup.
+--
+-- Structure:
+--   sales_reps          — one row per active rep (Brian, Seattle, etc.)
+--   sales_attributions  — one row per customer signup; locked at signup
+--
+-- The "rep_slug" is the URL-safe identifier used in /starter?rep=brian
+-- queries. It's also the field that gets stored in sales_attributions.
+-- We deliberately don't FK from sales_attributions.rep_slug to
+-- sales_reps.slug — if a rep leaves and is deleted, attributions remain
+-- intact and admin can still see the historical record.
+CREATE TABLE IF NOT EXISTS sales_reps (
+    id              SERIAL PRIMARY KEY,
+    slug            TEXT NOT NULL UNIQUE,     -- 'brian', 'seattle1', etc.
+    name            TEXT NOT NULL,
+    email           TEXT,
+    phone           TEXT,
+    commission_start_date BIGINT,             -- Date rep started (informational)
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at      BIGINT NOT NULL,
+    updated_at      BIGINT NOT NULL
+);
+
+-- Commission attribution. Locked at signup; never modified.
+-- One row per (user_id) — a user can only have one source attribution.
+-- If rep_slug is NULL or 'organic', no commission is earned.
+CREATE TABLE IF NOT EXISTS sales_attributions (
+    user_id         INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    rep_slug        TEXT,                     -- NULL or 'organic' = no commission
+    signed_up_at    BIGINT NOT NULL,          -- starts the 6-month window
+    starter_used    BOOLEAN NOT NULL DEFAULT FALSE,   -- did they use STARTER99?
+    locked          BOOLEAN NOT NULL DEFAULT TRUE     -- always TRUE; reserved
+);
+CREATE INDEX IF NOT EXISTS idx_sales_attrib_rep
+    ON sales_attributions(rep_slug, signed_up_at DESC);
+
 
 -- ── User roles — many-to-many; a user can hold several roles ──
 -- Roles: 'subscriber', 'crew', 'met', 'admin'
@@ -4417,6 +4474,36 @@ def stripe_webhook_v2():
                     # Grant subscriber role
                     newly_granted = _grant_subscriber_role(user_id, conn)
 
+                    # ── Sales rep attribution (locked at signup) ──
+                    # Capture rep slug + starter flag from metadata. Once
+                    # written, never modified — prevents commission disputes.
+                    # If the user has an existing attribution row (came back
+                    # after cancelling), DO NOT overwrite — that original
+                    # rep already collected their 6 months. The new
+                    # subscription becomes a fresh attribution as 'organic'.
+                    sess_rep_raw = (session_metadata.get("wv_rep") or "").strip().lower()
+                    sess_starter = (session_metadata.get("wv_starter") or "") == "1"
+                    rep_slug = "".join(c for c in sess_rep_raw if c.isalnum() or c == "_")[:40] or None
+                    signup_ms = int(time.time() * 1000)
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """INSERT INTO sales_attributions
+                                   (user_id, rep_slug, signed_up_at, starter_used, locked)
+                                   VALUES (%s, %s, %s, %s, TRUE)
+                                   ON CONFLICT (user_id) DO NOTHING""",
+                                (user_id, rep_slug or "organic", signup_ms, sess_starter),
+                            )
+                        print(
+                            f"[stripe-webhook] attribution: user_id={user_id} "
+                            f"rep={rep_slug or 'organic'} starter={sess_starter}",
+                            flush=True,
+                        )
+                    except Exception as e:
+                        # Attribution failure shouldn't break the signup —
+                        # log it loudly and move on.
+                        print(f"[stripe-webhook] attribution write failed: {e!r}", flush=True)
+
                 # Send the password-reset email so the new subscriber can set
                 # their password and sign in. Reusing the magic-link infra —
                 # password-reset and first-time-account-setup are the same flow.
@@ -7940,6 +8027,29 @@ def me_subscription():
         except Exception:
             next_billing_at = None
 
+    # Starter Month detection (sales funnel). If the user signed up
+    # via /starter (starter_used=TRUE) and it's been less than 30 days
+    # since signup, they're in their starter window.
+    is_starter_month = False
+    starter_renews_ms = None
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT signed_up_at, starter_used FROM sales_attributions WHERE user_id = %s",
+                    (user["id"],),
+                )
+                attrib = cur.fetchone()
+        if attrib and attrib.get("starter_used"):
+            signed_at = attrib["signed_up_at"]
+            now_ms_check = int(time.time() * 1000)
+            # 30 days = 30 * 24 * 3600 * 1000 = 2,592,000,000 ms
+            if (now_ms_check - signed_at) < 30 * 24 * 3600 * 1000:
+                is_starter_month = True
+                starter_renews_ms = signed_at + 30 * 24 * 3600 * 1000
+    except Exception as e:
+        print(f"[subscription] starter check failed: {e}", flush=True)
+
     return jsonify({
         "ok": True,
         "plan": plan,
@@ -7949,6 +8059,8 @@ def me_subscription():
         "member_since": row["created_at"],
         "is_active": row["is_active"] if "is_active" in row else True,
         "stripe_customer_id": row.get("stripe_customer_id"),
+        "is_starter_month": is_starter_month,
+        "starter_renews_at": starter_renews_ms,
     })
 
 
@@ -8989,7 +9101,9 @@ def subscribe_create_checkout():
 
     Request body:
         {
-          "tier": "hobbyist" | "pro_single" | "pro_multi"
+          "tier": "hobbyist" | "pro_single" | "pro_multi",
+          "starter": true,            // optional — apply STARTER99 coupon
+          "rep": "brian"              // optional — sales rep attribution
         }
 
     Returns:
@@ -9006,6 +9120,15 @@ def subscribe_create_checkout():
         return jsonify({"ok": False, "error": "invalid-tier"}), 400
 
     price_id = TIER_PRICE_MAP[tier_key]
+
+    # Starter Month — only applies to pro_single
+    use_starter = bool(data.get("starter")) and tier_key == "pro_single"
+
+    # Sales rep attribution — slug only, must be alphanumeric+underscore
+    rep_slug_raw = (data.get("rep") or "").strip().lower()
+    rep_slug = "".join(c for c in rep_slug_raw if c.isalnum() or c == "_")[:40]
+    if not rep_slug:
+        rep_slug = None
 
     # If the requester is signed in, pre-fill their email and link to
     # their existing Stripe customer if one exists. If they're cold
@@ -9028,23 +9151,29 @@ def subscribe_create_checkout():
     # Build the success/cancel URLs. We send them back to the home page
     # with a query flag so the frontend knows to celebrate or apologize.
     success_url = f"{FRONTEND_BASE_URL}/?subscribed=1&tier={tier_key}&session={{CHECKOUT_SESSION_ID}}"
+    if use_starter:
+        success_url += "&starter=1"
     cancel_url = f"{FRONTEND_BASE_URL}/?subscribe_cancelled=1&tier={tier_key}"
 
     # Build the Checkout Session params. If we have an existing Stripe
     # customer (this user previously subscribed and cancelled, for
     # example), pass `customer=` instead of `customer_email=` so the new
     # subscription is linked to the same customer record.
+    metadata = {"wv_tier": tier_key}
+    if use_starter:
+        metadata["wv_starter"] = "1"
+    if rep_slug:
+        metadata["wv_rep"] = rep_slug
+
     session_params = {
         "mode": "subscription",
         "payment_method_types": ["card"],
         "line_items": [{"price": price_id, "quantity": 1}],
-        "metadata": {
-            "wv_tier": tier_key,
-        },
+        "metadata": metadata,
         # Also attach the tier to the subscription itself, so we can
         # read it back later via subscription metadata if needed.
         "subscription_data": {
-            "metadata": {"wv_tier": tier_key},
+            "metadata": metadata.copy(),
         },
         "success_url": success_url,
         "cancel_url": cancel_url,
@@ -9054,6 +9183,13 @@ def subscribe_create_checkout():
         # extra portal step. Stripe surfaces this as an optional field.
         "phone_number_collection": {"enabled": True},
     }
+    # Apply STARTER99 coupon for Starter Month signups.
+    # Stripe duration:'once' handles the auto-rollover to full price.
+    if use_starter:
+        session_params["discounts"] = [{"coupon": STARTER_COUPON_ID}]
+        # allow_promotion_codes can't coexist with discounts on Stripe Checkout
+        session_params.pop("allow_promotion_codes", None)
+
     if existing_stripe_customer:
         session_params["customer"] = existing_stripe_customer
     elif customer_email:
@@ -14555,6 +14691,277 @@ def _process_scheduled_messages() -> None:
             print(f"[scheduled-msg-tick] fired id={row['id']} type={row['type']}", flush=True)
         else:
             print(f"[scheduled-msg-tick] FAILED id={row['id']} type={row['type']}: {err}", flush=True)
+
+
+# ════════════════════════════════════════════════════════════════════
+# Sales reps + commissions (Starter Month funnel)
+# ════════════════════════════════════════════════════════════════════
+#
+# Reps earn 20% of every monthly subscription payment from customers
+# they sourced, for 6 months after the customer's signup date.
+#
+# v1: admin sees per-rep commissions in Operations tab. Reps don't have
+# logins yet. Michael shares numbers with reps manually (text, CSV).
+
+REP_COMMISSION_PCT = 0.20
+REP_COMMISSION_WINDOW_MONTHS = 6
+
+# Subscription tier monthly cents (for commission calculation — what
+# the customer actually pays each month, not what they paid for month 0).
+TIER_MONTHLY_CENTS_FOR_COMMISSION = {
+    "hobbyist": 3000,
+    "pro_single": 40000,
+    "pro_multi": 120000,
+    "pro_enterprise": 200000,
+}
+
+# Starter Month override — month 0 was $99. Commission on $99 only.
+STARTER_MONTH_CENTS = 9900
+
+
+@app.route("/api/v1/admin/sales-reps", methods=["OPTIONS"])
+def _admin_sales_reps_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/sales-reps")
+def admin_sales_reps_list():
+    """List all sales reps."""
+    actor, err = _require_admin()
+    if err:
+        return err
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, slug, name, email, phone, commission_start_date,
+                          is_active, created_at, updated_at
+                   FROM sales_reps
+                   ORDER BY is_active DESC, name"""
+            )
+            rows = cur.fetchall()
+    reps = [dict(r) for r in rows]
+    return jsonify({"ok": True, "reps": reps})
+
+
+@app.post("/api/v1/admin/sales-reps")
+def admin_sales_rep_create():
+    """Create a new sales rep.
+
+    Body: {slug, name, email?, phone?, commission_start_date?}
+    """
+    actor, err = _require_admin()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    slug = (data.get("slug") or "").strip().lower()
+    # Sanitize slug: alphanumeric + underscore only, max 40 chars
+    slug = "".join(c for c in slug if c.isalnum() or c == "_")[:40]
+    name = (data.get("name") or "").strip()
+    if not slug or not name:
+        return jsonify({"ok": False, "error": "slug-and-name-required"}), 400
+
+    email = (data.get("email") or "").strip() or None
+    phone = (data.get("phone") or "").strip() or None
+    try:
+        start_date = int(data.get("commission_start_date") or 0) or None
+    except (ValueError, TypeError):
+        start_date = None
+    now_ms = int(time.time() * 1000)
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO sales_reps
+                       (slug, name, email, phone, commission_start_date,
+                        is_active, created_at, updated_at)
+                       VALUES (%s, %s, %s, %s, %s, TRUE, %s, %s)
+                       RETURNING id""",
+                    (slug, name, email, phone, start_date, now_ms, now_ms),
+                )
+                new_id = cur.fetchone()["id"]
+    except Exception as e:
+        # Most likely a duplicate slug
+        return jsonify({
+            "ok": False, "error": "create-failed",
+            "message": f"Could not create rep — slug '{slug}' may already exist."
+        }), 400
+    return jsonify({"ok": True, "id": new_id, "slug": slug})
+
+
+@app.patch("/api/v1/admin/sales-reps/<int:rep_id>")
+def admin_sales_rep_update(rep_id: int):
+    """Update a rep — name, email, phone, active flag, commission_start_date.
+    Slug is locked (it's tied to URLs and attributions)."""
+    actor, err = _require_admin()
+    if err:
+        return err
+    data = request.get_json(silent=True) or {}
+    sets = []
+    params: list = []
+    for field in ("name", "email", "phone"):
+        if field in data:
+            sets.append(f"{field} = %s")
+            params.append((data.get(field) or "").strip() or None)
+    if "is_active" in data:
+        sets.append("is_active = %s")
+        params.append(bool(data["is_active"]))
+    if "commission_start_date" in data:
+        try:
+            sets.append("commission_start_date = %s")
+            params.append(int(data["commission_start_date"]) if data["commission_start_date"] else None)
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "error": "invalid-start-date"}), 400
+    if not sets:
+        return jsonify({"ok": False, "error": "no-updates"}), 400
+    sets.append("updated_at = %s")
+    params.append(int(time.time() * 1000))
+    params.append(rep_id)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE sales_reps SET {', '.join(sets)} WHERE id = %s",
+                tuple(params),
+            )
+    return jsonify({"ok": True})
+
+
+def _compute_commissions_for_month(year: int, month: int) -> dict:
+    """Compute per-rep commissions for the given month, in Eastern Time.
+
+    For each subscriber with a rep attribution:
+      - Check if their 6-month window includes this month
+      - Determine what they paid this month (based on their tier + whether
+        this was their Starter Month)
+      - Rep earns 20% of what was paid
+
+    For v1, we approximate "what they paid" using their CURRENT tier and
+    a flat monthly amount. This is correct for stable customers but
+    doesn't account for mid-month tier changes, refunds, or chargebacks.
+    Real Stripe reconciliation comes later.
+    """
+    ET = ZoneInfo("America/New_York")
+    period_start = datetime(year, month, 1, 0, 0, 0, tzinfo=ET)
+    if month == 12:
+        period_end = datetime(year + 1, 1, 1, 0, 0, 0, tzinfo=ET)
+    else:
+        period_end = datetime(year, month + 1, 1, 0, 0, 0, tzinfo=ET)
+    period_start_ms = int(period_start.timestamp() * 1000)
+    period_end_ms = int(period_end.timestamp() * 1000)
+
+    # Load all reps (to ensure zero-rows for reps with no work)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, slug, name, email, is_active
+                   FROM sales_reps ORDER BY name"""
+            )
+            rep_rows = cur.fetchall()
+    reps_by_slug = {
+        r["slug"]: {
+            "rep_id": r["id"],
+            "slug": r["slug"],
+            "name": r["name"],
+            "email": r["email"],
+            "is_active": bool(r["is_active"]),
+            "customer_count": 0,
+            "commission_cents": 0,
+            "customers": [],
+        }
+        for r in rep_rows
+    }
+
+    # Load all sales attributions (only those with a real rep slug)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT a.user_id, a.rep_slug, a.signed_up_at, a.starter_used,
+                          u.email, u.name, u.subscription_tier, u.is_active
+                   FROM sales_attributions a
+                   JOIN users u ON u.id = a.user_id
+                   WHERE a.rep_slug IS NOT NULL AND a.rep_slug != 'organic'"""
+            )
+            attribs = cur.fetchall()
+
+    for a in attribs:
+        rep_slug = a["rep_slug"]
+        if rep_slug not in reps_by_slug:
+            continue  # Rep was deleted; skip silently
+
+        # Compute the customer's months-elapsed AT THE END of this period.
+        # Their first month (month 0) is the calendar month containing
+        # their signup. Each subsequent month is +1.
+        signed_dt = datetime.fromtimestamp(a["signed_up_at"] / 1000, tz=ET)
+        # Month index for this period relative to signup
+        delta_months = (period_start.year - signed_dt.year) * 12 + (period_start.month - signed_dt.month)
+
+        # If period is BEFORE signup, nothing to compute
+        if delta_months < 0:
+            continue
+        # If past the 6-month commission window (month 0 through 6 inclusive
+        # = 7 months on Starter; just month 1-6 for non-Starter)
+        # Per Michael's spec: Starter customers get 13 months total
+        # ($99 month + 12 × $400). Commission for "first 6 months" so:
+        #   Non-Starter: months 1-6 earn commission
+        #   Starter:     months 0 (= $99) + 1-6 (= $400) earn commission
+        if a["starter_used"]:
+            commission_eligible = (0 <= delta_months <= 6)  # 7 months
+        else:
+            commission_eligible = (0 <= delta_months <= 5)  # 6 months from month 0
+
+        if not commission_eligible:
+            continue
+        # Customer must still be active
+        if not a["is_active"]:
+            continue
+
+        # What did they pay this month?
+        tier = a["subscription_tier"] or ""
+        if a["starter_used"] and delta_months == 0:
+            month_cents = STARTER_MONTH_CENTS
+        else:
+            month_cents = TIER_MONTHLY_CENTS_FOR_COMMISSION.get(tier, 0)
+
+        commission_cents = int(month_cents * REP_COMMISSION_PCT)
+        reps_by_slug[rep_slug]["customer_count"] += 1
+        reps_by_slug[rep_slug]["commission_cents"] += commission_cents
+        reps_by_slug[rep_slug]["customers"].append({
+            "user_id": a["user_id"],
+            "email": a["email"],
+            "name": a["name"],
+            "signed_up_at": a["signed_up_at"],
+            "tier": tier,
+            "month_index": delta_months,
+            "starter_used": bool(a["starter_used"]),
+            "month_cents": month_cents,
+            "commission_cents": commission_cents,
+        })
+
+    reps_list = list(reps_by_slug.values())
+    reps_list.sort(key=lambda r: r["commission_cents"], reverse=True)
+
+    return {
+        "month": period_start.strftime("%B %Y"),
+        "period": {
+            "start_ms": period_start_ms,
+            "end_ms": period_end_ms,
+        },
+        "reps": reps_list,
+    }
+
+
+@app.get("/api/v1/admin/commissions/<int:year>/<int:month>")
+def admin_commissions(year: int, month: int):
+    """Per-rep commissions for the given month."""
+    actor, err = _require_admin()
+    if err:
+        return err
+    if month < 1 or month > 12 or year < 2024 or year > 2100:
+        return jsonify({"ok": False, "error": "invalid-period"}), 400
+    result = _compute_commissions_for_month(year, month)
+    result["ok"] = True
+    return jsonify(result)
 
 
 if __name__ == "__main__":
