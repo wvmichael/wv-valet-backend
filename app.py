@@ -10829,7 +10829,306 @@ def _brief_scheduler_loop() -> None:
             _process_scheduled_messages()
         except Exception as e:
             print(f"[scheduled-msg-tick] tick failed: {e!r}", flush=True)
+        # Phase 11 (May 17): Coverage scheduler jobs
+        # Generate today/tomorrow tasks for Pro subscribers, then check
+        # for escalations. Both run on the same 60s tick so deadlines
+        # are checked at minute resolution.
+        try:
+            _coverage_generate_pending_tasks()
+        except Exception as e:
+            print(f"[coverage-tasks] generate failed: {e!r}", flush=True)
+        try:
+            _coverage_check_escalations()
+        except Exception as e:
+            print(f"[coverage-tasks] escalation check failed: {e!r}", flush=True)
         time.sleep(60)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Coverage scheduler — Phase 2 (task generation + escalation)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _coverage_generate_pending_tasks() -> None:
+    """For every active Pro subscriber, ensure a daily_brief_tasks row
+    exists for today and tomorrow (in their local timezone).
+
+    Runs on the main scheduler tick. Idempotent — uses ON CONFLICT to
+    avoid duplicate rows. Generates 2 days ahead so timezone edge cases
+    (subscribers in HI vs NY) all get coverage even if the cron is a
+    few hours late.
+    """
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id AS user_id, u.name, u.email,
+                          sc.primary_met_id, sc.backup_met_id,
+                          sc.daily_brief_time, sc.daily_brief_timezone
+                   FROM users u
+                   JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'subscriber'
+                   LEFT JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active'
+                   LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
+                   WHERE u.is_active = TRUE
+                     AND s.tier IN ('pro_single','pro_multi','pro_enterprise')"""
+            )
+            subs = cur.fetchall()
+
+            # Read recurring + overrides once for performance
+            cur.execute(
+                """SELECT mrs.*, u.name AS met_name
+                   FROM met_recurring_shifts mrs
+                   JOIN users u ON u.id = mrs.met_user_id
+                   WHERE u.is_active = TRUE"""
+            )
+            recurring = cur.fetchall()
+
+            today_utc = datetime.now(timezone.utc).date()
+            window_start = today_utc.strftime("%Y-%m-%d")
+            window_end = (today_utc + timedelta(days=2)).strftime("%Y-%m-%d")
+            cur.execute(
+                """SELECT mso.*, u.name AS met_name
+                   FROM met_shift_overrides mso
+                   LEFT JOIN users u ON u.id = mso.met_user_id
+                   WHERE mso.shift_date >= %s
+                     AND mso.shift_date <= %s
+                   ORDER BY mso.created_at""",
+                (window_start, window_end),
+            )
+            overrides = cur.fetchall()
+
+    now_ms = int(time.time() * 1000)
+    created_count = 0
+
+    for sub in subs:
+        tz_name = sub.get("daily_brief_timezone") or "America/New_York"
+        delivery_time_str = sub.get("daily_brief_time") or "07:00"
+
+        try:
+            sub_tz = ZoneInfo(tz_name)
+        except Exception:
+            sub_tz = ZoneInfo("America/New_York")
+
+        # Today + tomorrow in subscriber's local timezone
+        now_local = datetime.now(sub_tz)
+        for offset in (0, 1):
+            local_date = (now_local + timedelta(days=offset)).date()
+            local_date_str = local_date.strftime("%Y-%m-%d")
+            # Compute deadline = local date + delivery time, converted to UTC ms
+            try:
+                hh, mm = delivery_time_str.split(":")
+                deadline_local = datetime(
+                    local_date.year, local_date.month, local_date.day,
+                    int(hh), int(mm), tzinfo=sub_tz
+                )
+                deadline_utc = deadline_local.astimezone(timezone.utc)
+                due_at_ms = int(deadline_utc.timestamp() * 1000)
+            except Exception as e:
+                print(f"[coverage-tasks] bad time '{delivery_time_str}' for user {sub['user_id']}: {e}", flush=True)
+                continue
+
+            # Skip generating if deadline already past (we don't backfill old days)
+            if due_at_ms < now_ms - 24 * 60 * 60 * 1000:
+                continue
+
+            # Resolve assigned Met via the same logic as the dashboard
+            dow = (local_date.weekday() + 1) % 7  # 0=Sun
+            assigned = _resolve_coverage_for_day(
+                local_date_str, dow, sub["user_id"], sub.get("primary_met_id"),
+                recurring, overrides, scope="subscriber"
+            )
+            assigned_met_id = assigned["met_id"] if assigned else None
+
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """INSERT INTO daily_brief_tasks
+                               (subscriber_user_id, task_date, assigned_met_id,
+                                due_at_ms, status)
+                               VALUES (%s, %s, %s, %s, 'pending')
+                               ON CONFLICT (subscriber_user_id, task_date) DO UPDATE
+                               SET assigned_met_id = COALESCE(daily_brief_tasks.assigned_met_id,
+                                                              EXCLUDED.assigned_met_id),
+                                   due_at_ms = EXCLUDED.due_at_ms
+                               RETURNING (xmax = 0) AS inserted""",
+                            (sub["user_id"], local_date_str, assigned_met_id,
+                             due_at_ms),
+                        )
+                        row = cur.fetchone()
+                        if row and row.get("inserted"):
+                            created_count += 1
+            except Exception as e:
+                print(f"[coverage-tasks] insert failed for user={sub['user_id']} date={local_date_str}: {e}", flush=True)
+
+    if created_count:
+        print(f"[coverage-tasks] generated {created_count} new task rows", flush=True)
+
+
+def _coverage_check_escalations() -> None:
+    """For pending daily brief tasks approaching their deadline, fire
+    SMS escalations.
+
+    Schedule:
+      - T-30 minutes (before deadline), Met not started → SMS assigned Met
+      - T+0 (deadline), still not sent → SMS admin + Chief Met (Joe)
+
+    Each escalation level recorded in escalated_at_ms / escalated_admin_at_ms
+    so we don't double-fire. If the brief is sent in between, the task
+    transitions to 'sent' and escalations stop.
+    """
+    now_ms = int(time.time() * 1000)
+    thirty_min_ms = 30 * 60 * 1000
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            # Find tasks whose deadline is within the next 30 min and
+            # haven't been started yet (or deadline has passed and not sent).
+            cur.execute(
+                """SELECT dbt.id, dbt.subscriber_user_id, dbt.assigned_met_id,
+                          dbt.task_date, dbt.due_at_ms, dbt.status,
+                          dbt.started_at_ms, dbt.sent_at_ms,
+                          dbt.escalated_at_ms, dbt.escalated_admin_at_ms,
+                          su.name AS subscriber_name,
+                          su.email AS subscriber_email,
+                          mu.name AS met_name, mu.phone AS met_phone,
+                          sc.backup_met_id, sc.daily_brief_timezone,
+                          bu.name AS backup_name, bu.phone AS backup_phone
+                   FROM daily_brief_tasks dbt
+                   JOIN users su ON su.id = dbt.subscriber_user_id
+                   LEFT JOIN users mu ON mu.id = dbt.assigned_met_id
+                   LEFT JOIN subscriber_coverage sc ON sc.user_id = dbt.subscriber_user_id
+                   LEFT JOIN users bu ON bu.id = sc.backup_met_id
+                   WHERE dbt.status = 'pending'
+                     AND dbt.sent_at_ms IS NULL
+                     AND dbt.due_at_ms <= %s""",
+                (now_ms + thirty_min_ms,),
+            )
+            rows = cur.fetchall()
+
+    for r in rows:
+        # If T-30 reached and we haven't sent Met SMS yet, send it
+        time_to_deadline = r["due_at_ms"] - now_ms
+        # Level 1: T-30 min, not started, not yet escalated
+        if (time_to_deadline <= thirty_min_ms
+            and r["started_at_ms"] is None
+            and r["escalated_at_ms"] is None
+            and r["assigned_met_id"]):
+            _coverage_escalate_to_met(r)
+        # Level 2: T+0 (deadline passed), not sent, not yet admin-escalated
+        elif (time_to_deadline <= 0
+              and r["sent_at_ms"] is None
+              and r["escalated_admin_at_ms"] is None):
+            _coverage_escalate_to_admin(r)
+
+
+def _coverage_escalate_to_met(task_row) -> None:
+    """SMS the assigned Met (and backup, if any) that the brief is due
+    in 30 minutes and they haven't started yet."""
+    now_ms = int(time.time() * 1000)
+    sub_name = task_row.get("subscriber_name") or "a Pro subscriber"
+    msg = (
+        f"WeatherValet: daily brief for {sub_name} is due in 30 minutes. "
+        f"You haven't started yet. Open your workspace to begin. "
+        f"Task date: {task_row['task_date']}."
+    )
+
+    targets = []
+    if task_row.get("met_phone"):
+        targets.append((task_row["assigned_met_id"], task_row["met_phone"], "assigned"))
+    if task_row.get("backup_phone"):
+        targets.append((task_row.get("backup_met_id"), task_row["backup_phone"], "backup"))
+
+    sent_any = False
+    for met_id, phone, role in targets:
+        try:
+            if send_sms(phone, msg):
+                sent_any = True
+                print(f"[coverage-escalate] L1 SMS to met={met_id} ({role}) for task={task_row['id']}", flush=True)
+        except Exception as e:
+            print(f"[coverage-escalate] L1 SMS failed met={met_id}: {e}", flush=True)
+
+    # Mark escalated even if SMS failed — we don't want to keep retrying
+    # endlessly. Failed sends will surface in logs for investigation.
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE daily_brief_tasks
+                       SET escalated_at_ms = %s
+                       WHERE id = %s""",
+                    (now_ms, task_row["id"]),
+                )
+    except Exception as e:
+        print(f"[coverage-escalate] DB update failed: {e}", flush=True)
+
+
+def _coverage_escalate_to_admin(task_row) -> None:
+    """SMS admins and Chief Met (Joe) when a brief deadline has passed
+    and the brief still hasn't been sent. This is the loud alert."""
+    now_ms = int(time.time() * 1000)
+    sub_name = task_row.get("subscriber_name") or "a Pro subscriber"
+    met_name = task_row.get("met_name") or "(unassigned)"
+    msg = (
+        f"WeatherValet ALERT: daily brief for {sub_name} is OVERDUE. "
+        f"Assigned Met: {met_name}. Date: {task_row['task_date']}. "
+        f"Coverage gap — needs immediate attention."
+    )
+
+    # Find escalation targets: all active admins + any user with name
+    # containing "Joe" or "Clauss" (Chief Met). Falls back gracefully if
+    # neither exists.
+    targets = []
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.name, u.phone
+                   FROM users u
+                   JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'admin'
+                   WHERE u.is_active = TRUE
+                     AND u.phone IS NOT NULL AND u.phone != ''"""
+            )
+            for r in cur.fetchall():
+                targets.append((r["id"], r["phone"], "admin"))
+
+            # Chief Met by email (configurable later)
+            chief_email = os.environ.get("CHIEF_MET_EMAIL", "joe@weathervalet.com").strip()
+            if chief_email:
+                cur.execute(
+                    """SELECT u.id, u.name, u.phone
+                       FROM users u
+                       WHERE LOWER(u.email) = LOWER(%s)
+                         AND u.is_active = TRUE
+                         AND u.phone IS NOT NULL AND u.phone != ''""",
+                    (chief_email,),
+                )
+                for r in cur.fetchall():
+                    # Avoid duplicates if Chief Met is also admin
+                    if not any(t[0] == r["id"] for t in targets):
+                        targets.append((r["id"], r["phone"], "chief"))
+
+    if not targets:
+        print(f"[coverage-escalate] L2: no admin/chief targets for task={task_row['id']}", flush=True)
+
+    for uid, phone, role in targets:
+        try:
+            if send_sms(phone, msg):
+                print(f"[coverage-escalate] L2 SMS to {role} uid={uid} for task={task_row['id']}", flush=True)
+        except Exception as e:
+            print(f"[coverage-escalate] L2 SMS failed uid={uid}: {e}", flush=True)
+
+    # Mark admin-escalated + status=overdue so the dashboard reflects it
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE daily_brief_tasks
+                       SET escalated_admin_at_ms = %s,
+                           status = 'overdue'
+                       WHERE id = %s""",
+                    (now_ms, task_row["id"]),
+                )
+    except Exception as e:
+        print(f"[coverage-escalate] L2 DB update failed: {e}", flush=True)
 
 
 def _check_missed_pro_briefs() -> None:
@@ -12969,6 +13268,43 @@ def met_pro_brief_send(draft_id):
         flush=True,
     )
 
+    # Phase 11 Phase 2 (May 17): Mark today's daily_brief_task as sent
+    # for this subscriber. Best effort — task tracking is separate
+    # from the actual send.
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT user_id FROM pro_brief_drafts WHERE id = %s""",
+                    (draft_id,),
+                )
+                drow = cur.fetchone()
+                if drow and drow.get("user_id"):
+                    subscriber_id = drow["user_id"]
+                    # Get subscriber's local date
+                    cur.execute(
+                        """SELECT daily_brief_timezone
+                           FROM subscriber_coverage WHERE user_id = %s""",
+                        (subscriber_id,),
+                    )
+                    cov_row = cur.fetchone()
+                    tz_name = (cov_row or {}).get("daily_brief_timezone") or "America/New_York"
+                    try:
+                        sub_tz = ZoneInfo(tz_name)
+                    except Exception:
+                        sub_tz = ZoneInfo("America/New_York")
+                    local_date_str = datetime.now(sub_tz).strftime("%Y-%m-%d")
+                    cur.execute(
+                        """UPDATE daily_brief_tasks
+                           SET sent_at_ms = %s, status = 'sent'
+                           WHERE subscriber_user_id = %s
+                             AND task_date = %s
+                             AND status != 'sent'""",
+                        (now_ms, subscriber_id, local_date_str),
+                    )
+    except Exception as e:
+        print(f"[pro-brief-send] task mark-sent failed (non-fatal): {e}", flush=True)
+
     return jsonify({
         "ok": True,
         "channels_used": channels_used,
@@ -13983,6 +14319,137 @@ def met_heartbeat():
                 (user["id"], now_ms, ua),
             )
     return jsonify({"ok": True, "at": now_ms})
+
+
+# ── Phase 2 (May 17): My daily-brief tasks ──
+# Returns the current Met's pending + completed brief tasks for today
+# and tomorrow. Met sees these in their workspace and can hit "I'm on it"
+# to claim/start a task, or send to mark complete.
+@app.route("/api/v1/met/my-tasks", methods=["OPTIONS"])
+def _met_my_tasks_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/my-tasks")
+def met_my_tasks():
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    now_ms = int(time.time() * 1000)
+    # Show today + tomorrow's tasks, plus any overdue tasks from today
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT dbt.id, dbt.subscriber_user_id, dbt.task_date,
+                          dbt.assigned_met_id, dbt.due_at_ms, dbt.status,
+                          dbt.started_at_ms, dbt.sent_at_ms,
+                          dbt.escalated_at_ms, dbt.escalated_admin_at_ms,
+                          su.name AS subscriber_name, su.email AS subscriber_email,
+                          sc.daily_brief_time, sc.daily_brief_timezone,
+                          s.tier
+                   FROM daily_brief_tasks dbt
+                   JOIN users su ON su.id = dbt.subscriber_user_id
+                   LEFT JOIN subscriber_coverage sc ON sc.user_id = dbt.subscriber_user_id
+                   LEFT JOIN subscriptions s ON s.user_id = dbt.subscriber_user_id AND s.status = 'active'
+                   WHERE dbt.assigned_met_id = %s
+                     AND dbt.due_at_ms >= %s
+                     AND dbt.due_at_ms <= %s
+                   ORDER BY dbt.due_at_ms ASC""",
+                (user["id"], now_ms - 24 * 60 * 60 * 1000, now_ms + 48 * 60 * 60 * 1000),
+            )
+            rows = cur.fetchall()
+
+    tasks = []
+    for r in rows:
+        tasks.append({
+            "id": r["id"],
+            "subscriber_user_id": r["subscriber_user_id"],
+            "subscriber_name": r["subscriber_name"],
+            "subscriber_email": r["subscriber_email"],
+            "task_date": r["task_date"],
+            "due_at_ms": r["due_at_ms"],
+            "status": r["status"],
+            "started_at_ms": r["started_at_ms"],
+            "sent_at_ms": r["sent_at_ms"],
+            "escalated_at_ms": r["escalated_at_ms"],
+            "delivery_time": r.get("daily_brief_time") or "07:00",
+            "delivery_timezone": r.get("daily_brief_timezone") or "America/New_York",
+            "tier": r.get("tier"),
+        })
+    return jsonify({"ok": True, "tasks": tasks})
+
+
+# "I'm on it" — Met indicates they're starting work on a task.
+@app.route("/api/v1/met/tasks/<int:task_id>/start", methods=["OPTIONS"])
+def _met_task_start_preflight(task_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/met/tasks/<int:task_id>/start")
+def met_task_start(task_id: int):
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            # Take responsibility — also re-assigns to this Met if it
+            # was assigned to someone else (case: covering for a peer)
+            cur.execute(
+                """UPDATE daily_brief_tasks
+                   SET started_at_ms = COALESCE(started_at_ms, %s),
+                       status = 'in_progress',
+                       assigned_met_id = %s
+                   WHERE id = %s
+                     AND status IN ('pending', 'overdue')
+                   RETURNING id, subscriber_user_id, task_date""",
+                (now_ms, user["id"], task_id),
+            )
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "task-not-found-or-completed"}), 404
+    return jsonify({"ok": True, "task_id": row["id"]})
+
+
+# Mark a task as sent — usually called by the existing brief-send flow
+# but exposed for manual mark-complete too.
+@app.route("/api/v1/met/tasks/<int:task_id>/complete", methods=["OPTIONS"])
+def _met_task_complete_preflight(task_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/met/tasks/<int:task_id>/complete")
+def met_task_complete(task_id: int):
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE daily_brief_tasks
+                   SET sent_at_ms = %s,
+                       status = 'sent'
+                   WHERE id = %s
+                   RETURNING id""",
+                (now_ms, task_id),
+            )
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "task-not-found"}), 404
+    return jsonify({"ok": True})
 
 
 # Get current Met's own recurring schedule (read-only convenience)
