@@ -11057,8 +11057,10 @@ def _coverage_check_escalations() -> None:
 
 
 def _coverage_escalate_to_met(task_row) -> None:
-    """SMS the assigned Met (and backup, if any) that the brief is due
-    in 30 minutes and they haven't started yet."""
+    """SMS the assigned (primary) Met that the brief is due in 30 minutes
+    and they haven't started yet. Backup is NOT pinged at this level —
+    they only get involved if the primary fails (L2 escalation). This
+    keeps SMS noise low and avoids cry-wolf fatigue."""
     now_ms = int(time.time() * 1000)
     sub_name = task_row.get("subscriber_name") or "a Pro subscriber"
     msg = (
@@ -11070,8 +11072,7 @@ def _coverage_escalate_to_met(task_row) -> None:
     targets = []
     if task_row.get("met_phone"):
         targets.append((task_row["assigned_met_id"], task_row["met_phone"], "assigned"))
-    if task_row.get("backup_phone"):
-        targets.append((task_row.get("backup_met_id"), task_row["backup_phone"], "backup"))
+    # Note: backup intentionally excluded here — see L2 escalation.
 
     sent_any = False
     for met_id, phone, role in targets:
@@ -11098,8 +11099,10 @@ def _coverage_escalate_to_met(task_row) -> None:
 
 
 def _coverage_escalate_to_admin(task_row) -> None:
-    """SMS admins and Chief Met (Joe) when a brief deadline has passed
-    and the brief still hasn't been sent. This is the loud alert."""
+    """SMS admins, Chief Met (Joe), AND the backup Met (if any) when a
+    brief deadline has passed and the brief still hasn't been sent.
+    This is the loud alert — backup is brought in here, not at L1,
+    so they only get pinged when it actually matters."""
     now_ms = int(time.time() * 1000)
     sub_name = task_row.get("subscriber_name") or "a Pro subscriber"
     met_name = task_row.get("met_name") or "(unassigned)"
@@ -11141,12 +11144,28 @@ def _coverage_escalate_to_admin(task_row) -> None:
                     if not any(t[0] == r["id"] for t in targets):
                         targets.append((r["id"], r["phone"], "chief"))
 
+    # Backup Met — only paged at L2, not L1. Use a friendlier message
+    # since they're being asked to actually do work, not just be aware.
+    if task_row.get("backup_phone") and task_row.get("backup_met_id"):
+        backup_id = task_row["backup_met_id"]
+        if not any(t[0] == backup_id for t in targets):
+            targets.append((backup_id, task_row["backup_phone"], "backup"))
+
     if not targets:
-        print(f"[coverage-escalate] L2: no admin/chief targets for task={task_row['id']}", flush=True)
+        print(f"[coverage-escalate] L2: no admin/chief/backup targets for task={task_row['id']}", flush=True)
 
     for uid, phone, role in targets:
+        # Friendly variant for backup — they're being asked to step in
+        if role == "backup":
+            send_msg = (
+                f"WeatherValet: {met_name} hasn't sent the daily brief for "
+                f"{sub_name} yet ({task_row['task_date']}). Can you cover? "
+                f"Open your workspace to claim the task."
+            )
+        else:
+            send_msg = msg
         try:
-            if send_sms(phone, msg):
+            if send_sms(phone, send_msg):
                 print(f"[coverage-escalate] L2 SMS to {role} uid={uid} for task={task_row['id']}", flush=True)
         except Exception as e:
             print(f"[coverage-escalate] L2 SMS failed uid={uid}: {e}", flush=True)
@@ -15166,13 +15185,19 @@ def admin_coverage_dashboard():
                 d["date"], d["day_of_week"], sub["id"], sub["primary_met_id"],
                 recurring, overrides, scope="subscriber"
             )
+            # is_gap: nobody assigned at all
+            # is_soft_gap: only the primary-fallback applies — primary
+            # Met is the owner but has no recurring shift for this day.
+            # Treated visually as "warning" not "ok".
+            via = assigned_met["via"] if assigned_met else None
             days_status.append({
                 "date": d["date"],
                 "day_of_week": d["day_of_week"],
                 "assigned_met_id": assigned_met["met_id"] if assigned_met else None,
                 "assigned_met_name": assigned_met["met_name"] if assigned_met else None,
-                "via": assigned_met["via"] if assigned_met else None,
+                "via": via,
                 "is_gap": assigned_met is None,
+                "is_soft_gap": (via == "primary-fallback"),
             })
         sub_coverage.append({
             "subscriber_id": sub["id"],
@@ -15289,10 +15314,18 @@ def _resolve_coverage_for_day(date_str, day_of_week, subscriber_id, primary_met_
                 and r["subscriber_user_id"] == subscriber_id
                 and r["met_user_id"] == primary_met_id):
                 return {"met_id": primary_met_id, "met_name": r["met_name"], "via": "primary"}
-        # No specific recurring shift, but primary is assigned. Whether
-        # they're "scheduled" or not, the brief needs writing — primary
-        # is responsible by default. Mark this as the primary fallback.
-        return {"met_id": primary_met_id, "met_name": None, "via": "primary-fallback"}
+        # No specific recurring shift, but primary is assigned. The
+        # brief still needs writing — primary is responsible by default.
+        # Caller treats `via=primary-fallback` as a soft warning (yellow)
+        # rather than confirmed coverage (green).
+        # Look up primary's name from any of their other shifts so the UI
+        # has a name to display.
+        primary_name = None
+        for r in all_recurring:
+            if r["met_user_id"] == primary_met_id:
+                primary_name = r.get("met_name")
+                break
+        return {"met_id": primary_met_id, "met_name": primary_name, "via": "primary-fallback"}
 
     return None  # GAP
 
