@@ -603,6 +603,38 @@ CREATE TABLE IF NOT EXISTS sales_attributions (
 CREATE INDEX IF NOT EXISTS idx_sales_attrib_rep
     ON sales_attributions(rep_slug, signed_up_at DESC);
 
+-- ── Custom mission templates (F-X2) ──
+--
+-- Built-in templates live in the frontend (CREW_MISSIONS dict in index.html).
+-- Mets can create CUSTOM templates that go on top of the built-ins.
+-- They appear in the deploy modal alongside the built-ins.
+--
+-- Severe templates need admin sign-off (status='pending-approval').
+-- Routine templates go straight to status='approved' (Mets are trained).
+CREATE TABLE IF NOT EXISTS mission_templates_user (
+    id              SERIAL PRIMARY KEY,
+    slug            TEXT NOT NULL UNIQUE,         -- 'wind-gust-check-1', auto-generated
+    template_name   TEXT NOT NULL,                -- short display name
+    eyebrow         TEXT,                         -- short context above headline
+    btn_headline    TEXT NOT NULL,                -- main button text Mets see
+    prompt          TEXT NOT NULL,                -- the SMS sent to Crew
+    answer_options  TEXT,                         -- JSON: [{id, label}, ...] or null for free-text
+    mode            TEXT NOT NULL DEFAULT 'routine',  -- 'routine' | 'severe'
+    icon            TEXT DEFAULT 'eye',           -- icon key
+    status          TEXT NOT NULL DEFAULT 'approved',  -- 'approved' | 'pending-approval' | 'rejected'
+    created_by_user_id INTEGER REFERENCES users(id),
+    created_by_name TEXT,
+    approved_by_user_id INTEGER REFERENCES users(id),
+    approved_at     BIGINT,
+    rejection_reason TEXT,
+    use_count       INTEGER NOT NULL DEFAULT 0,   -- track usefulness
+    created_at      BIGINT NOT NULL,
+    updated_at      BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mtu_status
+    ON mission_templates_user(status);
+
+
 
 -- ── User roles — many-to-many; a user can hold several roles ──
 -- Roles: 'subscriber', 'crew', 'met', 'admin'
@@ -11025,9 +11057,14 @@ def missions_list():
                        ORDER BY fired_at DESC LIMIT 20"""
                 )
             else:
+                # Mets see (a) all their own missions, plus (b) any
+                # pending-approval missions from other Mets so they can
+                # provide the second-set-of-eyes approval. This is the
+                # F-X1 launch fix: no single-admin bottleneck.
                 cur.execute(
                     """SELECT * FROM mission_deployments
                        WHERE fired_by_user_id = %s
+                          OR status = 'pending-approval'
                        ORDER BY fired_at DESC LIMIT 20""",
                     (user["id"],),
                 )
@@ -11163,6 +11200,41 @@ def missions_create():
                 flush=True,
             )
 
+    # F-X1: For severe (pending-approval) missions, SMS the other Mets
+    # so a second pair of eyes shows up fast. Time-critical workflow.
+    if status == "pending-approval":
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT u.id, u.phone FROM users u
+                           WHERE u.is_active = TRUE
+                             AND u.phone IS NOT NULL AND u.phone != ''
+                             AND u.id != %s
+                             AND (
+                               EXISTS (SELECT 1 FROM user_roles ur
+                                       WHERE ur.user_id = u.id AND ur.role = 'met')
+                               OR
+                               EXISTS (SELECT 1 FROM user_roles ur
+                                       WHERE ur.user_id = u.id AND ur.role = 'admin')
+                             )
+                           LIMIT 10""",
+                        (user["id"],),
+                    )
+                    notify_rows = cur.fetchall()
+            sev_msg = (
+                f"WeatherValet: SEVERE mission pending approval from "
+                f"{fired_by_name}. Polygon: {polygon_label or '—'}. "
+                f"Prompt: \"{prompt[:80]}\". Open the workspace Missions tab to review."
+            )
+            for n in notify_rows:
+                try:
+                    send_sms(n["phone"], sev_msg)
+                except Exception as e:
+                    print(f"[mission-sms] approval-notify failed for uid={n['id']}: {e}", flush=True)
+        except Exception as e:
+            print(f"[mission-sms] approval-notify lookup failed: {e}", flush=True)
+
     print(
         f"[mission] fired id={r['id']} template={template_id} "
         f"by user_id={user['id']} status={status} "
@@ -11289,10 +11361,21 @@ def missions_update(dep_id):
         if new_status not in ("fired", "cancelled", "completed", "pending-approval"):
             return jsonify({"ok": False, "error": "invalid-status"}), 400
 
-        # Approval: pending-approval → fired requires admin
+        # Approval: pending-approval → fired requires a SECOND Met or admin
+        # (not the same person who fired the mission). This prevents single-
+        # Met severe deployments AND avoids the single-admin bottleneck.
+        # Rationale: Mets are trained meteorologists. A second pair of eyes
+        # from another Met is the right guardrail, not non-meteorologist admin.
         if r["status"] == "pending-approval" and new_status == "fired":
-            if not is_admin:
-                return jsonify({"ok": False, "error": "admin-required"}), 403
+            is_other_met = ("met" in roles) and (r["fired_by_user_id"] != user["id"])
+            if not (is_admin or is_other_met):
+                # Same-Met self-approval, or non-Met non-admin trying to approve
+                if r["fired_by_user_id"] == user["id"]:
+                    return jsonify({
+                        "ok": False, "error": "second-met-required",
+                        "message": "Severe missions need approval from a different Met (or admin)."
+                    }), 403
+                return jsonify({"ok": False, "error": "met-or-admin-required"}), 403
             set_clauses.append("approved_by_user_id = %s")
             params.append(user["id"])
             set_clauses.append("approved_at = %s")
@@ -13210,6 +13293,237 @@ def met_thread_mark_read(thread_id):
 #
 # After creating, the existing POST /api/v1/met/threads/<id>/messages
 # endpoint handles the actual message send.
+
+# ── F-X2: Mission template creation & management ──
+# Mets can author custom mission templates. Routine ones go live
+# immediately; severe ones need admin (or other Met) approval.
+
+@app.route("/api/v1/met/mission-templates", methods=["OPTIONS"])
+def _met_mission_templates_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/mission-templates")
+def met_mission_templates_list():
+    """List all approved + pending custom templates.
+    Mets see all approved, plus their own pending ones.
+    Admins see everything."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    is_admin = "admin" in roles
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            if is_admin:
+                cur.execute(
+                    """SELECT * FROM mission_templates_user
+                       WHERE status != 'rejected'
+                       ORDER BY status DESC, created_at DESC"""
+                )
+            else:
+                cur.execute(
+                    """SELECT * FROM mission_templates_user
+                       WHERE status = 'approved'
+                          OR (status = 'pending-approval' AND created_by_user_id = %s)
+                       ORDER BY status DESC, created_at DESC""",
+                    (user["id"],),
+                )
+            rows = cur.fetchall()
+
+    templates = []
+    for r in rows:
+        try:
+            answers = _json_sched.loads(r["answer_options"]) if r["answer_options"] else None
+        except Exception:
+            answers = None
+        templates.append({
+            "id": r["id"],
+            "slug": r["slug"],
+            "template_name": r["template_name"],
+            "eyebrow": r["eyebrow"],
+            "btn_headline": r["btn_headline"],
+            "prompt": r["prompt"],
+            "answer_options": answers,
+            "mode": r["mode"],
+            "icon": r["icon"],
+            "status": r["status"],
+            "created_by_name": r["created_by_name"],
+            "created_at": r["created_at"],
+            "use_count": r["use_count"],
+        })
+    return jsonify({"ok": True, "templates": templates})
+
+
+@app.post("/api/v1/met/mission-templates")
+def met_mission_template_create():
+    """Create a custom mission template.
+
+    Body: {template_name, eyebrow?, btn_headline, prompt,
+           answer_options? (list of {id, label}), mode (routine|severe), icon?}
+    Routine templates → status='approved' immediately.
+    Severe templates → status='pending-approval' (need second Met or admin).
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    name = (data.get("template_name") or "").strip()
+    headline = (data.get("btn_headline") or "").strip()
+    prompt = (data.get("prompt") or "").strip()
+    if not name or not headline or not prompt:
+        return jsonify({
+            "ok": False, "error": "missing-fields",
+            "message": "Name, button headline, and prompt are required."
+        }), 400
+    if len(prompt) > 400:
+        return jsonify({"ok": False, "error": "prompt-too-long"}), 400
+
+    eyebrow = (data.get("eyebrow") or "").strip() or None
+    mode = (data.get("mode") or "routine").strip().lower()
+    if mode not in ("routine", "severe"):
+        mode = "routine"
+    icon = (data.get("icon") or "eye").strip().lower() or "eye"
+    answer_options = data.get("answer_options") or None
+    if answer_options is not None:
+        # Validate shape
+        if not isinstance(answer_options, list):
+            return jsonify({"ok": False, "error": "invalid-answers"}), 400
+        # Each {id, label}
+        for ao in answer_options:
+            if not isinstance(ao, dict) or "id" not in ao or "label" not in ao:
+                return jsonify({"ok": False, "error": "invalid-answer-shape"}), 400
+
+    # Routine = auto-approve. Severe = needs second Met / admin.
+    is_admin = "admin" in roles
+    if mode == "severe" and not is_admin:
+        status = "pending-approval"
+        approved_by_user_id = None
+        approved_at = None
+    else:
+        status = "approved"
+        approved_by_user_id = user["id"] if is_admin else None
+        approved_at = int(time.time() * 1000) if is_admin else None
+
+    # Generate a unique slug from the name
+    base_slug = "".join(c if c.isalnum() else "-" for c in name.lower())[:40].strip("-")
+    if not base_slug:
+        base_slug = "template"
+    # Ensure uniqueness by appending a counter
+    slug = base_slug
+    counter = 1
+    with db() as conn:
+        with conn.cursor() as cur:
+            while True:
+                cur.execute(
+                    "SELECT 1 FROM mission_templates_user WHERE slug = %s",
+                    (slug,),
+                )
+                if not cur.fetchone():
+                    break
+                counter += 1
+                slug = f"{base_slug}-{counter}"
+                if counter > 100:
+                    slug = f"{base_slug}-{int(time.time())}"
+                    break
+
+    answers_json = _json_sched.dumps(answer_options) if answer_options else None
+    actor_name = (user.get("name") or "").strip() or user.get("email")
+    now_ms = int(time.time() * 1000)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO mission_templates_user
+                   (slug, template_name, eyebrow, btn_headline, prompt,
+                    answer_options, mode, icon, status,
+                    created_by_user_id, created_by_name,
+                    approved_by_user_id, approved_at,
+                    created_at, updated_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   RETURNING id""",
+                (slug, name, eyebrow, headline, prompt, answers_json,
+                 mode, icon, status,
+                 user["id"], actor_name,
+                 approved_by_user_id, approved_at,
+                 now_ms, now_ms),
+            )
+            new_id = cur.fetchone()["id"]
+
+    print(
+        f"[mission-template] created id={new_id} slug={slug} by={user['id']} status={status}",
+        flush=True,
+    )
+    return jsonify({
+        "ok": True, "id": new_id, "slug": slug, "status": status,
+        "auto_approved": (status == "approved"),
+    })
+
+
+@app.patch("/api/v1/met/mission-templates/<int:tmpl_id>")
+def met_mission_template_update(tmpl_id: int):
+    """Approve or reject a pending template. Any Met or admin can act.
+    The creator cannot self-approve."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    action = (data.get("action") or "").strip().lower()
+    if action not in ("approve", "reject"):
+        return jsonify({"ok": False, "error": "invalid-action"}), 400
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM mission_templates_user WHERE id = %s",
+                (tmpl_id,),
+            )
+            r = cur.fetchone()
+    if not r:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    if r["status"] != "pending-approval":
+        return jsonify({"ok": False, "error": "not-pending"}), 409
+    if r["created_by_user_id"] == user["id"] and "admin" not in roles:
+        return jsonify({
+            "ok": False, "error": "self-approval",
+            "message": "You can't approve a template you created. Another Met or admin must approve."
+        }), 403
+
+    now_ms = int(time.time() * 1000)
+    if action == "approve":
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE mission_templates_user
+                       SET status = 'approved', approved_by_user_id = %s,
+                           approved_at = %s, updated_at = %s
+                       WHERE id = %s""",
+                    (user["id"], now_ms, now_ms, tmpl_id),
+                )
+    else:
+        reason = (data.get("reason") or "").strip() or None
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE mission_templates_user
+                       SET status = 'rejected', rejection_reason = %s,
+                           updated_at = %s
+                       WHERE id = %s""",
+                    (reason, now_ms, tmpl_id),
+                )
+    return jsonify({"ok": True})
+
 
 @app.route("/api/v1/met/pro-subscribers", methods=["OPTIONS"])
 def _met_pro_subscribers_preflight():
