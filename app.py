@@ -5306,13 +5306,22 @@ def _admin_auth():
     """Shared HTTP Basic Auth for all /admin/* routes. Returns None when
     auth passes, or a Flask response when it doesn't.
 
-    If WV_ADMIN_USER / WV_ADMIN_PASS aren't set, auth is skipped. That's
-    convenient for local dev but ALWAYS set them in production — the
-    dashboard exposes customer phone numbers and revenue data."""
+    SECURITY: if WV_ADMIN_USER / WV_ADMIN_PASS aren't set, this function
+    FAILS CLOSED (returns 503). Previously this silently allowed access,
+    which was a footgun: forget to set env vars on a new deploy and the
+    entire admin surface becomes public. Local dev should set these env
+    vars too (.env file or shell exports), same as production. There is
+    no longer a 'just for dev' bypass."""
     admin_user = os.environ.get("WV_ADMIN_USER")
     admin_pass = os.environ.get("WV_ADMIN_PASS")
     if not (admin_user and admin_pass):
-        return None
+        # Fail closed. If you see this in production, set WV_ADMIN_USER
+        # and WV_ADMIN_PASS env vars and redeploy.
+        return (
+            "Admin auth is not configured. Set WV_ADMIN_USER and WV_ADMIN_PASS env vars.",
+            503,
+            {"Content-Type": "text/plain"},
+        )
     auth = request.authorization
     if not auth or auth.username != admin_user or auth.password != admin_pass:
         return ("Auth required", 401, {"WWW-Authenticate": 'Basic realm="WV Admin"'})
