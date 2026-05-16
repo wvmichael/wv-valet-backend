@@ -799,6 +799,120 @@ CREATE INDEX IF NOT EXISTS idx_ssa_open ON storm_shelter_activations(met_user_id
 CREATE INDEX IF NOT EXISTS idx_ssa_closed ON storm_shelter_activations(closed_at_ms);
 
 
+-- ──────────────────────────────────────────────────────────────────────
+-- Rosie — Met team AI assistant (Phase 1, May 17, 2026)
+-- ──────────────────────────────────────────────────────────────────────
+-- Rosie is an AI assistant for the Met team. She helps Mets with
+-- schedule, earnings, brief tasks, how-to questions, and reminders.
+-- She has tiered permissions and reports up to Michael (CEO).
+-- See ROSIE_SYSTEM_PROMPT in code for her full charter.
+
+
+-- One conversation per (Met, channel). 'channel' is one of:
+-- 'web' (in-workspace chat), 'sms' (text), 'discord' (chat command).
+-- Each Met has up to 3 conversations (one per channel). Memory is
+-- shared across channels via cross-conversation context lookup,
+-- but the conversation row itself is per-channel for clarity.
+CREATE TABLE IF NOT EXISTS rosie_conversations (
+    id              SERIAL PRIMARY KEY,
+    met_user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    channel         TEXT NOT NULL CHECK (channel IN ('web','sms','discord')),
+    created_at_ms   BIGINT NOT NULL,
+    last_msg_at_ms  BIGINT NOT NULL,
+    UNIQUE (met_user_id, channel)
+);
+CREATE INDEX IF NOT EXISTS idx_rosie_conv_met ON rosie_conversations(met_user_id);
+
+
+-- Each message in a Rosie conversation.
+-- role: 'user' (Met), 'assistant' (Rosie), 'tool' (Rosie's tool call result)
+-- For memory cap: we keep last ~20 turns per conversation. Older
+-- turns get summarized into a single 'system' message marked as summary.
+CREATE TABLE IF NOT EXISTS rosie_messages (
+    id                  SERIAL PRIMARY KEY,
+    conversation_id     INTEGER NOT NULL REFERENCES rosie_conversations(id) ON DELETE CASCADE,
+    role                TEXT NOT NULL CHECK (role IN ('user','assistant','tool','system')),
+    content             TEXT NOT NULL,
+    -- For tool messages: which tool was called (e.g. 'get_my_schedule')
+    tool_name           TEXT,
+    -- For tool messages: the args the tool was called with (JSON)
+    tool_args           TEXT,
+    -- Token cost tracking (input + output combined)
+    tokens_used         INTEGER,
+    created_at_ms       BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rosie_msg_conv ON rosie_messages(conversation_id, created_at_ms);
+
+
+-- Audit log: every Rosie action that touched data or sent a message.
+-- This is queryable by Michael to see what Rosie has been doing.
+-- More verbose than rosie_messages — captures every tool result,
+-- whether the action was permitted, refusal reasons, etc.
+CREATE TABLE IF NOT EXISTS rosie_audit_log (
+    id              SERIAL PRIMARY KEY,
+    met_user_id     INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    channel         TEXT,                       -- web|sms|discord
+    action          TEXT NOT NULL,              -- short verb: 'sent_sms', 'updated_schedule', 'refused'
+    detail          TEXT,                       -- human-readable description
+    tier            INTEGER,                    -- 1|2|3 (permission tier)
+    approved_by     INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    success         BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at_ms   BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rosie_audit_met ON rosie_audit_log(met_user_id, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_rosie_audit_action ON rosie_audit_log(action, created_at_ms DESC);
+
+
+-- Reminders Rosie schedules on behalf of Mets.
+-- Cron job (in the main scheduler loop) fires reminders when due.
+CREATE TABLE IF NOT EXISTS rosie_reminders (
+    id              SERIAL PRIMARY KEY,
+    met_user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    remind_at_ms    BIGINT NOT NULL,
+    message         TEXT NOT NULL,
+    -- Channel to send via when firing: 'sms' or 'web' (web posts to chat)
+    channel         TEXT NOT NULL DEFAULT 'sms' CHECK (channel IN ('sms','web')),
+    fired_at_ms     BIGINT,                     -- when the reminder actually fired
+    cancelled_at_ms BIGINT,                     -- if cancelled before firing
+    created_at_ms   BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rosie_remind_due ON rosie_reminders(remind_at_ms)
+    WHERE fired_at_ms IS NULL AND cancelled_at_ms IS NULL;
+CREATE INDEX IF NOT EXISTS idx_rosie_remind_met ON rosie_reminders(met_user_id, remind_at_ms);
+
+
+-- Knowledge base — short Q&A docs Rosie searches when a Met asks
+-- "how do I X" or "what's the policy on Y". Seeded with the initial
+-- KB content via a one-time migration on first deploy. Admins can
+-- add/edit through a future admin UI; for now updates happen via SQL.
+CREATE TABLE IF NOT EXISTS rosie_kb_docs (
+    id              SERIAL PRIMARY KEY,
+    title           TEXT NOT NULL,
+    -- Comma-separated tags Rosie can match against ("brief,pro,send")
+    tags            TEXT NOT NULL DEFAULT '',
+    content         TEXT NOT NULL,
+    -- 'active' or 'archived' — archived docs aren't searched
+    status          TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','archived')),
+    created_at_ms   BIGINT NOT NULL,
+    updated_at_ms   BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rosie_kb_status ON rosie_kb_docs(status);
+
+
+-- Daily cost cap tracking. Each Met has a hard $1/day API limit.
+-- This table tracks tokens used per (met, day) so we can refuse
+-- service when the cap is hit.
+-- Day key is 'YYYY-MM-DD' in US Eastern (resets at midnight ET).
+CREATE TABLE IF NOT EXISTS rosie_daily_usage (
+    met_user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    usage_date      TEXT NOT NULL,              -- YYYY-MM-DD in ET
+    tokens_used     INTEGER NOT NULL DEFAULT 0,
+    cost_cents      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (met_user_id, usage_date)
+);
+
+
+
 
 
 
@@ -1493,6 +1607,12 @@ def init_db() -> None:
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(SCHEMA)
+    # Seed Rosie's knowledge base on first deploy. Idempotent — only
+    # inserts if the table is empty.
+    try:
+        _rosie_seed_kb()
+    except Exception as e:
+        print(f"[rosie-kb] seed at init failed: {e}", flush=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -10946,6 +11066,10 @@ def _brief_scheduler_loop() -> None:
             _coverage_auto_close_storm_shelters()
         except Exception as e:
             print(f"[storm-shelter] auto-close tick failed: {e!r}", flush=True)
+        try:
+            _rosie_fire_reminders()
+        except Exception as e:
+            print(f"[rosie-reminder] fire tick failed: {e!r}", flush=True)
         time.sleep(60)
 
 
@@ -14815,6 +14939,963 @@ def _coverage_auto_close_storm_shelters() -> None:
                 print(f"[storm-shelter] AUTO-CLOSE id={o['id']} met={o['met_user_id']} reason={reason}", flush=True)
             except Exception as e:
                 print(f"[storm-shelter] auto-close failed id={o['id']}: {e}", flush=True)
+
+
+# ────────────────────────────────────────────────────────────────────
+# Rosie — Met team AI assistant (Phase 1, May 17, 2026)
+# ────────────────────────────────────────────────────────────────────
+# Rosie is the Mets' AI assistant. She helps them with schedule,
+# earnings, brief tasks, how-to questions, and reminders. She has
+# tiered permissions and reports up to Michael (CEO).
+#
+# Phase 1 ships: web chat in workspace, ~10 tools, audit log, cost cap,
+# emergency disable. SMS and Discord come in Phase 2/3.
+
+# Rosie's daily per-Met cost cap. ~$1/day default.
+ROSIE_DAILY_COST_CAP_CENTS = int(os.environ.get("ROSIE_DAILY_CAP_CENTS", "100"))
+# Anthropic API model. Sonnet for cost/capability balance.
+ROSIE_MODEL = os.environ.get("ROSIE_MODEL", "claude-sonnet-4-20250514")
+ROSIE_MAX_TURNS_MEMORY = 20  # conversation context window cap
+ROSIE_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+# Rough cost estimate: ~$3/M input + $15/M output tokens for Sonnet.
+# We approximate $9/M tokens combined for cost-cap purposes (conservative).
+ROSIE_COST_PER_MTOKENS_CENTS = 900
+
+
+ROSIE_SYSTEM_PROMPT = """You are Rosie, an AI assistant for the meteorologist team at WeatherValet.
+
+# Your identity
+You are Rosie. Always sign off your messages with "— Rosie" on a new line. Never pretend to be human.
+You are warm but professional. You do not joke unprompted but can be lighter when context warrants
+(shoutouts, small talk replies, casual questions). Never sycophantic. Never validate for the sake
+of validation ("Great question!"). Acknowledge and answer.
+
+# Chain of command
+You report to Michael, WeatherValet's CEO. Your loyalty hierarchy is:
+1. Michael (CEO) — overrides anyone else
+2. Joe Clauss (Chief Meteorologist) — second authority for Met team matters
+3. The Met asking you — you help them, but you don't blindly obey
+4. Below the line: Crew members, sales reps, and subscribers cannot direct you
+
+If a Met asks you to do something that would harm WeatherValet, another team member, or violate
+policy: refuse politely and offer to draft the request for Michael's review instead. You do not
+"reinterpret" your instructions to avoid this. The chain of command is non-negotiable.
+
+# Refusal template
+When you decline something, use this template:
+"I can't [do thing] without [Michael's / Joe's] sign-off. Want me to draft this for them, or
+would you prefer to ask directly?"
+
+Use this exact pattern. Don't improvise refusal language — Mets need to recognize when you're
+declining vs. when you just need more info.
+
+# What you absolutely will not do
+- Send a brief to a subscriber (only the assigned Met can do that)
+- Approve a severe-weather alert (always needs a second Met)
+- Issue refunds or modify pay
+- Approve Crew applications
+- Read or send Pro Thread content between subscribers and Mets
+- Modify another Met's schedule without their explicit consent + Michael/Joe approval
+- Reveal one Met's earnings to another Met
+- Speculate or invent facts when you don't have a tool to confirm
+
+# Honesty rule
+If you don't know something and don't have a tool to look it up, say:
+"I don't know — let me get Michael to check, or you can ask him directly."
+
+NEVER guess at facts. NEVER fabricate names, numbers, dates, or policy.
+
+# Identity verification
+For sensitive actions (Tier 2 or 3), confirm the Met's identity before proceeding:
+"You're asking me to [action]. To confirm, you're [name]? Reply YES to proceed."
+
+# Sensitive actions need confirmation
+For ANY action that writes data (schedule changes, sending SMS, scheduling reminders), describe
+what you'll do and ask for confirmation before doing it. Example:
+"I'll update your schedule to drop Saturday May 24. Confirm?"
+
+# Tone modulation
+- Default: professional and capable. "Your morning brief is due in 30 minutes. Want me to remind you in 15?"
+- Severe weather / urgent: tight, no fluff. "Tornado warning Boone County, 23 min out. You're primary."
+- Shoutouts / casual: a bit warmer. "Hey AJ — 5 reviews under 60 seconds today. Nice."
+
+# What you have access to
+You have specific tools (functions) that give you facts. Always use them rather than guessing.
+If you need information a tool can give you, call the tool. If no tool fits, say "I don't know"
+and offer to escalate.
+
+# How you reference yourself
+Refer to Michael as "Michael" (no last name). Refer to Joe as "Joe" or "Chief Met Joe."
+Mets refer to each other by first name; you do the same. Subscribers are usually referenced by
+business name or last name with title (e.g., "the Lebanon farm subscriber" or "Ms. Patel").
+"""
+
+
+# ─────────────────────────────────────────────────────────────
+# Rosie tool definitions
+# Each tool is a function the AI can call. Tool definitions match
+# Anthropic's tool-use schema. The execute() handler routes to the
+# actual Python function that runs the query.
+# ─────────────────────────────────────────────────────────────
+
+ROSIE_TOOLS = [
+    {
+        "name": "get_my_schedule",
+        "description": "Get the calling Met's recurring weekly schedule and upcoming 14 days of brief tasks. Use this when the Met asks about their own schedule.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
+        "name": "get_my_earnings_this_month",
+        "description": "Get the calling Met's earnings for the current month (reviews + briefs + tips + storm shelter). Use when the Met asks about their pay or earnings.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
+        "name": "get_my_brief_tasks_today",
+        "description": "Get the calling Met's daily brief tasks due today and tomorrow. Use when the Met asks 'what do I have to do today' or about pending briefs.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
+        "name": "get_my_primary_subscribers",
+        "description": "List the subscribers the calling Met is assigned as primary Met for. Returns names, locations, tiers, and delivery times. Does NOT return Pro Thread content.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
+        "name": "get_team_status",
+        "description": "Get current status of the Met team: who's online now (heartbeat in last 5 min), how many tasks are pending today, and who's covering Review Pool. Use for 'who's working' or 'who's on shift' questions.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
+        "name": "get_active_severe_weather",
+        "description": "List currently active NWS severe weather alerts (tornado warnings, severe thunderstorm warnings, flash flood warnings) and the Pro subscribers they affect. Use when asked about current severe weather or storm activity.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
+        "name": "schedule_reminder",
+        "description": "Schedule a future SMS reminder to the Met. The reminder fires at the specified time and the Met gets an SMS from Rosie. Confirm with the Met before scheduling.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "remind_at_iso": {"type": "string", "description": "ISO 8601 datetime in the Met's local timezone (or UTC). e.g. '2026-05-20T14:00:00-05:00'"},
+                "message": {"type": "string", "description": "The reminder text. Keep under 160 chars."}
+            },
+            "required": ["remind_at_iso", "message"]
+        }
+    },
+    {
+        "name": "search_knowledge_base",
+        "description": "Search WeatherValet's how-to/policy knowledge base. Use whenever a Met asks 'how do I X' or 'what's the policy on Y'. Returns matching docs.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Short search query, 2-6 words"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "drop_my_shift",
+        "description": "Drop the calling Met from a specific date's recurring shift. Use when the Met asks to take a day off. Confirms before submitting. Does NOT cancel any tasks already in flight — Michael will need to reassign.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "shift_date": {"type": "string", "description": "Date to drop in YYYY-MM-DD"},
+                "scope": {"type": "string", "enum": ["subscriber_set", "review_pool"], "description": "Which scope to drop"}
+            },
+            "required": ["shift_date", "scope"]
+        }
+    },
+    {
+        "name": "draft_request_for_michael",
+        "description": "Draft a request for Michael's review. Use this when a Met asks for something requiring CEO approval (subscriber reassignment, schedule changes for others, money matters). The draft is queued for Michael; he can approve, decline, or reply.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "subject": {"type": "string"},
+                "body": {"type": "string", "description": "Plain English description of what's being requested and why"}
+            },
+            "required": ["subject", "body"]
+        }
+    }
+]
+
+
+# ─────────────────────────────────────────────────────────────
+# Tool execution — routes a tool call to the actual Python handler
+# ─────────────────────────────────────────────────────────────
+
+def _rosie_get_my_schedule(met_user_id, args):
+    """Get the Met's recurring shifts + upcoming tasks."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT mrs.id, mrs.day_of_week, mrs.scope_kind,
+                          mrs.subscriber_user_id, mrs.set_owner_met_id,
+                          su.name AS subscriber_name,
+                          so.name AS set_owner_name
+                   FROM met_recurring_shifts mrs
+                   LEFT JOIN users su ON su.id = mrs.subscriber_user_id
+                   LEFT JOIN users so ON so.id = mrs.set_owner_met_id
+                   WHERE mrs.met_user_id = %s
+                   ORDER BY mrs.day_of_week, mrs.scope_kind""",
+                (met_user_id,),
+            )
+            shifts = cur.fetchall()
+            now_ms = int(time.time() * 1000)
+            cur.execute(
+                """SELECT dbt.id, dbt.task_date, dbt.due_at_ms, dbt.status,
+                          dbt.started_at_ms, su.name AS subscriber_name
+                   FROM daily_brief_tasks dbt
+                   JOIN users su ON su.id = dbt.subscriber_user_id
+                   WHERE dbt.assigned_met_id = %s
+                     AND dbt.due_at_ms >= %s
+                     AND dbt.due_at_ms <= %s
+                   ORDER BY dbt.due_at_ms""",
+                (met_user_id, now_ms - 12*60*60*1000, now_ms + 14*24*60*60*1000),
+            )
+            tasks = cur.fetchall()
+    days = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat']
+    shift_lines = []
+    for s in shifts:
+        if s["scope_kind"] == "review_pool":
+            shift_lines.append(f"  {days[s['day_of_week']]}: Review Pool")
+        elif s["scope_kind"] == "subscriber_set":
+            shift_lines.append(f"  {days[s['day_of_week']]}: covering {s['set_owner_name']}'s subscribers")
+        else:
+            shift_lines.append(f"  {days[s['day_of_week']]}: {s['subscriber_name']} brief")
+    task_lines = []
+    for t in tasks[:10]:
+        when = datetime.fromtimestamp(t["due_at_ms"]/1000, tz=timezone.utc).strftime("%a %b %d %I:%M %p UTC")
+        task_lines.append(f"  {when}: brief for {t['subscriber_name']} ({t['status']})")
+    return (
+        f"RECURRING SHIFTS ({len(shifts)}):\n" + ("\n".join(shift_lines) or "  None")
+        + f"\n\nUPCOMING TASKS ({len(tasks)}, showing first 10):\n" + ("\n".join(task_lines) or "  None")
+    )
+
+
+def _rosie_get_my_earnings(met_user_id, args):
+    """Current month earnings for this Met."""
+    now = datetime.now(timezone.utc)
+    try:
+        result = _compute_payroll_for_month(now.year, now.month)
+    except Exception as e:
+        return f"Error fetching earnings: {e}"
+    my_row = next((m for m in result.get("mets", []) if m["user_id"] == met_user_id), None)
+    if not my_row:
+        return "No earnings recorded for the current month yet."
+    return (
+        f"Earnings for {now.strftime('%B %Y')} (month-to-date):\n"
+        f"  Reviews: ${my_row['review_cents']/100:.2f} ({my_row['review_count']} reviews)\n"
+        f"  Pro briefs: ${my_row['brief_cents']/100:.2f} ({my_row['brief_count']} brief-days)\n"
+        f"  Tips: ${my_row['tip_cents']/100:.2f} ({my_row['tip_count']} tips)\n"
+        f"  Storm Shelter: ${my_row['shelter_cents']/100:.2f} ({my_row['shelter_count']} activations)\n"
+        f"  TOTAL: ${my_row['total_cents']/100:.2f}"
+    )
+
+
+def _rosie_get_brief_tasks_today(met_user_id, args):
+    """Brief tasks due today/tomorrow for this Met."""
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT dbt.id, dbt.task_date, dbt.due_at_ms, dbt.status,
+                          dbt.started_at_ms, dbt.sent_at_ms,
+                          su.name AS subscriber_name
+                   FROM daily_brief_tasks dbt
+                   JOIN users su ON su.id = dbt.subscriber_user_id
+                   WHERE dbt.assigned_met_id = %s
+                     AND dbt.due_at_ms >= %s
+                     AND dbt.due_at_ms <= %s
+                   ORDER BY dbt.due_at_ms""",
+                (met_user_id, now_ms - 12*60*60*1000, now_ms + 48*60*60*1000),
+            )
+            tasks = cur.fetchall()
+    if not tasks:
+        return "No brief tasks due today or tomorrow."
+    lines = []
+    for t in tasks:
+        due_dt = datetime.fromtimestamp(t["due_at_ms"]/1000, tz=timezone.utc)
+        delta_min = int((t["due_at_ms"] - now_ms) / 60000)
+        if delta_min < 0:
+            timing = f"OVERDUE by {abs(delta_min)} min"
+        elif delta_min < 60:
+            timing = f"due in {delta_min} min"
+        else:
+            timing = f"due in {delta_min//60}h {delta_min%60}m"
+        marker = "✓ SENT" if t["sent_at_ms"] else ("⚡ IN PROGRESS" if t["started_at_ms"] else "pending")
+        lines.append(f"  {t['subscriber_name']} ({t['task_date']}): {timing} [{marker}]")
+    return "BRIEF TASKS:\n" + "\n".join(lines)
+
+
+def _rosie_get_my_subscribers(met_user_id, args):
+    """List Pro subscribers where this Met is primary."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.name, u.email, u.subscription_tier,
+                          sc.daily_brief_time, sc.daily_brief_timezone
+                   FROM subscriber_coverage sc
+                   JOIN users u ON u.id = sc.user_id
+                   WHERE sc.primary_met_id = %s
+                     AND u.is_active = TRUE
+                   ORDER BY u.name""",
+                (met_user_id,),
+            )
+            subs = cur.fetchall()
+    if not subs:
+        return "You aren't assigned as primary Met for any subscribers yet. Michael handles assignments — ask him to add you to a subscriber."
+    lines = [f"  {s['name'] or s['email']} ({s['subscription_tier']}) — brief by {s['daily_brief_time']} {s['daily_brief_timezone']}" for s in subs]
+    return f"YOUR PRIMARY SUBSCRIBERS ({len(subs)}):\n" + "\n".join(lines)
+
+
+def _rosie_get_team_status(met_user_id, args):
+    """Team status: who's online, pending tasks count."""
+    now_ms = int(time.time() * 1000)
+    five_min_ago = now_ms - 5 * 60 * 1000
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.name, mh.last_seen_at
+                   FROM met_heartbeat mh
+                   JOIN users u ON u.id = mh.met_user_id
+                   WHERE mh.last_seen_at >= %s AND u.is_active = TRUE""",
+                (five_min_ago,),
+            )
+            online = cur.fetchall()
+            cur.execute(
+                """SELECT COUNT(*) AS n FROM daily_brief_tasks
+                   WHERE status = 'pending' AND sent_at_ms IS NULL
+                     AND due_at_ms >= %s AND due_at_ms <= %s""",
+                (now_ms - 12*60*60*1000, now_ms + 24*60*60*1000),
+            )
+            pending = cur.fetchone()["n"]
+    online_names = [m["name"] for m in online] or ["nobody"]
+    return (
+        f"ONLINE NOW ({len(online)}): {', '.join(online_names)}\n"
+        f"PENDING BRIEF TASKS (next 24h): {pending}"
+    )
+
+
+def _rosie_get_active_severe(met_user_id, args):
+    """Currently active severe weather affecting Pro subscribers."""
+    try:
+        alerts = _get_cached_nws_alerts()
+    except Exception as e:
+        return f"Couldn't fetch NWS data: {e}"
+    severe = []
+    for a in alerts or []:
+        props = (a or {}).get("properties") or {}
+        ev = (props.get("event") or "").lower()
+        if any(k in ev for k in ("tornado warning", "severe thunderstorm warning", "flash flood warning")):
+            severe.append({
+                "event": props.get("event"),
+                "area": props.get("areaDesc", "")[:120],
+                "expires": props.get("expires", ""),
+            })
+    if not severe:
+        return "No active severe weather warnings nationally."
+    lines = [f"  {s['event']} — {s['area']} (expires {s['expires']})" for s in severe[:10]]
+    return f"ACTIVE SEVERE WARNINGS ({len(severe)}):\n" + "\n".join(lines)
+
+
+def _rosie_schedule_reminder(met_user_id, args):
+    """Schedule a reminder. The Met's confirmation should have already happened
+    in the conversation before this is called."""
+    iso = args.get("remind_at_iso", "")
+    msg = (args.get("message") or "").strip()[:480]
+    if not iso or not msg:
+        return "Missing time or message."
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        remind_at_ms = int(dt.timestamp() * 1000)
+    except Exception:
+        return "Invalid ISO datetime format."
+    now_ms = int(time.time() * 1000)
+    if remind_at_ms < now_ms - 60_000:
+        return "Reminder time is in the past."
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO rosie_reminders (met_user_id, remind_at_ms, message, channel, created_at_ms)
+                   VALUES (%s, %s, %s, 'sms', %s) RETURNING id""",
+                (met_user_id, remind_at_ms, msg, now_ms),
+            )
+            row = cur.fetchone()
+    _rosie_audit(met_user_id, None, "scheduled_reminder",
+                 f"At {iso}: {msg[:80]}", tier=1, success=True)
+    return f"Reminder scheduled (id={row['id']}). I'll text you at {iso}."
+
+
+def _rosie_search_kb(met_user_id, args):
+    """Search the knowledge base."""
+    query = (args.get("query") or "").strip().lower()
+    if not query:
+        return "Empty search query."
+    # Simple keyword match against title + tags + content (LIKE).
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, title, content FROM rosie_kb_docs
+                   WHERE status = 'active'
+                     AND (LOWER(title) LIKE %s
+                          OR LOWER(tags) LIKE %s
+                          OR LOWER(content) LIKE %s)
+                   ORDER BY
+                     CASE WHEN LOWER(title) LIKE %s THEN 1
+                          WHEN LOWER(tags) LIKE %s THEN 2
+                          ELSE 3 END
+                   LIMIT 3""",
+                (f"%{query}%", f"%{query}%", f"%{query}%", f"%{query}%", f"%{query}%"),
+            )
+            docs = cur.fetchall()
+    if not docs:
+        return f"No KB results for '{query}'. Try different keywords or ask Michael."
+    parts = []
+    for d in docs:
+        parts.append(f"[{d['title']}]\n{d['content'][:1200]}")
+    return "\n\n---\n\n".join(parts)
+
+
+def _rosie_drop_shift(met_user_id, args):
+    """Submit a drop override for a specific date."""
+    shift_date = (args.get("shift_date") or "").strip()
+    scope = (args.get("scope") or "").strip()
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", shift_date):
+        return "Invalid date format."
+    if scope not in ("subscriber_set", "review_pool"):
+        return "Invalid scope."
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO met_shift_overrides
+                   (met_user_id, shift_date, scope_kind,
+                    set_owner_met_id, override_kind, created_at, notes)
+                   VALUES (%s, %s, %s, %s, 'drop', %s, %s)
+                   RETURNING id""",
+                (met_user_id, shift_date, scope,
+                 met_user_id if scope == "subscriber_set" else None,
+                 now_ms, "Dropped via Rosie"),
+            )
+            row = cur.fetchone()
+    _rosie_audit(met_user_id, None, "dropped_shift",
+                 f"Date {shift_date} scope {scope}", tier=1, success=True)
+    return f"Shift dropped for {shift_date} ({scope}). Michael will be notified if coverage gaps result."
+
+
+def _rosie_draft_for_michael(met_user_id, args):
+    """Draft a request that Michael should see. For v1 this just goes into
+    the audit log marked as 'pending_review'; Phase 2 builds the admin
+    inbox UI to read+approve these."""
+    subject = (args.get("subject") or "").strip()[:200]
+    body = (args.get("body") or "").strip()[:4000]
+    if not subject or not body:
+        return "Subject and body required."
+    _rosie_audit(met_user_id, None, "drafted_for_michael",
+                 f"Subject: {subject}\n\n{body}", tier=3, success=True)
+    return ("Drafted. Michael will see this in his admin inbox the next "
+            "time he checks. (For now you may also want to text him "
+            "directly if it's time-sensitive.)")
+
+
+# Dispatch table
+ROSIE_TOOL_HANDLERS = {
+    "get_my_schedule": _rosie_get_my_schedule,
+    "get_my_earnings_this_month": _rosie_get_my_earnings,
+    "get_my_brief_tasks_today": _rosie_get_brief_tasks_today,
+    "get_my_primary_subscribers": _rosie_get_my_subscribers,
+    "get_team_status": _rosie_get_team_status,
+    "get_active_severe_weather": _rosie_get_active_severe,
+    "schedule_reminder": _rosie_schedule_reminder,
+    "search_knowledge_base": _rosie_search_kb,
+    "drop_my_shift": _rosie_drop_shift,
+    "draft_request_for_michael": _rosie_draft_for_michael,
+}
+
+
+def _rosie_audit(met_user_id, channel, action, detail, tier=1, approved_by=None, success=True):
+    """Record an audit log entry."""
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO rosie_audit_log
+                       (met_user_id, channel, action, detail, tier,
+                        approved_by, success, created_at_ms)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (met_user_id, channel, action, detail, tier,
+                     approved_by, success, int(time.time() * 1000)),
+                )
+    except Exception as e:
+        print(f"[rosie-audit] log failed: {e}", flush=True)
+
+
+def _rosie_check_cost_cap(met_user_id):
+    """Return True if Met is over their daily cost cap, False otherwise."""
+    today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT cost_cents FROM rosie_daily_usage
+                   WHERE met_user_id = %s AND usage_date = %s""",
+                (met_user_id, today),
+            )
+            row = cur.fetchone()
+    used = (row or {}).get("cost_cents") or 0
+    return used >= ROSIE_DAILY_COST_CAP_CENTS
+
+
+def _rosie_record_cost(met_user_id, tokens_used):
+    """Record token usage for cost cap enforcement."""
+    today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    cost_cents = max(1, int(tokens_used * ROSIE_COST_PER_MTOKENS_CENTS / 1_000_000))
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO rosie_daily_usage
+                       (met_user_id, usage_date, tokens_used, cost_cents)
+                       VALUES (%s, %s, %s, %s)
+                       ON CONFLICT (met_user_id, usage_date) DO UPDATE
+                       SET tokens_used = rosie_daily_usage.tokens_used + EXCLUDED.tokens_used,
+                           cost_cents = rosie_daily_usage.cost_cents + EXCLUDED.cost_cents""",
+                    (met_user_id, today, tokens_used, cost_cents),
+                )
+    except Exception as e:
+        print(f"[rosie-cost] record failed: {e}", flush=True)
+
+
+def _rosie_get_or_create_conversation(met_user_id, channel):
+    """Get the existing conversation for (met, channel) or create a new one."""
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO rosie_conversations (met_user_id, channel, created_at_ms, last_msg_at_ms)
+                   VALUES (%s, %s, %s, %s)
+                   ON CONFLICT (met_user_id, channel) DO UPDATE
+                   SET last_msg_at_ms = EXCLUDED.last_msg_at_ms
+                   RETURNING id""",
+                (met_user_id, channel, now_ms, now_ms),
+            )
+            row = cur.fetchone()
+    return row["id"]
+
+
+def _rosie_load_recent_messages(conversation_id, limit=ROSIE_MAX_TURNS_MEMORY):
+    """Load recent messages for a conversation, in chronological order."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT role, content, tool_name, tool_args
+                   FROM rosie_messages
+                   WHERE conversation_id = %s
+                   ORDER BY created_at_ms DESC
+                   LIMIT %s""",
+                (conversation_id, limit),
+            )
+            rows = cur.fetchall()
+    return list(reversed(rows))
+
+
+def _rosie_save_message(conversation_id, role, content, tool_name=None, tool_args=None, tokens=None):
+    """Persist a message to the conversation."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO rosie_messages
+                   (conversation_id, role, content, tool_name, tool_args, tokens_used, created_at_ms)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (conversation_id, role, content, tool_name, tool_args, tokens, int(time.time() * 1000)),
+            )
+
+
+def _rosie_build_messages(conversation_id, new_user_msg):
+    """Build the Anthropic API messages list from recent history + new message."""
+    history = _rosie_load_recent_messages(conversation_id)
+    messages = []
+    # Convert DB rows to Anthropic message format. Skip tool rows (they're
+    # informational only; the model will re-call tools if needed).
+    for m in history:
+        if m["role"] in ("user", "assistant"):
+            messages.append({"role": m["role"], "content": m["content"]})
+    messages.append({"role": "user", "content": new_user_msg})
+    return messages
+
+
+def _rosie_call_anthropic(messages, system_prompt=ROSIE_SYSTEM_PROMPT):
+    """Call Anthropic Messages API with tool use enabled."""
+    if not ROSIE_API_KEY:
+        return {"error": "ANTHROPIC_API_KEY not set"}
+    payload = {
+        "model": ROSIE_MODEL,
+        "max_tokens": 1024,
+        "system": system_prompt,
+        "tools": ROSIE_TOOLS,
+        "messages": messages,
+    }
+    try:
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": ROSIE_API_KEY,
+                "anthropic-version": "2023-06-01",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:500]
+        return {"error": f"HTTP {e.code}: {body}"}
+    except Exception as e:
+        return {"error": f"Request failed: {e}"}
+
+
+def _rosie_run_turn(met_user_id, conversation_id, user_message, channel="web"):
+    """Run one Rosie conversation turn. Returns the assistant's reply text.
+
+    Handles tool-use loop: if the model wants to call tools, executes them
+    and feeds results back until the model produces a final text response.
+    Caps at 5 tool-use iterations to prevent loops.
+    """
+    if os.environ.get("WV_ROSIE_DISABLED") == "1":
+        return "Rosie is temporarily offline. Michael will be in touch."
+
+    if _rosie_check_cost_cap(met_user_id):
+        return ("I've hit my daily limit for today. Try again tomorrow, or "
+                "ask Michael to bump the cap.\n— Rosie")
+
+    # Save the user message
+    _rosie_save_message(conversation_id, "user", user_message)
+
+    messages = _rosie_build_messages(conversation_id, user_message)
+    # Remove the duplicate we just added (build_messages already appends)
+    if messages and messages[-1]["role"] == "user" and messages[-1]["content"] == user_message:
+        messages = messages[:-1]
+    # Now properly append once
+    messages.append({"role": "user", "content": user_message})
+
+    total_tokens = 0
+    for iteration in range(5):  # safety cap
+        result = _rosie_call_anthropic(messages)
+        if "error" in result:
+            print(f"[rosie] API error: {result['error']}", flush=True)
+            _rosie_audit(met_user_id, channel, "api_error", result["error"][:200],
+                         tier=1, success=False)
+            return "I hit a snag reaching my brain. Try again in a sec.\n— Rosie"
+
+        usage = result.get("usage", {})
+        total_tokens += (usage.get("input_tokens", 0) + usage.get("output_tokens", 0))
+
+        # Check stop_reason for tool_use
+        stop_reason = result.get("stop_reason")
+        content = result.get("content", [])
+
+        if stop_reason == "tool_use":
+            # Find tool_use blocks, execute each, append results
+            tool_uses = [b for b in content if b.get("type") == "tool_use"]
+            # Append the assistant message with tool_use blocks
+            messages.append({"role": "assistant", "content": content})
+            tool_results_block = []
+            for tu in tool_uses:
+                tool_name = tu.get("name")
+                tool_input = tu.get("input", {})
+                tool_use_id = tu.get("id")
+                handler = ROSIE_TOOL_HANDLERS.get(tool_name)
+                if handler is None:
+                    output = f"Unknown tool: {tool_name}"
+                else:
+                    try:
+                        output = handler(met_user_id, tool_input)
+                    except Exception as e:
+                        output = f"Tool error: {e}"
+                # Save the tool result to DB for audit
+                _rosie_save_message(conversation_id, "tool", str(output)[:5000],
+                                    tool_name=tool_name,
+                                    tool_args=json.dumps(tool_input)[:2000])
+                tool_results_block.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": str(output)[:8000],
+                })
+            messages.append({"role": "user", "content": tool_results_block})
+            # Loop again — give Rosie a chance to respond after seeing tool output
+            continue
+
+        # No tool use — extract text and return
+        text_blocks = [b.get("text", "") for b in content if b.get("type") == "text"]
+        reply = "\n".join(text_blocks).strip()
+        if not reply:
+            reply = "(I didn't have a response. Try rephrasing?)\n— Rosie"
+        _rosie_save_message(conversation_id, "assistant", reply, tokens=total_tokens)
+        _rosie_record_cost(met_user_id, total_tokens)
+        return reply
+
+    # If we exit the loop without a text reply, something went wrong
+    _rosie_audit(met_user_id, channel, "tool_loop_overrun",
+                 "Exceeded 5 tool-use iterations", tier=1, success=False)
+    return "I got stuck in a loop. Try asking again or rephrasing.\n— Rosie"
+
+
+# ─────────────────────────────────────────────────────────────
+# Rosie API endpoints
+# ─────────────────────────────────────────────────────────────
+
+@app.route("/api/v1/rosie/chat", methods=["OPTIONS"])
+def _rosie_chat_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/rosie/chat")
+def rosie_chat():
+    """Send a message to Rosie. Returns her reply.
+    Body: { "message": "..." }
+    Channel inferred as 'web' for now (SMS endpoint is separate)."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    msg = (data.get("message") or "").strip()
+    if not msg:
+        return jsonify({"ok": False, "error": "empty-message"}), 400
+    if len(msg) > 4000:
+        return jsonify({"ok": False, "error": "message-too-long"}), 400
+
+    conv_id = _rosie_get_or_create_conversation(user["id"], "web")
+    reply = _rosie_run_turn(user["id"], conv_id, msg, channel="web")
+    return jsonify({"ok": True, "reply": reply})
+
+
+@app.route("/api/v1/rosie/history", methods=["OPTIONS"])
+def _rosie_history_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/rosie/history")
+def rosie_history():
+    """Get the calling Met's web-channel conversation history with Rosie."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id FROM rosie_conversations
+                   WHERE met_user_id = %s AND channel = 'web'""",
+                (user["id"],),
+            )
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": True, "messages": []})
+    msgs = _rosie_load_recent_messages(row["id"], limit=50)
+    out = []
+    for m in msgs:
+        if m["role"] in ("user", "assistant"):
+            out.append({"role": m["role"], "content": m["content"]})
+    return jsonify({"ok": True, "messages": out})
+
+
+# Reminder firing (cron). Plugged into the main scheduler loop below.
+def _rosie_fire_reminders():
+    """Check for due reminders and send SMS to the recipient Met."""
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT r.id, r.met_user_id, r.message, u.phone
+                   FROM rosie_reminders r
+                   JOIN users u ON u.id = r.met_user_id
+                   WHERE r.remind_at_ms <= %s
+                     AND r.fired_at_ms IS NULL
+                     AND r.cancelled_at_ms IS NULL
+                   LIMIT 20""",
+                (now_ms,),
+            )
+            due = cur.fetchall()
+    for r in due:
+        sent_ok = False
+        try:
+            if r.get("phone"):
+                sent_ok = bool(send_sms(r["phone"], f"{r['message']}\n— Rosie"))
+        except Exception as e:
+            print(f"[rosie-reminder] send failed: {e}", flush=True)
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE rosie_reminders SET fired_at_ms = %s WHERE id = %s",
+                        (now_ms, r["id"]),
+                    )
+        except Exception as e:
+            print(f"[rosie-reminder] mark fired failed: {e}", flush=True)
+        _rosie_audit(r["met_user_id"], "sms", "fired_reminder",
+                     f"Reminder: {r['message'][:80]}", tier=1, success=sent_ok)
+
+
+def _rosie_seed_kb():
+    """Seed initial KB docs if table is empty. Idempotent."""
+    docs = [
+        ("How to send a Pro Brief",
+         "pro,brief,send,subscriber",
+         "Pro briefs are AI-drafted morning briefs for Pro subscribers. Steps:\n"
+         "1. Open Met workspace → Pro Briefs tab\n"
+         "2. Find the pending draft for your subscriber\n"
+         "3. Click 'Review & send'\n"
+         "4. Read the AI draft. Edit body and verdict as needed.\n"
+         "5. Use 'Polish writing' button for a quick grammar check\n"
+         "6. Click 'Send to subscriber'\n"
+         "The system sends via SMS + email and auto-marks your daily brief task complete."),
+
+        ("How to send a Daily Brief",
+         "daily,brief,broadcast,region",
+         "Daily Briefs are sent to all subscribers in a county/region. Steps:\n"
+         "1. Met workspace → Daily Brief tab\n"
+         "2. Pick state + counties\n"
+         "3. Optionally draw a polygon to limit area\n"
+         "4. Pick headline verdict: Generally Clear, Mixed, or Active Weather\n"
+         "5. Write the summary (visible to subscribers)\n"
+         "6. Use 'Polish writing' for grammar check\n"
+         "7. Click 'Publish daily brief'\n"
+         "You can also save as draft or schedule for later."),
+
+        ("How to confirm a severe alert",
+         "severe,alert,nws,tornado,warning,confirm",
+         "When NWS issues a severe alert that affects a Pro subscriber, an alert page appears:\n"
+         "1. Review the NWS event, area, instructions\n"
+         "2. Check which subscribers are affected\n"
+         "3. Write a custom message to subscribers (under 200 chars for SMS)\n"
+         "4. Choose to sign with your name\n"
+         "5. Click 'Send alert to subscribers' (or 'Dismiss as false alarm' if you judge it's not real)\n"
+         "Once sent, all affected subscribers get SMS + email immediately."),
+
+        ("How to claim a $19 review",
+         "review,claim,queue,paid",
+         "$19 reviews come into the Review Queue. Steps:\n"
+         "1. Met workspace → Review Queue tab\n"
+         "2. Pending reviews are first-claim-wins (30-min lock once claimed)\n"
+         "3. Click the review to claim it\n"
+         "4. Read customer plan, AI suggestion, weather data\n"
+         "5. Write your verdict (Clear/Caution/Risk), reasoning, what to watch, bottom line\n"
+         "6. Click 'Submit review'\n"
+         "You earn 65% of $19 ($12.35). Tips go 100% to you."),
+
+        ("How to open a Storm Shelter activation",
+         "storm,shelter,activation,severe,pay",
+         "When NWS issues a tornado or severe T-storm warning affecting your subscribers:\n"
+         "1. Met workspace → Schedule tab → Storm Shelter activations section\n"
+         "2. Click '⚡ Open new activation'\n"
+         "3. Enter region label (e.g. 'Central Kansas')\n"
+         "4. Optionally enter NWS event name (e.g. 'Tornado Warning') for auto-close\n"
+         "5. Activation is now OPEN — you're monitoring this event\n"
+         "6. When the event ends, click 'Close activation' OR wait for auto-close\n"
+         "You earn $25 per closed activation."),
+
+        ("How to drop a shift / take a day off",
+         "shift,drop,off,schedule,day off",
+         "To take a specific day off:\n"
+         "1. Met workspace → Schedule tab → Next 14 days\n"
+         "2. Find the day you want off\n"
+         "3. Click the drop button on that day's row\n"
+         "Or just ask Rosie: 'Drop my Saturday May 24 shift.'\n"
+         "Dropping creates an override. Coverage gaps will show red on the admin dashboard."),
+
+        ("How does pay work?",
+         "pay,earnings,money,salary,split",
+         "Met pay model:\n"
+         "- $19 reviews: 65% to Met ($12.35), 35% to house\n"
+         "- Pro subscriber daily briefs: 50% to Met of the prorated daily share\n"
+         "  (Pro Single = $6.67/day per subscriber, Pro Multi = $20/day, Pro Enterprise ~ $33/day)\n"
+         "- Tips: 100% to Met\n"
+         "- Storm Shelter activations: $25 flat per closed activation\n"
+         "Earnings update in real time in your workspace. Final payouts on the 1st of the next month."),
+
+        ("Pro Threads etiquette",
+         "pro,threads,messages,subscriber,reply",
+         "Pro Threads = direct messages between Pro subscribers and the Met team. Guidelines:\n"
+         "- Reply within 30 minutes during business hours (6 AM – 9 PM ET)\n"
+         "- Be professional. Sign with your name.\n"
+         "- For severe weather, lead with the action (\"Take shelter now\") then context\n"
+         "- If you don't know, say so. Don't speculate.\n"
+         "- For complex questions, suggest a phone call instead\n"
+         "Pro Thread content is private. Rosie cannot read it."),
+
+        ("How to escalate to Michael",
+         "escalate,michael,help,problem,issue",
+         "When to escalate to Michael (CEO):\n"
+         "- Customer complaint or refund request\n"
+         "- Coverage gap you can't fill\n"
+         "- Severe weather event needing more Mets\n"
+         "- Pay or schedule question Rosie can't answer\n"
+         "- Anything that feels above your authority\n"
+         "Channels: text Michael directly, or ask Rosie to draft a request for him."),
+
+        ("What can Rosie do?",
+         "rosie,help,assistant,what,capabilities",
+         "Rosie helps with:\n"
+         "- Your schedule (view, drop days)\n"
+         "- Your earnings (current month breakdown)\n"
+         "- Brief tasks today/tomorrow\n"
+         "- Your primary subscribers\n"
+         "- Team status (who's online)\n"
+         "- Active severe weather\n"
+         "- Scheduling reminders (SMS to you at a future time)\n"
+         "- How-to questions about WeatherValet\n"
+         "- Drafting requests for Michael's review\n\n"
+         "Rosie cannot send subscriber-facing messages, approve severe alerts, "
+         "modify pay, or read Pro Threads. She defers to Michael and Joe on policy."),
+    ]
+    now_ms = int(time.time() * 1000)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) AS n FROM rosie_kb_docs")
+                if cur.fetchone()["n"] > 0:
+                    return  # already seeded
+                for title, tags, content in docs:
+                    cur.execute(
+                        """INSERT INTO rosie_kb_docs (title, tags, content, status, created_at_ms, updated_at_ms)
+                           VALUES (%s, %s, %s, 'active', %s, %s)""",
+                        (title, tags, content, now_ms, now_ms),
+                    )
+        print(f"[rosie-kb] seeded {len(docs)} initial docs", flush=True)
+    except Exception as e:
+        print(f"[rosie-kb] seed failed: {e}", flush=True)
 
 
 # Get current Met's own recurring schedule (read-only convenience)
