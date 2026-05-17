@@ -18471,13 +18471,22 @@ def _publish_daily_brief_internal(content: dict, audience: dict | None,
         if audience and isinstance(audience, dict):
             counties = audience.get("counties") or []
 
+        # CRITICAL: Pro tier subscribers get their personalized Pro Brief
+        # only — they're excluded from Daily Brief broadcasts to avoid
+        # spam (two weather messages per morning would burn the
+        # relationship fast). Hobbyist tier subscribers are the Daily
+        # Brief audience. This makes the tiers feel materially different:
+        # Hobbyist = broadcast, Pro = bespoke. May 17, 2026.
         if not counties:
-            # No specific counties — broadcast to all active subscribers
+            # No specific counties — broadcast to all active Hobbyist subscribers
             sql = """SELECT DISTINCT u.id, u.email, u.phone, u.name,
                             bp.channels
                      FROM users u
                      LEFT JOIN brief_preferences bp ON bp.user_id = u.id
                      WHERE u.is_active = TRUE
+                       AND (u.subscription_tier IS NULL
+                            OR u.subscription_tier NOT IN
+                               ('pro_single','pro_multi','pro_enterprise'))
                        AND EXISTS (
                          SELECT 1 FROM user_roles ur
                          WHERE ur.user_id = u.id AND ur.role = 'subscriber'
@@ -18491,6 +18500,9 @@ def _publish_daily_brief_internal(content: dict, audience: dict | None,
                      LEFT JOIN brief_preferences bp ON bp.user_id = u.id
                      WHERE u.is_active = TRUE
                        AND sl.county = ANY(%s)
+                       AND (u.subscription_tier IS NULL
+                            OR u.subscription_tier NOT IN
+                               ('pro_single','pro_multi','pro_enterprise'))
                        AND EXISTS (
                          SELECT 1 FROM user_roles ur
                          WHERE ur.user_id = u.id AND ur.role = 'subscriber'
