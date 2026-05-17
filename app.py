@@ -14632,11 +14632,228 @@ def met_pro_brief_send(draft_id):
     except Exception as e:
         print(f"[pro-brief-send] task mark-sent failed (non-fatal): {e}", flush=True)
 
+    # ───────────────────────────────────────────────────────────────
+    # Multi-send (May 17, 2026): if the Met selected additional
+    # subscribers in the editor sidebar, send the same brief content
+    # to each of them now.
+    #
+    # Trust model: per Chris's feedback (May 17), we trust Mets to use
+    # this responsibly. Rosie will monitor multi-send patterns over time
+    # and flag suspicious bulk-sends (Phase 2 post-launch).
+    #
+    # Each additional recipient gets:
+    #   - Their own brief_history row (with their primary Met's name)
+    #   - Their own access token + web view URL
+    #   - SMS + email via THEIR channel preferences (not the original sub's)
+    # ───────────────────────────────────────────────────────────────
+    additional_user_ids = []
+    try:
+        body_data = request.get_json(silent=True) or {}
+        raw = body_data.get("additional_recipients") or []
+        if isinstance(raw, list):
+            # Sanitize: must be ints, must not include the original draft user
+            seen = set([row["user_id"]])
+            for uid in raw:
+                try:
+                    uid_int = int(uid)
+                    if uid_int not in seen:
+                        additional_user_ids.append(uid_int)
+                        seen.add(uid_int)
+                except (TypeError, ValueError):
+                    continue
+        # Hard cap to prevent abuse: max 50 additional recipients per send
+        if len(additional_user_ids) > 50:
+            additional_user_ids = additional_user_ids[:50]
+    except Exception as e:
+        print(f"[pro-brief-send] multi-send parse failed: {e}", flush=True)
+
+    multi_results = []
+    for extra_user_id in additional_user_ids:
+        try:
+            # Verify the extra recipient is a Pro-tier subscriber for whom
+            # the calling Met is the assigned primary (or admin override).
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT u.id, u.email, u.phone, u.name,
+                                  u.subscription_tier,
+                                  bp.channels,
+                                  sc.primary_met_id,
+                                  loc.label AS loc_label
+                           FROM users u
+                           LEFT JOIN brief_preferences bp ON bp.user_id = u.id
+                           LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
+                           LEFT JOIN saved_locations loc
+                                ON loc.user_id = u.id AND loc.is_primary = TRUE
+                           WHERE u.id = %s AND u.is_active = TRUE""",
+                        (extra_user_id,),
+                    )
+                    sub = cur.fetchone()
+
+            if not sub:
+                multi_results.append({"user_id": extra_user_id, "ok": False, "error": "not-found"})
+                continue
+            # Only Pro-tier eligible
+            if (sub.get("subscription_tier") or "") not in ("pro_single", "pro_multi", "pro_enterprise"):
+                multi_results.append({"user_id": extra_user_id, "ok": False, "error": "not-pro-tier"})
+                continue
+            # Authorization: calling Met must be the primary for this sub,
+            # OR be an admin. Otherwise refuse.
+            is_admin = "admin" in (user.get("roles") or [])
+            if not is_admin and sub.get("primary_met_id") != user["id"]:
+                multi_results.append({"user_id": extra_user_id, "ok": False, "error": "not-your-subscriber"})
+                continue
+
+            # Insert brief_history for this recipient
+            sub_loc_label = sub.get("loc_label") or "your location"
+            extra_hist_id = None
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO brief_history
+                           (user_id, brief_type, delivered_at, verdict, snippet,
+                            full_body, delivery_status, channels_used,
+                            is_met_touched, met_name)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s)
+                           RETURNING id""",
+                        (extra_user_id, row["brief_type"], int(time.time() * 1000),
+                         final_verdict,
+                         bottom_line[:200] if bottom_line else (final_snippet or legacy_body[:140]),
+                         full_body, "pending", "", met_name),
+                    )
+                    extra_hist_id = cur.fetchone()["id"]
+
+            # Create access token
+            extra_token = secrets.token_urlsafe(24)
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """INSERT INTO brief_access_tokens
+                               (token, history_id, subscriber_user_id, created_at_ms)
+                               VALUES (%s, %s, %s, %s)""",
+                            (extra_token, extra_hist_id, extra_user_id, int(time.time() * 1000)),
+                        )
+            except Exception as e:
+                print(f"[pro-brief-send] multi token insert failed user={extra_user_id}: {e}", flush=True)
+
+            extra_web_url = f"{frontend_base}/brief/{extra_token}"
+
+            # Dispatch via this subscriber's preferred channels
+            extra_channels = [ch for ch in (sub.get("channels") or "sms,email").split(",") if ch]
+            extra_channels_used = []
+            extra_any_success = False
+
+            for ch in extra_channels:
+                if ch == "sms" and sub.get("phone"):
+                    if is_structured and bottom_line:
+                        sms_intro = bottom_line[:140].rstrip()
+                        if len(bottom_line) > 140:
+                            sms_intro = sms_intro.rsplit(" ", 1)[0] + "…"
+                        extra_sms = (
+                            f"{verdict_label} · WeatherValet\n\n"
+                            f"{sms_intro}\n\n"
+                            f"Full brief: {extra_web_url}\n— {met_name}"
+                        )
+                    else:
+                        extra_sms = (final_snippet or legacy_body[:140]) + f"\n\nFull: {extra_web_url}\n— {met_name}"
+                    try:
+                        if send_sms(sub["phone"], extra_sms):
+                            extra_channels_used.append("sms")
+                            extra_any_success = True
+                    except Exception as e:
+                        print(f"[pro-brief-send] multi SMS failed user={extra_user_id}: {e}", flush=True)
+                elif ch == "email" and sub.get("email"):
+                    extra_subject = f"Your WeatherValet brief — {sub_loc_label}"
+                    try:
+                        if is_structured:
+                            extra_html = _render_pro_brief_email_html(
+                                verdict=final_verdict,
+                                verdict_label=verdict_label,
+                                bottom_line=bottom_line,
+                                weather_details=weather_details,
+                                whats_ahead=whats_ahead,
+                                image_url=image_url,
+                                met_name=met_name,
+                                location_label=sub_loc_label,
+                                subscriber_name=sub.get("name") or "",
+                                web_url=extra_web_url,
+                            )
+                            if _send_brief_email(sub["email"], extra_subject, extra_html, html=True):
+                                extra_channels_used.append("email")
+                                extra_any_success = True
+                        else:
+                            if _send_brief_email(sub["email"], extra_subject, full_body):
+                                extra_channels_used.append("email")
+                                extra_any_success = True
+                    except Exception as e:
+                        print(f"[pro-brief-send] multi email failed user={extra_user_id}: {e}", flush=True)
+
+            extra_delivery_status = "sent" if extra_any_success else "failed"
+
+            # Update brief_history with delivery result
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """UPDATE brief_history
+                               SET delivery_status = %s, channels_used = %s
+                               WHERE id = %s""",
+                            (extra_delivery_status, ",".join(extra_channels_used), extra_hist_id),
+                        )
+            except Exception as e:
+                print(f"[pro-brief-send] multi hist update failed: {e}", flush=True)
+
+            # Also try to mark the daily_brief_task as sent if one exists
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """SELECT daily_brief_timezone FROM subscriber_coverage
+                               WHERE user_id = %s""",
+                            (extra_user_id,),
+                        )
+                        tzr = cur.fetchone()
+                        extra_tz_name = (tzr or {}).get("daily_brief_timezone") or "America/New_York"
+                        try:
+                            etz = ZoneInfo(extra_tz_name)
+                        except Exception:
+                            etz = ZoneInfo("America/New_York")
+                        extra_date_str = datetime.now(etz).strftime("%Y-%m-%d")
+                        cur.execute(
+                            """UPDATE daily_brief_tasks
+                               SET sent_at_ms = %s, status = 'sent'
+                               WHERE subscriber_user_id = %s
+                                 AND task_date = %s
+                                 AND status != 'sent'""",
+                            (int(time.time() * 1000), extra_user_id, extra_date_str),
+                        )
+            except Exception as e:
+                print(f"[pro-brief-send] multi task mark failed: {e}", flush=True)
+
+            multi_results.append({
+                "user_id": extra_user_id,
+                "ok": extra_any_success,
+                "channels_used": extra_channels_used,
+                "history_id": extra_hist_id,
+            })
+            print(
+                f"[pro-brief-send] multi-send draft={draft_id} -> user={extra_user_id} "
+                f"channels={extra_channels_used} status={extra_delivery_status}",
+                flush=True,
+            )
+
+        except Exception as e:
+            print(f"[pro-brief-send] multi-send failed user={extra_user_id}: {e}", flush=True)
+            multi_results.append({"user_id": extra_user_id, "ok": False, "error": "exception"})
+
     return jsonify({
         "ok": True,
         "channels_used": channels_used,
         "delivery_status": delivery_status,
         "history_id": history_id,
+        "multi_results": multi_results,
+        "multi_count": len([r for r in multi_results if r.get("ok")]),
     })
 
 
