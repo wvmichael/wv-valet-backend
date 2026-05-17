@@ -5626,6 +5626,572 @@ def admin_queue():
     )
 
 
+@app.get("/admin/pro-brief-prototype")
+def admin_pro_brief_prototype():
+    """Pro Brief prototype — static HTML preview of the structured Pro
+    Brief format we're planning for launch. Pure mock data, no DB writes.
+    Shared with Mets for feedback before we build the real version.
+
+    Three test subscribers, each rendered three ways:
+      - SMS preview (what their phone shows)
+      - Email preview (what the email looks like)
+      - Web view preview (full structured brief)
+
+    All data is fake but based loosely on the real subscriber list, with
+    "(TEST)" tags so nothing here can be confused with production data.
+    """
+    auth_resp = _admin_auth()
+    if auth_resp is not None:
+        return auth_resp
+
+    return PRO_BRIEF_PROTOTYPE_HTML
+
+
+# Self-contained prototype HTML. Built as a single string so the admin
+# route stays clean. Mock data is hardcoded — three Pro Single test
+# subscribers based on real Kansas accounts. No production data leaks
+# in or out of this page.
+PRO_BRIEF_PROTOTYPE_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pro Brief Prototype — WeatherValet</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #f3f4f6;
+    color: #0f1116;
+    line-height: 1.5;
+  }
+  .container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 24px 20px;
+  }
+  .page-header {
+    background: #fff;
+    border: 1px solid rgba(15,17,22,0.08);
+    border-radius: 12px;
+    padding: 20px 24px;
+    margin-bottom: 24px;
+  }
+  .page-header h1 { margin: 0 0 6px; font-size: 22px; }
+  .page-header p { margin: 0; color: rgba(15,17,22,0.6); font-size: 14px; }
+  .banner {
+    background: linear-gradient(135deg, #fef3c7, #fde68a);
+    border: 1px solid #d97706;
+    color: #92400e;
+    padding: 12px 16px;
+    border-radius: 8px;
+    font-size: 13px;
+    margin-bottom: 24px;
+    font-weight: 500;
+  }
+  .subscriber-section {
+    background: #fff;
+    border: 1px solid rgba(15,17,22,0.08);
+    border-radius: 12px;
+    padding: 24px;
+    margin-bottom: 24px;
+  }
+  .sub-name {
+    font-size: 18px;
+    font-weight: 700;
+    margin-bottom: 4px;
+  }
+  .sub-meta {
+    font-size: 13px;
+    color: rgba(15,17,22,0.6);
+    margin-bottom: 20px;
+  }
+  .three-views {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 20px;
+  }
+  @media (max-width: 900px) {
+    .three-views { grid-template-columns: 1fr; }
+  }
+  .view-col h3 {
+    margin: 0 0 10px;
+    font-size: 13px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: rgba(15,17,22,0.55);
+  }
+  /* Phone mockup for SMS view */
+  .phone-frame {
+    background: #1a1a1a;
+    border-radius: 20px;
+    padding: 14px 10px;
+    max-width: 260px;
+    margin: 0 auto;
+  }
+  .phone-screen {
+    background: #fff;
+    border-radius: 10px;
+    padding: 12px;
+    min-height: 180px;
+  }
+  .phone-from {
+    font-size: 11px;
+    color: rgba(15,17,22,0.55);
+    margin-bottom: 6px;
+  }
+  .phone-msg {
+    background: #e9f3ff;
+    border-radius: 12px;
+    padding: 10px 12px;
+    font-size: 13px;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  /* Email mockup */
+  .email-frame {
+    background: #fff;
+    border: 1px solid rgba(15,17,22,0.12);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .email-header {
+    background: #f8f9fa;
+    padding: 10px 14px;
+    border-bottom: 1px solid rgba(15,17,22,0.08);
+    font-size: 11px;
+  }
+  .email-header .line { margin: 3px 0; }
+  .email-header .label { color: rgba(15,17,22,0.55); width: 60px; display: inline-block; }
+  .email-body {
+    padding: 18px 16px;
+    font-size: 13.5px;
+    line-height: 1.55;
+  }
+  /* Web view mockup */
+  .web-frame {
+    background: #fff;
+    border: 1px solid rgba(15,17,22,0.12);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .web-header {
+    background: #0f172a;
+    color: #fff;
+    padding: 14px 16px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .web-body {
+    padding: 18px 16px;
+    font-size: 13.5px;
+    line-height: 1.55;
+  }
+  /* Brief content styling */
+  .verdict-chip {
+    display: inline-block;
+    padding: 4px 12px;
+    border-radius: 999px;
+    font-size: 11.5px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .verdict-clear { background: rgba(18,161,80,0.15); color: #0e6e3a; }
+  .verdict-caution { background: rgba(245,158,11,0.18); color: #92400e; }
+  .verdict-risk { background: rgba(194,52,43,0.15); color: #9a1d18; }
+  .section-label {
+    font-size: 10.5px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: rgba(15,17,22,0.5);
+    margin: 14px 0 4px;
+  }
+  .section-label:first-child { margin-top: 0; }
+  .brief-list {
+    margin: 0;
+    padding-left: 0;
+    list-style: none;
+  }
+  .brief-list li {
+    padding: 3px 0;
+    font-size: 13px;
+  }
+  .brief-list li::before {
+    content: "•";
+    color: rgba(15,17,22,0.4);
+    margin-right: 8px;
+  }
+  .met-sig {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px dashed rgba(15,17,22,0.1);
+    font-size: 12px;
+    color: rgba(15,17,22,0.6);
+    font-style: italic;
+  }
+  .reply-hint {
+    margin-top: 12px;
+    padding: 8px 12px;
+    background: rgba(37,99,235,0.06);
+    border-left: 3px solid #2563eb;
+    font-size: 11.5px;
+    color: rgba(15,17,22,0.7);
+    border-radius: 0 4px 4px 0;
+  }
+  .feedback-prompt {
+    margin-top: 32px;
+    padding: 20px 24px;
+    background: #fff;
+    border: 2px dashed #2563eb;
+    border-radius: 12px;
+    font-size: 14px;
+  }
+  .feedback-prompt strong { color: #2563eb; }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <div class="banner">
+    ⚠️ PROTOTYPE — All subscribers shown are TEST data. No real briefs are sent. For internal Met team review only.
+  </div>
+
+  <div class="page-header">
+    <h1>Pro Brief — proposed structured format</h1>
+    <p>Three Pro Single test subscribers. Each shown three ways: SMS (phone), email, web view. The structure is the same across all three; presentation adapts to the medium.</p>
+  </div>
+
+  <!-- ───────────────────────────────────────────────────────────── -->
+  <!-- Subscriber 1: Eric Stoddard Farms (farmer, soil/wind/spray) -->
+  <!-- ───────────────────────────────────────────────────────────── -->
+  <div class="subscriber-section">
+    <div class="sub-name">Eric Stoddard Farms <span style="color:rgba(245,158,11,0.85); font-weight:600;">(TEST)</span></div>
+    <div class="sub-meta">Pro Single · Kansas · Cares about: soil saturation, wind for spraying, frost risk · Delivery: 6:00 AM CT · Primary Met: Chris</div>
+
+    <div class="three-views">
+
+      <!-- SMS preview -->
+      <div class="view-col">
+        <h3>📱 SMS preview</h3>
+        <div class="phone-frame">
+          <div class="phone-screen">
+            <div class="phone-from">From: WeatherValet</div>
+            <div class="phone-msg">⚠️ CAUTION · Tue May 19
+
+Morning workable, PM thunderstorms 2-5 PM (65%). Spray window before noon if winds stay below 12 mph.
+
+Full brief: weathervalet.ai/brief/k3p9
+— Chris</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Email preview -->
+      <div class="view-col">
+        <h3>📧 Email preview</h3>
+        <div class="email-frame">
+          <div class="email-header">
+            <div class="line"><span class="label">From:</span> Chris &lt;briefs@weathervalet.ai&gt;</div>
+            <div class="line"><span class="label">To:</span> Eric Stoddard Farms</div>
+            <div class="line"><span class="label">Subject:</span> Your brief — Tuesday, May 19</div>
+          </div>
+          <div class="email-body">
+            <div style="font-size:11px; color:rgba(15,17,22,0.5); margin-bottom: 8px;">Eric Stoddard Farms · Tuesday, May 19, 2026</div>
+
+            <div class="section-label">Today's call</div>
+            <span class="verdict-chip verdict-caution">⚠️ Caution</span>
+
+            <div class="section-label">Bottom line</div>
+            <div>Morning starts clear and dry. Afternoon brings 60-70% chance of thunderstorms 2-5 PM, then clearing by dusk. One spray window before lunch if winds cooperate.</div>
+
+            <div class="section-label">Key numbers</div>
+            <ul class="brief-list">
+              <li>Soil moisture: 0.4&quot; past 3 days (workable AM)</li>
+              <li>Wind: 5-12 mph SW, gusts to 18</li>
+              <li>Temp: 58° → 76°</li>
+              <li>Rain chance: 65% (2-5 PM), 0% rest of day</li>
+            </ul>
+
+            <div class="section-label">What to watch</div>
+            <div>Storms could trigger earlier if the cap breaks — I'm watching a 1 PM window. I'll text if it shifts.</div>
+
+            <div class="met-sig">— Chris, your meteorologist</div>
+
+            <div class="reply-hint">
+              💬 Reply to this email or text the SMS to talk to Chris directly.
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Web view preview -->
+      <div class="view-col">
+        <h3>🌐 Web view preview</h3>
+        <div class="web-frame">
+          <div class="web-header">
+            weathervalet.ai/brief/k3p9 · 🔒 logged in as Eric
+          </div>
+          <div class="web-body">
+            <div style="font-size:11px; color:rgba(15,17,22,0.5); margin-bottom: 8px;">Tuesday, May 19, 2026 · Eric Stoddard Farms</div>
+
+            <div class="section-label">Today's call</div>
+            <span class="verdict-chip verdict-caution">⚠️ Caution</span>
+
+            <div class="section-label">Bottom line</div>
+            <div>Morning starts clear and dry. Afternoon brings 60-70% chance of thunderstorms 2-5 PM, then clearing by dusk. One spray window before lunch if winds cooperate.</div>
+
+            <div class="section-label">Key numbers</div>
+            <ul class="brief-list">
+              <li>Soil moisture: 0.4&quot; past 3 days (workable AM)</li>
+              <li>Wind: 5-12 mph SW, gusts to 18</li>
+              <li>Temp: 58° → 76°</li>
+              <li>Rain chance: 65% (2-5 PM), 0% rest of day</li>
+            </ul>
+
+            <div class="section-label">What to watch</div>
+            <div>Storms could trigger earlier if the cap breaks — I'm watching a 1 PM window. I'll text if it shifts.</div>
+
+            <div style="margin-top: 16px; padding-top: 12px; border-top: 1px solid rgba(15,17,22,0.08); font-size: 12px;">
+              <a href="#" style="color: #2563eb; text-decoration: none;">📨 Reply to Chris</a> &nbsp;·&nbsp;
+              <a href="#" style="color: #2563eb; text-decoration: none;">📜 Past briefs</a>
+            </div>
+
+            <div class="met-sig">— Chris, your meteorologist</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ───────────────────────────────────────────────────────────── -->
+  <!-- Subscriber 2: Dunker High School Athletics (AD)             -->
+  <!-- ───────────────────────────────────────────────────────────── -->
+  <div class="subscriber-section">
+    <div class="sub-name">Dunker High School Athletics <span style="color:rgba(245,158,11,0.85); font-weight:600;">(TEST)</span></div>
+    <div class="sub-meta">Pro Single · Kansas · Cares about: lightning safety, rain timing for outdoor events, field conditions · Delivery: 5:30 AM CT · Primary Met: Chris</div>
+
+    <div class="three-views">
+
+      <!-- SMS -->
+      <div class="view-col">
+        <h3>📱 SMS preview</h3>
+        <div class="phone-frame">
+          <div class="phone-screen">
+            <div class="phone-from">From: WeatherValet</div>
+            <div class="phone-msg">⚠️ CAUTION · Tue May 19
+
+Track meet 4-6 PM at risk. Storms 2-5 PM with lightning. Recommend moving events earlier or postponing.
+
+Full brief: weathervalet.ai/brief/m7q2
+— Chris</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Email -->
+      <div class="view-col">
+        <h3>📧 Email preview</h3>
+        <div class="email-frame">
+          <div class="email-header">
+            <div class="line"><span class="label">From:</span> Chris &lt;briefs@weathervalet.ai&gt;</div>
+            <div class="line"><span class="label">To:</span> Dunker HS Athletics</div>
+            <div class="line"><span class="label">Subject:</span> Your brief — Tuesday, May 19</div>
+          </div>
+          <div class="email-body">
+            <div style="font-size:11px; color:rgba(15,17,22,0.5); margin-bottom: 8px;">Dunker HS Athletics · Tuesday, May 19, 2026</div>
+
+            <div class="section-label">Today's call</div>
+            <span class="verdict-chip verdict-caution">⚠️ Caution</span>
+
+            <div class="section-label">Bottom line</div>
+            <div>Today's track meet (4-6 PM) is in the bullseye for afternoon thunderstorms. Lightning risk is real — recommend moving events to early afternoon or postponing. Morning practice is fine.</div>
+
+            <div class="section-label">Key numbers</div>
+            <ul class="brief-list">
+              <li>Storm window: 2-5 PM (65% chance)</li>
+              <li>Lightning risk: ELEVATED 3-6 PM</li>
+              <li>Wind: 5-12 mph (no field-condition concerns)</li>
+              <li>Temp: 58° → 76°, comfortable for athletes</li>
+              <li>Field surface: dry overnight, no morning dew issues</li>
+            </ul>
+
+            <div class="section-label">What to watch</div>
+            <div>Storms could fire earlier (1 PM trigger possible). I'll text immediately if first lightning strike is within 10 miles of the school. NWS may issue Severe T-Storm Watch by noon.</div>
+
+            <div class="met-sig">— Chris, your meteorologist</div>
+
+            <div class="reply-hint">
+              💬 Reply to this email or text the SMS to talk to Chris directly.
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Web view -->
+      <div class="view-col">
+        <h3>🌐 Web view preview</h3>
+        <div class="web-frame">
+          <div class="web-header">
+            weathervalet.ai/brief/m7q2 · 🔒 logged in as Dunker HS
+          </div>
+          <div class="web-body">
+            <div style="font-size:11px; color:rgba(15,17,22,0.5); margin-bottom: 8px;">Tuesday, May 19, 2026 · Dunker HS Athletics</div>
+
+            <div class="section-label">Today's call</div>
+            <span class="verdict-chip verdict-caution">⚠️ Caution</span>
+
+            <div class="section-label">Bottom line</div>
+            <div>Today's track meet (4-6 PM) is in the bullseye for afternoon thunderstorms. Lightning risk is real — recommend moving events to early afternoon or postponing. Morning practice is fine.</div>
+
+            <div class="section-label">Key numbers</div>
+            <ul class="brief-list">
+              <li>Storm window: 2-5 PM (65% chance)</li>
+              <li>Lightning risk: ELEVATED 3-6 PM</li>
+              <li>Wind: 5-12 mph (no field-condition concerns)</li>
+              <li>Temp: 58° → 76°, comfortable</li>
+              <li>Field surface: dry overnight</li>
+            </ul>
+
+            <div class="section-label">What to watch</div>
+            <div>Storms could fire earlier (1 PM trigger possible). I'll text immediately if first lightning strike is within 10 miles of the school.</div>
+
+            <div style="margin-top: 16px; padding-top: 12px; border-top: 1px solid rgba(15,17,22,0.08); font-size: 12px;">
+              <a href="#" style="color: #2563eb; text-decoration: none;">📨 Reply to Chris</a> &nbsp;·&nbsp;
+              <a href="#" style="color: #2563eb; text-decoration: none;">📜 Past briefs</a>
+            </div>
+
+            <div class="met-sig">— Chris, your meteorologist</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ───────────────────────────────────────────────────────────── -->
+  <!-- Subscriber 3: Kevin Holle Farms (farming partnership)        -->
+  <!-- ───────────────────────────────────────────────────────────── -->
+  <div class="subscriber-section">
+    <div class="sub-name">Kevin Holle Farms Partnership <span style="color:rgba(245,158,11,0.85); font-weight:600;">(TEST)</span></div>
+    <div class="sub-meta">Pro Single · Kansas · Cares about: harvest timing, equipment ops windows, soil conditions, frost · Delivery: 5:00 AM CT · Primary Met: Chris</div>
+
+    <div class="three-views">
+
+      <!-- SMS -->
+      <div class="view-col">
+        <h3>📱 SMS preview</h3>
+        <div class="phone-frame">
+          <div class="phone-screen">
+            <div class="phone-from">From: WeatherValet</div>
+            <div class="phone-msg">✓ CLEAR · Tue May 19
+
+Excellent harvest day. Dry through midnight, no field-work limits. Use this window.
+
+Full brief: weathervalet.ai/brief/v4n7
+— Chris</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Email -->
+      <div class="view-col">
+        <h3>📧 Email preview</h3>
+        <div class="email-frame">
+          <div class="email-header">
+            <div class="line"><span class="label">From:</span> Chris &lt;briefs@weathervalet.ai&gt;</div>
+            <div class="line"><span class="label">To:</span> Kevin Holle Farms</div>
+            <div class="line"><span class="label">Subject:</span> Your brief — Tuesday, May 19</div>
+          </div>
+          <div class="email-body">
+            <div style="font-size:11px; color:rgba(15,17,22,0.5); margin-bottom: 8px;">Kevin Holle Farms · Tuesday, May 19, 2026</div>
+
+            <div class="section-label">Today's call</div>
+            <span class="verdict-chip verdict-clear">✓ Clear</span>
+
+            <div class="section-label">Bottom line</div>
+            <div>Excellent day for harvest and field work. Dry conditions all day, no precipitation through midnight. Light winds, mild temperatures. Take advantage — Wednesday looks similar but rain returns Thursday.</div>
+
+            <div class="section-label">Key numbers</div>
+            <ul class="brief-list">
+              <li>Rain chance: 0% all day, 0% overnight</li>
+              <li>Wind: 5-10 mph S, no equipment limits</li>
+              <li>Temp: 52° → 78°, no frost risk</li>
+              <li>Humidity at sunrise: 72% (light dew, dries by 9 AM)</li>
+              <li>Soil temp at 4&quot;: 64° (favorable)</li>
+            </ul>
+
+            <div class="section-label">What to watch</div>
+            <div>Long-range models hint at a Thursday-Friday rain event, 0.5-1.0&quot; possible. If you have any wrap-up to do this week, today and tomorrow are your windows.</div>
+
+            <div class="met-sig">— Chris, your meteorologist</div>
+
+            <div class="reply-hint">
+              💬 Reply to this email or text the SMS to talk to Chris directly.
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Web view -->
+      <div class="view-col">
+        <h3>🌐 Web view preview</h3>
+        <div class="web-frame">
+          <div class="web-header">
+            weathervalet.ai/brief/v4n7 · 🔒 logged in as Kevin Holle
+          </div>
+          <div class="web-body">
+            <div style="font-size:11px; color:rgba(15,17,22,0.5); margin-bottom: 8px;">Tuesday, May 19, 2026 · Kevin Holle Farms</div>
+
+            <div class="section-label">Today's call</div>
+            <span class="verdict-chip verdict-clear">✓ Clear</span>
+
+            <div class="section-label">Bottom line</div>
+            <div>Excellent day for harvest and field work. Dry all day, no precipitation through midnight. Light winds, mild temps. Take advantage — Thursday brings rain.</div>
+
+            <div class="section-label">Key numbers</div>
+            <ul class="brief-list">
+              <li>Rain chance: 0% all day &amp; overnight</li>
+              <li>Wind: 5-10 mph S</li>
+              <li>Temp: 52° → 78°, no frost</li>
+              <li>Humidity at sunrise: 72%</li>
+              <li>Soil temp at 4&quot;: 64°</li>
+            </ul>
+
+            <div class="section-label">What to watch</div>
+            <div>Long-range models hint at Thursday-Friday rain (0.5-1.0&quot;). Today and tomorrow are your windows.</div>
+
+            <div style="margin-top: 16px; padding-top: 12px; border-top: 1px solid rgba(15,17,22,0.08); font-size: 12px;">
+              <a href="#" style="color: #2563eb; text-decoration: none;">📨 Reply to Chris</a> &nbsp;·&nbsp;
+              <a href="#" style="color: #2563eb; text-decoration: none;">📜 Past briefs</a>
+            </div>
+
+            <div class="met-sig">— Chris, your meteorologist</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ───────────────────────────────────────────────────────────── -->
+  <!-- Feedback prompt                                              -->
+  <!-- ───────────────────────────────────────────────────────────── -->
+  <div class="feedback-prompt">
+    <strong>For Met team review:</strong> What would you change? Section order? Different metrics? More/less detail? Different verdict labels? Reply in <code>#brief collab</code> on Discord or text Michael directly. This is the format we'd build for launch on May 24.
+  </div>
+
+</div>
+</body>
+</html>
+"""
+
+
 @app.get("/admin/dashboard")
 def admin_dashboard():
     """The operator dashboard — today's tickets, summary stats, AI-vs-human
