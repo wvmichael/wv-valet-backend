@@ -181,6 +181,14 @@ TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER", "")  # Twilio number we send from
 
+# Rosie's dedicated Twilio number. Separate from the main WV number so:
+#   - Mets recognize "this is Rosie" by the From: number
+#   - Inbound SMS to this number routes to /api/v1/rosie/sms (Rosie chat),
+#     not to the customer support inbox
+#   - Falls back to TWILIO_FROM_NUMBER if not set, so existing single-number
+#     deploys still work (Rosie just shares the main number).
+ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
+
 # The on-duty meteorologist's phone, in E.164 format (+15555550101).
 # When you have multiple, swap this for a routing function.
 METEOROLOGIST_PHONE = os.environ.get("METEOROLOGIST_PHONE", "")
@@ -2523,6 +2531,27 @@ def send_sms(to: str, body: str) -> bool:
     except Exception as e:
         # Twilio errors come in many flavors; log the type, never crash the request
         print(f"[sms] FAILED to={to}: {type(e).__name__}: {e}", flush=True)
+        return False
+
+
+def send_sms_from(to: str, body: str, from_number: str) -> bool:
+    """SMS variant that lets the caller specify the From: number.
+
+    Used by Rosie so her texts come from her own Twilio number (and replies
+    route to her webhook). Falls back to TWILIO_FROM_NUMBER if from_number
+    is empty — keeps single-number deploys working.
+    """
+    sender = from_number or TWILIO_FROM_NUMBER
+    if not (TwilioClient and TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and sender):
+        print(f"[sms-stub] from={sender or '(none)'} to={to}\n{body}\n", flush=True)
+        return True
+    try:
+        client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        msg = client.messages.create(body=body, from_=sender, to=to)
+        print(f"[sms] sent sid={msg.sid} from={sender} to={to}", flush=True)
+        return True
+    except Exception as e:
+        print(f"[sms] FAILED from={sender} to={to}: {type(e).__name__}: {e}", flush=True)
         return False
 
 
@@ -11070,6 +11099,10 @@ def _brief_scheduler_loop() -> None:
             _rosie_fire_reminders()
         except Exception as e:
             print(f"[rosie-reminder] fire tick failed: {e!r}", flush=True)
+        try:
+            _rosie_proactive_check_tick()
+        except Exception as e:
+            print(f"[rosie-proactive] tick failed: {e!r}", flush=True)
         time.sleep(60)
 
 
@@ -15731,6 +15764,338 @@ def rosie_history():
     return jsonify({"ok": True, "messages": out})
 
 
+# ─────────────────────────────────────────────────────────────
+# Rosie SMS — inbound webhook from Twilio
+# When a Met texts Rosie's number, Twilio POSTs here. We look up
+# the Met by phone, run a Rosie turn, and reply with TwiML so the
+# response comes back as an SMS.
+# ─────────────────────────────────────────────────────────────
+
+@app.post("/api/v1/rosie/sms")
+def rosie_sms_inbound():
+    """Twilio webhook for inbound SMS to Rosie's number.
+
+    Twilio POSTs form-encoded data (NOT JSON). Fields we use:
+      From   — sender's phone number (E.164)
+      Body   — message text
+      To     — Rosie's number (we ignore; could verify)
+
+    Returns TwiML XML so Twilio sends Rosie's response as an SMS reply.
+    """
+    from_phone = (request.form.get("From") or "").strip()
+    body = (request.form.get("Body") or "").strip()
+
+    # Empty body, just acknowledge
+    if not body:
+        return ("<?xml version='1.0' encoding='UTF-8'?><Response/>",
+                200, {"Content-Type": "text/xml"})
+
+    # Look up Met by phone. Phone match is exact on E.164.
+    met = None
+    if from_phone:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT u.id, u.name, u.phone
+                       FROM users u
+                       JOIN user_roles ur ON ur.user_id = u.id
+                       WHERE u.phone = %s
+                         AND ur.role IN ('met','admin')
+                         AND u.is_active = TRUE
+                       LIMIT 1""",
+                    (from_phone,),
+                )
+                met = cur.fetchone()
+
+    if not met:
+        # Unknown number. Reply politely so a misdirected text doesn't get
+        # lost in silence, but don't process the message.
+        reply = ("This number is for the WeatherValet meteorologist team. "
+                 "If you're a customer, please reply to your usual WV number "
+                 "or email hello@weathervalet.ai.")
+        twiml = f"<?xml version='1.0' encoding='UTF-8'?><Response><Message>{escape_xml(reply)}</Message></Response>"
+        return (twiml, 200, {"Content-Type": "text/xml"})
+
+    # Run a Rosie turn on the SMS conversation
+    try:
+        conv_id = _rosie_get_or_create_conversation(met["id"], "sms")
+        reply = _rosie_run_turn(met["id"], conv_id, body, channel="sms")
+    except Exception as e:
+        print(f"[rosie-sms] turn failed: {e}", flush=True)
+        reply = "Something went wrong on my end. Try again in a sec.\n— Rosie"
+
+    # SMS-trim: keep replies under 320 chars (2 SMS segments) where possible.
+    # Long answers get truncated with a hint to use web chat.
+    if len(reply) > 320:
+        reply = reply[:280].rstrip() + "...\n\n(More in your workspace chat with me.)\n— Rosie"
+
+    twiml = f"<?xml version='1.0' encoding='UTF-8'?><Response><Message>{escape_xml(reply)}</Message></Response>"
+    return (twiml, 200, {"Content-Type": "text/xml"})
+
+
+def escape_xml(s: str) -> str:
+    """Minimal XML escape for TwiML message bodies."""
+    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+             .replace('"', "&quot;").replace("'", "&apos;"))
+
+
+# ─────────────────────────────────────────────────────────────
+# Rosie proactive triggers — Rosie reaches out on her own
+# Each function below runs on its own schedule via the main loop.
+# Designed to be lightweight: query, decide, send if needed, log.
+# Cooldowns prevent spamming Mets with repeat messages.
+# ─────────────────────────────────────────────────────────────
+
+def _rosie_proactive_morning_briefing():
+    """At 6 AM ET, send each Met their day's brief tasks.
+
+    Cooldown: once per Met per calendar day (uses ET).
+    Skips Mets with no tasks today (don't ping just to ping).
+    Skips Mets who logged in within the last 30 minutes (they're already
+    looking at their workspace).
+    """
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    # Only run between 5:55 AM and 6:05 AM ET — narrow window so we don't
+    # accidentally fire twice when the cron is busy
+    if not (now_et.hour == 6 and now_et.minute < 6):
+        return
+
+    today_str = now_et.strftime("%Y-%m-%d")
+    now_ms = int(time.time() * 1000)
+    thirty_min_ago = now_ms - 30 * 60 * 1000
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.name, u.phone, mh.last_seen_at
+                   FROM users u
+                   JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'met'
+                   LEFT JOIN met_heartbeat mh ON mh.met_user_id = u.id
+                   WHERE u.is_active = TRUE AND u.phone IS NOT NULL""",
+            )
+            mets = cur.fetchall()
+
+    for m in mets:
+        # Skip if Met was active in the last 30 min
+        if m.get("last_seen_at") and m["last_seen_at"] > thirty_min_ago:
+            continue
+        # Check cooldown (one briefing per day per Met)
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT COUNT(*) AS n FROM rosie_audit_log
+                       WHERE met_user_id = %s
+                         AND action = 'proactive_morning_briefing'
+                         AND created_at_ms >= %s""",
+                    (m["id"], int(datetime.combine(now_et.date(), datetime.min.time(),
+                                                    tzinfo=ZoneInfo("America/New_York")).timestamp() * 1000)),
+                )
+                if cur.fetchone()["n"] > 0:
+                    continue
+
+        # Count today's tasks for this Met
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT COUNT(*) AS n, MIN(due_at_ms) AS first_due
+                       FROM daily_brief_tasks
+                       WHERE assigned_met_id = %s
+                         AND task_date = %s
+                         AND sent_at_ms IS NULL""",
+                    (m["id"], today_str),
+                )
+                row = cur.fetchone()
+
+        task_count = (row or {}).get("n") or 0
+        if task_count == 0:
+            continue  # nothing to brief about
+
+        first_due_ms = row.get("first_due") or 0
+        first_due_str = ""
+        if first_due_ms:
+            fd = datetime.fromtimestamp(first_due_ms / 1000, tz=ZoneInfo("America/New_York"))
+            first_due_str = fd.strftime("%I:%M %p ET").lstrip("0")
+
+        first_name = (m.get("name") or "").split()[0] or "there"
+        msg = (
+            f"Good morning, {first_name}. You have {task_count} brief "
+            f"{'task' if task_count == 1 else 'tasks'} today"
+            f"{', earliest by ' + first_due_str if first_due_str else ''}. "
+            f"Open your workspace when ready.\n— Rosie"
+        )
+        try:
+            sent = send_sms_from(m["phone"], msg, ROSIE_TWILIO_NUMBER)
+        except Exception as e:
+            print(f"[rosie-morning] send failed met={m['id']}: {e}", flush=True)
+            sent = False
+        _rosie_audit(m["id"], "sms", "proactive_morning_briefing",
+                     f"{task_count} tasks today", tier=1, success=sent)
+
+
+def _rosie_proactive_inactivity_nudge():
+    """If a Met hasn't logged in for 7+ days, send a friendly check-in.
+
+    Cooldown: once per Met per 7-day rolling window. Won't repeat-nudge.
+    Only fires once a day (runs at 4 PM ET).
+    """
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    if not (now_et.hour == 16 and now_et.minute < 6):
+        return  # narrow window
+
+    now_ms = int(time.time() * 1000)
+    seven_days_ago = now_ms - 7 * 24 * 60 * 60 * 1000
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.name, u.phone, mh.last_seen_at
+                   FROM users u
+                   JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'met'
+                   LEFT JOIN met_heartbeat mh ON mh.met_user_id = u.id
+                   WHERE u.is_active = TRUE AND u.phone IS NOT NULL
+                     AND (mh.last_seen_at IS NULL OR mh.last_seen_at < %s)""",
+                (seven_days_ago,),
+            )
+            inactive = cur.fetchall()
+
+    for m in inactive:
+        # Cooldown check: don't nudge if we nudged this Met in last 7 days
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT COUNT(*) AS n FROM rosie_audit_log
+                       WHERE met_user_id = %s
+                         AND action = 'proactive_inactivity_nudge'
+                         AND created_at_ms >= %s""",
+                    (m["id"], seven_days_ago),
+                )
+                if cur.fetchone()["n"] > 0:
+                    continue
+
+        first_name = (m.get("name") or "").split()[0] or "there"
+        msg = (
+            f"Hey {first_name}, haven't seen you log in for a bit. "
+            f"Everything OK? If you need to drop shifts or change your "
+            f"schedule, just text me back.\n— Rosie"
+        )
+        try:
+            sent = send_sms_from(m["phone"], msg, ROSIE_TWILIO_NUMBER)
+        except Exception as e:
+            print(f"[rosie-inactivity] send failed met={m['id']}: {e}", flush=True)
+            sent = False
+        _rosie_audit(m["id"], "sms", "proactive_inactivity_nudge",
+                     "7-day inactivity check-in", tier=1, success=sent)
+
+
+def _rosie_proactive_severe_weather_heads_up():
+    """When a tornado/severe-T-storm warning fires affecting a Met's
+    primary subscribers, send a one-time heads-up.
+
+    Cooldown: per (Met, NWS event id) — same warning won't re-page.
+    Only sends to the PRIMARY met for affected subscribers.
+    """
+    try:
+        alerts = _get_cached_nws_alerts() or []
+    except Exception:
+        return
+
+    # Find current severe alerts
+    severe = []
+    for a in alerts:
+        props = (a or {}).get("properties") or {}
+        ev = (props.get("event") or "").lower()
+        if any(k in ev for k in ("tornado warning", "severe thunderstorm warning",
+                                  "flash flood warning")):
+            severe.append({
+                "id": props.get("id") or str(hash(json.dumps(props, sort_keys=True)))[:32],
+                "event": props.get("event"),
+                "area": props.get("areaDesc", "")[:120],
+                "same_codes": props.get("geocode", {}).get("SAME") or [],
+            })
+
+    if not severe:
+        return
+
+    # For each severe alert, find affected Pro subscribers and their primary Mets.
+    # Match strategy: NWS alerts include affectedZones URLs and areaDesc that
+    # mentions counties. For v1 we do a loose substring match: subscriber's
+    # saved-location county appears in the alert's areaDesc text. Imperfect
+    # but works for the launch team's coverage areas.
+    for alert in severe:
+        area_desc = (alert.get("area") or "").lower()
+        if not area_desc:
+            continue
+
+        with db() as conn:
+            with conn.cursor() as cur:
+                # Find Pro subscribers whose county name appears in the alert area.
+                # The county column on saved_locations stores e.g. "Boone County".
+                cur.execute(
+                    """SELECT DISTINCT sc.primary_met_id, loc.county
+                       FROM subscriber_coverage sc
+                       JOIN users u ON u.id = sc.user_id
+                       JOIN saved_locations loc ON loc.user_id = sc.user_id AND loc.is_primary = TRUE
+                       WHERE u.is_active = TRUE
+                         AND u.subscription_tier IN ('pro_single','pro_multi','pro_enterprise')
+                         AND sc.primary_met_id IS NOT NULL
+                         AND loc.county IS NOT NULL""",
+                )
+                rows = cur.fetchall()
+        met_ids = set()
+        for r in rows:
+            county = (r.get("county") or "").lower().replace(" county", "").strip()
+            if county and county in area_desc:
+                met_ids.add(r["primary_met_id"])
+
+        for met_id in met_ids:
+            # Cooldown: have we already paged this Met for this event id?
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT COUNT(*) AS n FROM rosie_audit_log
+                           WHERE met_user_id = %s
+                             AND action = 'proactive_severe_heads_up'
+                             AND detail LIKE %s""",
+                        (met_id, f"%{alert['id'][:32]}%"),
+                    )
+                    if cur.fetchone()["n"] > 0:
+                        continue
+                    cur.execute("SELECT phone, name FROM users WHERE id = %s", (met_id,))
+                    u = cur.fetchone()
+
+            if not (u and u.get("phone")):
+                continue
+            first_name = (u.get("name") or "").split()[0] or "there"
+            msg = (
+                f"Heads up, {first_name}: {alert['event']} affecting your "
+                f"subscribers — {alert['area'][:90]}. NWS feed is live. "
+                f"You're primary.\n— Rosie"
+            )
+            try:
+                sent = send_sms_from(u["phone"], msg, ROSIE_TWILIO_NUMBER)
+            except Exception as e:
+                print(f"[rosie-severe] send failed met={met_id}: {e}", flush=True)
+                sent = False
+            _rosie_audit(met_id, "sms", "proactive_severe_heads_up",
+                         f"Event id {alert['id'][:32]}: {alert['event']}",
+                         tier=1, success=sent)
+
+
+def _rosie_proactive_check_tick():
+    """Top-level cron entry: dispatches each proactive trigger.
+    Each individual trigger checks its own time window + cooldown, so this
+    is just a fan-out point. Runs every 60s alongside other cron jobs."""
+    if os.environ.get("WV_ROSIE_DISABLED") == "1":
+        return
+    for fn in (_rosie_proactive_morning_briefing,
+               _rosie_proactive_inactivity_nudge,
+               _rosie_proactive_severe_weather_heads_up):
+        try:
+            fn()
+        except Exception as e:
+            print(f"[rosie-proactive] {fn.__name__} failed: {e}", flush=True)
+
+
 # Reminder firing (cron). Plugged into the main scheduler loop below.
 def _rosie_fire_reminders():
     """Check for due reminders and send SMS to the recipient Met."""
@@ -15752,7 +16117,8 @@ def _rosie_fire_reminders():
         sent_ok = False
         try:
             if r.get("phone"):
-                sent_ok = bool(send_sms(r["phone"], f"{r['message']}\n— Rosie"))
+                # Use Rosie's dedicated number so replies route to her SMS webhook
+                sent_ok = bool(send_sms_from(r["phone"], f"{r['message']}\n— Rosie", ROSIE_TWILIO_NUMBER))
         except Exception as e:
             print(f"[rosie-reminder] send failed: {e}", flush=True)
         try:
