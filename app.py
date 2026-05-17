@@ -17442,6 +17442,97 @@ def rosie_history():
 
 
 # ─────────────────────────────────────────────────────────────
+# SMS inbound router (May 17, 2026)
+# Single endpoint that Twilio's "A message comes in" webhook
+# points at. Routes based on who's texting:
+#   - Met or admin (phone matches a user with met/admin role) → Rosie
+#   - Subscriber (phone matches a user with subscriber role)   → reply capture
+#   - Unknown number                                           → polite reply
+#
+# Rationale: we have one toll-free number, two use cases. Rather
+# than buy a second number, route at the application layer.
+# ─────────────────────────────────────────────────────────────
+
+@app.route("/api/v1/sms-inbound-router", methods=["OPTIONS"])
+def _sms_inbound_router_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/sms-inbound-router")
+def sms_inbound_router():
+    """Front door for ALL inbound SMS. Decides which handler to invoke
+    based on the sender's role.
+
+    Twilio sends form-encoded data. We look up the sender's phone in
+    the users table once, then dispatch to the appropriate logic:
+
+        Met or admin role     → Rosie chat (returns TwiML reply)
+        Subscriber role       → brief reply capture (returns empty TwiML)
+        No match              → polite "wrong number" reply
+
+    All paths return TwiML so Twilio doesn't retry.
+    """
+    from_phone = (request.form.get("From") or "").strip()
+    body = (request.form.get("Body") or "").strip()
+
+    # Empty body, just ack
+    if not body:
+        return ("<?xml version='1.0' encoding='UTF-8'?><Response/>",
+                200, {"Content-Type": "text/xml"})
+
+    # Look up the sender's role(s). One query, returns highest-privilege role.
+    # Met/admin take priority over subscriber if the same person has both
+    # (e.g. a Met testing the system using their own subscriber account).
+    sender_role = None
+    if from_phone:
+        try:
+            normalized = _normalize_phone(from_phone)
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT ur.role
+                           FROM users u
+                           JOIN user_roles ur ON ur.user_id = u.id
+                           WHERE u.phone IN (%s, %s)
+                             AND u.is_active = TRUE
+                             AND ur.role IN ('admin', 'met', 'subscriber')
+                           ORDER BY CASE ur.role
+                             WHEN 'admin'      THEN 1
+                             WHEN 'met'        THEN 2
+                             WHEN 'subscriber' THEN 3
+                             ELSE 4
+                           END
+                           LIMIT 1""",
+                        (from_phone, normalized),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        sender_role = row["role"]
+        except Exception as e:
+            print(f"[sms-router] lookup failed: {e}", flush=True)
+
+    print(
+        f"[sms-router] from={from_phone} role={sender_role} body_len={len(body)}",
+        flush=True,
+    )
+
+    if sender_role in ("met", "admin"):
+        # Hand off to Rosie. We invoke the existing function directly —
+        # it reads request.form so the call works as-is.
+        return rosie_sms_inbound()
+    elif sender_role == "subscriber":
+        # Hand off to reply capture. Same trick — reads request.form.
+        return replies_sms_inbound()
+    else:
+        # Unknown number. Be polite, don't be silent.
+        reply = ("Thanks for texting WeatherValet. We didn't recognize this "
+                 "number. If you're a subscriber, please text from the phone "
+                 "we have on file, or email hello@weathervalet.ai.")
+        twiml = f"<?xml version='1.0' encoding='UTF-8'?><Response><Message>{escape_xml(reply)}</Message></Response>"
+        return (twiml, 200, {"Content-Type": "text/xml"})
+
+
+# ─────────────────────────────────────────────────────────────
 # Rosie SMS — inbound webhook from Twilio
 # When a Met texts Rosie's number, Twilio POSTs here. We look up
 # the Met by phone, run a Rosie turn, and reply with TwiML so the
