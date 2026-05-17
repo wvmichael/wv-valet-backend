@@ -1481,6 +1481,37 @@ CREATE TABLE IF NOT EXISTS brief_access_tokens (
 CREATE INDEX IF NOT EXISTS idx_brief_tokens_history ON brief_access_tokens(history_id);
 CREATE INDEX IF NOT EXISTS idx_brief_tokens_sub ON brief_access_tokens(subscriber_user_id);
 
+-- ── Brief replies (May 17, 2026 — Phase 1 foundation) ──
+-- Inbound SMS and email messages from subscribers, captured via Twilio
+-- and Resend webhooks. Phase 1 just LOGS them — full Pro Thread
+-- integration ships separately. The intent is to never lose a
+-- subscriber's reply, even before routing is sophisticated.
+--
+-- channel: 'sms' or 'email'
+-- from_address: phone number (sms) or email (email)
+-- matched_user_id: subscriber we identified, or NULL if unknown
+-- routed_status: 'pending' (Phase 1 default), later 'routed', 'manual', 'spam'
+-- raw_payload: full webhook JSON for debugging / audit
+CREATE TABLE IF NOT EXISTS brief_replies (
+    id              SERIAL PRIMARY KEY,
+    received_at_ms  BIGINT NOT NULL,
+    channel         TEXT NOT NULL CHECK (channel IN ('sms', 'email')),
+    from_address    TEXT NOT NULL,
+    to_address      TEXT,
+    subject         TEXT,
+    body            TEXT NOT NULL,
+    matched_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    matched_via     TEXT,                       -- 'phone', 'email', or NULL
+    primary_met_id  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    routed_status   TEXT NOT NULL DEFAULT 'pending',
+    routed_at_ms    BIGINT,
+    raw_payload     TEXT,                       -- JSON dump for debugging
+    notes           TEXT                        -- admin notes
+);
+CREATE INDEX IF NOT EXISTS idx_brief_replies_received ON brief_replies(received_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_brief_replies_matched ON brief_replies(matched_user_id, received_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_brief_replies_status ON brief_replies(routed_status, received_at_ms DESC);
+
 -- ── NWS severe alert pages (Phase 10 Item #7) ──
 -- One row per NWS alert that affected at least one Pro subscriber.
 -- Created by the scheduler when polling NWS detects a new alert whose
@@ -9578,6 +9609,400 @@ def brief_view(token: str):
             "is_met_touched": row["is_met_touched"],
         },
     })
+
+
+# ════════════════════════════════════════════════════════════════════
+# Brief reply routing — Phase 1 foundation (May 17, 2026)
+# ════════════════════════════════════════════════════════════════════
+#
+# When a subscriber replies to a brief (SMS or email), the message comes
+# in via Twilio's inbound webhook or Resend's inbound webhook. This
+# foundation captures every inbound reply, attempts to identify the
+# subscriber by phone/email, and notifies Mets via Discord.
+#
+# Phase 2 (Monday): thread replies into Pro Threads, parse email
+# reply chains, handle ambiguous matches (multiple users sharing a
+# phone), and add the Pro Threads UI badge for unread replies.
+
+def _normalize_phone(raw: str) -> str:
+    """Strip everything but digits + leading +. Twilio sends E.164
+    format ('+15551234567') but be defensive in case format drifts.
+    """
+    if not raw:
+        return ""
+    s = raw.strip()
+    if not s:
+        return ""
+    # Keep leading + and digits only
+    if s.startswith("+"):
+        digits = "+" + "".join(c for c in s[1:] if c.isdigit())
+    else:
+        digits = "".join(c for c in s if c.isdigit())
+        # US default if 10 digits and no country code
+        if len(digits) == 10:
+            digits = "+1" + digits
+        elif len(digits) == 11 and digits.startswith("1"):
+            digits = "+" + digits
+    return digits
+
+
+def _match_user_by_phone(phone: str) -> tuple[int | None, int | None]:
+    """Look up a subscriber by phone number. Returns (user_id, primary_met_id)
+    or (None, None) if no match found.
+
+    Ambiguity note: if multiple users share a phone number (e.g. family
+    plan), we pick the most recently active subscriber. Phase 2 will
+    handle this more carefully by also checking which user has an open
+    brief in flight.
+    """
+    normalized = _normalize_phone(phone)
+    if not normalized:
+        return None, None
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                # Match user by phone, prefer subscriber role + active
+                cur.execute(
+                    """SELECT u.id, sc.primary_met_id
+                       FROM users u
+                       LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
+                       WHERE u.phone = %s AND u.is_active = TRUE
+                         AND EXISTS (
+                           SELECT 1 FROM user_roles ur
+                            WHERE ur.user_id = u.id AND ur.role = 'subscriber'
+                         )
+                       ORDER BY u.id DESC
+                       LIMIT 1""",
+                    (normalized,),
+                )
+                row = cur.fetchone()
+                if row:
+                    return row["id"], row.get("primary_met_id")
+    except Exception as e:
+        print(f"[reply-route] phone lookup failed: {e}", flush=True)
+    return None, None
+
+
+def _match_user_by_email(email: str) -> tuple[int | None, int | None]:
+    """Look up a subscriber by email. Returns (user_id, primary_met_id)."""
+    if not email:
+        return None, None
+    e = email.strip().lower()
+    if not e or "@" not in e:
+        return None, None
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT u.id, sc.primary_met_id
+                       FROM users u
+                       LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
+                       WHERE LOWER(u.email) = %s AND u.is_active = TRUE
+                       LIMIT 1""",
+                    (e,),
+                )
+                row = cur.fetchone()
+                if row:
+                    return row["id"], row.get("primary_met_id")
+    except Exception as ex:
+        print(f"[reply-route] email lookup failed: {ex}", flush=True)
+    return None, None
+
+
+def _notify_met_of_reply(reply_id: int, channel: str, from_addr: str,
+                          body: str, matched_user_id: int | None,
+                          primary_met_id: int | None) -> None:
+    """Phase 1: post a heads-up to Discord. Phase 2 will SMS the
+    specific Met and thread into Pro Threads.
+
+    Posts to #general for now since we don't have a dedicated
+    #replies channel set up yet.
+    """
+    try:
+        webhook = os.environ.get("DISCORD_WEBHOOK_GENERAL", "").strip()
+        if not webhook:
+            return
+        # Look up subscriber name if matched
+        sub_name = "Unknown subscriber"
+        if matched_user_id:
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT name, email FROM users WHERE id = %s",
+                            (matched_user_id,),
+                        )
+                        urow = cur.fetchone()
+                        if urow:
+                            sub_name = urow.get("name") or urow.get("email") or sub_name
+            except Exception:
+                pass
+
+        channel_emoji = "📱" if channel == "sms" else "📧"
+        match_note = (
+            f"\u2192 {sub_name}" if matched_user_id
+            else f"\u2192 unmatched ({from_addr})"
+        )
+        truncated_body = body[:240] + ("…" if len(body) > 240 else "")
+        msg = (
+            f"{channel_emoji} **New brief reply** {match_note}\n"
+            f"> {truncated_body}\n"
+            f"_(reply #{reply_id} — Phase 1 capture only; full routing comes Monday)_"
+        )
+        _discord_post(webhook, msg, username="WV Replies")
+    except Exception as e:
+        print(f"[reply-route] discord notify failed: {e}", flush=True)
+
+
+@app.route("/api/v1/replies/sms-inbound", methods=["OPTIONS"])
+def _replies_sms_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/replies/sms-inbound")
+def replies_sms_inbound():
+    """Twilio inbound SMS webhook. Twilio POSTs form-encoded data with:
+        From    — sender's phone (E.164)
+        To      — our Twilio number
+        Body    — message text
+        MessageSid, AccountSid, etc.
+
+    We respond with empty TwiML (200 OK) so Twilio knows we received it.
+    No auto-reply via TwiML at this layer — that's Rosie's job if it's
+    a Met, or Phase 2 routing if it's a subscriber.
+
+    Security: Twilio includes an X-Twilio-Signature header. Phase 2
+    will validate it. Phase 1 logs everything and trusts the source
+    (Render's IP allowlist + the obscure URL provides reasonable
+    interim security).
+    """
+    try:
+        # Twilio sends form-encoded by default
+        form = request.form
+        from_addr = form.get("From", "")
+        to_addr = form.get("To", "")
+        body = form.get("Body", "")
+        sid = form.get("MessageSid", "")
+
+        # Match to a user by phone
+        matched_user_id, primary_met_id = _match_user_by_phone(from_addr)
+
+        # Capture
+        now_ms = int(time.time() * 1000)
+        payload = {
+            "From": from_addr, "To": to_addr, "Body": body,
+            "MessageSid": sid,
+        }
+        reply_id = None
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO brief_replies
+                           (received_at_ms, channel, from_address, to_address,
+                            body, matched_user_id, matched_via, primary_met_id,
+                            raw_payload)
+                           VALUES (%s, 'sms', %s, %s, %s, %s, %s, %s, %s)
+                           RETURNING id""",
+                        (now_ms, from_addr, to_addr, body,
+                         matched_user_id,
+                         "phone" if matched_user_id else None,
+                         primary_met_id,
+                         json.dumps(payload)),
+                    )
+                    reply_id = cur.fetchone()["id"]
+        except Exception as e:
+            print(f"[reply-route] sms insert failed: {e}", flush=True)
+
+        print(
+            f"[reply-route] SMS reply id={reply_id} from={from_addr} "
+            f"matched_user={matched_user_id} body_len={len(body)}",
+            flush=True,
+        )
+
+        # Notify Mets via Discord (best effort, async-ish)
+        if reply_id is not None:
+            try:
+                _notify_met_of_reply(reply_id, "sms", from_addr, body,
+                                     matched_user_id, primary_met_id)
+            except Exception:
+                pass
+
+        # Twilio expects TwiML (or 200 OK with empty body works fine)
+        return ('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
+                200, {"Content-Type": "application/xml"})
+    except Exception as e:
+        print(f"[reply-route] sms webhook failed: {e}", flush=True)
+        # Even on error, return 200 so Twilio doesn't retry endlessly
+        return ('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
+                200, {"Content-Type": "application/xml"})
+
+
+@app.route("/api/v1/replies/email-inbound", methods=["OPTIONS"])
+def _replies_email_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/replies/email-inbound")
+def replies_email_inbound():
+    """Resend Inbound Email webhook. Resend POSTs JSON with the
+    parsed message. Expected fields per Resend docs:
+        type: 'email.received'
+        data: {
+            from: { email, name },
+            to: [ { email, name }, ... ],
+            subject,
+            text,           # plain-text body
+            html,           # rendered HTML body (we ignore)
+            messageId,
+            ...
+        }
+
+    Phase 1: log everything, attempt match by sender email, notify
+    Discord. Phase 2: strip quoted reply chains, thread to Pro Threads.
+
+    Security: Resend webhooks can be signed with a secret. Phase 2 will
+    validate signatures. Phase 1 trusts the source.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        # Defensive parsing — Resend may nest under "data" or send flat
+        evt = data.get("data") or data
+        from_obj = evt.get("from") or {}
+        from_addr = (from_obj.get("email") if isinstance(from_obj, dict) else from_obj) or ""
+        to_list = evt.get("to") or []
+        if isinstance(to_list, list) and to_list:
+            first = to_list[0]
+            to_addr = (first.get("email") if isinstance(first, dict) else first) or ""
+        else:
+            to_addr = ""
+        subject = evt.get("subject", "")
+        body_text = evt.get("text", "") or ""
+        # If only HTML present, strip tags as a last resort
+        if not body_text and evt.get("html"):
+            body_text = re.sub(r"<[^>]+>", "", evt.get("html"))
+            body_text = re.sub(r"\s+", " ", body_text).strip()
+        message_id = evt.get("messageId", "")
+
+        # Match to user
+        matched_user_id, primary_met_id = _match_user_by_email(from_addr)
+
+        # Capture
+        now_ms = int(time.time() * 1000)
+        reply_id = None
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO brief_replies
+                           (received_at_ms, channel, from_address, to_address,
+                            subject, body, matched_user_id, matched_via,
+                            primary_met_id, raw_payload)
+                           VALUES (%s, 'email', %s, %s, %s, %s, %s, %s, %s, %s)
+                           RETURNING id""",
+                        (now_ms, from_addr, to_addr, subject, body_text,
+                         matched_user_id,
+                         "email" if matched_user_id else None,
+                         primary_met_id,
+                         json.dumps(data)[:50000]),  # cap payload size
+                    )
+                    reply_id = cur.fetchone()["id"]
+        except Exception as e:
+            print(f"[reply-route] email insert failed: {e}", flush=True)
+
+        print(
+            f"[reply-route] EMAIL reply id={reply_id} from={from_addr} "
+            f"subject={subject[:60]!r} matched_user={matched_user_id}",
+            flush=True,
+        )
+
+        # Notify Mets via Discord
+        if reply_id is not None:
+            try:
+                _notify_met_of_reply(reply_id, "email", from_addr, body_text,
+                                     matched_user_id, primary_met_id)
+            except Exception:
+                pass
+
+        return jsonify({"ok": True, "reply_id": reply_id})
+    except Exception as e:
+        print(f"[reply-route] email webhook failed: {e}", flush=True)
+        # 200 so Resend doesn't retry — we logged the error
+        return jsonify({"ok": False, "error": "internal"}), 200
+
+
+@app.route("/api/v1/admin/brief-replies", methods=["OPTIONS"])
+def _admin_brief_replies_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/brief-replies")
+def admin_brief_replies():
+    """List captured brief replies for admin review. Phase 1 visibility
+    tool — lets Michael confirm replies are being captured before the
+    Phase 2 Pro Thread integration ships.
+
+    Query params:
+        limit: max rows (default 50, max 200)
+        status: filter by routed_status (pending/routed/manual/spam)
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    try:
+        limit = int(request.args.get("limit", 50))
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, 200))
+    status_filter = (request.args.get("status") or "").strip().lower()
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            if status_filter:
+                cur.execute(
+                    """SELECT r.*, u.name AS sub_name, u.email AS sub_email
+                       FROM brief_replies r
+                       LEFT JOIN users u ON u.id = r.matched_user_id
+                       WHERE r.routed_status = %s
+                       ORDER BY r.received_at_ms DESC
+                       LIMIT %s""",
+                    (status_filter, limit),
+                )
+            else:
+                cur.execute(
+                    """SELECT r.*, u.name AS sub_name, u.email AS sub_email
+                       FROM brief_replies r
+                       LEFT JOIN users u ON u.id = r.matched_user_id
+                       ORDER BY r.received_at_ms DESC
+                       LIMIT %s""",
+                    (limit,),
+                )
+            rows = cur.fetchall()
+
+    replies = [
+        {
+            "id": r["id"],
+            "received_at_ms": r["received_at_ms"],
+            "channel": r["channel"],
+            "from_address": r["from_address"],
+            "to_address": r["to_address"],
+            "subject": r.get("subject") or "",
+            "body": r["body"],
+            "matched_user_id": r.get("matched_user_id"),
+            "matched_via": r.get("matched_via"),
+            "sub_name": r.get("sub_name") or "",
+            "sub_email": r.get("sub_email") or "",
+            "primary_met_id": r.get("primary_met_id"),
+            "routed_status": r["routed_status"],
+            "routed_at_ms": r.get("routed_at_ms"),
+            "notes": r.get("notes") or "",
+        }
+        for r in rows
+    ]
+    return jsonify({"ok": True, "replies": replies, "count": len(replies)})
 
 
 # ════════════════════════════════════════════════════════════════════
