@@ -194,6 +194,16 @@ ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 METEOROLOGIST_PHONE = os.environ.get("METEOROLOGIST_PHONE", "")
 METEOROLOGIST_NAME = os.environ.get("METEOROLOGIST_NAME", "your meteorologist")
 
+# Discord webhooks — Rosie posts to team channels.
+# Each is a webhook URL Discord generated for a specific channel. Set
+# the ones you want; missing values mean "skip that channel."
+# To get a webhook URL: Discord channel settings → Integrations →
+# Webhooks → New Webhook → Copy URL. Doesn't require a bot account.
+DISCORD_WEBHOOK_ANNOUNCEMENTS = os.environ.get("DISCORD_WEBHOOK_ANNOUNCEMENTS", "")
+DISCORD_WEBHOOK_SEVERE_WEATHER = os.environ.get("DISCORD_WEBHOOK_SEVERE_WEATHER", "")
+DISCORD_WEBHOOK_SHIFT_HANDOFF = os.environ.get("DISCORD_WEBHOOK_SHIFT_HANDOFF", "")
+DISCORD_WEBHOOK_GENERAL = os.environ.get("DISCORD_WEBHOOK_GENERAL", "")
+
 # How Stripe reaches us for webhooks (must be HTTPS in production). Locally,
 # use ngrok or stripe-cli to forward webhooks.
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://localhost:8080")
@@ -16081,6 +16091,237 @@ def _rosie_proactive_severe_weather_heads_up():
                          tier=1, success=sent)
 
 
+# ─────────────────────────────────────────────────────────────
+# Rosie Discord — outbound webhook posting (Phase 3a)
+# Rosie posts to team Discord channels for things the whole team
+# should see: severe weather heads-ups, morning team status,
+# shift handoff prompts. We use Discord webhooks (not a bot), so
+# no WebSocket / no separate worker needed.
+# ─────────────────────────────────────────────────────────────
+
+def _discord_post(webhook_url: str, content: str, username: str = "Rosie") -> bool:
+    """POST a message to a Discord webhook URL. Returns True on success.
+
+    Discord webhooks accept JSON with 'content' (the message), optional
+    'username' (override the webhook's default name), and optional
+    'avatar_url'. We let Rosie override the display name so all her
+    posts show "Rosie" regardless of the webhook's underlying owner.
+
+    Discord rate-limits webhooks to 30 messages per minute per webhook.
+    We don't hit that organically, so no special backoff.
+
+    Failures are logged and swallowed — Discord posts are best-effort,
+    we don't want to block other proactive work if Discord is down.
+    """
+    if not webhook_url:
+        return False
+    # Truncate to 2000 chars (Discord's per-message limit)
+    if len(content) > 1990:
+        content = content[:1985] + "…"
+    try:
+        payload = {
+            "content": content,
+            "username": username,
+            "allowed_mentions": {"parse": []},  # don't ping @everyone accidentally
+        }
+        req = urllib.request.Request(
+            webhook_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status in (200, 204)
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")[:200]
+        except Exception:
+            pass
+        print(f"[discord] post failed HTTP {e.code}: {body}", flush=True)
+        return False
+    except Exception as e:
+        print(f"[discord] post failed: {type(e).__name__}: {e}", flush=True)
+        return False
+
+
+def _rosie_discord_severe_weather():
+    """When a tornado/severe T-storm/flash flood warning fires nationally,
+    post a summary to #severe weather. Cooldown per (channel, alert id)
+    so the same alert never double-posts.
+
+    Different from the SMS heads-up (which goes to the specific primary
+    Met for affected subscribers). This channel post is informational
+    for the whole team — "this is happening, everyone be aware."
+    """
+    if not DISCORD_WEBHOOK_SEVERE_WEATHER:
+        return
+    try:
+        alerts = _get_cached_nws_alerts() or []
+    except Exception:
+        return
+
+    severe = []
+    for a in alerts:
+        props = (a or {}).get("properties") or {}
+        ev = (props.get("event") or "").lower()
+        if any(k in ev for k in ("tornado warning", "severe thunderstorm warning",
+                                  "flash flood warning")):
+            alert_id = props.get("id") or str(hash(json.dumps(props, sort_keys=True)))[:32]
+            severe.append({
+                "id": alert_id,
+                "event": props.get("event"),
+                "area": props.get("areaDesc", "")[:200],
+                "headline": props.get("headline", "")[:200],
+                "expires": props.get("expires", ""),
+            })
+
+    if not severe:
+        return
+
+    for alert in severe:
+        # Cooldown: did we already post this alert to Discord?
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT COUNT(*) AS n FROM rosie_audit_log
+                       WHERE action = 'discord_severe_post'
+                         AND detail LIKE %s""",
+                    (f"%{alert['id'][:32]}%",),
+                )
+                if cur.fetchone()["n"] > 0:
+                    continue
+
+        # Pick an emoji based on event type
+        ev_lower = (alert["event"] or "").lower()
+        if "tornado" in ev_lower:
+            emoji = "🌪️"
+        elif "flash flood" in ev_lower:
+            emoji = "🌊"
+        else:
+            emoji = "⛈️"
+
+        msg = (
+            f"{emoji} **{alert['event']}**\n"
+            f"📍 {alert['area']}\n"
+            f"⏰ Until {alert['expires']}\n\n"
+            f"_Posted automatically — primary Mets for affected subscribers "
+            f"have been SMS'd separately._"
+        )
+        ok = _discord_post(DISCORD_WEBHOOK_SEVERE_WEATHER, msg)
+        _rosie_audit(None, "discord", "discord_severe_post",
+                     f"Event id {alert['id'][:32]}: {alert['event']}",
+                     tier=1, success=ok)
+
+
+def _rosie_discord_morning_team_status():
+    """At 6:30 AM ET, post a brief team-wide status to #announcements:
+    how many tasks today across the team, who's on call, weather risk
+    outlook.
+
+    Cooldown: once per calendar day (ET). Sends to #announcements.
+    """
+    if not DISCORD_WEBHOOK_ANNOUNCEMENTS:
+        return
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    if not (now_et.hour == 6 and 30 <= now_et.minute < 36):
+        return
+
+    # Cooldown: already posted today?
+    midnight_ms = int(datetime.combine(now_et.date(), datetime.min.time(),
+                                        tzinfo=ZoneInfo("America/New_York")).timestamp() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT COUNT(*) AS n FROM rosie_audit_log
+                   WHERE action = 'discord_morning_team_status'
+                     AND created_at_ms >= %s""",
+                (midnight_ms,),
+            )
+            if cur.fetchone()["n"] > 0:
+                return
+            # Count today's tasks across the team
+            today_str = now_et.strftime("%Y-%m-%d")
+            cur.execute(
+                """SELECT COUNT(*) AS total_tasks,
+                          COUNT(DISTINCT assigned_met_id) AS mets_assigned
+                   FROM daily_brief_tasks
+                   WHERE task_date = %s
+                     AND sent_at_ms IS NULL""",
+                (today_str,),
+            )
+            task_row = cur.fetchone() or {}
+            # Active severe alerts count
+            cur.execute(
+                """SELECT COUNT(*) AS n FROM storm_shelter_activations
+                   WHERE closed_at_ms IS NULL""",
+            )
+            shelter_row = cur.fetchone() or {}
+
+    total = task_row.get("total_tasks") or 0
+    mets_n = task_row.get("mets_assigned") or 0
+    shelters = shelter_row.get("n") or 0
+
+    day_name = now_et.strftime("%A, %B %d")
+    parts = [f"☀️ **Good morning, team — {day_name}**", ""]
+    if total > 0:
+        parts.append(f"📋 **{total} brief task{'s' if total != 1 else ''}** today "
+                     f"across **{mets_n} Met{'s' if mets_n != 1 else ''}**.")
+    else:
+        parts.append("📋 No Pro brief tasks scheduled for today.")
+    if shelters > 0:
+        parts.append(f"⚡ **{shelters} Storm Shelter activation{'s' if shelters != 1 else ''}** "
+                     f"still open from overnight.")
+    parts.append("")
+    parts.append("_Check your workspace for your tasks. Reach out if you need coverage._")
+
+    msg = "\n".join(parts)
+    ok = _discord_post(DISCORD_WEBHOOK_ANNOUNCEMENTS, msg)
+    _rosie_audit(None, "discord", "discord_morning_team_status",
+                 f"Day {today_str}: {total} tasks / {shelters} shelters",
+                 tier=1, success=ok)
+
+
+def _rosie_discord_shift_handoff_reminder():
+    """At end of each Met's shift (rough heuristic: 9 PM ET), post a
+    prompt to #shift handoff asking departing Mets to leave a note for
+    the next shift.
+
+    Cooldown: once per day. We don't try to detect individual shift
+    ends — just one team-wide prompt at end of business day.
+    """
+    if not DISCORD_WEBHOOK_SHIFT_HANDOFF:
+        return
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    if not (now_et.hour == 21 and now_et.minute < 6):
+        return
+
+    midnight_ms = int(datetime.combine(now_et.date(), datetime.min.time(),
+                                        tzinfo=ZoneInfo("America/New_York")).timestamp() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT COUNT(*) AS n FROM rosie_audit_log
+                   WHERE action = 'discord_shift_handoff'
+                     AND created_at_ms >= %s""",
+                (midnight_ms,),
+            )
+            if cur.fetchone()["n"] > 0:
+                return
+
+    msg = (
+        "🔄 **End of day — shift handoff window**\n\n"
+        "If you're wrapping up, drop a quick note for whoever's on tomorrow:\n"
+        "• What's the weather outlook overnight?\n"
+        "• Any subscribers needing extra attention?\n"
+        "• Anything in progress that needs follow-up?\n\n"
+        "_Doesn't need to be formal — a few lines helps the team stay aligned._"
+    )
+    ok = _discord_post(DISCORD_WEBHOOK_SHIFT_HANDOFF, msg)
+    _rosie_audit(None, "discord", "discord_shift_handoff",
+                 "Posted end-of-day handoff prompt", tier=1, success=ok)
+
+
 def _rosie_proactive_check_tick():
     """Top-level cron entry: dispatches each proactive trigger.
     Each individual trigger checks its own time window + cooldown, so this
@@ -16089,7 +16330,10 @@ def _rosie_proactive_check_tick():
         return
     for fn in (_rosie_proactive_morning_briefing,
                _rosie_proactive_inactivity_nudge,
-               _rosie_proactive_severe_weather_heads_up):
+               _rosie_proactive_severe_weather_heads_up,
+               _rosie_discord_severe_weather,
+               _rosie_discord_morning_team_status,
+               _rosie_discord_shift_handoff_reminder):
         try:
             fn()
         except Exception as e:
