@@ -1170,8 +1170,11 @@ CREATE INDEX IF NOT EXISTS idx_saved_locations_user ON saved_locations(user_id, 
 CREATE TABLE IF NOT EXISTS brief_preferences (
     user_id              INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
     morning_enabled      BOOLEAN NOT NULL DEFAULT TRUE,
-    morning_window_start TEXT NOT NULL DEFAULT '05:30',  -- HH:MM local
-    morning_window_end   TEXT NOT NULL DEFAULT '07:00',
+    -- Default 7:00-7:30 AM local time. Chris's call for the AI Daily Brief
+    -- standard (May 17, 2026). Mets can still send Pro Briefs earlier per
+    -- subscriber. This window applies to AI auto-briefs only.
+    morning_window_start TEXT NOT NULL DEFAULT '07:00',  -- HH:MM local
+    morning_window_end   TEXT NOT NULL DEFAULT '07:30',
     evening_enabled      BOOLEAN NOT NULL DEFAULT FALSE,
     evening_window_start TEXT,                            -- nullable when evening off
     evening_window_end   TEXT,
@@ -1438,6 +1441,45 @@ CREATE INDEX IF NOT EXISTS idx_pro_brief_drafts_status
     ON pro_brief_drafts(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_pro_brief_drafts_user
     ON pro_brief_drafts(user_id, created_at DESC);
+
+-- Structured Pro Brief sections (May 17, 2026). The original schema
+-- stored brief body as a single "met_body" field. The structured format
+-- splits it into four sections that the editor renders separately and
+-- the email/web view present with clear headings:
+--   bottom_line  — the prose paragraph (2-3 sentences)
+--   weather_details — bullet-style metrics (one per line in plain text)
+--   whats_ahead  — Met's narrative about what could change today
+--   image_url    — optional attached graphic (SPC outlook, etc.)
+-- met_body is kept for backward compat: when a Met edits structured
+-- sections, we also concatenate them into met_body so any legacy code
+-- paths that read met_body still get sensible content.
+ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS bottom_line TEXT;
+ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS weather_details TEXT;
+ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS whats_ahead TEXT;
+ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS image_url TEXT;
+-- Subscriber's chosen delivery time for sort-ordering in the Met queue.
+-- Snapshotted from brief_preferences at draft-generation time so that
+-- "earliest first" ordering matches what the subscriber expects, even
+-- if they change their preferred time later.
+ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS delivery_time_local TEXT;
+
+-- Brief access tokens (May 17, 2026). Each sent Pro Brief gets a random
+-- unguessable token. The subscriber's web view URL embeds this token:
+--   https://weathervalet.ai/brief/<token>
+-- We map token → (history_id, subscriber_user_id) and verify the
+-- subscriber is logged in as the matching user before rendering. This
+-- keeps URLs shareable-but-not-readable: someone with the URL still
+-- can't see the brief without a session cookie for the right account.
+CREATE TABLE IF NOT EXISTS brief_access_tokens (
+    token              TEXT PRIMARY KEY,
+    history_id         INTEGER NOT NULL REFERENCES brief_history(id) ON DELETE CASCADE,
+    subscriber_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at_ms      BIGINT NOT NULL,
+    last_viewed_at_ms  BIGINT,
+    view_count         INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_brief_tokens_history ON brief_access_tokens(history_id);
+CREATE INDEX IF NOT EXISTS idx_brief_tokens_sub ON brief_access_tokens(subscriber_user_id);
 
 -- ── NWS severe alert pages (Phase 10 Item #7) ──
 -- One row per NWS alert that affected at least one Pro subscriber.
@@ -9451,6 +9493,93 @@ def me_brief_history():
     return jsonify({"ok": True, "history": history})
 
 
+# Brief access endpoint — token-gated full-brief view (May 17, 2026).
+# Used by the web view at weathervalet.ai/brief/<token>. The frontend
+# fetches this endpoint, then renders the brief as a styled page if
+# successful. The token is a 32-char unguessable string created at
+# send time; auth requires the logged-in user to match the brief's
+# recipient.
+@app.route("/api/v1/brief/<token>", methods=["OPTIONS"])
+def _brief_view_preflight(token):
+    return ("", 204)
+
+
+@app.get("/api/v1/brief/<token>")
+def brief_view(token: str):
+    """Return brief content for the given access token.
+
+    Requires login. Returns 401 if not authenticated, 403 if logged in
+    but as the wrong user, 404 if the token doesn't exist. On success,
+    increments view_count and returns the structured brief.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    if not token or len(token) < 16 or len(token) > 128:
+        return jsonify({"ok": False, "error": "invalid-token"}), 400
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT t.history_id, t.subscriber_user_id,
+                          h.delivered_at, h.verdict, h.snippet, h.full_body,
+                          h.met_name, h.is_met_touched, h.brief_type,
+                          h.channels_used,
+                          d.bottom_line, d.weather_details, d.whats_ahead,
+                          d.image_url, d.location_label,
+                          u.name AS sub_name
+                   FROM brief_access_tokens t
+                   JOIN brief_history h ON h.id = t.history_id
+                   LEFT JOIN pro_brief_drafts d ON d.history_id = h.id
+                   LEFT JOIN users u ON u.id = t.subscriber_user_id
+                   WHERE t.token = %s""",
+                (token,),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+
+    # Authorization: only the subscriber the brief was sent to can view it.
+    # Admins can also view (for support/debugging).
+    roles = user.get("roles") or []
+    if user["id"] != row["subscriber_user_id"] and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    # Update view count + last viewed timestamp (best effort)
+    try:
+        now_ms = int(time.time() * 1000)
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE brief_access_tokens
+                       SET last_viewed_at_ms = %s, view_count = view_count + 1
+                       WHERE token = %s""",
+                    (now_ms, token),
+                )
+    except Exception as e:
+        print(f"[brief-view] view-count update failed: {e}", flush=True)
+
+    return jsonify({
+        "ok": True,
+        "brief": {
+            "delivered_at_ms": row["delivered_at"],
+            "verdict": row["verdict"],
+            "bottom_line": row.get("bottom_line"),
+            "weather_details": row.get("weather_details"),
+            "whats_ahead": row.get("whats_ahead"),
+            "image_url": row.get("image_url"),
+            "full_body": row["full_body"],  # legacy fallback
+            "met_name": row["met_name"],
+            "location_label": row.get("location_label"),
+            "subscriber_name": row.get("sub_name"),
+            "brief_type": row["brief_type"],
+            "is_met_touched": row["is_met_touched"],
+        },
+    })
+
+
 # ════════════════════════════════════════════════════════════════════
 # Subscriber portal — write endpoints (Phase 10 Chunk B1)
 # ════════════════════════════════════════════════════════════════════
@@ -11255,55 +11384,74 @@ def _send_welcome_email_with_temp_password(email: str, name: str,
         return False
 
 
-def _send_brief_email(email: str, subject: str, body_text: str) -> bool:
+def _send_brief_email(email: str, subject: str, body_text: str, html: bool = False) -> bool:
     """Send a daily brief via Resend. Mirrors _send_magic_link_email but
     for plain text brief content. Stub mode (no API key) logs to console.
+
+    If html=True, body_text is treated as a complete HTML email body that
+    should be sent as-is (rather than wrapped in the default shell). Used
+    for the structured Pro Brief format which builds its own HTML.
     """
     api_key = os.environ.get("RESEND_API_KEY", "").strip()
     from_addr = os.environ.get("EMAIL_FROM", "").strip()
 
     if not api_key or not from_addr:
-        print(f"[brief-email-stub] To: {email}\nSubject: {subject}\n{body_text}\n", flush=True)
+        print(f"[brief-email-stub] To: {email}\nSubject: {subject}\n{body_text[:500]}\n", flush=True)
         return True
 
-    # Build a nicely-structured HTML body inside the shared email shell.
-    # The brief text typically has paragraphs separated by blank lines —
-    # we preserve those by converting \n\n to paragraph breaks and single
-    # \n to <br>.
-    body_html = ''
-    paragraphs = body_text.split('\n\n')
-    for i, para in enumerate(paragraphs):
-        if not para.strip():
-            continue
-        # Single newlines within a paragraph become <br>
-        para_html = para.replace('\n', '<br>')
-        margin = '0 0 14px' if i < len(paragraphs) - 1 else '0'
-        body_html += (
-            f'<p style="color:#0E1116;font-size:15px;line-height:1.6;'
-            f'margin:{margin};">{para_html}</p>'
+    if html:
+        # Caller built complete HTML. Send as-is. Plain-text fallback is
+        # a minimal stripped version for clients that don't render HTML.
+        html_body = body_text
+        # Naive HTML-to-text for the plain part — strip tags, collapse whitespace
+        plain_text = re.sub(r'<[^>]+>', '', body_text)
+        plain_text = re.sub(r'\s+', ' ', plain_text).strip()
+        payload = json.dumps({
+            "from": from_addr,
+            "to": [email],
+            "subject": subject,
+            "html": html_body,
+            "text": plain_text[:5000],
+        }).encode("utf-8")
+    else:
+        # Build a nicely-structured HTML body inside the shared email shell.
+        # The brief text typically has paragraphs separated by blank lines —
+        # we preserve those by converting \n\n to paragraph breaks and single
+        # \n to <br>.
+        body_html = ''
+        paragraphs = body_text.split('\n\n')
+        for i, para in enumerate(paragraphs):
+            if not para.strip():
+                continue
+            # Single newlines within a paragraph become <br>
+            para_html = para.replace('\n', '<br>')
+            margin = '0 0 14px' if i < len(paragraphs) - 1 else '0'
+            body_html += (
+                f'<p style="color:#0E1116;font-size:15px;line-height:1.6;'
+                f'margin:{margin};">{para_html}</p>'
+            )
+
+        html_body_inner = (
+            f'<h1 style="color:#0E1116;font-size:20px;margin:0 0 18px;'
+            f'font-weight:600;letter-spacing:-0.01em;">{subject}</h1>'
+            + body_html +
+            '<p style="color:#8B8F96;font-size:12px;line-height:1.5;margin:24px 0 0;'
+            'padding-top:18px;border-top:1px solid #ECEEF1;">'
+            'Adjust your brief preferences or threshold alerts in your '
+            '<a href="https://weathervalet.ai/?portal=1" '
+            'style="color:#2E4FB8;text-decoration:none;">subscriber portal</a>.</p>'
         )
+        # Preheader: first ~90 chars of brief body so inbox preview is useful
+        preheader_text = body_text.replace('\n', ' ').strip()[:90]
+        html_body = _email_shell(html_body_inner, preheader=preheader_text)
 
-    html_body_inner = (
-        f'<h1 style="color:#0E1116;font-size:20px;margin:0 0 18px;'
-        f'font-weight:600;letter-spacing:-0.01em;">{subject}</h1>'
-        + body_html +
-        '<p style="color:#8B8F96;font-size:12px;line-height:1.5;margin:24px 0 0;'
-        'padding-top:18px;border-top:1px solid #ECEEF1;">'
-        'Adjust your brief preferences or threshold alerts in your '
-        '<a href="https://weathervalet.ai/?portal=1" '
-        'style="color:#2E4FB8;text-decoration:none;">subscriber portal</a>.</p>'
-    )
-    # Preheader: first ~90 chars of brief body so inbox preview is useful
-    preheader_text = body_text.replace('\n', ' ').strip()[:90]
-    html_body = _email_shell(html_body_inner, preheader=preheader_text)
-
-    payload = json.dumps({
-        "from": from_addr,
-        "to": [email],
-        "subject": subject,
-        "html": html_body,
-        "text": body_text,
-    }).encode("utf-8")
+        payload = json.dumps({
+            "from": from_addr,
+            "to": [email],
+            "subject": subject,
+            "html": html_body,
+            "text": body_text,
+        }).encode("utf-8")
 
     req = urllib.request.Request(
         "https://api.resend.com/emails",
@@ -11321,6 +11469,124 @@ def _send_brief_email(email: str, subject: str, body_text: str) -> bool:
     except Exception as e:
         print(f"[brief-email] FAILED to={email}: {type(e).__name__}: {e}", flush=True)
         return False
+
+
+def _render_pro_brief_email_html(
+    verdict: str,
+    verdict_label: str,
+    bottom_line: str,
+    weather_details: str,
+    whats_ahead: str,
+    image_url: str,
+    met_name: str,
+    location_label: str,
+    subscriber_name: str,
+    web_url: str,
+) -> str:
+    """Render a structured Pro Brief as a complete email-safe HTML string.
+
+    Uses inline styles only (no <style> blocks) because email clients
+    strip <style>. Uses table-based layout where alignment matters,
+    plain divs where it doesn't.
+
+    Verdict chip color matches the verdict:
+        clear   -> green
+        caution -> amber
+        risk    -> red
+    """
+    v = (verdict or "").lower()
+    if v == "clear":
+        chip_bg = "#0e6e3a"
+        chip_fg = "#ffffff"
+    elif v == "risk":
+        chip_bg = "#9a1d18"
+        chip_fg = "#ffffff"
+    else:
+        chip_bg = "#92400e"
+        chip_fg = "#ffffff"
+
+    # Format date in subscriber's locale
+    today_str = datetime.now(timezone.utc).strftime("%A, %B %-d, %Y") if hasattr(datetime, "strftime") else datetime.now(timezone.utc).strftime("%A, %B %d, %Y")
+
+    def _section(label, content):
+        if not content:
+            return ""
+        # Convert newlines to <br> for weather_details (which is bullet-style)
+        body_html = content.replace("\n", "<br>")
+        return (
+            f'<div style="margin-top:22px;">'
+            f'<div style="font-size:11px;font-weight:700;text-transform:uppercase;'
+            f'letter-spacing:0.08em;color:#6b7280;margin-bottom:6px;">{label}</div>'
+            f'<div style="font-size:15px;line-height:1.55;color:#0f1116;">{body_html}</div>'
+            f'</div>'
+        )
+
+    image_html = ""
+    if image_url:
+        image_html = (
+            f'<div style="margin-top:22px;">'
+            f'<img src="{image_url}" alt="Forecast graphic" '
+            f'style="max-width:100%;height:auto;border-radius:8px;display:block;">'
+            f'</div>'
+        )
+
+    sub_display = subscriber_name or location_label
+
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Your WeatherValet brief</title>
+</head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+<div style="max-width:600px;margin:0 auto;background:#ffffff;">
+
+  <!-- Header bar -->
+  <div style="background:linear-gradient(135deg,#C2342B 0%,#9a1d18 100%);padding:18px 24px;color:#fff;">
+    <div style="font-size:20px;font-weight:700;letter-spacing:-0.01em;">⚡ WeatherValet</div>
+    <div style="font-size:12px;opacity:0.85;margin-top:2px;">{sub_display} · {today_str}</div>
+  </div>
+
+  <!-- Body -->
+  <div style="padding:24px;">
+
+    <!-- Today's call -->
+    <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:#6b7280;margin-bottom:6px;">Today's call</div>
+    <div style="display:inline-block;background:{chip_bg};color:{chip_fg};padding:6px 14px;border-radius:999px;font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;">{verdict_label}</div>
+
+    {_section("Bottom line", bottom_line)}
+    {_section("Weather details", weather_details)}
+    {_section("What's ahead", whats_ahead)}
+    {image_html}
+
+    <!-- Signature -->
+    <div style="margin-top:28px;padding-top:18px;border-top:1px dashed #e5e7eb;color:#6b7280;font-size:13px;font-style:italic;">
+      — {met_name}, WeatherValet
+    </div>
+
+    <!-- Reply prompt -->
+    <div style="margin-top:18px;padding:12px 14px;background:rgba(37,99,235,0.06);border-left:3px solid #2563eb;font-size:12.5px;color:#374151;border-radius:0 6px 6px 0;">
+      💬 Reply to this email or text us to talk to {met_name} directly.
+    </div>
+
+    <!-- Web view link -->
+    <div style="margin-top:18px;text-align:center;">
+      <a href="{web_url}" style="display:inline-block;background:#2563eb;color:#ffffff;padding:10px 24px;border-radius:6px;font-size:13px;font-weight:600;text-decoration:none;">View brief on web</a>
+    </div>
+
+  </div>
+
+  <!-- Footer -->
+  <div style="padding:18px 24px;background:#f8f9fa;color:#9ca3af;font-size:11px;line-height:1.5;text-align:center;">
+    WeatherValet — your meteorologist on call.<br>
+    Adjust preferences in your <a href="https://weathervalet.ai/?portal=1" style="color:#2563eb;text-decoration:none;">subscriber portal</a>.
+  </div>
+
+</div>
+</body>
+</html>"""
+    return html
 
 
 def _timezone_for_latlng(lat: float, lng: float) -> str:
@@ -11465,7 +11731,8 @@ def _process_pending_briefs() -> None:
                           loc.label AS loc_label,
                           loc.address_text AS loc_address,
                           loc.lat AS loc_lat,
-                          loc.lng AS loc_lng
+                          loc.lng AS loc_lng,
+                          loc.county AS loc_county
                        FROM users u
                        JOIN brief_preferences bp ON bp.user_id = u.id
                        LEFT JOIN saved_locations loc
@@ -11496,6 +11763,43 @@ def _process_pending_briefs() -> None:
                 continue
             if _already_sent_today(c["user_id"], "morning", user_tz):
                 continue
+
+            # Daily Brief cancellation check (May 17, 2026). If a Met
+            # published a Daily Brief broadcast that included this
+            # subscriber within the last 24 hours, skip the AI auto-brief.
+            # Avoids double-messaging when the Met has already taken care
+            # of this subscriber's county personally that morning.
+            #
+            # Implementation: when a Met publishes a Daily Brief broadcast,
+            # _publish_daily_brief_internal writes a brief_history row per
+            # recipient with brief_type='daily_brief'. We check for any
+            # such row in the last 24h for this user. If found, skip.
+            try:
+                twenty_four_h_ago_ms = int(time.time() * 1000) - 24 * 60 * 60 * 1000
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """SELECT 1 FROM brief_history
+                               WHERE user_id = %s
+                                 AND brief_type = 'daily_brief'
+                                 AND delivered_at >= %s
+                               LIMIT 1""",
+                            (c["user_id"], twenty_four_h_ago_ms),
+                        )
+                        if cur.fetchone():
+                            print(
+                                f"[brief-scheduler] skipping AI auto-brief "
+                                f"user={c['user_id']} — Met already broadcast "
+                                f"to them in last 24h",
+                                flush=True,
+                            )
+                            continue
+            except Exception as e:
+                # Cancellation check failure shouldn't block the AI brief —
+                # better to send a possible duplicate than skip a real
+                # subscriber due to a query error. Log and continue.
+                print(f"[brief-scheduler] cancel-check failed user={c['user_id']}: {e}", flush=True)
+
             if not c["loc_lat"] or not c["loc_lng"]:
                 # No primary location set — skip silently. Subscriber should
                 # add one in the portal; we don't pester them with an error.
@@ -14036,6 +14340,15 @@ def met_pro_brief_update(draft_id):
 def met_pro_brief_send(draft_id):
     """Send the Met's edited brief to the subscriber. Marks status='sent',
     records brief_history row (is_met_touched=TRUE), dispatches via SMS+email.
+
+    May 17, 2026 rebuild: structured Pro Brief format.
+    - SMS = short (verdict + bottom line + link to web view)
+    - Email = full structured brief with all four sections
+    - Web view = same as email, gated by login
+
+    If the draft has structured fields (bottom_line, weather_details,
+    whats_ahead) populated, we use those. Otherwise we fall back to the
+    legacy single-body field for backward compat with older drafts.
     """
     user = _get_current_user()
     if user is None:
@@ -14046,7 +14359,8 @@ def met_pro_brief_send(draft_id):
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """SELECT d.*, u.email AS sub_email, u.phone AS sub_phone
+                """SELECT d.*, u.email AS sub_email, u.phone AS sub_phone,
+                          u.name AS sub_name
                    FROM pro_brief_drafts d
                    JOIN users u ON u.id = d.user_id
                    WHERE d.id = %s""",
@@ -14059,46 +14373,55 @@ def met_pro_brief_send(draft_id):
     if row["status"] not in ("pending-review", "claimed"):
         return jsonify({"ok": False, "error": "already-sent-or-expired", "status": row["status"]}), 409
 
-    # Use met_* fields (which default to ai_* values from scheduler).
+    # Resolve final content with backward compat
     final_verdict = (row["met_verdict"] or row["ai_verdict"] or "caution").strip()
     final_snippet = (row["met_snippet"] or row["ai_snippet"] or "").strip()
-    final_body = (row["met_body"] or row["ai_body"] or "").strip()
+    legacy_body = (row["met_body"] or row["ai_body"] or "").strip()
 
-    if not final_body:
-        return jsonify({"ok": False, "error": "empty-body"}), 400
+    # New structured sections — fall back to legacy body for older drafts
+    bottom_line = (row.get("bottom_line") or "").strip()
+    weather_details = (row.get("weather_details") or "").strip()
+    whats_ahead = (row.get("whats_ahead") or "").strip()
+    image_url = (row.get("image_url") or "").strip()
 
-    # Dispatch through the channels the subscriber configured (snapshot)
-    channels = [ch for ch in (row["channels"] or "").split(",") if ch]
-    channels_used = []
-    any_success = False
+    is_structured = bool(bottom_line or weather_details or whats_ahead)
+
+    # If no structured content AND no legacy body — can't send empty
+    if not is_structured and not legacy_body:
+        return jsonify({"ok": False, "error": "empty-brief"}), 400
+
     met_name = user.get("name") or "Your meteorologist"
     location_label = row["location_label"] or "your location"
-
-    # Add Met signature to the body so the subscriber knows it was reviewed
-    body_with_sig = final_body + f"\n\n— {met_name}, WeatherValet"
-
-    for ch in channels:
-        if ch == "sms" and row["sub_phone"]:
-            sms_text = (final_snippet or final_body[:140]) + f"\n— {met_name}\nFull: {body_with_sig[:900]}"
-            try:
-                if send_sms(row["sub_phone"], sms_text):
-                    channels_used.append("sms")
-                    any_success = True
-            except Exception as e:
-                print(f"[pro-brief-send] SMS failed user={row['user_id']}: {e}", flush=True)
-        elif ch == "email" and row["sub_email"]:
-            subject = f"Your WeatherValet brief — {location_label}"
-            try:
-                if _send_brief_email(row["sub_email"], subject, body_with_sig):
-                    channels_used.append("email")
-                    any_success = True
-            except Exception as e:
-                print(f"[pro-brief-send] email failed user={row['user_id']}: {e}", flush=True)
-
-    delivery_status = "sent" if any_success else "failed"
     now_ms = int(time.time() * 1000)
 
-    # Write brief_history row + capture id, then update the draft
+    # Verdict label for display
+    verdict_label = {
+        "clear": "✓ CLEAR",
+        "caution": "⚠ CAUTION",
+        "risk": "⚠ RISK",
+    }.get(final_verdict.lower(), final_verdict.upper())
+
+    # Build the rich content. We do this BEFORE creating the access token
+    # because we want to insert brief_history first to get its id.
+
+    # Concatenated full body for brief_history / legacy compatibility
+    # (so admin views, audit logs, search etc. all show useful content)
+    if is_structured:
+        full_body_parts = [
+            f"TODAY'S CALL: {verdict_label}",
+        ]
+        if bottom_line:
+            full_body_parts.append(f"\nBOTTOM LINE\n{bottom_line}")
+        if weather_details:
+            full_body_parts.append(f"\nWEATHER DETAILS\n{weather_details}")
+        if whats_ahead:
+            full_body_parts.append(f"\nWHAT'S AHEAD\n{whats_ahead}")
+        full_body_parts.append(f"\n— {met_name}, WeatherValet")
+        full_body = "\n".join(full_body_parts)
+    else:
+        full_body = legacy_body + f"\n\n— {met_name}, WeatherValet"
+
+    # Write brief_history row first so we can attach the access token
     history_id = None
     try:
         with db() as conn:
@@ -14111,13 +14434,105 @@ def met_pro_brief_send(draft_id):
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s)
                        RETURNING id""",
                     (row["user_id"], row["brief_type"], now_ms, final_verdict,
-                     final_snippet or final_body[:140], body_with_sig,
-                     delivery_status, ",".join(channels_used), met_name),
+                     bottom_line[:200] if bottom_line else (final_snippet or legacy_body[:140]),
+                     full_body, "pending", "", met_name),
                 )
                 history_id = cur.fetchone()["id"]
     except Exception as e:
         print(f"[pro-brief-send] history insert failed: {e}", flush=True)
+        return jsonify({"ok": False, "error": "history-insert-failed"}), 500
 
+    # Create a brief access token for the web view
+    access_token = secrets.token_urlsafe(24)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO brief_access_tokens
+                       (token, history_id, subscriber_user_id, created_at_ms)
+                       VALUES (%s, %s, %s, %s)""",
+                    (access_token, history_id, row["user_id"], now_ms),
+                )
+    except Exception as e:
+        print(f"[pro-brief-send] token insert failed: {e}", flush=True)
+        # Continue anyway — SMS/email still ships, just no web view link
+
+    frontend_base = os.environ.get("FRONTEND_BASE_URL") or os.environ.get("PUBLIC_BASE_URL") or "https://weathervalet.ai"
+    if frontend_base.endswith("/"):
+        frontend_base = frontend_base[:-1]
+    web_url = f"{frontend_base}/brief/{access_token}"
+
+    # Dispatch through the channels the subscriber configured (snapshot)
+    channels = [ch for ch in (row["channels"] or "").split(",") if ch]
+    channels_used = []
+    any_success = False
+
+    for ch in channels:
+        if ch == "sms" and row["sub_phone"]:
+            # SMS = short. Verdict + truncated bottom line + link to web view.
+            # Goal: keeps under 2 SMS segments (320 chars) typically.
+            if is_structured and bottom_line:
+                sms_intro = bottom_line[:140].rstrip()
+                if len(bottom_line) > 140:
+                    sms_intro = sms_intro.rsplit(" ", 1)[0] + "…"
+                sms_text = (
+                    f"{verdict_label} · WeatherValet\n\n"
+                    f"{sms_intro}\n\n"
+                    f"Full brief: {web_url}\n— {met_name}"
+                )
+            else:
+                # Legacy fallback
+                sms_text = (final_snippet or legacy_body[:140]) + f"\n\nFull: {web_url}\n— {met_name}"
+            try:
+                if send_sms(row["sub_phone"], sms_text):
+                    channels_used.append("sms")
+                    any_success = True
+            except Exception as e:
+                print(f"[pro-brief-send] SMS failed user={row['user_id']}: {e}", flush=True)
+        elif ch == "email" and row["sub_email"]:
+            subject = f"Your WeatherValet brief — {location_label}"
+            try:
+                # Build rich HTML email for structured briefs
+                if is_structured:
+                    html_body = _render_pro_brief_email_html(
+                        verdict=final_verdict,
+                        verdict_label=verdict_label,
+                        bottom_line=bottom_line,
+                        weather_details=weather_details,
+                        whats_ahead=whats_ahead,
+                        image_url=image_url,
+                        met_name=met_name,
+                        location_label=location_label,
+                        subscriber_name=row.get("sub_name") or "",
+                        web_url=web_url,
+                    )
+                    if _send_brief_email(row["sub_email"], subject, html_body, html=True):
+                        channels_used.append("email")
+                        any_success = True
+                else:
+                    # Legacy plain-text email
+                    if _send_brief_email(row["sub_email"], subject, full_body):
+                        channels_used.append("email")
+                        any_success = True
+            except Exception as e:
+                print(f"[pro-brief-send] email failed user={row['user_id']}: {e}", flush=True)
+
+    delivery_status = "sent" if any_success else "failed"
+
+    # Update brief_history delivery_status + channels_used
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE brief_history
+                       SET delivery_status = %s, channels_used = %s
+                       WHERE id = %s""",
+                    (delivery_status, ",".join(channels_used), history_id),
+                )
+    except Exception as e:
+        print(f"[pro-brief-send] history update failed: {e}", flush=True)
+
+    # Update the draft
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -14126,13 +14541,14 @@ def met_pro_brief_send(draft_id):
                        sent_by_name = %s, final_verdict = %s, final_body = %s,
                        history_id = %s
                    WHERE id = %s""",
-                (now_ms, user["id"], met_name, final_verdict, body_with_sig,
+                (now_ms, user["id"], met_name, final_verdict, full_body,
                  history_id, draft_id),
             )
 
     print(
         f"[pro-brief-send] draft={draft_id} sent by met={user['id']} "
-        f"channels={channels_used} status={delivery_status}",
+        f"channels={channels_used} status={delivery_status} "
+        f"structured={is_structured} token={access_token[:8]}…",
         flush=True,
     )
 
