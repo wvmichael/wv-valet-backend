@@ -1512,6 +1512,55 @@ CREATE INDEX IF NOT EXISTS idx_brief_replies_received ON brief_replies(received_
 CREATE INDEX IF NOT EXISTS idx_brief_replies_matched ON brief_replies(matched_user_id, received_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_brief_replies_status ON brief_replies(routed_status, received_at_ms DESC);
 
+-- ── Page visits (May 18, 2026 - Command Center analytics) ──
+-- Tracks page loads for the marketing dashboard. Pinged from the frontend
+-- on every screen render so we can answer "how many uniques today?"
+--
+-- Privacy: we hash the IP and don't store user-agents. The visitor_hash
+-- is sha256(ip + day_salt) so a visitor counts once per day per source
+-- without us storing their actual IP.
+--
+-- path: which screen ("/", "/starter", "/portal", etc.)
+-- visitor_hash: deterministic per-day per-IP hash (for unique counting)
+-- referrer: where they came from (helps marketing attribution)
+-- user_id: if logged in (NULL for anon visitors)
+CREATE TABLE IF NOT EXISTS page_visits (
+    id              BIGSERIAL PRIMARY KEY,
+    visited_at_ms   BIGINT NOT NULL,
+    path            TEXT NOT NULL,
+    visitor_hash    TEXT NOT NULL,
+    referrer        TEXT,
+    user_id         INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    country         TEXT,                            -- best-effort, may be NULL
+    region          TEXT                             -- US state if known
+);
+CREATE INDEX IF NOT EXISTS idx_page_visits_visited ON page_visits(visited_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_page_visits_path ON page_visits(path, visited_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_page_visits_hash ON page_visits(visitor_hash, visited_at_ms DESC);
+
+-- ── Search events (May 18, 2026 - Command Center analytics) ──
+-- Tracks AI homepage searches: what people typed into "What's your plan?"
+-- and where they searched from. Helps marketing identify high-intent
+-- demographics and popular use cases for vertical landing pages.
+--
+-- query_text: what they typed (truncated to 500 chars, raw text — no PII expected)
+-- location_text: where they searched (e.g., "Lebanon, IN")
+-- verdict: clear/caution/risk - the result they got
+-- searched_at_ms: when
+-- user_id: if logged in
+CREATE TABLE IF NOT EXISTS search_events (
+    id              BIGSERIAL PRIMARY KEY,
+    searched_at_ms  BIGINT NOT NULL,
+    query_text      TEXT,
+    location_text   TEXT,
+    verdict         TEXT,
+    user_id         INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    visitor_hash    TEXT,                            -- same hash as page_visits
+    region          TEXT                             -- US state if known
+);
+CREATE INDEX IF NOT EXISTS idx_search_events_at ON search_events(searched_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_search_events_loc ON search_events(location_text, searched_at_ms DESC);
+
 -- ── NWS severe alert pages (Phase 10 Item #7) ──
 -- One row per NWS alert that affected at least one Pro subscriber.
 -- Created by the scheduler when polling NWS detects a new alert whose
@@ -6504,6 +6553,315 @@ def admin_brief_submit():
 def healthz():
     """Liveness probe, useful for container orchestrators."""
     return jsonify({"ok": True, "ts": now_ts()})
+
+
+# ════════════════════════════════════════════════════════════════════
+# Analytics: page visits + search events (May 18, 2026)
+# ════════════════════════════════════════════════════════════════════
+#
+# Lightweight tracking for the Command Center marketing dashboard.
+# Privacy-conscious: we hash visitor IPs with a daily salt so we can
+# count uniques without storing actual IPs. Hashes don't persist
+# across days, so we cannot track an individual across days.
+
+def _today_visitor_salt() -> str:
+    """Per-day salt. Resets at UTC midnight so visitor_hash is unique
+    per day but not linkable across days."""
+    today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Combine with a stable server-side seed so the salt isn't guessable
+    seed = os.environ.get("ANALYTICS_SALT", "wv-default-salt-change-in-prod")
+    return f"{today_utc}:{seed}"
+
+
+def _hash_visitor(ip: str) -> str:
+    """Hash an IP with today's salt. Returns a stable 16-char identifier
+    that's unique per day per IP, but unlinkable across days and not
+    reversible to the IP."""
+    if not ip:
+        ip = "anon"
+    h = hashlib.sha256()
+    h.update(_today_visitor_salt().encode("utf-8"))
+    h.update(ip.encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def _client_ip() -> str:
+    """Get the client IP, respecting Cloudflare and proxy headers.
+    Cloudflare sets CF-Connecting-IP. Render/proxies set X-Forwarded-For
+    (which may have multiple IPs comma-separated; first is client)."""
+    cf_ip = request.headers.get("CF-Connecting-IP", "").strip()
+    if cf_ip:
+        return cf_ip
+    xff = request.headers.get("X-Forwarded-For", "").strip()
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.remote_addr or ""
+
+
+def _client_region() -> tuple[str, str]:
+    """Get country code and US state from Cloudflare headers.
+    Returns (country, region). Empty strings if unknown."""
+    country = request.headers.get("CF-IPCountry", "").strip() or ""
+    region = request.headers.get("CF-Region-Code", "").strip() or ""
+    return country, region
+
+
+@app.route("/api/v1/analytics/visit", methods=["OPTIONS"])
+def _analytics_visit_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/analytics/visit")
+def analytics_visit():
+    """Log a page visit. Called by the frontend on each screen render.
+
+    Body: {"path": "/", "referrer": "https://google.com/..."}
+    Returns: {"ok": true}
+
+    Best effort: errors are logged but never block the visitor.
+    The endpoint never returns user data; it's write-only from the
+    client's perspective.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        path = (data.get("path") or "/")[:200]
+        referrer = (data.get("referrer") or "")[:500] or None
+        ip = _client_ip()
+        country, region = _client_region()
+        visitor_hash = _hash_visitor(ip)
+
+        # If logged in, link to user_id (best effort)
+        user_id = None
+        try:
+            user = _get_current_user()
+            if user:
+                user_id = user["id"]
+        except Exception:
+            pass
+
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO page_visits
+                       (visited_at_ms, path, visitor_hash, referrer,
+                        user_id, country, region)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                    (int(time.time() * 1000), path, visitor_hash,
+                     referrer, user_id, country or None, region or None),
+                )
+    except Exception as e:
+        # Best-effort: never break the visitor's experience
+        print(f"[analytics-visit] failed: {e}", flush=True)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/v1/analytics/search", methods=["OPTIONS"])
+def _analytics_search_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/analytics/search")
+def analytics_search():
+    """Log a homepage AI search. Called by the frontend when a search
+    completes. Tracks what people are searching for and from where.
+
+    Body: {"query": "...", "location": "...", "verdict": "clear|caution|risk"}
+    Returns: {"ok": true}
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        query_text = (data.get("query") or "")[:500] or None
+        location_text = (data.get("location") or "")[:200] or None
+        verdict = (data.get("verdict") or "")[:20] or None
+        ip = _client_ip()
+        country, region = _client_region()
+        visitor_hash = _hash_visitor(ip)
+
+        user_id = None
+        try:
+            user = _get_current_user()
+            if user:
+                user_id = user["id"]
+        except Exception:
+            pass
+
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO search_events
+                       (searched_at_ms, query_text, location_text, verdict,
+                        user_id, visitor_hash, region)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                    (int(time.time() * 1000), query_text, location_text,
+                     verdict, user_id, visitor_hash, region or None),
+                )
+    except Exception as e:
+        print(f"[analytics-search] failed: {e}", flush=True)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/v1/admin/command-center/stats", methods=["OPTIONS"])
+def _cmd_center_stats_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/command-center/stats")
+def admin_command_center_stats():
+    """Return marketing stats for the Command Center dashboard.
+
+    Computed:
+      - Today / yesterday / 7-day unique visitors (distinct visitor_hash)
+      - Today / yesterday / 7-day total page views
+      - Today / yesterday / 7-day search counts
+      - Current subscriber count (and 7-day delta)
+      - Current crew member count (and 7-day delta)
+      - Top search regions (US states with most searches in last 7 days)
+
+    All times are UTC. The frontend handles timezone display.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    now_ms = int(time.time() * 1000)
+    day_ms = 24 * 60 * 60 * 1000
+
+    # UTC day boundaries
+    today_start_dt = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    today_start_ms = int(today_start_dt.timestamp() * 1000)
+    yesterday_start_ms = today_start_ms - day_ms
+    week_ago_start_ms = today_start_ms - 6 * day_ms  # last 7 calendar days incl today
+    two_weeks_ago_ms = today_start_ms - 13 * day_ms
+
+    stats: dict = {}
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                # ── Visitors ──
+                cur.execute(
+                    """SELECT
+                          COUNT(DISTINCT CASE WHEN visited_at_ms >= %s THEN visitor_hash END) AS uniq_today,
+                          COUNT(DISTINCT CASE WHEN visited_at_ms >= %s AND visited_at_ms < %s THEN visitor_hash END) AS uniq_yesterday,
+                          COUNT(DISTINCT CASE WHEN visited_at_ms >= %s THEN visitor_hash END) AS uniq_7d,
+                          COUNT(DISTINCT CASE WHEN visited_at_ms >= %s AND visited_at_ms < %s THEN visitor_hash END) AS uniq_prev_7d,
+                          COUNT(CASE WHEN visited_at_ms >= %s THEN 1 END) AS views_today,
+                          COUNT(CASE WHEN visited_at_ms >= %s AND visited_at_ms < %s THEN 1 END) AS views_yesterday,
+                          COUNT(CASE WHEN visited_at_ms >= %s THEN 1 END) AS views_7d
+                       FROM page_visits""",
+                    (today_start_ms,
+                     yesterday_start_ms, today_start_ms,
+                     week_ago_start_ms,
+                     two_weeks_ago_ms, week_ago_start_ms,
+                     today_start_ms,
+                     yesterday_start_ms, today_start_ms,
+                     week_ago_start_ms),
+                )
+                row = cur.fetchone() or {}
+                stats["visitors"] = {
+                    "today": row.get("uniq_today") or 0,
+                    "yesterday": row.get("uniq_yesterday") or 0,
+                    "seven_day": row.get("uniq_7d") or 0,
+                    "previous_seven_day": row.get("uniq_prev_7d") or 0,
+                    "views_today": row.get("views_today") or 0,
+                    "views_yesterday": row.get("views_yesterday") or 0,
+                    "views_seven_day": row.get("views_7d") or 0,
+                }
+
+                # ── Searches ──
+                cur.execute(
+                    """SELECT
+                          COUNT(CASE WHEN searched_at_ms >= %s THEN 1 END) AS today,
+                          COUNT(CASE WHEN searched_at_ms >= %s AND searched_at_ms < %s THEN 1 END) AS yesterday,
+                          COUNT(CASE WHEN searched_at_ms >= %s THEN 1 END) AS seven_day,
+                          COUNT(CASE WHEN searched_at_ms >= %s AND searched_at_ms < %s THEN 1 END) AS prev_seven_day
+                       FROM search_events""",
+                    (today_start_ms,
+                     yesterday_start_ms, today_start_ms,
+                     week_ago_start_ms,
+                     two_weeks_ago_ms, week_ago_start_ms),
+                )
+                row = cur.fetchone() or {}
+                stats["searches"] = {
+                    "today": row.get("today") or 0,
+                    "yesterday": row.get("yesterday") or 0,
+                    "seven_day": row.get("seven_day") or 0,
+                    "previous_seven_day": row.get("prev_seven_day") or 0,
+                }
+
+                # ── Subscribers ──
+                cur.execute(
+                    """SELECT
+                          COUNT(*) FILTER (WHERE u.is_active = TRUE) AS total,
+                          COUNT(*) FILTER (WHERE u.is_active = TRUE AND u.created_at >= %s) AS new_7d,
+                          COUNT(*) FILTER (WHERE u.is_active = TRUE AND u.created_at >= %s AND u.created_at < %s) AS new_prev_7d
+                       FROM users u
+                       JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'subscriber'""",
+                    (week_ago_start_ms, two_weeks_ago_ms, week_ago_start_ms),
+                )
+                row = cur.fetchone() or {}
+                stats["subscribers"] = {
+                    "total": row.get("total") or 0,
+                    "new_seven_day": row.get("new_7d") or 0,
+                    "new_previous_seven_day": row.get("new_prev_7d") or 0,
+                }
+
+                # ── Crew members ──
+                cur.execute(
+                    """SELECT
+                          COUNT(*) FILTER (WHERE u.is_active = TRUE) AS total,
+                          COUNT(*) FILTER (WHERE u.is_active = TRUE AND u.created_at >= %s) AS new_7d,
+                          COUNT(*) FILTER (WHERE u.is_active = TRUE AND u.created_at >= %s AND u.created_at < %s) AS new_prev_7d
+                       FROM users u
+                       JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'crew'""",
+                    (week_ago_start_ms, two_weeks_ago_ms, week_ago_start_ms),
+                )
+                row = cur.fetchone() or {}
+                stats["crew"] = {
+                    "total": row.get("total") or 0,
+                    "new_seven_day": row.get("new_7d") or 0,
+                    "new_previous_seven_day": row.get("new_prev_7d") or 0,
+                }
+
+                # ── Top search regions (US states with most searches, 7d) ──
+                cur.execute(
+                    """SELECT region, COUNT(*) AS n
+                       FROM search_events
+                       WHERE searched_at_ms >= %s AND region IS NOT NULL AND region != ''
+                       GROUP BY region
+                       ORDER BY n DESC
+                       LIMIT 10""",
+                    (week_ago_start_ms,),
+                )
+                stats["top_regions"] = [
+                    {"region": r["region"], "count": r["n"]}
+                    for r in cur.fetchall()
+                ]
+
+                # ── Top search locations (text locations, 7d) ──
+                cur.execute(
+                    """SELECT location_text, COUNT(*) AS n
+                       FROM search_events
+                       WHERE searched_at_ms >= %s AND location_text IS NOT NULL AND location_text != ''
+                       GROUP BY location_text
+                       ORDER BY n DESC
+                       LIMIT 10""",
+                    (week_ago_start_ms,),
+                )
+                stats["top_locations"] = [
+                    {"location": r["location_text"], "count": r["n"]}
+                    for r in cur.fetchall()
+                ]
+
+    except Exception as e:
+        print(f"[command-center-stats] failed: {e}", flush=True)
+        return jsonify({"ok": False, "error": "query-failed"}), 500
+
+    return jsonify({"ok": True, "stats": stats, "computed_at_ms": now_ms})
 
 
 # ════════════════════════════════════════════════════════════════════════════
