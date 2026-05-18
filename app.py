@@ -11951,11 +11951,17 @@ def subscribe_create_checkout():
     try:
         session = stripe.checkout.Session.create(**session_params)
     except Exception as e:
+        # Log the full error server-side for the Render logs
         print(f"[subscribe] checkout session create failed: {e}", flush=True)
+        # Also surface a short version to the frontend for diagnosis.
+        # This is safe to expose: Stripe error messages don't include
+        # API keys or other secrets.
+        err_msg = str(e)[:200]
         return jsonify({
             "ok": False,
             "error": "stripe-error",
-            "message": "Couldn't start checkout. Please try again.",
+            "message": f"Couldn't start checkout. Stripe says: {err_msg}",
+            "debug_error": err_msg,
         }), 500
 
     return jsonify({"ok": True, "url": session.url})
