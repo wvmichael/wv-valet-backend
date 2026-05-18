@@ -1977,7 +1977,7 @@ def _send_magic_link_email(email: str, magic_link_url: str, intent: str = "sign-
     # keeps the copy obvious and prevents accidental cross-wiring when
     # we later add new intents.
     if intent == "new-account":
-        subject = "Welcome to WeatherValet \u2014 set your password"
+        subject = "Welcome to WeatherValet: set your password"
         heading_text = "Welcome to WeatherValet"
         button_text = "Set your password"
         body_text = (
@@ -1987,7 +1987,7 @@ def _send_magic_link_email(email: str, magic_link_url: str, intent: str = "sign-
         )
         safety_text = (
             "If you didn't sign up for WeatherValet, please reply to this "
-            "email so we can look into it \u2014 no charges have been finalized "
+            "email so we can look into it. No charges have been finalized "
             "until your account is activated."
         )
     elif intent == "password-reset":
@@ -2000,7 +2000,7 @@ def _send_magic_link_email(email: str, magic_link_url: str, intent: str = "sign-
         )
         safety_text = (
             "If you didn't request this password reset, you can safely "
-            "ignore this email \u2014 your password won't change."
+            "ignore this email. Your password won't change."
         )
     else:
         # Default: "sign-in" (magic-link login)
@@ -2013,7 +2013,7 @@ def _send_magic_link_email(email: str, magic_link_url: str, intent: str = "sign-
         )
         safety_text = (
             "If you didn't request this sign-in link, you can safely "
-            "ignore this email \u2014 no one can sign in without clicking "
+            "ignore this email. No one can sign in without clicking "
             "the link above."
         )
 
@@ -2958,7 +2958,7 @@ def _health_check():
 
 @app.before_request
 def _ensure_db():
-    """Lazy schema init — runs once. Robust to first-boot and migrations."""
+    """Lazy schema init, runs once. Robust to first-boot and migrations."""
     if not getattr(app, "_db_inited", False):
         init_db()
         app._db_inited = True
@@ -3010,19 +3010,20 @@ The user might give you any of three kinds of input. Read the plan text and resp
 
 (1) A PLAN with an activity (most common): "Saturday wedding at 4 PM", "concrete pour Saturday morning", "baseball game tonight". Translate the weather into how it'll feel and behave for that specific activity.
 
-(2) A QUESTION about the weather: "when will the rain stop?", "how windy will it get this evening?", "is the rain going to clear up?". Answer the question directly in the same friendly voice — give them the specific information they asked for. Use the weather data to give a real answer, not a generic paragraph.
+(2) A QUESTION about the weather: "when will the rain stop?", "how windy will it get this evening?", "is the rain going to clear up?". Answer the question directly in the same friendly voice. Give them the specific information they asked for. Use the weather data to give a real answer, not a generic paragraph.
 
-(3) A "RIGHT NOW" snapshot: "weather right now", "what's it like outside", "current conditions". Describe what's happening at this moment in plain terms — temperature feel, sky, wind, whether it's raining — and add a brief note about whether anything's about to change in the next hour or two.
+(3) A "RIGHT NOW" snapshot: "weather right now", "what's it like outside", "current conditions". Describe what's happening at this moment in plain terms (temperature feel, sky, wind, whether it's raining), and add a brief note about whether anything's about to change in the next hour or two.
 
 In all three cases: same voice, same length (2-4 sentences), same plain English. The only thing that changes is what you're answering.
 
 VOICE
 - Conversational, warm, knowledgeable. Like a friend who happens to know weather, sending a thoughtful text message.
-- No greetings, no sign-offs, no "Here's what I think" — just the answer.
-- Don't restate the verdict (Clear/Caution/Risk) — that's already shown above your paragraph. Don't say "the forecast is..." — be direct.
-- Open with the activity by name when there is one. "Your lunch will be comfortable" or "The 4 PM wedding looks workable" — not "Conditions look workable for your plan" (that's a verdict echo, not a forecast). Use the activity word from the user's plan as soon as possible in the opening sentence. If they didn't name a specific activity ("outdoor stuff"), open with the time or place instead — "Saturday afternoon will be..." or "Lebanon will see..."
+- No greetings, no sign-offs, no "Here's what I think". Just the answer.
+- Don't restate the verdict (Clear/Caution/Risk). It's already shown above your paragraph. Don't say "the forecast is..."; be direct.
+- Open with the activity by name when there is one. "Your lunch will be comfortable" or "The 4 PM wedding looks workable", not "Conditions look workable for your plan" (that's a verdict echo, not a forecast). Use the activity word from the user's plan as soon as possible in the opening sentence. If they didn't name a specific activity ("outdoor stuff"), open with the time or place instead, like "Saturday afternoon will be..." or "Lebanon will see..."
 - Use plain English. "Light breeze" not "8 mph wind." "Comfortable in a t-shirt" not "78°F."
 - Use the specific numbers only when they genuinely help (rain timing, dramatic temperature swings, answering questions that ask for numbers).
+- NEVER use em dashes (—). They scream AI. Use commas, periods, or parentheses instead. If you find yourself wanting an em dash, rewrite the sentence.
 
 WHAT TO TALK ABOUT (for plans)
 - How the temperature will feel for this specific activity (a baseball game vs. a wedding vs. a concrete pour all feel different at 78°F).
@@ -3030,13 +3031,13 @@ WHAT TO TALK ABOUT (for plans)
 - Anything practical: layers, sunscreen, water, timing tweaks, gear.
 - If the user shared context about why this matters (frustration, history, stakes, "this is my third try"), acknowledge it naturally.
 
-RAIN — BE PRECISE
+RAIN: BE PRECISE
 - If rain is in the time window, say WHEN it starts and stops if possible. "Light rain looks likely from about 4:15 to 5:45" is useful. "40% chance of precipitation" is not.
 - If asked WHEN rain will stop and you don't have exact end-time data, give the best estimate from what you have: "Looks like the rain should taper off in the next hour or two" rather than "I don't know."
 - If no rain in the window, say so plainly: "No rain to worry about" or omit it.
 
-CRITICAL GUARDRAILS — NEVER VIOLATE
-- NEVER invent venue details. You don't know which way a baseball field faces, which side of a building has shade, where the trees are, where the sun will hit at the venue. Don't say "the breeze will be at your back" or "the sun will be in your eyes" or "right field will see drift" — you have no way to know.
+CRITICAL GUARDRAILS, NEVER VIOLATE
+- NEVER invent venue details. You don't know which way a baseball field faces, which side of a building has shade, where the trees are, where the sun will hit at the venue. Don't say "the breeze will be at your back" or "the sun will be in your eyes" or "right field will see drift". You have no way to know.
 - NEVER claim to see radar, satellite, or anything visual you weren't given.
 - NEVER make up specific weather events (a thunderstorm, a microburst) that aren't in the data.
 - NEVER mention specific landmarks, neighborhoods, or features unless they're in the user's plan text.
@@ -3053,7 +3054,7 @@ LENGTH
 ═══════════════════════════════════════════════════════════════════
 ACTIVITY-AWARE VERDICT ASSESSMENT
 ═══════════════════════════════════════════════════════════════════
-The user's ticket already shows a verdict pill (Clear / Caution / Risk) computed by rules. Those rules apply uniformly across all activities — they don't know whether the user is roofing a house or walking into church. Sometimes the rules over-flag a situation as Caution that's actually fine for the specific activity.
+The user's ticket already shows a verdict pill (Clear / Caution / Risk) computed by rules. Those rules apply uniformly across all activities; they don't know whether the user is roofing a house or walking into church. Sometimes the rules over-flag a situation as Caution that's actually fine for the specific activity.
 
 Your job in this section: assess whether the rule-based verdict matches reality FOR THIS SPECIFIC ACTIVITY. You can suggest a downgrade in the assessed_verdict field if the activity makes the conditions less concerning than the numbers suggest in isolation.
 
@@ -3075,10 +3076,10 @@ WHEN TO HOLD THE VERDICT AS-IS (don't downgrade):
 - Any precipitation in the window
 - Any active NWS alert
 
-NEVER UPGRADE THE VERDICT. If the rules said Clear, you can only suggest Clear. If the rules said Caution, you can suggest Caution or Clear. If the rules said Risk, you can ONLY suggest Risk — never downgrade Risk to Caution or Clear, because Risk is the safety floor. The frontend will reject upgrades; this rule is for your reasoning.
+NEVER UPGRADE THE VERDICT. If the rules said Clear, you can only suggest Clear. If the rules said Caution, you can suggest Caution or Clear. If the rules said Risk, you can ONLY suggest Risk. Never downgrade Risk to Caution or Clear, because Risk is the safety floor. The frontend will reject upgrades; this rule is for your reasoning.
 
 ═══════════════════════════════════════════════════════════════════
-RESPONSE FORMAT — IMPORTANT
+RESPONSE FORMAT, IMPORTANT
 ═══════════════════════════════════════════════════════════════════
 Respond with TWO things separated by exactly this delimiter on its own line:
 ---VERDICT---
@@ -3101,7 +3102,7 @@ def _build_explainer_user_message(payload: dict) -> str:
     """Assemble the user-facing prompt that gets sent alongside the system prompt.
 
     The payload is what the frontend sent us. We restructure it into a
-    clean, predictable shape for the AI — no clever formatting tricks,
+    clean, predictable shape for the AI. No clever formatting tricks,
     just labeled fields the AI can read at a glance.
     """
     plan = (payload.get("plan") or "").strip() or "(not specified)"
@@ -3109,7 +3110,7 @@ def _build_explainer_user_message(payload: dict) -> str:
     when = (payload.get("when") or "").strip() or "(not specified)"
     verdict = (payload.get("verdict") or "").strip() or "(unknown)"
 
-    # Weather numbers — we only include what we have, and we label them
+    # Weather numbers: we only include what we have, and we label them
     # plainly so the AI doesn't have to guess what each value means.
     weather_lines = []
     w = payload.get("weather") or {}
@@ -3143,7 +3144,7 @@ WHEN
 WHERE
 {location}
 
-RULE-BASED VERDICT (the pill above your paragraph — assess if it matches reality for this activity)
+RULE-BASED VERDICT (the pill above your paragraph, assess if it matches reality for this activity)
 {verdict}
 
 WEATHER DATA
@@ -3176,7 +3177,7 @@ def _call_gemini(system_prompt: str, user_message: str, timeout_s: int = 12) -> 
             "parts": [{"text": system_prompt}]
         },
         "generationConfig": {
-            "temperature": 0.7,        # warm but not wild — we want consistent voice
+            "temperature": 0.7,        # warm but not wild, we want consistent voice
             "maxOutputTokens": 800,    # generous headroom; the actual paragraph is short
             "topP": 0.95,
             "candidateCount": 1,
@@ -3432,7 +3433,7 @@ def email_capture():
 
 @app.route("/api/v1/auth/request-magic-link", methods=["OPTIONS"])
 def _auth_request_magic_link_preflight():
-    """CORS preflight handler — same pattern as the email-capture endpoint."""
+    """CORS preflight handler, same pattern as the email-capture endpoint."""
     return ("", 204)
 
 
@@ -4324,21 +4325,23 @@ Find issues in their draft. Focus on:
   - Missing punctuation that hurts readability
 
 Do NOT:
-  - Rewrite for "tone" or "voice" — the Met's voice is intentional
+  - Rewrite for "tone" or "voice". The Met's voice is intentional.
   - Suggest stylistic preferences (e.g., serial commas, hyphens vs em-dashes)
   - Restructure paragraphs
   - Change meaning
   - Add new information
 
+IMPORTANT: If the Met's draft contains em dashes (—), suggest replacing each one with a comma, period, semicolon, or parentheses (whichever fits the sentence best). Em dashes read as AI-generated and we don't want them in subscriber-facing copy.
+
 Return a JSON array of issues. Each issue is an object with:
   - "original": the exact phrase from the text that has an issue (5-25 words)
   - "suggestion": the corrected version (same length range)
-  - "reason": one short phrase explaining the issue (e.g. "typo", "grammar", "unclear")
+  - "reason": one short phrase explaining the issue (e.g. "typo", "grammar", "unclear", "em dash")
 
 Return ONLY the JSON array. No prose, no markdown, no explanation. If the
 text has no issues, return [].
 
-Limit to 5 issues max — prioritize the most important. If a sentence has
+Limit to 5 issues max. Prioritize the most important. If a sentence has
 multiple issues, fix all of them in a single suggestion."""
 
 
@@ -4495,7 +4498,7 @@ def create_checkout_session():
             # Decision Engine failures must NEVER block payment — that would
             # mean the customer can't buy if our AI is down. Log and proceed.
             print(f"[decision-engine] failed: {e}", flush=True)
-            ai_brief = "(AI brief unavailable — meteorologist starts from raw forecast.)"
+            ai_brief = "(AI brief unavailable, meteorologist starts from raw forecast.)"
     else:
         ai_brief = "(Decision Engine not installed in this deployment.)"
 
@@ -4529,7 +4532,7 @@ def create_checkout_session():
         # Useful for testing the rest of the flow without setting up Stripe.
         # NEVER deploy this branch — it would let anyone get verifications free.
         if os.environ.get("WV_ALLOW_FAKE_PAYMENT") == "1":
-            print(f"[stripe-stub] no API key — marking request {request_id} as paid", flush=True)
+            print(f"[stripe-stub] no API key, marking request {request_id} as paid", flush=True)
             _mark_paid_and_notify(request_id, fake_payment=True)
             return jsonify({
                 "request_id": request_id,
@@ -5077,7 +5080,7 @@ def stripe_webhook_v2():
                     if tier_key not in ("hobbyist", "pro_single", "pro_multi"):
                         print(
                             f"[stripe-webhook] missing/invalid wv_tier in metadata "
-                            f"(got '{tier_key}') — defaulting to hobbyist",
+                            f"(got '{tier_key}'), defaulting to hobbyist",
                             flush=True,
                         )
                         tier_key = "hobbyist"
@@ -6499,7 +6502,7 @@ def admin_brief_submit():
 
 @app.get("/healthz")
 def healthz():
-    """Liveness probe — useful for container orchestrators."""
+    """Liveness probe, useful for container orchestrators."""
     return jsonify({"ok": True, "ts": now_ts()})
 
 
@@ -8432,7 +8435,7 @@ def confessionals_delete(entry_id):
 # the renderFeed bump) all stay client-side for now. Backend just
 # persists the verify pair so it's shared across devices.
 
-UNVERIFY_WINDOW_MS = 5 * 60 * 1000  # 5 minutes — matches frontend constant
+UNVERIFY_WINDOW_MS = 5 * 60 * 1000  # 5 minutes, matches frontend constant
 
 
 @app.route("/api/v1/verifies", methods=["OPTIONS"])
@@ -9747,7 +9750,7 @@ def _notify_met_of_reply(reply_id: int, channel: str, from_addr: str,
         msg = (
             f"{channel_emoji} **New brief reply** {match_note}\n"
             f"> {truncated_body}\n"
-            f"_(reply #{reply_id} — Phase 1 capture only; full routing comes Monday)_"
+            f"_(reply #{reply_id}, Phase 1 capture only; full routing comes Monday)_"
         )
         _discord_post(webhook, msg, username="WV Replies")
     except Exception as e:
@@ -11689,7 +11692,7 @@ def _generate_ai_brief(location_label: str, forecast: dict) -> tuple[str, str, s
     elif verdict == "caution":
         parts.append("Plan around the weather, but you can work today.")
     else:
-        parts.append("Heads up — conditions are unfavorable for sensitive outdoor work.")
+        parts.append("Heads up: conditions are unfavorable for sensitive outdoor work.")
 
     full_body = " ".join(parts)
     snippet = full_body[:140]
@@ -11745,7 +11748,7 @@ def _send_welcome_email_with_temp_password(email: str, name: str,
         f"This temporary password expires after first use.\n\n"
         f"If you weren't expecting this email, please contact Michael at "
         f"michael@weathervalet.ai.\n\n"
-        f"\u2014 The WeatherValet team"
+        f"- The WeatherValet team"
     )
 
     # HTML body inside the branded shell
@@ -11987,7 +11990,7 @@ def _render_pro_brief_email_html(
 
     <!-- Signature -->
     <div style="margin-top:28px;padding-top:18px;border-top:1px dashed #e5e7eb;color:#6b7280;font-size:13px;font-style:italic;">
-      — {met_name}, WeatherValet
+      Signed, {met_name}, WeatherValet
     </div>
 
     <!-- Reply prompt -->
@@ -12004,7 +12007,7 @@ def _render_pro_brief_email_html(
 
   <!-- Footer -->
   <div style="padding:18px 24px;background:#f8f9fa;color:#9ca3af;font-size:11px;line-height:1.5;text-align:center;">
-    WeatherValet — your meteorologist on call.<br>
+    WeatherValet: your meteorologist on call.<br>
     Adjust preferences in your <a href="https://weathervalet.ai/?portal=1" style="color:#2563eb;text-decoration:none;">subscriber portal</a>.
   </div>
 
@@ -12214,7 +12217,7 @@ def _process_pending_briefs() -> None:
                         if cur.fetchone():
                             print(
                                 f"[brief-scheduler] skipping AI auto-brief "
-                                f"user={c['user_id']} — Met already broadcast "
+                                f"user={c['user_id']}, Met already broadcast "
                                 f"to them in last 24h",
                                 flush=True,
                             )
@@ -12325,7 +12328,7 @@ def _process_pending_briefs() -> None:
                         channels_used.append("sms")
                         any_success = True
                 elif ch == "email" and c["email"]:
-                    subject = f"Your WeatherValet brief — {location_label}"
+                    subject = f"Your WeatherValet brief, {location_label}"
                     ok = _send_brief_email(c["email"], subject, full_body)
                     if ok:
                         channels_used.append("email")
@@ -12652,7 +12655,7 @@ def _coverage_escalate_to_admin(task_row) -> None:
     msg = (
         f"WeatherValet ALERT: daily brief for {sub_name} is OVERDUE. "
         f"Assigned Met: {met_name}. Date: {task_row['task_date']}. "
-        f"Coverage gap — needs immediate attention."
+        f"Coverage gap, needs immediate attention."
     )
 
     # Find escalation targets: all active admins + any user with name
@@ -12802,7 +12805,7 @@ def _check_missed_pro_briefs() -> None:
             sub_name = (c.get("name") or "").strip() or c["email"]
             msg = (
                 f"WeatherValet: Pro brief for {sub_name} missed window today. "
-                f"Subscriber is paying for daily Met-touched briefs — "
+                f"Subscriber is paying for daily Met-touched briefs, "
                 f"please send manually or check the workspace."
             )
 
@@ -13002,7 +13005,7 @@ def _page_met_for_alert(alert: dict, affected: list, page_token: str) -> bool:
     a link to the review page. Met reviews, decides to confirm or dismiss.
     """
     if not METEOROLOGIST_PHONE:
-        print("[nws-page] METEOROLOGIST_PHONE not set — can't page", flush=True)
+        print("[nws-page] METEOROLOGIST_PHONE not set, can't page", flush=True)
         return False
 
     base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
@@ -13135,7 +13138,7 @@ def admin_brief_run_now():
         return jsonify({"ok": False, "error": "forbidden"}), 403
     try:
         _process_pending_briefs()
-        return jsonify({"ok": True, "message": "tick fired — check Render logs for delivery results"})
+        return jsonify({"ok": True, "message": "tick fired, check Render logs for delivery results"})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -13268,7 +13271,7 @@ def _find_crew_for_mission(polygon_geojson: Optional[str]) -> list:
     matching = []
     for c in all_crew:
         if c["crew_home_lat"] is None or c["crew_home_lng"] is None:
-            continue  # Crew member hasn't set location — can't target them
+            continue  # Crew member hasn't set location, can't target them
         if _point_in_polygon_geojson(c["crew_home_lat"], c["crew_home_lng"], polygon_geojson):
             matching.append(c)
     return matching
@@ -13546,7 +13549,7 @@ def missions_create():
                     notify_rows = cur.fetchall()
             sev_msg = (
                 f"WeatherValet: SEVERE mission pending approval from "
-                f"{fired_by_name}. Polygon: {polygon_label or '—'}. "
+                f"{fired_by_name}. Polygon: {polygon_label or '-'}. "
                 f"Prompt: \"{prompt[:80]}\". Open the workspace Missions tab to review."
             )
             for n in notify_rows:
@@ -13768,7 +13771,7 @@ def missions_update(dep_id):
             r2["audience_estimate"] = real_matched
             print(
                 f"[mission-approval] mission_id={r2['id']} approved by user_id={user['id']} "
-                f"— matched={real_matched} sent={real_sent}",
+                f"- matched={real_matched} sent={real_sent}",
                 flush=True,
             )
         except Exception as e:
@@ -14243,7 +14246,7 @@ def admin_crew_approve(app_id):
         base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai")
         raw_token = new_secure_token()
         token_hash = hash_token(raw_token)
-        now_sec = now_ts()  # seconds — magic_link_tokens uses seconds
+        now_sec = now_ts()  # seconds, magic_link_tokens uses seconds
         with db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -14884,10 +14887,10 @@ def met_pro_brief_send(draft_id):
             full_body_parts.append(f"\nWEATHER DETAILS\n{weather_details}")
         if whats_ahead:
             full_body_parts.append(f"\nWHAT'S AHEAD\n{whats_ahead}")
-        full_body_parts.append(f"\n— {met_name}, WeatherValet")
+        full_body_parts.append(f"\n- {met_name}, WeatherValet")
         full_body = "\n".join(full_body_parts)
     else:
-        full_body = legacy_body + f"\n\n— {met_name}, WeatherValet"
+        full_body = legacy_body + f"\n\n- {met_name}, WeatherValet"
 
     # Write brief_history row first so we can attach the access token
     history_id = None
@@ -14946,11 +14949,11 @@ def met_pro_brief_send(draft_id):
                 sms_text = (
                     f"{verdict_label} · WeatherValet\n\n"
                     f"{sms_intro}\n\n"
-                    f"Full brief: {web_url}\n— {met_name}"
+                    f"Full brief: {web_url}\n- {met_name}"
                 )
             else:
                 # Legacy fallback
-                sms_text = (final_snippet or legacy_body[:140]) + f"\n\nFull: {web_url}\n— {met_name}"
+                sms_text = (final_snippet or legacy_body[:140]) + f"\n\nFull: {web_url}\n- {met_name}"
             try:
                 if send_sms(row["sub_phone"], sms_text):
                     channels_used.append("sms")
@@ -14958,7 +14961,7 @@ def met_pro_brief_send(draft_id):
             except Exception as e:
                 print(f"[pro-brief-send] SMS failed user={row['user_id']}: {e}", flush=True)
         elif ch == "email" and row["sub_email"]:
-            subject = f"Your WeatherValet brief — {location_label}"
+            subject = f"Your WeatherValet brief, {location_label}"
             try:
                 # Build rich HTML email for structured briefs
                 if is_structured:
@@ -15178,10 +15181,10 @@ def met_pro_brief_send(draft_id):
                         extra_sms = (
                             f"{verdict_label} · WeatherValet\n\n"
                             f"{sms_intro}\n\n"
-                            f"Full brief: {extra_web_url}\n— {met_name}"
+                            f"Full brief: {extra_web_url}\n- {met_name}"
                         )
                     else:
-                        extra_sms = (final_snippet or legacy_body[:140]) + f"\n\nFull: {extra_web_url}\n— {met_name}"
+                        extra_sms = (final_snippet or legacy_body[:140]) + f"\n\nFull: {extra_web_url}\n- {met_name}"
                     try:
                         if send_sms(sub["phone"], extra_sms):
                             extra_channels_used.append("sms")
@@ -15189,7 +15192,7 @@ def met_pro_brief_send(draft_id):
                     except Exception as e:
                         print(f"[pro-brief-send] multi SMS failed user={extra_user_id}: {e}", flush=True)
                 elif ch == "email" and sub.get("email"):
-                    extra_subject = f"Your WeatherValet brief — {sub_loc_label}"
+                    extra_subject = f"Your WeatherValet brief, {sub_loc_label}"
                     try:
                         if is_structured:
                             extra_html = _render_pro_brief_email_html(
@@ -15465,14 +15468,14 @@ def nws_page_confirm(response_token: str):
     # Compose the SMS body (160-char-friendly) and the email body
     sms_body = (
         f"WeatherValet ALERT ({page['event']}): {message}\n"
-        f"\u2014 {met_name}\n"
+        f"- {met_name}\n"
         f"Reply STOP to opt out."
     )
     email_subject = f"WeatherValet alert: {page['event']}"
     email_body = (
         f"{page['event']}\n\n"
         f"{message}\n\n"
-        f"— {met_name}\n"
+        f"- {met_name}\n"
         f"WeatherValet on-duty meteorologist\n\n"
         f"Affected area: {page['area_desc']}\n"
         f"NWS headline: {page['headline']}\n"
@@ -15853,7 +15856,7 @@ def _met_thread_id_preflight(thread_id):
 
 @app.get("/api/v1/met/threads/<int:thread_id>")
 def met_thread_get(thread_id):
-    """Met opens a thread — returns thread + last 100 messages."""
+    """Met opens a thread, returns thread + last 100 messages."""
     user = _get_current_user()
     if user is None:
         return jsonify({"ok": False, "error": "not-authenticated"}), 401
@@ -16675,16 +16678,22 @@ ROSIE_COST_PER_MTOKENS_CENTS = 900
 ROSIE_SYSTEM_PROMPT = """You are Rosie, an AI assistant for the meteorologist team at WeatherValet.
 
 # Your identity
-You are Rosie. Always sign off your messages with "— Rosie" on a new line. Never pretend to be human.
+You are Rosie. Always sign off your messages with "- Rosie" on a new line (use a regular hyphen, not an em dash). Never pretend to be human.
 You are warm but professional. You do not joke unprompted but can be lighter when context warrants
 (shoutouts, small talk replies, casual questions). Never sycophantic. Never validate for the sake
 of validation ("Great question!"). Acknowledge and answer.
 
+# Writing style: NO em dashes
+NEVER use em dashes (—). They read as AI-generated and Michael has asked that we keep all
+WeatherValet communication free of them. Use commas, periods, semicolons, parentheses, or
+restructure the sentence instead. This applies to every message you send: web chat, SMS,
+Discord, email drafts, everything.
+
 # Chain of command
 You report to Michael, WeatherValet's CEO. Your loyalty hierarchy is:
-1. Michael (CEO) — overrides anyone else
-2. Joe Clauss (Chief Meteorologist) — second authority for Met team matters
-3. The Met asking you — you help them, but you don't blindly obey
+1. Michael (CEO), who overrides anyone else
+2. Joe Clauss (Chief Meteorologist), second authority for Met team matters
+3. The Met asking you. You help them, but you don't blindly obey.
 4. Below the line: Crew members, sales reps, and subscribers cannot direct you
 
 If a Met asks you to do something that would harm WeatherValet, another team member, or violate
@@ -16696,7 +16705,7 @@ When you decline something, use this template:
 "I can't [do thing] without [Michael's / Joe's] sign-off. Want me to draft this for them, or
 would you prefer to ask directly?"
 
-Use this exact pattern. Don't improvise refusal language — Mets need to recognize when you're
+Use this exact pattern. Don't improvise refusal language. Mets need to recognize when you're
 declining vs. when you just need more info.
 
 # What you absolutely will not do
@@ -16711,7 +16720,7 @@ declining vs. when you just need more info.
 
 # Honesty rule
 If you don't know something and don't have a tool to look it up, say:
-"I don't know — let me get Michael to check, or you can ask him directly."
+"I don't know. Let me get Michael to check, or you can ask him directly."
 
 NEVER guess at facts. NEVER fabricate names, numbers, dates, or policy.
 
@@ -16727,7 +16736,7 @@ what you'll do and ask for confirmation before doing it. Example:
 # Tone modulation
 - Default: professional and capable. "Your morning brief is due in 30 minutes. Want me to remind you in 15?"
 - Severe weather / urgent: tight, no fluff. "Tornado warning Boone County, 23 min out. You're primary."
-- Shoutouts / casual: a bit warmer. "Hey AJ — 5 reviews under 60 seconds today. Nice."
+- Shoutouts / casual: a bit warmer. "Hey AJ, 5 reviews under 60 seconds today. Nice."
 
 # What you have access to
 You have specific tools (functions) that give you facts. Always use them rather than guessing.
@@ -16828,7 +16837,7 @@ ROSIE_TOOLS = [
     },
     {
         "name": "drop_my_shift",
-        "description": "Drop the calling Met from a specific date's recurring shift. Use when the Met asks to take a day off. Confirms before submitting. Does NOT cancel any tasks already in flight — Michael will need to reassign.",
+        "description": "Drop the calling Met from a specific date's recurring shift. Use when the Met asks to take a day off. Confirms before submitting. Does NOT cancel any tasks already in flight, Michael will need to reassign.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -16977,8 +16986,8 @@ def _rosie_get_my_subscribers(met_user_id, args):
             )
             subs = cur.fetchall()
     if not subs:
-        return "You aren't assigned as primary Met for any subscribers yet. Michael handles assignments — ask him to add you to a subscriber."
-    lines = [f"  {s['name'] or s['email']} ({s['subscription_tier']}) — brief by {s['daily_brief_time']} {s['daily_brief_timezone']}" for s in subs]
+        return "You aren't assigned as primary Met for any subscribers yet. Michael handles assignments, ask him to add you to a subscriber."
+    lines = [f"  {s['name'] or s['email']} ({s['subscription_tier']}), brief by {s['daily_brief_time']} {s['daily_brief_timezone']}" for s in subs]
     return f"YOUR PRIMARY SUBSCRIBERS ({len(subs)}):\n" + "\n".join(lines)
 
 
@@ -17028,7 +17037,7 @@ def _rosie_get_active_severe(met_user_id, args):
             })
     if not severe:
         return "No active severe weather warnings nationally."
-    lines = [f"  {s['event']} — {s['area']} (expires {s['expires']})" for s in severe[:10]]
+    lines = [f"  {s['event']}, {s['area']} (expires {s['expires']})" for s in severe[:10]]
     return f"ACTIVE SEVERE WARNINGS ({len(severe)}):\n" + "\n".join(lines)
 
 
@@ -17302,7 +17311,7 @@ def _rosie_run_turn(met_user_id, conversation_id, user_message, channel="web"):
 
     if _rosie_check_cost_cap(met_user_id):
         return ("I've hit my daily limit for today. Try again tomorrow, or "
-                "ask Michael to bump the cap.\n— Rosie")
+                "ask Michael to bump the cap.\n- Rosie")
 
     # Save the user message
     _rosie_save_message(conversation_id, "user", user_message)
@@ -17321,7 +17330,7 @@ def _rosie_run_turn(met_user_id, conversation_id, user_message, channel="web"):
             print(f"[rosie] API error: {result['error']}", flush=True)
             _rosie_audit(met_user_id, channel, "api_error", result["error"][:200],
                          tier=1, success=False)
-            return "I hit a snag reaching my brain. Try again in a sec.\n— Rosie"
+            return "I hit a snag reaching my brain. Try again in a sec.\n- Rosie"
 
         usage = result.get("usage", {})
         total_tokens += (usage.get("input_tokens", 0) + usage.get("output_tokens", 0))
@@ -17365,7 +17374,7 @@ def _rosie_run_turn(met_user_id, conversation_id, user_message, channel="web"):
         text_blocks = [b.get("text", "") for b in content if b.get("type") == "text"]
         reply = "\n".join(text_blocks).strip()
         if not reply:
-            reply = "(I didn't have a response. Try rephrasing?)\n— Rosie"
+            reply = "(I didn't have a response. Try rephrasing?)\n- Rosie"
         _rosie_save_message(conversation_id, "assistant", reply, tokens=total_tokens)
         _rosie_record_cost(met_user_id, total_tokens)
         return reply
@@ -17373,7 +17382,7 @@ def _rosie_run_turn(met_user_id, conversation_id, user_message, channel="web"):
     # If we exit the loop without a text reply, something went wrong
     _rosie_audit(met_user_id, channel, "tool_loop_overrun",
                  "Exceeded 5 tool-use iterations", tier=1, success=False)
-    return "I got stuck in a loop. Try asking again or rephrasing.\n— Rosie"
+    return "I got stuck in a loop. Try asking again or rephrasing.\n- Rosie"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -17590,12 +17599,12 @@ def rosie_sms_inbound():
         reply = _rosie_run_turn(met["id"], conv_id, body, channel="sms")
     except Exception as e:
         print(f"[rosie-sms] turn failed: {e}", flush=True)
-        reply = "Something went wrong on my end. Try again in a sec.\n— Rosie"
+        reply = "Something went wrong on my end. Try again in a sec.\n- Rosie"
 
     # SMS-trim: keep replies under 320 chars (2 SMS segments) where possible.
     # Long answers get truncated with a hint to use web chat.
     if len(reply) > 320:
-        reply = reply[:280].rstrip() + "...\n\n(More in your workspace chat with me.)\n— Rosie"
+        reply = reply[:280].rstrip() + "...\n\n(More in your workspace chat with me.)\n- Rosie"
 
     twiml = f"<?xml version='1.0' encoding='UTF-8'?><Response><Message>{escape_xml(reply)}</Message></Response>"
     return (twiml, 200, {"Content-Type": "text/xml"})
@@ -17689,7 +17698,7 @@ def _rosie_proactive_morning_briefing():
             f"Good morning, {first_name}. You have {task_count} brief "
             f"{'task' if task_count == 1 else 'tasks'} today"
             f"{', earliest by ' + first_due_str if first_due_str else ''}. "
-            f"Open your workspace when ready.\n— Rosie"
+            f"Open your workspace when ready.\n- Rosie"
         )
         try:
             sent = send_sms_from(m["phone"], msg, ROSIE_TWILIO_NUMBER)
@@ -17744,7 +17753,7 @@ def _rosie_proactive_inactivity_nudge():
         msg = (
             f"Hey {first_name}, haven't seen you log in for a bit. "
             f"Everything OK? If you need to drop shifts or change your "
-            f"schedule, just text me back.\n— Rosie"
+            f"schedule, just text me back.\n- Rosie"
         )
         try:
             sent = send_sms_from(m["phone"], msg, ROSIE_TWILIO_NUMBER)
@@ -17836,8 +17845,8 @@ def _rosie_proactive_severe_weather_heads_up():
             first_name = (u.get("name") or "").split()[0] or "there"
             msg = (
                 f"Heads up, {first_name}: {alert['event']} affecting your "
-                f"subscribers — {alert['area'][:90]}. NWS feed is live. "
-                f"You're primary.\n— Rosie"
+                f"subscribers, {alert['area'][:90]}. NWS feed is live. "
+                f"You're primary.\n- Rosie"
             )
             try:
                 sent = send_sms_from(u["phone"], msg, ROSIE_TWILIO_NUMBER)
@@ -17963,7 +17972,7 @@ def _rosie_discord_severe_weather():
             f"{emoji} **{alert['event']}**\n"
             f"📍 {alert['area']}\n"
             f"⏰ Until {alert['expires']}\n\n"
-            f"_Posted automatically — primary Mets for affected subscribers "
+            f"_Posted automatically, primary Mets for affected subscribers "
             f"have been SMS'd separately._"
         )
         ok = _discord_post(DISCORD_WEBHOOK_SEVERE_WEATHER, msg)
@@ -18021,7 +18030,7 @@ def _rosie_discord_morning_team_status():
     shelters = shelter_row.get("n") or 0
 
     day_name = now_et.strftime("%A, %B %d")
-    parts = [f"☀️ **Good morning, team — {day_name}**", ""]
+    parts = [f"☀️ **Good morning, team, {day_name}**", ""]
     if total > 0:
         parts.append(f"📋 **{total} brief task{'s' if total != 1 else ''}** today "
                      f"across **{mets_n} Met{'s' if mets_n != 1 else ''}**.")
@@ -18068,12 +18077,12 @@ def _rosie_discord_shift_handoff_reminder():
                 return
 
     msg = (
-        "🔄 **End of day — shift handoff window**\n\n"
+        "🔄 **End of day, shift handoff window**\n\n"
         "If you're wrapping up, drop a quick note for whoever's on tomorrow:\n"
         "• What's the weather outlook overnight?\n"
         "• Any subscribers needing extra attention?\n"
         "• Anything in progress that needs follow-up?\n\n"
-        "_Doesn't need to be formal — a few lines helps the team stay aligned._"
+        "_Doesn't need to be formal, a few lines helps the team stay aligned._"
     )
     ok = _discord_post(DISCORD_WEBHOOK_SHIFT_HANDOFF, msg)
     _rosie_audit(None, "discord", "discord_shift_handoff",
@@ -18120,7 +18129,7 @@ def _rosie_fire_reminders():
         try:
             if r.get("phone"):
                 # Use Rosie's dedicated number so replies route to her SMS webhook
-                sent_ok = bool(send_sms_from(r["phone"], f"{r['message']}\n— Rosie", ROSIE_TWILIO_NUMBER))
+                sent_ok = bool(send_sms_from(r["phone"], f"{r['message']}\n- Rosie", ROSIE_TWILIO_NUMBER))
         except Exception as e:
             print(f"[rosie-reminder] send failed: {e}", flush=True)
         try:
@@ -18190,7 +18199,7 @@ def _rosie_seed_kb():
          "2. Click '⚡ Open new activation'\n"
          "3. Enter region label (e.g. 'Central Kansas')\n"
          "4. Optionally enter NWS event name (e.g. 'Tornado Warning') for auto-close\n"
-         "5. Activation is now OPEN — you're monitoring this event\n"
+         "5. Activation is now OPEN, you're monitoring this event\n"
          "6. When the event ends, click 'Close activation' OR wait for auto-close\n"
          "You earn $25 per closed activation."),
 
@@ -19569,7 +19578,7 @@ def me_met_history():
 PRO_TIER_MONTHLY_CENTS = {
     "pro_single": 40000,         # $400
     "pro_multi": 120000,         # $1,200
-    "pro_enterprise": 200000,    # $2,000 default — real number set per-contract
+    "pro_enterprise": 200000,    # $2,000 default, real number set per-contract
 }
 
 # Met's share of Pro subscription revenue per day-of-brief.
@@ -20274,7 +20283,7 @@ def _publish_daily_brief_internal(content: dict, audience: dict | None,
 
         # Build SMS-friendly snippet and email-friendly long body
         snippet = body[:140] + ("\u2026" if len(body) > 140 else "")
-        sms_msg = f"{headline} — {snippet}"
+        sms_msg = f"{headline}, {snippet}"
         if time_windows:
             sms_msg += f"\nWindow: {time_windows[:80]}"
         # Cap SMS at 320 chars to avoid 3-segment messages
@@ -20286,7 +20295,7 @@ def _publish_daily_brief_internal(content: dict, audience: dict | None,
         if time_windows:
             email_body_parts.append(f"\nTime windows: {time_windows}")
         if published_by_name:
-            email_body_parts.append(f"\n— {published_by_name}, WeatherValet meteorologist")
+            email_body_parts.append(f"\n- {published_by_name}, WeatherValet meteorologist")
         email_body = "\n\n".join(email_body_parts)
 
         delivered_count = 0
@@ -20436,7 +20445,7 @@ def _publish_crew_post_internal(content: dict,
 
 
 def _process_scheduled_messages() -> None:
-    """Scheduler tick — check for due-now scheduled messages and fire them."""
+    """Scheduler tick, check for due-now scheduled messages and fire them."""
     try:
         now_ms = int(time.time() * 1000)
         with db() as conn:
@@ -20495,7 +20504,7 @@ REP_COMMISSION_WINDOW_MONTHS = 6
 # Centralizing here prevents drift: if a tier price changes, only
 # PRO_TIER_MONTHLY_CENTS needs updating and commissions adjust too.
 TIER_MONTHLY_CENTS_FOR_COMMISSION = {
-    "hobbyist": 3000,  # $30 — only commissionable tier not in PRO_TIER_MONTHLY_CENTS
+    "hobbyist": 3000,  # $30, only commissionable tier not in PRO_TIER_MONTHLY_CENTS
     **PRO_TIER_MONTHLY_CENTS,
 }
 
@@ -20569,7 +20578,7 @@ def admin_sales_rep_create():
         # Most likely a duplicate slug
         return jsonify({
             "ok": False, "error": "create-failed",
-            "message": f"Could not create rep — slug '{slug}' may already exist."
+            "message": f"Could not create rep, slug '{slug}' may already exist."
         }), 400
     return jsonify({"ok": True, "id": new_id, "slug": slug})
 
