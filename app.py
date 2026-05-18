@@ -684,6 +684,17 @@ CREATE TABLE IF NOT EXISTS subscriber_coverage (
 CREATE INDEX IF NOT EXISTS idx_subcov_primary ON subscriber_coverage(primary_met_id);
 CREATE INDEX IF NOT EXISTS idx_subcov_backup  ON subscriber_coverage(backup_met_id);
 
+-- Subscriber-provided context for the Met (May 18, 2026).
+-- These four fields are filled in by the subscriber via the portal
+-- and visible to their assigned Met in the Pro Brief workspace. The
+-- Met uses this context when drafting briefs, and the AI brief
+-- generator prompts include it for personalization.
+ALTER TABLE subscriber_coverage ADD COLUMN IF NOT EXISTS business_role TEXT;
+ALTER TABLE subscriber_coverage ADD COLUMN IF NOT EXISTS weather_decisions TEXT;
+ALTER TABLE subscriber_coverage ADD COLUMN IF NOT EXISTS peak_need_times TEXT;
+ALTER TABLE subscriber_coverage ADD COLUMN IF NOT EXISTS additional_context TEXT;
+ALTER TABLE subscriber_coverage ADD COLUMN IF NOT EXISTS context_updated_at BIGINT;
+
 
 -- Met recurring weekly schedule. One row per Met per day of week per scope.
 -- scope_kind: 'subscriber' (covers a specific Pro subscriber's brief)
@@ -9944,6 +9955,129 @@ def _me_brief_preferences_preflight():
     return ("", 204)
 
 
+# ════════════════════════════════════════════════════════════════════
+# Subscriber-provided context for their Met (May 18, 2026)
+# ════════════════════════════════════════════════════════════════════
+#
+# These endpoints let the subscriber write a short personal context
+# document that their assigned Met reads when drafting Pro Briefs.
+# Fields:
+#   business_role        — e.g. "Athletic Director, Lebanon High School"
+#   weather_decisions    — e.g. "Outdoor practice scheduling, game-day field conditions"
+#   peak_need_times      — e.g. "Tue/Thu practice afternoons, Fri/Sat game days"
+#   additional_context   — anything else useful (drainage, lightning policy, etc.)
+#
+# All fields are optional. The Met workspace + AI brief generator both
+# include these when present.
+
+@app.route("/api/v1/me/met-context", methods=["OPTIONS"])
+def _me_met_context_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/met-context")
+def me_met_context_get():
+    """Return the current user's Met context (business info + needs)."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT business_role, weather_decisions,
+                              peak_need_times, additional_context,
+                              context_updated_at
+                       FROM subscriber_coverage
+                       WHERE user_id = %s""",
+                    (user["id"],),
+                )
+                row = cur.fetchone()
+    except Exception as e:
+        print(f"[me-met-context-get] failed user_id={user['id']}: {e}", flush=True)
+        return jsonify({"ok": False, "error": "query-failed"}), 500
+
+    if not row:
+        # No coverage row yet (Hobbyist, or new Pro before webhook landed)
+        return jsonify({
+            "ok": True,
+            "business_role": "",
+            "weather_decisions": "",
+            "peak_need_times": "",
+            "additional_context": "",
+            "context_updated_at": None,
+        })
+
+    return jsonify({
+        "ok": True,
+        "business_role": row.get("business_role") or "",
+        "weather_decisions": row.get("weather_decisions") or "",
+        "peak_need_times": row.get("peak_need_times") or "",
+        "additional_context": row.get("additional_context") or "",
+        "context_updated_at": row.get("context_updated_at"),
+    })
+
+
+@app.post("/api/v1/me/met-context")
+def me_met_context_save():
+    """Save the current user's Met context. Creates the coverage row
+    if missing (for Pro subscribers; Hobbyists also get a row but Met
+    assignment fields stay null)."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    data = request.get_json(silent=True) or {}
+    # Trim and cap lengths so we don't accept abusive input. 2000 chars
+    # per field is generous for human-written context.
+    def _clean(s, max_len=2000):
+        s = (s or "").strip()
+        return s[:max_len] if s else ""
+
+    business_role = _clean(data.get("business_role"), 200)
+    weather_decisions = _clean(data.get("weather_decisions"), 2000)
+    peak_need_times = _clean(data.get("peak_need_times"), 500)
+    additional_context = _clean(data.get("additional_context"), 2000)
+    now_ms = int(time.time() * 1000)
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                # Ensure the row exists. INSERT-on-conflict handles the
+                # case where the coverage row was never created (e.g.
+                # legacy Hobbyist who's editing their context).
+                cur.execute(
+                    """INSERT INTO subscriber_coverage
+                       (user_id, daily_brief_time, daily_brief_timezone,
+                        business_role, weather_decisions, peak_need_times,
+                        additional_context, context_updated_at, updated_at)
+                       VALUES (%s, '07:00', 'America/New_York',
+                               %s, %s, %s, %s, %s, %s)
+                       ON CONFLICT (user_id) DO UPDATE SET
+                           business_role = EXCLUDED.business_role,
+                           weather_decisions = EXCLUDED.weather_decisions,
+                           peak_need_times = EXCLUDED.peak_need_times,
+                           additional_context = EXCLUDED.additional_context,
+                           context_updated_at = EXCLUDED.context_updated_at,
+                           updated_at = EXCLUDED.updated_at""",
+                    (user["id"], business_role, weather_decisions,
+                     peak_need_times, additional_context, now_ms, now_ms),
+                )
+    except Exception as e:
+        print(f"[me-met-context-save] failed user_id={user['id']}: {e}", flush=True)
+        return jsonify({"ok": False, "error": "save-failed"}), 500
+
+    return jsonify({
+        "ok": True,
+        "business_role": business_role,
+        "weather_decisions": weather_decisions,
+        "peak_need_times": peak_need_times,
+        "additional_context": additional_context,
+        "context_updated_at": now_ms,
+    })
+
+
 @app.get("/api/v1/me/brief-preferences")
 def me_brief_preferences():
     """Return the current user's brief delivery preferences.
@@ -15689,10 +15823,16 @@ def met_pro_briefs_list():
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """SELECT d.*, u.email AS subscriber_email, u.name AS subscriber_name,
-                          u.phone AS subscriber_phone
+                """SELECT d.*,
+                          u.email AS subscriber_email, u.name AS subscriber_name,
+                          u.phone AS subscriber_phone,
+                          sc.business_role,
+                          sc.weather_decisions,
+                          sc.peak_need_times,
+                          sc.additional_context
                    FROM pro_brief_drafts d
                    JOIN users u ON u.id = d.user_id
+                   LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
                    WHERE d.status IN ('pending-review', 'claimed')
                       OR (d.status = 'sent' AND d.sent_at >= %s)
                    ORDER BY
@@ -15718,6 +15858,11 @@ def met_pro_briefs_list():
             "subscriber_email": r["subscriber_email"],
             "subscriber_name": r.get("subscriber_name") or "",
             "subscriber_phone": r.get("subscriber_phone") or "",
+            # Subscriber-provided context (May 18, 2026)
+            "subscriber_business_role": r.get("business_role") or "",
+            "subscriber_weather_decisions": r.get("weather_decisions") or "",
+            "subscriber_peak_need_times": r.get("peak_need_times") or "",
+            "subscriber_additional_context": r.get("additional_context") or "",
             "user_tier": r["user_tier"],
             "location_label": r["location_label"],
             "channels": r["channels"],
