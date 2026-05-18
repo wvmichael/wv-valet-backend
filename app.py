@@ -12514,12 +12514,19 @@ _NWS_ALERTS_CACHE_LOCK = threading.Lock()
 
 def _get_cached_nws_alerts() -> list:
     """Return the latest active NWS alerts list, fetching at most once
-    per 60 seconds across all callers."""
+    per 60 seconds across all callers.
+
+    Also filters out alerts whose expires_at has passed, even if they
+    were captured in the cache before expiry. Defense-in-depth.
+    """
     with _NWS_ALERTS_CACHE_LOCK:
         now = time.time()
         if _NWS_ALERTS_CACHE["data"] is not None and \
            (now - _NWS_ALERTS_CACHE["fetched_at"]) < 60:
-            return _NWS_ALERTS_CACHE["data"]
+            # Filter expired alerts at read time too
+            now_ms = int(now * 1000)
+            return [a for a in _NWS_ALERTS_CACHE["data"]
+                    if (a.get("expires_at") is None or a["expires_at"] >= now_ms)]
     # Fetch outside the lock so concurrent callers don't all serialize
     fresh = _fetch_active_nws_alerts()
     with _NWS_ALERTS_CACHE_LOCK:
@@ -12591,10 +12598,17 @@ def me_severe_weather_status():
     # Fetch alerts (cached for 60s)
     alerts = _get_cached_nws_alerts()
 
-    # Find the worst alert whose polygon contains the user's location
+    # Find the worst alert whose polygon contains the user's location.
+    # Defense-in-depth: also filter expired alerts here in case the
+    # cache holds a previously-active alert that has since expired.
+    now_ms = int(time.time() * 1000)
     worst = None
     worst_rank = 0
     for alert in alerts:
+        # Skip expired alerts
+        exp = alert.get("expires_at")
+        if exp is not None and exp < now_ms:
+            continue
         geom = alert.get("geometry")
         if not geom:
             continue
@@ -13966,6 +13980,7 @@ def _fetch_active_nws_alerts() -> list:
         return []
 
     features = data.get("features") or []
+    now_ms = int(time.time() * 1000)
     out = []
     for f in features:
         props = f.get("properties") or {}
@@ -13988,6 +14003,13 @@ def _fetch_active_nws_alerts() -> list:
                 ).timestamp() * 1000)
             except (ValueError, TypeError):
                 pass
+        # ── Filter out expired alerts (May 18, 2026) ──
+        # NWS /alerts/active sometimes returns alerts whose expiration
+        # has already passed but haven't been removed from the feed yet.
+        # We trust the alert's own expires/ends timestamp: if it's in
+        # the past, treat the alert as inactive.
+        if expires_ms is not None and expires_ms < now_ms:
+            continue
         out.append({
             "nws_id": nws_id,
             "event": props.get("event") or "",
