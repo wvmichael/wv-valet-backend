@@ -10189,6 +10189,21 @@ def replies_sms_inbound():
             except Exception:
                 pass
 
+        # Phase 2 (May 18, 2026): Thread the reply into Pro Threads if the
+        # sender is a matched Pro-tier subscriber. The reply becomes a
+        # message in their thread; their primary Met sees it in the
+        # workspace immediately.
+        if matched_user_id is not None and reply_id is not None:
+            try:
+                _maybe_route_reply_to_pro_thread(
+                    reply_id=reply_id,
+                    matched_user_id=matched_user_id,
+                    body=body,
+                    channel="sms",
+                )
+            except Exception as e:
+                print(f"[reply-route] pro thread routing failed: {e}", flush=True)
+
         # Twilio expects TwiML (or 200 OK with empty body works fine)
         return ('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
                 200, {"Content-Type": "application/xml"})
@@ -10285,11 +10300,181 @@ def replies_email_inbound():
             except Exception:
                 pass
 
+        # Phase 2 (May 18, 2026): Thread the reply into Pro Threads if the
+        # sender is a matched Pro-tier subscriber.
+        if matched_user_id is not None and reply_id is not None:
+            try:
+                _maybe_route_reply_to_pro_thread(
+                    reply_id=reply_id,
+                    matched_user_id=matched_user_id,
+                    body=body_text,
+                    channel="email",
+                )
+            except Exception as e:
+                print(f"[reply-route] pro thread routing failed: {e}", flush=True)
+
         return jsonify({"ok": True, "reply_id": reply_id})
     except Exception as e:
         print(f"[reply-route] email webhook failed: {e}", flush=True)
         # 200 so Resend doesn't retry — we logged the error
         return jsonify({"ok": False, "error": "internal"}), 200
+
+
+def _strip_quoted_reply(body: str) -> str:
+    """Strip quoted reply chains from email bodies.
+
+    Email replies typically include the original message after the new
+    reply, prefixed with patterns like:
+      "On Wed, Jan 1, 2026 at 10:00 AM, X wrote:"
+      "> previous message text..."
+      "-----Original Message-----"
+      "From: someone@example.com"
+
+    This function returns just the user's new content. If no quoted
+    section is detected, returns the body unchanged.
+    """
+    if not body:
+        return body or ""
+    lines = body.split("\n")
+    cutoff_idx = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        # Common reply-chain markers
+        if stripped.startswith(">") and i < len(lines) - 1:
+            cutoff_idx = i
+            break
+        if stripped.startswith("-----Original Message-----"):
+            cutoff_idx = i
+            break
+        if stripped.startswith("From:") and i > 0:
+            # Check that the next line or two look like email metadata
+            ahead = "\n".join(lines[i:i+5])
+            if "Sent:" in ahead or "To:" in ahead or "Subject:" in ahead:
+                cutoff_idx = i
+                break
+        # "On <date>, <person> wrote:" pattern (Gmail/Apple Mail)
+        if re.match(r"^On\s+.+,.+wrote:?\s*$", stripped):
+            cutoff_idx = i
+            break
+        # Outlook "_____ From: ..." pattern
+        if stripped.startswith("_______________") and i > 0:
+            cutoff_idx = i
+            break
+
+    if cutoff_idx is not None and cutoff_idx > 0:
+        body = "\n".join(lines[:cutoff_idx])
+    return body.strip()
+
+
+def _maybe_route_reply_to_pro_thread(
+    reply_id: int,
+    matched_user_id: int,
+    body: str,
+    channel: str,
+) -> None:
+    """Route an inbound brief reply into Pro Threads if the sender is a
+    Pro-tier subscriber. Updates brief_replies.routed_status accordingly.
+
+    Skips Hobbyist subscribers (they don't have Pro Threads). For those,
+    the reply stays in brief_replies and is visible via the admin
+    endpoint; future Met-team-inbox feature will handle them.
+    """
+    # Get the subscriber's tier + name
+    sub_tier = None
+    sub_name = None
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.subscription_tier, u.name, u.email
+                   FROM users u WHERE u.id = %s""",
+                (matched_user_id,),
+            )
+            r = cur.fetchone()
+            if r:
+                sub_tier = r.get("subscription_tier") or ""
+                sub_name = r.get("name") or (r.get("email") or "").split("@")[0] or "Subscriber"
+
+    pro_tiers = ("pro_single", "pro_multi", "pro_enterprise")
+    if sub_tier not in pro_tiers:
+        # Hobbyist or unknown tier: do not auto-route. Leave the reply
+        # in brief_replies for admin review. Mark routed_status as
+        # 'hobbyist-pending' so it's easy to filter for the future
+        # Met-team-inbox UI.
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """UPDATE brief_replies
+                           SET routed_status = 'hobbyist-pending',
+                               routed_at_ms = %s
+                           WHERE id = %s""",
+                        (int(time.time() * 1000), reply_id),
+                    )
+        except Exception as e:
+            print(f"[reply-route] hobbyist mark failed: {e}", flush=True)
+        print(
+            f"[reply-route] reply={reply_id} matched_user={matched_user_id} "
+            f"tier={sub_tier!r} skipped pro thread routing (not pro tier)",
+            flush=True,
+        )
+        return
+
+    # For email replies, strip quoted reply chains
+    clean_body = body
+    if channel == "email":
+        clean_body = _strip_quoted_reply(body)
+
+    # Mark channel in the body for Met clarity ("via SMS" or "via email")
+    channel_label = "via SMS" if channel == "sms" else "via email"
+    body_with_label = f"[Reply {channel_label}]\n{clean_body}"
+
+    # Post to Pro Thread. notify_met=False because we already paged via
+    # Discord in the inbound handler (Phase 1). Avoid double-notification.
+    msg = _post_to_pro_thread(
+        subscriber_user_id=matched_user_id,
+        body=body_with_label,
+        sender_role="subscriber",
+        sender_user_id=matched_user_id,
+        sender_name=sub_name,
+        notify_met=False,
+    )
+
+    if msg:
+        # Mark the reply as successfully routed
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """UPDATE brief_replies
+                           SET routed_status = 'routed',
+                               routed_at_ms = %s,
+                               notes = %s
+                           WHERE id = %s""",
+                        (int(time.time() * 1000),
+                         f"thread_msg_id={msg['id']} thread_id={msg['thread_id']}",
+                         reply_id),
+                    )
+        except Exception as e:
+            print(f"[reply-route] routed mark failed: {e}", flush=True)
+        print(
+            f"[reply-route] reply={reply_id} routed to pro_thread "
+            f"msg={msg['id']} sub={matched_user_id}",
+            flush=True,
+        )
+    else:
+        # Routing failed but reply is still captured. Mark for manual review.
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """UPDATE brief_replies
+                           SET routed_status = 'route-failed',
+                               routed_at_ms = %s
+                           WHERE id = %s""",
+                        (int(time.time() * 1000), reply_id),
+                    )
+        except Exception as e:
+            print(f"[reply-route] route-failed mark failed: {e}", flush=True)
 
 
 @app.route("/api/v1/admin/brief-replies", methods=["OPTIONS"])
@@ -15995,6 +16180,102 @@ def _get_or_create_thread_for_subscriber(user_id: int):
             return cur.fetchone()
 
 
+def _post_to_pro_thread(
+    subscriber_user_id: int,
+    body: str,
+    sender_role: str,
+    sender_user_id: int | None = None,
+    sender_name: str | None = None,
+    notify_met: bool = True,
+) -> dict | None:
+    """Append a message to a subscriber's Pro Thread. Idempotent thread
+    creation. Returns the message dict, or None on failure.
+
+    Used by:
+      - Portal "send message" endpoint (sender_role='subscriber')
+      - Met workspace reply endpoint (sender_role='met')
+      - Brief reply webhooks (sender_role='subscriber', auto-routed inbound)
+
+    notify_met: if True, sends an SMS heads-up to METEOROLOGIST_PHONE.
+                Skip for high-volume contexts (bulk imports) to avoid
+                paging Met about every message.
+    """
+    if not body or not body.strip():
+        return None
+    body = body.strip()[:5000]  # cap at 5KB
+
+    thread = _get_or_create_thread_for_subscriber(subscriber_user_id)
+    if not thread:
+        return None
+
+    now_ms = int(time.time() * 1000)
+    preview = body[:120]
+    msg_id = None
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO pro_thread_messages
+                       (thread_id, created_at, sender_role, sender_user_id,
+                        sender_name, body)
+                       VALUES (%s, %s, %s, %s, %s, %s)
+                       RETURNING id""",
+                    (thread["id"], now_ms, sender_role,
+                     sender_user_id, sender_name or "", body),
+                )
+                msg_id = cur.fetchone()["id"]
+
+                # Update thread metadata based on who sent
+                if sender_role == "subscriber":
+                    cur.execute(
+                        """UPDATE pro_threads
+                           SET last_message_at = %s,
+                               last_message_preview = %s,
+                               last_message_from = 'subscriber',
+                               unread_for_met = unread_for_met + 1
+                           WHERE id = %s""",
+                        (now_ms, preview, thread["id"]),
+                    )
+                else:  # met
+                    cur.execute(
+                        """UPDATE pro_threads
+                           SET last_message_at = %s,
+                               last_message_preview = %s,
+                               last_message_from = 'met',
+                               unread_for_subscriber = unread_for_subscriber + 1
+                           WHERE id = %s""",
+                        (now_ms, preview, thread["id"]),
+                    )
+    except Exception as e:
+        print(f"[pro-thread-post] insert failed sub={subscriber_user_id}: {e}", flush=True)
+        return None
+
+    # Page on-duty Met if requested (only for subscriber-originated messages)
+    if notify_met and sender_role == "subscriber":
+        try:
+            met_phone = os.environ.get("METEOROLOGIST_PHONE", "").strip()
+            if met_phone:
+                base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+                sms_body = (
+                    f"WV Pro Thread from {sender_name or 'subscriber'}:\n"
+                    f"{preview}\n\n"
+                    f"Reply in workspace: {base}/?screen=met"
+                )
+                send_sms(met_phone, sms_body)
+        except Exception as e:
+            print(f"[pro-thread-post] Met SMS notify failed: {e}", flush=True)
+
+    return {
+        "id": msg_id,
+        "thread_id": thread["id"],
+        "subscriber_user_id": subscriber_user_id,
+        "sender_role": sender_role,
+        "body": body,
+        "created_at": now_ms,
+    }
+
+
 def _is_pro_subscriber(user: dict) -> bool:
     """True if the user is a Pro-tier subscriber. Pro Threads is a Pro
     feature; Hobbyists can't access it."""
@@ -16292,7 +16573,9 @@ def met_thread_send(thread_id):
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """SELECT t.id, t.subscriber_user_id, u.phone AS sub_phone
+                """SELECT t.id, t.subscriber_user_id,
+                          u.phone AS sub_phone,
+                          u.email AS sub_email
                    FROM pro_threads t
                    JOIN users u ON u.id = t.subscriber_user_id
                    WHERE t.id = %s""",
@@ -16327,18 +16610,65 @@ def met_thread_send(thread_id):
                 (now_ms, preview, thread_id),
             )
 
-    # Notify subscriber by SMS so they know to check
+    # Notify subscriber by SMS so they know to check.
+    # Phase 2 (May 18, 2026): also send the full message body via email
+    # so the subscriber gets the actual reply, not just a notification.
+    # SMS stays as a short "check your thread" ping due to length limits.
     try:
-        if thread.get("sub_phone"):
-            base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+        sub_phone = thread.get("sub_phone")
+        sub_email = thread.get("sub_email")
+        base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+        portal_url = f"{base}/?portal=threads"
+
+        if sub_phone:
             sms_body = (
                 f"WeatherValet: {sender_name} replied to your thread.\n"
                 f"{preview}\n\n"
-                f"View: {base}/?portal=threads"
+                f"View: {portal_url}"
             )
-            send_sms(thread["sub_phone"], sms_body)
+            send_sms(sub_phone, sms_body)
+
+        if sub_email:
+            # Build the full email so the subscriber gets the actual message
+            email_subject = f"Reply from {sender_name} (WeatherValet)"
+            # Convert plain text body to HTML preserving line breaks
+            body_html_paragraphs = ""
+            for para in body.split("\n\n"):
+                if not para.strip():
+                    continue
+                para_html = para.replace("\n", "<br>")
+                body_html_paragraphs += (
+                    f'<p style="color:#0E1116;font-size:15px;line-height:1.6;'
+                    f'margin:0 0 14px;">{_html_escape(para_html)}</p>'
+                )
+            html_inner = (
+                f'<h1 style="color:#0E1116;font-size:20px;margin:0 0 18px;'
+                f'font-weight:600;letter-spacing:-0.01em;">'
+                f'Message from {_html_escape(sender_name)}</h1>'
+                + body_html_paragraphs +
+                f'<p style="color:#5B6370;font-size:13px;line-height:1.55;'
+                f'margin:20px 0 0;padding-top:18px;'
+                f'border-top:1px solid #ECEEF1;">'
+                f'Reply to this email or open your '
+                f'<a href="{portal_url}" style="color:#2E4FB8;'
+                f'text-decoration:none;">subscriber portal</a> to continue '
+                f'the conversation with {_html_escape(sender_name)}.</p>'
+            )
+            html_body = _email_shell(
+                html_inner,
+                preheader=f"{sender_name} replied: {preview[:80]}"
+            )
+            text_body = (
+                f"Message from {sender_name} (WeatherValet)\n\n"
+                f"{body}\n\n"
+                f"---\nReply to this email or visit your portal:\n{portal_url}\n"
+            )
+            # Use _send_brief_email with html=True; it sends html_body as-is.
+            # Text fallback is stripped from the HTML, which is fine for
+            # this format (it'll roughly match the structure we built).
+            _send_brief_email(sub_email, email_subject, html_body, html=True)
     except Exception as e:
-        print(f"[pro-thread] subscriber SMS notify failed: {e}", flush=True)
+        print(f"[pro-thread] subscriber notify failed: {e}", flush=True)
 
     return jsonify({
         "ok": True,
