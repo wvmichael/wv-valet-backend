@@ -5142,6 +5142,23 @@ def stripe_webhook_v2():
                     # Grant subscriber role
                     newly_granted = _grant_subscriber_role(user_id, conn)
 
+                    # ── Subscriber coverage row (May 18, 2026) ──
+                    # Every Pro-tier subscriber needs a row in subscriber_coverage
+                    # so Mets can be assigned + Daily Brief scheduler can run.
+                    # Hobbyist tier still gets a row (defaults), used for
+                    # Daily Brief timezone/window even without a primary Met.
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """INSERT INTO subscriber_coverage
+                                   (user_id, daily_brief_time, daily_brief_timezone, updated_at)
+                                   VALUES (%s, '07:00', 'America/New_York', %s)
+                                   ON CONFLICT (user_id) DO NOTHING""",
+                                (user_id, int(time.time() * 1000)),
+                            )
+                    except Exception as e:
+                        print(f"[stripe-webhook] coverage row write failed: {e!r}", flush=True)
+
                     # ── Sales rep attribution (locked at signup) ──
                     # Capture rep slug + starter flag from metadata. Once
                     # written, never modified — prevents commission disputes.
@@ -10740,6 +10757,279 @@ def admin_brief_replies():
         for r in rows
     ]
     return jsonify({"ok": True, "replies": replies, "count": len(replies)})
+
+
+# ════════════════════════════════════════════════════════════════════
+# Admin subscriber management (May 18, 2026)
+# ════════════════════════════════════════════════════════════════════
+#
+# Lightweight tools for assigning primary Mets to subscribers, listing
+# active subscribers with their coverage state, and the unassigned ones
+# that need attention. Used during pre-launch dogfooding and ongoing
+# admin operations.
+
+@app.route("/api/v1/admin/subscribers", methods=["OPTIONS"])
+def _admin_subscribers_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/subscribers")
+def admin_list_subscribers():
+    """List all active subscribers with their coverage assignment.
+
+    Returns:
+      [
+        {
+          id, email, name, phone, subscription_tier, created_at,
+          primary_met_id, primary_met_name,
+          backup_met_id, backup_met_name,
+          daily_brief_time, daily_brief_timezone
+        }, ...
+      ]
+
+    Sorted: unassigned (no primary Met) first, then by created_at desc.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT
+                          u.id, u.email, u.name, u.phone, u.subscription_tier,
+                          u.created_at,
+                          sc.primary_met_id,
+                          sc.backup_met_id,
+                          sc.daily_brief_time,
+                          sc.daily_brief_timezone,
+                          pm.name AS primary_met_name,
+                          pm.email AS primary_met_email,
+                          bm.name AS backup_met_name,
+                          bm.email AS backup_met_email
+                       FROM users u
+                       JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'subscriber'
+                       LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
+                       LEFT JOIN users pm ON pm.id = sc.primary_met_id
+                       LEFT JOIN users bm ON bm.id = sc.backup_met_id
+                       WHERE u.is_active = TRUE
+                       ORDER BY
+                          CASE WHEN sc.primary_met_id IS NULL THEN 0 ELSE 1 END,
+                          u.created_at DESC"""
+                )
+                rows = cur.fetchall()
+    except Exception as e:
+        print(f"[admin-list-subscribers] failed: {e}", flush=True)
+        return jsonify({"ok": False, "error": "query-failed"}), 500
+
+    out = []
+    for r in rows:
+        out.append({
+            "id": r["id"],
+            "email": r["email"],
+            "name": r["name"] or "",
+            "phone": r["phone"] or "",
+            "subscription_tier": r["subscription_tier"] or "",
+            "created_at": r["created_at"],
+            "primary_met_id": r.get("primary_met_id"),
+            "primary_met_name": r.get("primary_met_name") or "",
+            "primary_met_email": r.get("primary_met_email") or "",
+            "backup_met_id": r.get("backup_met_id"),
+            "backup_met_name": r.get("backup_met_name") or "",
+            "backup_met_email": r.get("backup_met_email") or "",
+            "daily_brief_time": r.get("daily_brief_time") or "07:00",
+            "daily_brief_timezone": r.get("daily_brief_timezone") or "America/New_York",
+        })
+    return jsonify({"ok": True, "subscribers": out, "count": len(out)})
+
+
+@app.route("/api/v1/admin/mets", methods=["OPTIONS"])
+def _admin_mets_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/mets")
+def admin_list_mets():
+    """List all Mets (active users with the 'met' or 'admin' role).
+    Used to populate the Met-picker UI for primary Met assignment."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT DISTINCT u.id, u.email, u.name
+                   FROM users u
+                   JOIN user_roles ur ON ur.user_id = u.id
+                   WHERE u.is_active = TRUE
+                     AND ur.role IN ('met', 'admin')
+                   ORDER BY u.name, u.email"""
+            )
+            rows = cur.fetchall()
+
+    return jsonify({"ok": True, "mets": [
+        {"id": r["id"], "name": r["name"] or "", "email": r["email"]}
+        for r in rows
+    ]})
+
+
+@app.route("/api/v1/admin/subscribers/<int:user_id>/coverage", methods=["OPTIONS"])
+def _admin_assign_coverage_preflight(user_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/subscribers/<int:user_id>/coverage")
+def admin_assign_coverage(user_id):
+    """Set or update a subscriber's primary/backup Met assignment.
+
+    Body: {
+      "primary_met_id": 5,           // optional, can be null to clear
+      "backup_met_id": 7,            // optional, can be null
+      "daily_brief_time": "06:30",   // optional, HH:MM 24h
+      "daily_brief_timezone": "America/Chicago"  // optional
+    }
+
+    Creates the subscriber_coverage row if missing. Validates that
+    assigned Mets actually have the 'met' or 'admin' role.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    primary_met_id = data.get("primary_met_id")  # may be None to clear
+    backup_met_id = data.get("backup_met_id")
+    daily_brief_time = (data.get("daily_brief_time") or "").strip()
+    daily_brief_timezone = (data.get("daily_brief_timezone") or "").strip()
+
+    # Validate the assigned Mets actually exist and have the right role
+    def _validate_met(met_id):
+        if met_id is None:
+            return True
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT 1 FROM user_roles
+                           WHERE user_id = %s AND role IN ('met', 'admin') LIMIT 1""",
+                        (met_id,),
+                    )
+                    return cur.fetchone() is not None
+        except Exception:
+            return False
+
+    if primary_met_id is not None and not _validate_met(primary_met_id):
+        return jsonify({"ok": False, "error": "invalid-primary-met"}), 400
+    if backup_met_id is not None and not _validate_met(backup_met_id):
+        return jsonify({"ok": False, "error": "invalid-backup-met"}), 400
+
+    # Validate the user exists and is a subscriber
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id FROM users u
+                   JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'subscriber'
+                   WHERE u.id = %s AND u.is_active = TRUE""",
+                (user_id,),
+            )
+            if not cur.fetchone():
+                return jsonify({"ok": False, "error": "subscriber-not-found"}), 404
+
+    # Validate time format if provided
+    if daily_brief_time and not re.match(r"^\d{2}:\d{2}$", daily_brief_time):
+        return jsonify({"ok": False, "error": "invalid-time-format"}), 400
+
+    # Build the upsert. Use COALESCE to preserve existing values when
+    # the request omits a field.
+    try:
+        now_ms = int(time.time() * 1000)
+        with db() as conn:
+            with conn.cursor() as cur:
+                # Ensure a row exists
+                cur.execute(
+                    """INSERT INTO subscriber_coverage
+                       (user_id, daily_brief_time, daily_brief_timezone, updated_at)
+                       VALUES (%s, '07:00', 'America/New_York', %s)
+                       ON CONFLICT (user_id) DO NOTHING""",
+                    (user_id, now_ms),
+                )
+                # Build SET clauses for the fields we have
+                set_parts = ["updated_at = %s"]
+                params: list = [now_ms]
+                # primary_met_id: always update (None clears it)
+                if "primary_met_id" in data:
+                    set_parts.append("primary_met_id = %s")
+                    params.append(primary_met_id)
+                if "backup_met_id" in data:
+                    set_parts.append("backup_met_id = %s")
+                    params.append(backup_met_id)
+                if daily_brief_time:
+                    set_parts.append("daily_brief_time = %s")
+                    params.append(daily_brief_time)
+                if daily_brief_timezone:
+                    set_parts.append("daily_brief_timezone = %s")
+                    params.append(daily_brief_timezone)
+                params.append(user_id)
+                cur.execute(
+                    f"""UPDATE subscriber_coverage
+                        SET {', '.join(set_parts)}
+                        WHERE user_id = %s""",
+                    params,
+                )
+
+                # Return the updated row
+                cur.execute(
+                    """SELECT sc.*, pm.name AS primary_met_name, pm.email AS primary_met_email,
+                              bm.name AS backup_met_name, bm.email AS backup_met_email
+                       FROM subscriber_coverage sc
+                       LEFT JOIN users pm ON pm.id = sc.primary_met_id
+                       LEFT JOIN users bm ON bm.id = sc.backup_met_id
+                       WHERE sc.user_id = %s""",
+                    (user_id,),
+                )
+                row = cur.fetchone()
+    except Exception as e:
+        print(f"[admin-assign-coverage] failed user_id={user_id}: {e}", flush=True)
+        return jsonify({"ok": False, "error": "update-failed"}), 500
+
+    # Audit log
+    try:
+        _audit_log(
+            actor_user_id=user["id"],
+            actor_name=user.get("name") or user.get("email") or "admin",
+            action="subscriber-coverage-update",
+            target_type="user",
+            target_id=user_id,
+            details={
+                "primary_met_id": primary_met_id,
+                "backup_met_id": backup_met_id,
+                "daily_brief_time": daily_brief_time or None,
+                "daily_brief_timezone": daily_brief_timezone or None,
+            },
+        )
+    except Exception:
+        pass
+
+    return jsonify({
+        "ok": True,
+        "coverage": {
+            "user_id": row["user_id"],
+            "primary_met_id": row.get("primary_met_id"),
+            "primary_met_name": row.get("primary_met_name") or "",
+            "backup_met_id": row.get("backup_met_id"),
+            "backup_met_name": row.get("backup_met_name") or "",
+            "daily_brief_time": row.get("daily_brief_time") or "07:00",
+            "daily_brief_timezone": row.get("daily_brief_timezone") or "America/New_York",
+        }
+    })
 
 
 # ════════════════════════════════════════════════════════════════════
