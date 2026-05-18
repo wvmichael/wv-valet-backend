@@ -6864,6 +6864,197 @@ def admin_command_center_stats():
     return jsonify({"ok": True, "stats": stats, "computed_at_ms": now_ms})
 
 
+@app.route("/api/v1/admin/command-center/charts", methods=["OPTIONS"])
+def _cmd_center_charts_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/command-center/charts")
+def admin_command_center_charts():
+    """Stage 2 of Command Center analytics. Returns time-series and
+    aggregate data for charts in the dashboard.
+
+    Computed:
+      - daily_visitors[14]: unique + total views per day for last 14 days
+      - daily_searches[14]: search count per day for last 14 days
+      - hourly_pattern[24]: average visitors per hour of day (last 7 days)
+      - top_queries[10]: most searched plan/query texts (last 7 days)
+      - signup_funnel: rough conversion numbers (visitors -> searches -> subscribers)
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    now_ms = int(time.time() * 1000)
+    day_ms = 24 * 60 * 60 * 1000
+
+    # UTC day boundaries
+    today_start_dt = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    today_start_ms = int(today_start_dt.timestamp() * 1000)
+    fourteen_days_ago_ms = today_start_ms - 13 * day_ms  # 14 days INCLUDING today
+    seven_days_ago_ms = today_start_ms - 6 * day_ms
+
+    charts: dict = {}
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                # ── Daily visitors (14 days) ──
+                # Group visits by day-bucket. We compute the bucket on the
+                # backend side to avoid timezone confusion.
+                cur.execute(
+                    """SELECT
+                          FLOOR((visited_at_ms - %s) / %s)::int AS day_offset,
+                          COUNT(DISTINCT visitor_hash) AS uniq,
+                          COUNT(*) AS views
+                       FROM page_visits
+                       WHERE visited_at_ms >= %s
+                       GROUP BY day_offset
+                       ORDER BY day_offset""",
+                    (fourteen_days_ago_ms, day_ms, fourteen_days_ago_ms),
+                )
+                rows = cur.fetchall()
+                # Build a full 14-day series with zero-fills
+                daily_visitors = []
+                rows_by_offset = {r["day_offset"]: r for r in rows}
+                for offset in range(14):
+                    bucket_start_ms = fourteen_days_ago_ms + offset * day_ms
+                    bucket_date = datetime.fromtimestamp(
+                        bucket_start_ms / 1000, tz=timezone.utc
+                    ).strftime("%Y-%m-%d")
+                    r = rows_by_offset.get(offset)
+                    daily_visitors.append({
+                        "date": bucket_date,
+                        "day_offset": offset,
+                        "unique_visitors": (r or {}).get("uniq") or 0,
+                        "total_views": (r or {}).get("views") or 0,
+                    })
+                charts["daily_visitors"] = daily_visitors
+
+                # ── Daily searches (14 days) ──
+                cur.execute(
+                    """SELECT
+                          FLOOR((searched_at_ms - %s) / %s)::int AS day_offset,
+                          COUNT(*) AS n
+                       FROM search_events
+                       WHERE searched_at_ms >= %s
+                       GROUP BY day_offset
+                       ORDER BY day_offset""",
+                    (fourteen_days_ago_ms, day_ms, fourteen_days_ago_ms),
+                )
+                rows = cur.fetchall()
+                daily_searches = []
+                rows_by_offset = {r["day_offset"]: r for r in rows}
+                for offset in range(14):
+                    bucket_start_ms = fourteen_days_ago_ms + offset * day_ms
+                    bucket_date = datetime.fromtimestamp(
+                        bucket_start_ms / 1000, tz=timezone.utc
+                    ).strftime("%Y-%m-%d")
+                    r = rows_by_offset.get(offset)
+                    daily_searches.append({
+                        "date": bucket_date,
+                        "day_offset": offset,
+                        "count": (r or {}).get("n") or 0,
+                    })
+                charts["daily_searches"] = daily_searches
+
+                # ── Hourly pattern (7 days) ──
+                # Computed as average visitors per hour across last 7 days.
+                # Uses EXTRACT(HOUR FROM TO_TIMESTAMP) which is portable Postgres.
+                cur.execute(
+                    """SELECT
+                          EXTRACT(HOUR FROM TO_TIMESTAMP(visited_at_ms / 1000))::int AS hour_utc,
+                          COUNT(*) AS visits
+                       FROM page_visits
+                       WHERE visited_at_ms >= %s
+                       GROUP BY hour_utc
+                       ORDER BY hour_utc""",
+                    (seven_days_ago_ms,),
+                )
+                rows = cur.fetchall()
+                hourly_by_hour = {r["hour_utc"]: r["visits"] for r in rows}
+                # Fill all 24 hours with zero defaults
+                hourly_pattern = []
+                for h in range(24):
+                    hourly_pattern.append({
+                        "hour_utc": h,
+                        "visits": hourly_by_hour.get(h, 0),
+                    })
+                charts["hourly_pattern"] = hourly_pattern
+
+                # ── Top search queries (7 days) ──
+                # The "marketing intel goldmine": what are people actually typing?
+                cur.execute(
+                    """SELECT query_text, COUNT(*) AS n
+                       FROM search_events
+                       WHERE searched_at_ms >= %s
+                         AND query_text IS NOT NULL
+                         AND query_text != ''
+                       GROUP BY query_text
+                       ORDER BY n DESC, query_text
+                       LIMIT 10""",
+                    (seven_days_ago_ms,),
+                )
+                charts["top_queries"] = [
+                    {"query": r["query_text"], "count": r["n"]}
+                    for r in cur.fetchall()
+                ]
+
+                # ── Signup funnel (rough lifetime estimate) ──
+                # Visitors that ever loaded -> searches done -> subscribers signed up.
+                # We use lifetime data for the denominators (because the
+                # earliest visits/searches show real funnel pressure).
+                # All counts are over the last 7 days for a comparable window.
+                cur.execute(
+                    """SELECT COUNT(DISTINCT visitor_hash) AS uniq_visitors
+                       FROM page_visits
+                       WHERE visited_at_ms >= %s""",
+                    (seven_days_ago_ms,),
+                )
+                funnel_visitors = (cur.fetchone() or {}).get("uniq_visitors") or 0
+
+                cur.execute(
+                    """SELECT COUNT(DISTINCT visitor_hash) AS searched
+                       FROM search_events
+                       WHERE searched_at_ms >= %s""",
+                    (seven_days_ago_ms,),
+                )
+                funnel_searched = (cur.fetchone() or {}).get("searched") or 0
+
+                cur.execute(
+                    """SELECT COUNT(*) AS new_subs
+                       FROM users u
+                       JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'subscriber'
+                       WHERE u.created_at >= %s AND u.is_active = TRUE""",
+                    (seven_days_ago_ms,),
+                )
+                funnel_subscribers = (cur.fetchone() or {}).get("new_subs") or 0
+
+                charts["signup_funnel"] = {
+                    "visitors_7d": funnel_visitors,
+                    "searched_7d": funnel_searched,
+                    "new_subscribers_7d": funnel_subscribers,
+                    "search_rate_pct": (
+                        round(funnel_searched / funnel_visitors * 100, 1)
+                        if funnel_visitors > 0 else 0
+                    ),
+                    "subscribe_rate_pct": (
+                        round(funnel_subscribers / funnel_searched * 100, 1)
+                        if funnel_searched > 0 else 0
+                    ),
+                }
+
+    except Exception as e:
+        print(f"[command-center-charts] failed: {e}", flush=True)
+        return jsonify({"ok": False, "error": "query-failed"}), 500
+
+    return jsonify({"ok": True, "charts": charts, "computed_at_ms": now_ms})
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Templates — minimal HTML, brand voice intact
 # ════════════════════════════════════════════════════════════════════════════
