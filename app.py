@@ -11596,15 +11596,22 @@ def me_threshold_alerts_delete(alert_id):
 # user commits to saving it.
 
 def _geocode_address(query: str) -> Optional[dict]:
-    """Look up a free-form address string using Open-Meteo's geocoding API.
+    """Look up a free-form address string. Two-stage:
 
-    No API key required, no rate-limit signup. Returns the first result
-    or None if no match. Result shape:
+    1. Open-Meteo geocoding API — fast, great for place names ("Lebanon, IN",
+       "Indianapolis"). No API key, no rate-limit signup. Won't find street
+       addresses though.
+    2. Nominatim (OpenStreetMap) fallback — slower, handles full street
+       addresses ("123 Main St, Lebanon, IN"). Free for low volume,
+       requires User-Agent. Used when Open-Meteo returns nothing.
+
+    Returns the first result or None if no match across both providers.
+    Result shape:
         {
           "lat": float,
           "lng": float,
           "name": "Lebanon",
-          "admin1": "Indiana",       # state
+          "admin1": "Indiana",        # state
           "admin2": "Boone County",   # county
           "country": "United States"
         }
@@ -11618,8 +11625,18 @@ def _geocode_address(query: str) -> Optional[dict]:
     if not q:
         return None
 
+    # ── Stage 1: Open-Meteo (place names) ──
+    result = _geocode_via_open_meteo(q)
+    if result is not None:
+        return result
+
+    # ── Stage 2: Nominatim fallback (street addresses) ──
+    return _geocode_via_nominatim(q)
+
+
+def _geocode_via_open_meteo(q: str) -> Optional[dict]:
+    """Open-Meteo geocoding: fast, place-name database. No street addresses."""
     try:
-        # URL-encode the query
         from urllib.parse import quote
         url = (
             "https://geocoding-api.open-meteo.com/v1/search"
@@ -11629,10 +11646,10 @@ def _geocode_address(query: str) -> Optional[dict]:
         with urllib.request.urlopen(req, timeout=4) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, ValueError, TimeoutError) as e:
-        print(f"[GEOCODE] failed for '{q[:80]}': {e}", flush=True)
+        print(f"[GEOCODE-OM] failed for '{q[:80]}': {e}", flush=True)
         return None
     except Exception as e:
-        print(f"[GEOCODE] unexpected error for '{q[:80]}': {e}", flush=True)
+        print(f"[GEOCODE-OM] unexpected error for '{q[:80]}': {e}", flush=True)
         return None
 
     results = (data or {}).get("results") or []
@@ -11648,6 +11665,55 @@ def _geocode_address(query: str) -> Optional[dict]:
         "admin2": r.get("admin2") or "",   # county
         "country": r.get("country") or "",
     }
+
+
+def _geocode_via_nominatim(q: str) -> Optional[dict]:
+    """Nominatim (OpenStreetMap) geocoding: slower, handles street addresses.
+
+    Free for low-volume use. Requires a real User-Agent (Nominatim policy).
+    Max ~1 req/sec at low volume; we trust this won't be hit at launch
+    scale. If we exceed, swap to Google Maps Geocoding API.
+    """
+    try:
+        from urllib.parse import quote
+        url = (
+            "https://nominatim.openstreetmap.org/search"
+            f"?q={quote(q)}&format=json&addressdetails=1&limit=1"
+            "&countrycodes=us"  # bias to US for now; remove if expanding
+        )
+        req = urllib.request.Request(url, headers={
+            # Nominatim policy: identify the app + contact email
+            "User-Agent": "WeatherValet/1.0 (hello@weathervalet.ai)",
+            "Accept": "application/json",
+        })
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, ValueError, TimeoutError) as e:
+        print(f"[GEOCODE-NOM] failed for '{q[:80]}': {e}", flush=True)
+        return None
+    except Exception as e:
+        print(f"[GEOCODE-NOM] unexpected error for '{q[:80]}': {e}", flush=True)
+        return None
+
+    if not data or not isinstance(data, list) or len(data) == 0:
+        return None
+
+    r = data[0]
+    addr = r.get("address") or {}
+    # Nominatim's address fields: state, county, city/town/village
+    name = (addr.get("city") or addr.get("town") or addr.get("village")
+            or addr.get("hamlet") or r.get("display_name", "").split(",")[0])
+    try:
+        return {
+            "lat": float(r.get("lat")),
+            "lng": float(r.get("lon")),
+            "name": (name or q)[:120],
+            "admin1": addr.get("state") or "",
+            "admin2": addr.get("county") or "",
+            "country": addr.get("country") or "",
+        }
+    except (ValueError, TypeError):
+        return None
 
 
 @app.route("/api/v1/geocode", methods=["OPTIONS"])
