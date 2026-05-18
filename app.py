@@ -2280,11 +2280,21 @@ def _get_or_create_user(email: str, conn) -> int:
     with conn.cursor() as cur:
         # Look up by lowercase email
         cur.execute(
-            "SELECT id FROM users WHERE LOWER(email) = LOWER(%s)",
+            "SELECT id, created_at FROM users WHERE LOWER(email) = LOWER(%s)",
             (normalized,),
         )
         row = cur.fetchone()
         if row:
+            # Auto-heal: if this user was created with a bogus timestamp
+            # (NULL, 0, or anything pre-2024), backfill it to now. This
+            # is a one-time fix per row that runs the first time we
+            # look up an affected user after the May 18, 2026 deploy.
+            existing_created = row.get("created_at") or 0
+            if existing_created < 1704067200000:  # Jan 1, 2024 UTC
+                cur.execute(
+                    "UPDATE users SET created_at = %s WHERE id = %s AND (created_at IS NULL OR created_at < %s)",
+                    (now, row["id"], 1704067200000),
+                )
             return row["id"]
 
         # Doesn't exist — create the user
@@ -9863,13 +9873,20 @@ def me_subscription():
     except Exception as e:
         print(f"[subscription] starter check failed: {e}", flush=True)
 
+    # Guard against bogus created_at values (epoch 0, NULL, or pre-2024
+    # data from before WeatherValet existed). Return None so the frontend
+    # shows a placeholder instead of "January 1970".
+    member_since_ms = row.get("created_at")
+    if not member_since_ms or member_since_ms < 1704067200000:  # Jan 1, 2024
+        member_since_ms = None
+
     return jsonify({
         "ok": True,
         "plan": plan,
         "plan_display": plan_display,
         "price_display": price_display,
         "next_billing_at": next_billing_at,
-        "member_since": row["created_at"],
+        "member_since": member_since_ms,
         "is_active": row["is_active"] if "is_active" in row else True,
         "stripe_customer_id": row.get("stripe_customer_id"),
         "is_starter_month": is_starter_month,
