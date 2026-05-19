@@ -2522,7 +2522,8 @@ def _get_current_user() -> Optional[dict]:
             # Join session + user + roles in one query for efficiency
             cur.execute(
                 """SELECT s.user_id, s.expires_at, s.idle_expires_at,
-                          u.email, u.name, u.is_active
+                          u.email, u.name, u.is_active,
+                          u.password_hash, u.password_must_change
                    FROM sessions s
                    JOIN users u ON u.id = s.user_id
                    WHERE s.session_id_hash = %s""",
@@ -2575,11 +2576,21 @@ def _get_current_user() -> Optional[dict]:
             )
             role_rows = cur.fetchall()
 
+    # must_set_password: True if user has no password OR was flagged to
+    # change. The frontend uses this to surface the set-password modal
+    # if the user has a valid session but never finished setting their
+    # password (e.g. they closed the tab during initial signup).
+    must_set_password = (
+        not row.get("password_hash")
+        or bool(row.get("password_must_change"))
+    )
+
     return {
         "id": row["user_id"],
         "email": row["email"],
         "name": row["name"],
         "roles": [r["role"] for r in role_rows],
+        "must_set_password": must_set_password,
     }
 
 
@@ -4038,6 +4049,7 @@ def auth_session():
             "name": user["name"],
         },
         "workspaces": workspaces,
+        "must_set_password": user.get("must_set_password", False),
     }), 200
 
 
