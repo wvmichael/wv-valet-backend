@@ -493,6 +493,14 @@ CREATE INDEX IF NOT EXISTS idx_users_stripe_customer ON users(stripe_customer_id
 -- Values: 'hobbyist' | 'pro_single' | 'pro_multi' | 'pro_enterprise'
 ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_tier TEXT;
 
+-- ── Subscriber migration tracking (May 19, 2026) ──
+-- For subscribers imported from the legacy AWSC weather service into
+-- WeatherValet. NULL for regular Stripe signups; 'awsc_legacy' for
+-- imported subscribers. Used by admin to filter the user list and by
+-- the migration tooling to make imports idempotent.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS migrated_from TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS migrated_at BIGINT;
+
 -- ── Phone number (Phase 10 Item #3) ──
 -- E.164 format ("+15555550101"). Used for daily brief SMS delivery
 -- and threshold alerts. Collected during subscriber signup (via Stripe
@@ -2049,6 +2057,24 @@ def _send_magic_link_email(email: str, magic_link_url: str, intent: str = "sign-
             "If you didn't sign up for WeatherValet, please reply to this "
             "email so we can look into it. No charges have been finalized "
             "until your account is activated."
+        )
+    elif intent == "migrated":
+        # Welcome email for grandfathered subscribers being migrated from
+        # the legacy AWSC weather service into WeatherValet. Same service
+        # they've been using; just a new portal + same Met team. They
+        # already pay through Stripe and that doesn't change.
+        subject = "Welcome to WeatherValet: your account is ready"
+        heading_text = "Welcome to WeatherValet"
+        button_text = "Set my password"
+        body_text = (
+            "Your WeatherValet account is set up and ready. Same service, "
+            "same meteorologist team, same number you've been texting. "
+            "Your subscription continues at your current rate, no card "
+            "changes needed. Tap the button below to set a password "
+            "and access your new dashboard. This link is valid for 7 days."
+        )
+        safety_text = (
+            "Questions? Just reply to this email and a human will read it."
         )
     elif intent == "password-reset":
         subject = "Reset your WeatherValet password"
@@ -22055,6 +22081,405 @@ def admin_sales_rep_update(rep_id: int):
                 tuple(params),
             )
     return jsonify({"ok": True})
+
+
+# ════════════════════════════════════════════════════════════════════
+# Subscriber migration tooling (May 19, 2026)
+# ════════════════════════════════════════════════════════════════════
+#
+# Imports existing AWSC weather subscribers into WeatherValet without
+# charging them again, breaking their existing Stripe subs, or asking
+# them to re-enter card info.
+#
+# Per-subscriber flow:
+#   1. Create-or-update WeatherValet user account, tied to existing Stripe customer
+#   2. Grant subscriber role
+#   3. Save primary location (subscriber's address) with lat/lng + label
+#   4. Set brief delivery preferences (time + timezone)
+#   5. Assign primary Met (Chris for KS, Michael for IN/NJ)
+#   6. (If skip_stripe is False) Modify their Stripe subscription:
+#        - Move to WeatherValet product price ID
+#        - Apply grandfathered coupon if specified
+#        - proration_behavior='none' so they don't see any charge
+#   7. Send welcome email with 7-day magic link (intent='migrated')
+#   8. Audit log
+#
+# Idempotency: if a user with the same email already exists AND has
+# migrated_at set, we update their record but do NOT re-send the welcome
+# email and do NOT re-modify their Stripe subscription. Safe to re-run
+# the same import without side effects.
+#
+# Failure isolation: each step that can fail (Stripe modify, email send)
+# is wrapped in try/except so a partial failure still creates the user
+# account and returns a warnings list explaining what didn't complete.
+
+@app.route("/api/v1/admin/import-subscriber", methods=["OPTIONS"])
+def _admin_import_subscriber_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/import-subscriber")
+def admin_import_subscriber():
+    """Import an existing AWSC subscriber into WeatherValet.
+
+    Body:
+      {
+        "email": "subscriber@example.com",
+        "name": "Subscriber Name",
+        "phone": "+13175551234",
+        "stripe_customer_id": "cus_xxx",        // optional if skip_stripe=true
+        "stripe_subscription_id": "sub_xxx",    // optional if skip_stripe=true
+        "tier": "hobbyist" | "pro_single",
+        "coupon_id": "wv_grandfathered_pro_single" | null,
+        "address": "123 Main St, Lebanon IN",   // text form
+        "lat": 40.0481,
+        "lng": -86.4694,
+        "location_label": "Home",
+        "brief_time": "07:00",                  // HH:MM 24h local
+        "brief_timezone": "America/New_York",
+        "primary_met_user_id": 42,
+        "send_welcome_email": true,
+        "skip_stripe": false                    // true for annual subs we leave alone
+      }
+
+    Returns 200:
+      {
+        "ok": true,
+        "user_id": 123,
+        "magic_link_sent": true,
+        "stripe_modified": true,
+        "warnings": []                          // list of strings
+      }
+    """
+    actor, err = _require_admin()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    warnings = []
+
+    # ── Validate inputs ─────────────────────────────────────────
+    email = (data.get("email") or "").strip()
+    if not email or "@" not in email:
+        return jsonify({"ok": False, "error": "invalid-email"}), 400
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"ok": False, "error": "missing-name"}), 400
+    phone = (data.get("phone") or "").strip() or None
+    tier = (data.get("tier") or "").strip()
+    if tier not in ("hobbyist", "pro_single", "pro_multi"):
+        return jsonify({"ok": False, "error": "invalid-tier"}), 400
+
+    skip_stripe = bool(data.get("skip_stripe"))
+    stripe_customer_id = (data.get("stripe_customer_id") or "").strip() or None
+    stripe_subscription_id = (data.get("stripe_subscription_id") or "").strip() or None
+    coupon_id = (data.get("coupon_id") or "").strip() or None
+
+    if not skip_stripe:
+        if not stripe_customer_id or not stripe_customer_id.startswith("cus_"):
+            return jsonify({"ok": False, "error": "invalid-stripe-customer-id"}), 400
+        if not stripe_subscription_id or not stripe_subscription_id.startswith("sub_"):
+            return jsonify({"ok": False, "error": "invalid-stripe-subscription-id"}), 400
+
+    try:
+        lat = float(data.get("lat"))
+        lng = float(data.get("lng"))
+    except (ValueError, TypeError):
+        return jsonify({"ok": False, "error": "missing-coordinates"}), 400
+    location_label = (data.get("location_label") or "Home").strip()
+    address = (data.get("address") or "").strip()
+
+    brief_time = (data.get("brief_time") or "07:00").strip()
+    # Validate HH:MM format
+    import re as _re
+    if not _re.match(r"^\d{2}:\d{2}$", brief_time):
+        return jsonify({"ok": False, "error": "invalid-brief-time"}), 400
+    brief_timezone = (data.get("brief_timezone") or "America/New_York").strip()
+
+    primary_met_user_id = data.get("primary_met_user_id")
+    if primary_met_user_id is not None:
+        try:
+            primary_met_user_id = int(primary_met_user_id)
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "error": "invalid-met-user-id"}), 400
+
+    send_welcome = data.get("send_welcome_email", True)
+
+    now_ms = int(time.time() * 1000)
+
+    # ── Idempotency check + user create/update ────────────────────
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, migrated_at FROM users WHERE LOWER(email) = LOWER(%s)",
+                    (email,),
+                )
+                existing = cur.fetchone()
+
+                if existing and existing.get("migrated_at"):
+                    # Already migrated. Update non-destructive fields but
+                    # don't re-send email or re-modify Stripe.
+                    user_id = existing["id"]
+                    cur.execute(
+                        """UPDATE users SET
+                             name = COALESCE(%s, name),
+                             phone = COALESCE(%s, phone),
+                             stripe_customer_id = COALESCE(%s, stripe_customer_id),
+                             subscription_tier = COALESCE(%s, subscription_tier)
+                           WHERE id = %s""",
+                        (name, phone, stripe_customer_id, tier, user_id),
+                    )
+                    warnings.append("already-migrated: updated user details only, did not re-send email or re-modify Stripe")
+                    skip_stripe = True   # don't touch Stripe
+                    send_welcome = False  # don't re-send email
+
+                elif existing:
+                    # User exists (maybe they were a free signup or had an
+                    # earlier account). Mark them as migrated now.
+                    user_id = existing["id"]
+                    cur.execute(
+                        """UPDATE users SET
+                             name = COALESCE(%s, name),
+                             phone = COALESCE(%s, phone),
+                             stripe_customer_id = COALESCE(%s, stripe_customer_id),
+                             subscription_tier = %s,
+                             is_active = TRUE,
+                             migrated_from = 'awsc_legacy',
+                             migrated_at = %s,
+                             password_must_change = TRUE
+                           WHERE id = %s""",
+                        (name, phone, stripe_customer_id, tier, now_ms, user_id),
+                    )
+                else:
+                    # New user — create fresh
+                    cur.execute(
+                        """INSERT INTO users
+                             (email, name, phone, created_at, is_active,
+                              stripe_customer_id, subscription_tier,
+                              migrated_from, migrated_at, password_must_change)
+                           VALUES (%s, %s, %s, %s, TRUE, %s, %s,
+                                   'awsc_legacy', %s, TRUE)
+                           RETURNING id""",
+                        (email, name, phone, now_ms,
+                         stripe_customer_id, tier, now_ms),
+                    )
+                    user_id = cur.fetchone()["id"]
+    except Exception as e:
+        print(f"[migration] user create/update failed for {email}: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "user-create-failed",
+                        "message": str(e)}), 500
+
+    # ── Grant subscriber role ─────────────────────────────────────
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO user_roles (user_id, role, granted_at)
+                       VALUES (%s, 'subscriber', %s)
+                       ON CONFLICT DO NOTHING""",
+                    (user_id, now_ms),
+                )
+    except Exception as e:
+        warnings.append(f"role-grant-failed: {e}")
+        print(f"[migration] role grant failed user_id={user_id}: {e!r}", flush=True)
+
+    # ── Save primary location ─────────────────────────────────────
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                # Clear any existing is_primary flag on other locations
+                cur.execute(
+                    "UPDATE saved_locations SET is_primary = FALSE WHERE user_id = %s",
+                    (user_id,),
+                )
+                # Insert the new primary
+                cur.execute(
+                    """INSERT INTO saved_locations
+                         (user_id, label, address_text, lat, lng,
+                          is_primary, created_at, updated_at)
+                       VALUES (%s, %s, %s, %s, %s, TRUE, %s, %s)""",
+                    (user_id, location_label, address, lat, lng,
+                     now_ms, now_ms),
+                )
+                # Set the user's timezone based on location
+                cur.execute(
+                    "UPDATE users SET timezone = %s WHERE id = %s",
+                    (brief_timezone, user_id),
+                )
+    except Exception as e:
+        warnings.append(f"location-save-failed: {e}")
+        print(f"[migration] location save failed user_id={user_id}: {e!r}", flush=True)
+
+    # ── Set subscriber_coverage (brief time + Met assignment) ─────
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO subscriber_coverage
+                         (user_id, primary_met_id, daily_brief_time,
+                          daily_brief_timezone, updated_at)
+                       VALUES (%s, %s, %s, %s, %s)
+                       ON CONFLICT (user_id) DO UPDATE
+                       SET primary_met_id = EXCLUDED.primary_met_id,
+                           daily_brief_time = EXCLUDED.daily_brief_time,
+                           daily_brief_timezone = EXCLUDED.daily_brief_timezone,
+                           updated_at = EXCLUDED.updated_at""",
+                    (user_id, primary_met_user_id, brief_time,
+                     brief_timezone, now_ms),
+                )
+    except Exception as e:
+        warnings.append(f"coverage-set-failed: {e}")
+        print(f"[migration] coverage set failed user_id={user_id}: {e!r}", flush=True)
+
+    # ── Modify Stripe subscription ────────────────────────────────
+    stripe_modified = False
+    if not skip_stripe and stripe is not None and STRIPE_SECRET_KEY:
+        new_price_id = TIER_PRICE_MAP.get(tier)
+        if not new_price_id:
+            warnings.append(f"stripe-no-price-id-for-tier: {tier}")
+        else:
+            try:
+                # Fetch the current subscription to find its item id
+                sub = stripe.Subscription.retrieve(stripe_subscription_id)
+                items = sub.get("items", {}).get("data", [])
+                if not items:
+                    warnings.append("stripe-no-items-on-subscription")
+                else:
+                    current_item_id = items[0]["id"]
+                    modify_kwargs = {
+                        "items": [{
+                            "id": current_item_id,
+                            "price": new_price_id,
+                        }],
+                        "proration_behavior": "none",
+                        "metadata": {
+                            "wv_migrated_from_awsc": "true",
+                            "wv_migrated_at_ms": str(now_ms),
+                        },
+                    }
+                    if coupon_id:
+                        modify_kwargs["coupon"] = coupon_id
+                    stripe.Subscription.modify(stripe_subscription_id, **modify_kwargs)
+                    stripe_modified = True
+            except Exception as e:
+                warnings.append(f"stripe-modify-failed: {e}")
+                print(f"[migration] Stripe modify failed sub={stripe_subscription_id}: {e!r}", flush=True)
+    elif skip_stripe:
+        warnings.append("stripe-skipped-by-request")
+    else:
+        warnings.append("stripe-not-configured")
+
+    # ── Send welcome email with 7-day magic link ─────────────────
+    magic_link_sent = False
+    if send_welcome:
+        try:
+            raw_token = new_secure_token()
+            token_hash = hash_token(raw_token)
+            # 7-day TTL for migration (vs. normal 15-min) so subscribers
+            # have ample time to find and click the email.
+            seven_days_seconds = 7 * 24 * 60 * 60
+            now_seconds = int(time.time())
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO magic_link_tokens
+                             (token_hash, user_id, created_at, expires_at, ip_requested)
+                           VALUES (%s, %s, %s, %s, %s)""",
+                        (token_hash, user_id, now_seconds,
+                         now_seconds + seven_days_seconds, "migration-import"),
+                    )
+            base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai")
+            magic_link_url = f"{base}/?auth=verify&token={raw_token}&intent=migrated"
+            if _send_magic_link_email(email, magic_link_url, intent="migrated"):
+                magic_link_sent = True
+            else:
+                warnings.append("welcome-email-send-failed")
+        except Exception as e:
+            warnings.append(f"welcome-email-failed: {e}")
+            print(f"[migration] welcome email failed user_id={user_id}: {e!r}", flush=True)
+
+    # ── Audit log ─────────────────────────────────────────────────
+    try:
+        _audit_log(
+            actor_user_id=actor.get("id") if actor else None,
+            actor_name=actor.get("name") if actor else "admin",
+            action="migration.import",
+            target_type="user",
+            target_id=user_id,
+            details={
+                "email": email,
+                "tier": tier,
+                "coupon_id": coupon_id,
+                "stripe_modified": stripe_modified,
+                "skip_stripe": skip_stripe,
+                "magic_link_sent": magic_link_sent,
+                "warnings": warnings,
+            },
+        )
+    except Exception as e:
+        print(f"[migration] audit log failed: {e!r}", flush=True)
+
+    print(
+        f"[migration] imported user_id={user_id} email={email} tier={tier} "
+        f"stripe_modified={stripe_modified} magic_link_sent={magic_link_sent} "
+        f"warnings={len(warnings)}",
+        flush=True,
+    )
+
+    return jsonify({
+        "ok": True,
+        "user_id": user_id,
+        "magic_link_sent": magic_link_sent,
+        "stripe_modified": stripe_modified,
+        "warnings": warnings,
+    })
+
+
+@app.route("/api/v1/admin/import-subscriber/recent", methods=["OPTIONS"])
+def _admin_import_recent_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/import-subscriber/recent")
+def admin_import_subscriber_recent():
+    """Return the most recently migrated subscribers (last 30). Used in
+    the admin migration UI to show what's been imported today."""
+    actor, err = _require_admin()
+    if err:
+        return err
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.email, u.name, u.phone, u.subscription_tier,
+                          u.stripe_customer_id, u.migrated_at,
+                          sc.daily_brief_time, sc.daily_brief_timezone,
+                          mu.name AS primary_met_name
+                   FROM users u
+                   LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
+                   LEFT JOIN users mu ON mu.id = sc.primary_met_id
+                   WHERE u.migrated_at IS NOT NULL
+                   ORDER BY u.migrated_at DESC
+                   LIMIT 30""",
+            )
+            rows = cur.fetchall()
+
+    return jsonify({
+        "ok": True,
+        "imports": [{
+            "user_id": r["id"],
+            "email": r["email"],
+            "name": r.get("name") or "",
+            "phone": r.get("phone") or "",
+            "tier": r.get("subscription_tier") or "",
+            "stripe_customer_id": r.get("stripe_customer_id") or "",
+            "migrated_at": r.get("migrated_at"),
+            "brief_time": r.get("daily_brief_time") or "",
+            "brief_timezone": r.get("daily_brief_timezone") or "",
+            "primary_met_name": r.get("primary_met_name") or "",
+        } for r in rows]
+    })
 
 
 def _compute_commissions_for_month(year: int, month: int) -> dict:
