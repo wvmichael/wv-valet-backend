@@ -539,6 +539,20 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS met_onboarded_at BIGINT;
 -- location's lat/lng on save.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS timezone TEXT NOT NULL DEFAULT 'America/Indiana/Indianapolis';
 
+-- Met daily commission per subscriber (May 20, 2026).
+-- Stores how much one day's brief earns for the Met who writes it.
+-- The whole point: a grandfathered subscriber paying $100/mo
+-- (instead of the $400/mo list price) should have their Met earn
+-- $1.67/day (50% of $100/30), NOT $6.67/day (50% of $400/30).
+-- This protects against accidentally overpaying Mets based on
+-- list price rather than actual subscriber revenue.
+--
+-- Default 0 = no commission tracked. Admin sets per-subscriber during
+-- migration / signup. Phase 2: read this when a brief is submitted,
+-- credit it to the Met who wrote the brief (whoever they are — no
+-- "assigned Met" concept, just "whoever covered today gets today's pay").
+ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_commission_cents INTEGER NOT NULL DEFAULT 0;
+
 -- Phase 10 Met tips: track which Met completed each verification + a
 -- customer-facing token for the review/tip page (separate from Met's
 -- claim_token so we can give customers a URL that doesn't expose
@@ -24225,6 +24239,17 @@ def admin_import_subscriber():
         "brief_time": "07:00",                  // HH:MM 24h local
         "brief_timezone": "America/New_York",
         "primary_met_user_id": 42,
+        "daily_commission_cents": 167,          // optional. $0.01 = 1.
+                                                // If omitted, auto-defaults
+                                                // to 50% of tier list price / 30.
+                                                // For grandfathered customers,
+                                                // SET MANUALLY to match what
+                                                // they actually pay, not list.
+                                                // Eric ($100/mo) = 167 ($1.67/day)
+                                                // Steven ($10/mo) = 17  ($0.17/day)
+                                                // Hobbyist $30/mo = 50  ($0.50/day)
+                                                // Robert ($1140/yr) = 156 ($1.56/day)
+                                                // Hobbyist $342/yr = 47 ($0.47/day)
         "send_welcome_email": true,
         "skip_stripe": false                    // true for annual subs we leave alone
       }
@@ -24290,6 +24315,27 @@ def admin_import_subscriber():
         except (ValueError, TypeError):
             return jsonify({"ok": False, "error": "invalid-met-user-id"}), 400
 
+    # Met daily commission for this subscriber (cents per day).
+    # Critical for grandfathered customers — protects against paying Mets
+    # based on list price instead of what the customer actually pays.
+    # If not specified, defaults to 50% of the standard tier monthly price / 30.
+    raw_commission = data.get("daily_commission_cents")
+    if raw_commission is None or raw_commission == "":
+        # Auto-default based on tier (50% of list price / 30 days)
+        tier_defaults = {
+            "hobbyist":   50,    # $0.50/day  = 50% of $30/mo / 30
+            "pro_single": 667,   # $6.67/day  = 50% of $400/mo / 30
+            "pro_multi":  2000,  # $20.00/day = 50% of $1,200/mo / 30
+        }
+        daily_commission_cents = tier_defaults.get(tier, 0)
+    else:
+        try:
+            daily_commission_cents = int(raw_commission)
+            if daily_commission_cents < 0:
+                return jsonify({"ok": False, "error": "invalid-commission"}), 400
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "error": "invalid-commission"}), 400
+
     send_welcome = data.get("send_welcome_email", True)
 
     now_ms = int(time.time() * 1000)
@@ -24331,12 +24377,14 @@ def admin_import_subscriber():
                              phone = COALESCE(%s, phone),
                              stripe_customer_id = COALESCE(%s, stripe_customer_id),
                              subscription_tier = %s,
+                             daily_commission_cents = %s,
                              is_active = TRUE,
                              migrated_from = 'awsc_legacy',
                              migrated_at = %s,
                              password_must_change = TRUE
                            WHERE id = %s""",
-                        (name, phone, stripe_customer_id, tier, now_ms, user_id),
+                        (name, phone, stripe_customer_id, tier,
+                         daily_commission_cents, now_ms, user_id),
                     )
                 else:
                     # New user — create fresh
@@ -24344,12 +24392,14 @@ def admin_import_subscriber():
                         """INSERT INTO users
                              (email, name, phone, created_at, is_active,
                               stripe_customer_id, subscription_tier,
+                              daily_commission_cents,
                               migrated_from, migrated_at, password_must_change)
-                           VALUES (%s, %s, %s, %s, TRUE, %s, %s,
+                           VALUES (%s, %s, %s, %s, TRUE, %s, %s, %s,
                                    'awsc_legacy', %s, TRUE)
                            RETURNING id""",
                         (email, name, phone, now_ms,
-                         stripe_customer_id, tier, now_ms),
+                         stripe_customer_id, tier,
+                         daily_commission_cents, now_ms),
                     )
                     user_id = cur.fetchone()["id"]
     except Exception as e:
