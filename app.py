@@ -16913,8 +16913,13 @@ def _missions_create_preflight():
 
 
 @app.post("/api/v1/missions")
-def missions_create():
-    """Create a mission. Admin or Met can call this.
+def crew_missions_create():
+    """Create a Crew mission (new May 20, 2026 system).
+
+    Note: function renamed to crew_missions_create to avoid collision
+    with the older missions_create() function that serves
+    /api/v1/missions/deployments. Both can coexist; different routes,
+    different tables, different purposes.
 
     Body:
       {
