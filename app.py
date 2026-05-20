@@ -16991,6 +16991,78 @@ def missions_create():
     return jsonify({"ok": True, "mission_id": new_id})
 
 
+# ─── Mission response (Crew v2 — May 20, 2026) ──────────────────────
+
+@app.route("/api/v1/me/crew/missions/<int:mission_id>/respond", methods=["OPTIONS"])
+def _me_crew_mission_respond_preflight(mission_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/me/crew/missions/<int:mission_id>/respond")
+def me_crew_mission_respond(mission_id: int):
+    """Submit a Crew member's response to a mission. Crew-only.
+
+    Body:
+      {
+        "response_text": "Saw the fog rolling in around 6:45 AM, ~50ft visibility",
+        "image_url": "optional"
+      }
+
+    Idempotent: if user has already responded, the existing row is
+    updated with the new response_text (lets Crew refine their report).
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if not _is_crew_member(user):
+        return jsonify({"ok": False, "error": "not-crew"}), 403
+
+    data = request.get_json(silent=True) or {}
+    response_text = (data.get("response_text") or "").strip()
+    if not response_text:
+        return jsonify({"ok": False, "error": "empty-response"}), 400
+    if len(response_text) > 1000:
+        return jsonify({"ok": False, "error": "response-too-long",
+                        "message": "Max 1000 characters."}), 400
+    image_url = (data.get("image_url") or "").strip() or None
+    now_ms = int(time.time() * 1000)
+
+    # Verify mission exists and is still active
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, expires_at, is_active FROM crew_missions
+                       WHERE id = %s""",
+                    (mission_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"ok": False, "error": "mission-not-found"}), 404
+                if not row.get("is_active") or row["expires_at"] <= now_ms:
+                    return jsonify({"ok": False, "error": "mission-expired",
+                                    "message": "This mission is no longer active."}), 400
+
+                # Upsert response
+                cur.execute(
+                    """INSERT INTO crew_mission_responses
+                         (mission_id, user_id, response_text, image_url, submitted_at)
+                       VALUES (%s, %s, %s, %s, %s)
+                       ON CONFLICT (mission_id, user_id) DO UPDATE
+                         SET response_text = EXCLUDED.response_text,
+                             image_url = EXCLUDED.image_url,
+                             submitted_at = EXCLUDED.submitted_at
+                       RETURNING id""",
+                    (mission_id, user["id"], response_text, image_url, now_ms),
+                )
+                resp_id = cur.fetchone()["id"]
+    except Exception as e:
+        print(f"[mission-respond] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+
+    return jsonify({"ok": True, "response_id": resp_id})
+
+
 # ─── Notification preferences ───────────────────────────────────────
 
 @app.route("/api/v1/me/crew/notifications", methods=["OPTIONS"])
