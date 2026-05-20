@@ -1706,6 +1706,48 @@ CREATE INDEX IF NOT EXISTS idx_ssm_active
 CREATE INDEX IF NOT EXISTS idx_ssm_event
     ON storm_shelter_messages(nws_event_key, posted_at DESC);
 
+-- ── Crew reports (May 20, 2026) ──
+-- The real reports submitted by Crew members. Each row is a single
+-- observation: "I saw hail at this lat/lng at this time." Optional
+-- text + image, type for filtering ('storm', 'hail', 'wind', 'fog',
+-- 'flood', 'snow', 'tornado', 'other').
+--
+-- Verification: other Crew members verify reports they've seen with
+-- their own eyes. Each verification gets a row in crew_report_verifications.
+-- The verified_count column on this table is a denormalized cache.
+CREATE TABLE IF NOT EXISTS crew_reports (
+    id              SERIAL PRIMARY KEY,
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    user_name       TEXT,                     -- snapshot at submit time
+    report_type     TEXT NOT NULL,            -- 'storm'|'hail'|'wind'|...
+    latitude        DOUBLE PRECISION NOT NULL,
+    longitude       DOUBLE PRECISION NOT NULL,
+    notes           TEXT,
+    image_url       TEXT,
+    verified_count  INTEGER NOT NULL DEFAULT 0,
+    is_hidden       BOOLEAN NOT NULL DEFAULT FALSE,  -- admin moderation soft-hide
+    created_at      BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_crew_reports_user
+    ON crew_reports(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_crew_reports_recent
+    ON crew_reports(is_hidden, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_crew_reports_geo
+    ON crew_reports(latitude, longitude, created_at DESC)
+    WHERE is_hidden = FALSE;
+
+-- ── Crew report verifications ──
+-- One row per (report, verifier). Lets us count and prevent double-verify.
+CREATE TABLE IF NOT EXISTS crew_report_verifications (
+    id              SERIAL PRIMARY KEY,
+    report_id       INTEGER NOT NULL REFERENCES crew_reports(id) ON DELETE CASCADE,
+    verifier_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    verified_at     BIGINT NOT NULL,
+    UNIQUE (report_id, verifier_user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_crew_verif_report
+    ON crew_report_verifications(report_id);
+
 -- ── Crew missions (May 20, 2026) ──
 -- Missions are short tasks a Met or Admin can assign to Crew members
 -- in a region. Examples:
@@ -16552,6 +16594,236 @@ def _cos_approx(lat_deg: float) -> float:
     """Quick cosine approximation for distance bounding box math."""
     import math
     return math.cos(math.radians(lat_deg))
+
+
+# ─── Crew reports (list + submit + verify) ──────────────────────────
+
+@app.route("/api/v1/crew/reports", methods=["OPTIONS"])
+def _crew_reports_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/crew/reports")
+def crew_reports_list():
+    """List recent Crew reports. Open to all (read-only for unauth).
+
+    Query params:
+        lat, lng    - centerpoint (optional, defaults to none)
+        radius_mi   - filter radius (optional, default 100)
+        minutes     - lookback window in minutes (default 240 = 4h)
+        limit       - max rows (default 50)
+
+    Returns lean payload: id, type, lat/lng, name, time, verified count,
+    is_mine flag (for highlighting on the map).
+    """
+    user = _get_current_user()  # nullable
+    try:
+        radius_mi = float(request.args.get("radius_mi", 100))
+        minutes = int(request.args.get("minutes", 240))
+        limit = int(request.args.get("limit", 50))
+        if limit > 200:
+            limit = 200
+    except (TypeError, ValueError):
+        radius_mi = 100.0
+        minutes = 240
+        limit = 50
+
+    cutoff_ms = int(time.time() * 1000) - (minutes * 60 * 1000)
+    lat_arg = request.args.get("lat")
+    lng_arg = request.args.get("lng")
+    use_geo = False
+    if lat_arg and lng_arg:
+        try:
+            center_lat = float(lat_arg)
+            center_lng = float(lng_arg)
+            use_geo = True
+        except (TypeError, ValueError):
+            pass
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                if use_geo:
+                    lat_delta = radius_mi / 69.0
+                    lng_delta = radius_mi / (69.0 * max(0.01, abs(_cos_approx(center_lat))))
+                    cur.execute(
+                        """SELECT id, user_id, user_name, report_type,
+                                  latitude, longitude, notes, image_url,
+                                  verified_count, created_at
+                           FROM crew_reports
+                           WHERE is_hidden = FALSE
+                             AND created_at >= %s
+                             AND latitude BETWEEN %s AND %s
+                             AND longitude BETWEEN %s AND %s
+                           ORDER BY created_at DESC LIMIT %s""",
+                        (cutoff_ms,
+                         center_lat - lat_delta, center_lat + lat_delta,
+                         center_lng - lng_delta, center_lng + lng_delta,
+                         limit),
+                    )
+                else:
+                    cur.execute(
+                        """SELECT id, user_id, user_name, report_type,
+                                  latitude, longitude, notes, image_url,
+                                  verified_count, created_at
+                           FROM crew_reports
+                           WHERE is_hidden = FALSE
+                             AND created_at >= %s
+                           ORDER BY created_at DESC LIMIT %s""",
+                        (cutoff_ms, limit),
+                    )
+                rows = cur.fetchall()
+    except Exception as e:
+        print(f"[crew-reports-list] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+
+    me_id = user["id"] if user else None
+    return jsonify({
+        "ok": True,
+        "reports": [{
+            "id": r["id"],
+            "user_name": r.get("user_name") or "Anonymous",
+            "report_type": r["report_type"],
+            "lat": r["latitude"],
+            "lng": r["longitude"],
+            "notes": r.get("notes") or "",
+            "image_url": r.get("image_url") or "",
+            "verified_count": r.get("verified_count", 0),
+            "created_at": r["created_at"],
+            "is_mine": (r["user_id"] == me_id),
+        } for r in rows]
+    })
+
+
+@app.post("/api/v1/crew/reports")
+def crew_reports_submit():
+    """Submit a new Crew report. Crew only.
+
+    Body:
+      {
+        "report_type": "storm"|"hail"|"wind"|"fog"|"flood"|"snow"|"tornado"|"other",
+        "lat": 39.8,
+        "lng": -86.2,
+        "notes": "optional",
+        "image_url": "optional"
+      }
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if not _is_crew_member(user):
+        return jsonify({"ok": False, "error": "not-crew"}), 403
+
+    data = request.get_json(silent=True) or {}
+    report_type = (data.get("report_type") or "").strip().lower()
+    if report_type not in ("storm", "hail", "wind", "fog", "flood",
+                           "snow", "tornado", "rain", "other"):
+        return jsonify({"ok": False, "error": "invalid-report-type"}), 400
+
+    try:
+        lat = float(data.get("lat"))
+        lng = float(data.get("lng"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "missing-location"}), 400
+    if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
+        return jsonify({"ok": False, "error": "invalid-coordinates"}), 400
+
+    notes = (data.get("notes") or "").strip()
+    if len(notes) > 500:
+        notes = notes[:500]
+    image_url = (data.get("image_url") or "").strip() or None
+    now_ms = int(time.time() * 1000)
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO crew_reports
+                         (user_id, user_name, report_type, latitude, longitude,
+                          notes, image_url, verified_count, is_hidden, created_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, 0, FALSE, %s)
+                       RETURNING id""",
+                    (user["id"], user.get("name") or "", report_type,
+                     lat, lng, notes or None, image_url, now_ms),
+                )
+                new_id = cur.fetchone()["id"]
+    except Exception as e:
+        print(f"[crew-report-submit] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+
+    return jsonify({"ok": True, "report_id": new_id})
+
+
+@app.route("/api/v1/crew/reports/<int:report_id>/verify", methods=["OPTIONS"])
+def _crew_verify_preflight(report_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/crew/reports/<int:report_id>/verify")
+def crew_report_verify(report_id: int):
+    """Crew member verifies a report. One per (report, verifier).
+    Self-verification not allowed."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if not _is_crew_member(user):
+        return jsonify({"ok": False, "error": "not-crew"}), 403
+
+    now_ms = int(time.time() * 1000)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                # Don't allow self-verification
+                cur.execute(
+                    "SELECT user_id FROM crew_reports WHERE id = %s",
+                    (report_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"ok": False, "error": "report-not-found"}), 404
+                if row["user_id"] == user["id"]:
+                    return jsonify({
+                        "ok": False,
+                        "error": "self-verify",
+                        "message": "You can't verify your own report.",
+                    }), 400
+
+                # Insert verification (idempotent via UNIQUE constraint)
+                cur.execute(
+                    """INSERT INTO crew_report_verifications
+                         (report_id, verifier_user_id, verified_at)
+                       VALUES (%s, %s, %s)
+                       ON CONFLICT (report_id, verifier_user_id) DO NOTHING
+                       RETURNING id""",
+                    (report_id, user["id"], now_ms),
+                )
+                inserted = cur.fetchone() is not None
+
+                # Bump cached count if new
+                if inserted:
+                    cur.execute(
+                        """UPDATE crew_reports
+                           SET verified_count = verified_count + 1
+                           WHERE id = %s
+                           RETURNING verified_count""",
+                        (report_id,),
+                    )
+                    new_count = cur.fetchone()["verified_count"]
+                else:
+                    cur.execute(
+                        "SELECT verified_count FROM crew_reports WHERE id = %s",
+                        (report_id,),
+                    )
+                    new_count = cur.fetchone()["verified_count"]
+    except Exception as e:
+        print(f"[crew-verify] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+
+    return jsonify({
+        "ok": True,
+        "verified_count": new_count,
+        "already_verified": not inserted,
+    })
 
 
 # ─── Mission list (Crew-facing) ─────────────────────────────────────
