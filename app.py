@@ -1624,6 +1624,44 @@ CREATE INDEX IF NOT EXISTS idx_nws_alert_pages_status
 CREATE INDEX IF NOT EXISTS idx_nws_alert_pages_token
     ON nws_alert_pages(response_token);
 
+-- ── Pro Multi team memberships (May 20, 2026) ──
+-- For Pro Multi subscribers: maps the "primary" subscriber (who pays)
+-- to additional team members (who consume the briefs at no extra cost,
+-- included in the $1,200/mo Pro Multi flat fee).
+--
+-- Each team member is a separate `users` row with their own login,
+-- their own brief preferences (text/email channels, phone number),
+-- and their own Pro Thread with the Met. They see the same briefs
+-- the primary sees, but each one is delivered to them personally
+-- via their preferred channel.
+--
+-- Design notes:
+--   - One row per (primary, member) pair
+--   - primary_user_id is the Pro Multi subscriber paying the bill
+--   - member_user_id is the team user receiving briefs
+--   - status: 'pending' (invite sent, not accepted) | 'active' | 'removed'
+--   - role_label: free-text role hint shown to Met ("Coach", "Assistant
+--     Coach", "Athletic Director") so the Met knows who's who in
+--     Pro Threads.
+--   - Hard cap of 25 active members per primary, prevents accidental
+--     abuse. Real Pro Multi customers should be under 10.
+CREATE TABLE IF NOT EXISTS pro_multi_memberships (
+    id                  SERIAL PRIMARY KEY,
+    primary_user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    member_user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role_label          TEXT,
+    status              TEXT NOT NULL DEFAULT 'pending',
+    invited_at          BIGINT NOT NULL,
+    accepted_at         BIGINT,
+    removed_at          BIGINT,
+    invited_by_user_id  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    UNIQUE (primary_user_id, member_user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_pmm_primary
+    ON pro_multi_memberships(primary_user_id, status);
+CREATE INDEX IF NOT EXISTS idx_pmm_member
+    ON pro_multi_memberships(member_user_id, status);
+
 -- ── Pro Threads (Phase 10 — Met<>Subscriber DMs) ──
 -- One thread per subscriber, holding their conversation with the Met
 -- team. Simpler than per-topic threading: subscribers see one continuous
@@ -3900,6 +3938,16 @@ def auth_verify():
                 (row["user_id"],),
             )
             role_rows = cur.fetchall()
+
+            # If this user is a team member with a 'pending' membership,
+            # accepting the magic link activates the membership. From now
+            # on, briefs sent to their primary fan out to them.
+            cur.execute(
+                """UPDATE pro_multi_memberships
+                   SET status = 'active', accepted_at = %s
+                   WHERE member_user_id = %s AND status = 'pending'""",
+                (int(time.time() * 1000), row["user_id"]),
+            )
 
         # Create the session (inserts a row, returns the raw session ID)
         raw_session_id = _create_session(row["user_id"], conn)
@@ -10114,6 +10162,396 @@ def me_met_context_save():
         "additional_context": additional_context,
         "context_updated_at": now_ms,
     })
+
+
+# ════════════════════════════════════════════════════════════════════
+# Pro Multi team memberships (May 20, 2026)
+# ════════════════════════════════════════════════════════════════════
+#
+# For Pro Multi subscribers ($1,200/mo flat fee), the primary subscriber
+# can add team members at no extra cost. Each team member:
+#   - Has their own login (own email, own password, own phone)
+#   - Has their own brief delivery preferences (text/email channels)
+#   - Has their own Pro Thread with the Met team
+#   - Receives the same briefs the primary receives, delivered via
+#     their personal channel preferences
+#   - Cannot see other team members' Pro Threads
+#   - Cannot invite more team members (only the primary can)
+#   - Cannot see billing details (only the primary can)
+#
+# Endpoints:
+#   GET    /api/v1/me/team                     — list team members (primary only)
+#   POST   /api/v1/me/team/invite              — invite a new team member
+#   DELETE /api/v1/me/team/<member_id>         — remove a team member
+#
+# Status values:
+#   'pending'  — invite sent, member has not signed in yet
+#   'active'   — member has accepted (logged in via magic link)
+#   'removed'  — primary removed them; row kept for audit
+
+@app.route("/api/v1/me/team", methods=["OPTIONS"])
+def _me_team_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/team")
+def me_team_list():
+    """List team members for the calling Pro Multi subscriber.
+    
+    Returns 403 for non-Pro-Multi subscribers (this isn't their feature).
+    Returns the list of (pending + active) members with their names,
+    emails, role labels, and status.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    # Only Pro Multi subscribers can manage a team
+    tier = (user.get("subscription_tier") or "").lower()
+    if tier != "pro_multi":
+        return jsonify({
+            "ok": False,
+            "error": "not-pro-multi",
+            "message": "Team members are a Pro Multi feature. Your current tier doesn't include this.",
+        }), 403
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT pmm.id AS membership_id,
+                              pmm.member_user_id,
+                              pmm.role_label,
+                              pmm.status,
+                              pmm.invited_at,
+                              pmm.accepted_at,
+                              u.name AS member_name,
+                              u.email AS member_email,
+                              u.phone AS member_phone
+                       FROM pro_multi_memberships pmm
+                       JOIN users u ON u.id = pmm.member_user_id
+                       WHERE pmm.primary_user_id = %s
+                         AND pmm.status IN ('pending', 'active')
+                       ORDER BY pmm.invited_at DESC""",
+                    (user["id"],),
+                )
+                rows = cur.fetchall()
+    except Exception as e:
+        print(f"[team-list] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+
+    return jsonify({
+        "ok": True,
+        "team": [{
+            "membership_id": r["membership_id"],
+            "member_user_id": r["member_user_id"],
+            "name": r["member_name"] or "",
+            "email": r["member_email"] or "",
+            "phone": r["member_phone"] or "",
+            "role_label": r["role_label"] or "",
+            "status": r["status"],
+            "invited_at": r["invited_at"],
+            "accepted_at": r["accepted_at"],
+        } for r in rows]
+    })
+
+
+@app.route("/api/v1/me/team/invite", methods=["OPTIONS"])
+def _me_team_invite_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/me/team/invite")
+def me_team_invite():
+    """Invite a new team member.
+
+    Body:
+      {
+        "email": "member@example.com",
+        "name": "Member Name",
+        "phone": "+13175551234",      // optional
+        "role_label": "Assistant Coach" // optional, shown to Met for context
+      }
+
+    Behavior:
+      1. Validate primary is Pro Multi
+      2. Validate not at 25-member cap
+      3. Create or update the member's user row (active=true, no password)
+      4. Grant subscriber role to the member
+      5. Create the membership row (status='pending')
+      6. Send the member a magic-link invitation email (intent='team-invite')
+      7. Return success
+
+    Idempotency: if the email is already a team member (active or pending)
+    of THIS primary, return the existing membership.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    tier = (user.get("subscription_tier") or "").lower()
+    if tier != "pro_multi":
+        return jsonify({
+            "ok": False,
+            "error": "not-pro-multi",
+            "message": "Team invites are a Pro Multi feature.",
+        }), 403
+
+    data = request.get_json(silent=True) or {}
+    member_email = (data.get("email") or "").strip().lower()
+    if not member_email or "@" not in member_email:
+        return jsonify({"ok": False, "error": "invalid-email"}), 400
+    member_name = (data.get("name") or "").strip()
+    if not member_name:
+        return jsonify({"ok": False, "error": "missing-name"}), 400
+    member_phone = (data.get("phone") or "").strip() or None
+    role_label = (data.get("role_label") or "").strip() or None
+
+    # Prevent self-invite
+    primary_email = (user.get("email") or "").lower()
+    if member_email == primary_email:
+        return jsonify({
+            "ok": False,
+            "error": "self-invite",
+            "message": "You can't invite yourself.",
+        }), 400
+
+    now_ms = int(time.time() * 1000)
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                # ── Check team-size cap ───────────────────────────────
+                cur.execute(
+                    """SELECT COUNT(*) AS n FROM pro_multi_memberships
+                       WHERE primary_user_id = %s
+                         AND status IN ('pending', 'active')""",
+                    (user["id"],),
+                )
+                if cur.fetchone()["n"] >= 25:
+                    return jsonify({
+                        "ok": False,
+                        "error": "team-cap-reached",
+                        "message": "You've reached the 25-member team cap. Remove an inactive member to add a new one.",
+                    }), 400
+
+                # ── Create or update member's user row ────────────────
+                cur.execute(
+                    "SELECT id FROM users WHERE LOWER(email) = LOWER(%s)",
+                    (member_email,),
+                )
+                existing = cur.fetchone()
+                if existing:
+                    member_user_id = existing["id"]
+                    # Update name/phone if provided, mark active
+                    cur.execute(
+                        """UPDATE users SET
+                             name = COALESCE(NULLIF(%s, ''), name),
+                             phone = COALESCE(NULLIF(%s, ''), phone),
+                             is_active = TRUE
+                           WHERE id = %s""",
+                        (member_name, member_phone, member_user_id),
+                    )
+                else:
+                    cur.execute(
+                        """INSERT INTO users
+                             (email, name, phone, created_at, is_active,
+                              password_must_change)
+                           VALUES (%s, %s, %s, %s, TRUE, TRUE)
+                           RETURNING id""",
+                        (member_email, member_name, member_phone, now_ms),
+                    )
+                    member_user_id = cur.fetchone()["id"]
+
+                # ── Grant subscriber role ─────────────────────────────
+                cur.execute(
+                    """INSERT INTO user_roles (user_id, role, granted_at)
+                       VALUES (%s, 'subscriber', %s)
+                       ON CONFLICT DO NOTHING""",
+                    (member_user_id, now_ms),
+                )
+
+                # ── Check for existing membership (idempotency) ───────
+                cur.execute(
+                    """SELECT id, status FROM pro_multi_memberships
+                       WHERE primary_user_id = %s AND member_user_id = %s""",
+                    (user["id"], member_user_id),
+                )
+                existing_membership = cur.fetchone()
+                if existing_membership:
+                    if existing_membership["status"] in ("pending", "active"):
+                        return jsonify({
+                            "ok": True,
+                            "membership_id": existing_membership["id"],
+                            "already_member": True,
+                            "message": f"{member_name} is already on your team.",
+                        })
+                    else:
+                        # Re-activate a previously-removed membership
+                        cur.execute(
+                            """UPDATE pro_multi_memberships SET
+                                 status = 'pending',
+                                 role_label = COALESCE(%s, role_label),
+                                 invited_at = %s,
+                                 accepted_at = NULL,
+                                 removed_at = NULL,
+                                 invited_by_user_id = %s
+                               WHERE id = %s""",
+                            (role_label, now_ms, user["id"], existing_membership["id"]),
+                        )
+                        membership_id = existing_membership["id"]
+                else:
+                    # New membership
+                    cur.execute(
+                        """INSERT INTO pro_multi_memberships
+                             (primary_user_id, member_user_id, role_label,
+                              status, invited_at, invited_by_user_id)
+                           VALUES (%s, %s, %s, 'pending', %s, %s)
+                           RETURNING id""",
+                        (user["id"], member_user_id, role_label, now_ms, user["id"]),
+                    )
+                    membership_id = cur.fetchone()["id"]
+    except Exception as e:
+        print(f"[team-invite] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+
+    # ── Send invitation email with 7-day magic link ───────────────
+    magic_link_sent = False
+    try:
+        raw_token = new_secure_token()
+        token_hash = hash_token(raw_token)
+        seven_days_seconds = 7 * 24 * 60 * 60
+        now_seconds = int(time.time())
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO magic_link_tokens
+                         (token_hash, user_id, created_at, expires_at, ip_requested)
+                       VALUES (%s, %s, %s, %s, %s)""",
+                    (token_hash, member_user_id, now_seconds,
+                     now_seconds + seven_days_seconds, "team-invite"),
+                )
+        base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai")
+        magic_link_url = f"{base}/?auth=verify&token={raw_token}&intent=team-invite"
+        primary_name = user.get("name") or "your team lead"
+        if _send_team_invite_email(member_email, magic_link_url,
+                                   primary_name=primary_name,
+                                   member_name=member_name):
+            magic_link_sent = True
+    except Exception as e:
+        print(f"[team-invite] email failed: {e!r}", flush=True)
+
+    return jsonify({
+        "ok": True,
+        "membership_id": membership_id,
+        "member_user_id": member_user_id,
+        "magic_link_sent": magic_link_sent,
+    })
+
+
+@app.route("/api/v1/me/team/<int:membership_id>", methods=["OPTIONS"])
+def _me_team_delete_preflight(membership_id):
+    return ("", 204)
+
+
+@app.delete("/api/v1/me/team/<int:membership_id>")
+def me_team_remove(membership_id: int):
+    """Remove a team member from the calling primary's team.
+
+    Soft-delete: sets status='removed' and removed_at timestamp. The
+    member's user account remains (they keep their login, can still
+    receive briefs from any OTHER team they may be on, etc.) but no
+    longer receives this team's briefs.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    tier = (user.get("subscription_tier") or "").lower()
+    if tier != "pro_multi":
+        return jsonify({"ok": False, "error": "not-pro-multi"}), 403
+
+    now_ms = int(time.time() * 1000)
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE pro_multi_memberships SET
+                         status = 'removed',
+                         removed_at = %s
+                       WHERE id = %s
+                         AND primary_user_id = %s
+                       RETURNING id""",
+                    (now_ms, membership_id, user["id"]),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"ok": False, "error": "not-found"}), 404
+    except Exception as e:
+        print(f"[team-remove] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+
+    return jsonify({"ok": True})
+
+
+def _send_team_invite_email(email: str, magic_link_url: str,
+                            primary_name: str, member_name: str) -> bool:
+    """Send a team invite email. Returns True if Resend accepted the request.
+
+    The email is shorter than a regular magic-link email — focused on
+    "you've been added to the X team on WeatherValet" framing rather
+    than "set your password."
+    """
+    if not RESEND_API_KEY:
+        print("[team-invite-email] RESEND_API_KEY not set, skipping", flush=True)
+        return False
+    try:
+        subject = f"You've been added to {primary_name}'s WeatherValet team"
+        html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style="margin:0;padding:0;background:#F8F9FB;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#0E1116;">
+  <div style="max-width:560px;margin:32px auto;padding:32px 28px;background:#fff;border-radius:12px;box-shadow:0 1px 3px rgba(15,17,22,0.06);">
+    <h1 style="font-size:22px;font-weight:600;margin:0 0 16px;">Hi {member_name},</h1>
+    <p style="font-size:15px;line-height:1.55;color:rgba(15,17,22,0.75);margin:0 0 14px;">
+      {primary_name} has added you to their WeatherValet team. You&rsquo;ll receive their daily meteorologist briefs and severe weather alerts, plus you can message their meteorologist team directly.
+    </p>
+    <p style="font-size:15px;line-height:1.55;color:rgba(15,17,22,0.75);margin:0 0 22px;">
+      Tap the button below to set your password and get started. This link is valid for 7 days.
+    </p>
+    <div style="text-align:center;margin:28px 0;">
+      <a href="{magic_link_url}" style="display:inline-block;background:#2E4FB8;color:#fff;text-decoration:none;padding:13px 28px;border-radius:8px;font-weight:600;font-size:15px;">Set up my access</a>
+    </div>
+    <p style="font-size:13px;line-height:1.55;color:rgba(15,17,22,0.55);margin:22px 0 0;">
+      Questions? Just reply to this email and a human will read it.
+    </p>
+  </div>
+</body></html>"""
+        text = (f"Hi {member_name},\n\n"
+                f"{primary_name} has added you to their WeatherValet team. "
+                "You'll receive their daily meteorologist briefs and severe "
+                "weather alerts, plus you can message their meteorologist "
+                "team directly.\n\n"
+                "Tap the link below to set your password and get started. "
+                f"This link is valid for 7 days.\n\n{magic_link_url}\n\n"
+                "Questions? Just reply to this email and a human will read it.")
+        resend_headers = {
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        resend_body = {
+            "from": "WeatherValet <hello@weathervalet.ai>",
+            "to": [email],
+            "subject": subject,
+            "html": html,
+            "text": text,
+        }
+        resp = requests.post("https://api.resend.com/emails",
+                              json=resend_body, headers=resend_headers, timeout=10)
+        return resp.status_code in (200, 201, 202)
+    except Exception as e:
+        print(f"[team-invite-email] failed: {e!r}", flush=True)
+        return False
 
 
 @app.get("/api/v1/me/brief-preferences")
@@ -16413,6 +16851,40 @@ def met_pro_brief_send(draft_id):
     except Exception as e:
         print(f"[pro-brief-send] multi-send parse failed: {e}", flush=True)
 
+    # ── Pro Multi team member auto-include (May 20, 2026) ─────────────
+    # If the primary subscriber is on Pro Multi tier, automatically fan
+    # out the brief to all ACTIVE team members. Met doesn't have to
+    # remember to check team membership — system does it.
+    #
+    # We use the same 'seen' set so we don't duplicate if the Met also
+    # manually selected a team member via the multisend list.
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT pmm.member_user_id
+                       FROM pro_multi_memberships pmm
+                       JOIN users primary_u ON primary_u.id = pmm.primary_user_id
+                       WHERE pmm.primary_user_id = %s
+                         AND pmm.status = 'active'
+                         AND primary_u.subscription_tier = 'pro_multi'""",
+                    (row["user_id"],),
+                )
+                team_rows = cur.fetchall()
+                seen_set = set([row["user_id"]] + additional_user_ids)
+                for t in team_rows:
+                    if t["member_user_id"] not in seen_set:
+                        additional_user_ids.append(t["member_user_id"])
+                        seen_set.add(t["member_user_id"])
+                if team_rows:
+                    print(
+                        f"[pro-brief-send] auto-included {len(team_rows)} "
+                        f"team members for primary user={row['user_id']}",
+                        flush=True,
+                    )
+    except Exception as e:
+        print(f"[pro-brief-send] team auto-include failed: {e!r}", flush=True)
+
     multi_results = []
     for extra_user_id in additional_user_ids:
         try:
@@ -16439,14 +16911,39 @@ def met_pro_brief_send(draft_id):
             if not sub:
                 multi_results.append({"user_id": extra_user_id, "ok": False, "error": "not-found"})
                 continue
-            # Only Pro-tier eligible
-            if (sub.get("subscription_tier") or "") not in ("pro_single", "pro_multi", "pro_enterprise"):
-                multi_results.append({"user_id": extra_user_id, "ok": False, "error": "not-pro-tier"})
-                continue
+
+            # Check if this extra_user_id is a team member of the primary
+            # (row["user_id"] is the primary subscriber for this brief).
+            # Team members inherit Pro Multi eligibility + Met assignment
+            # from the primary, so they pass tier + auth checks via the
+            # membership row.
+            is_team_member = False
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """SELECT 1 FROM pro_multi_memberships
+                               WHERE primary_user_id = %s
+                                 AND member_user_id = %s
+                                 AND status = 'active'
+                               LIMIT 1""",
+                            (row["user_id"], extra_user_id),
+                        )
+                        is_team_member = cur.fetchone() is not None
+            except Exception as e:
+                print(f"[pro-brief-send] team check failed: {e!r}", flush=True)
+
+            # Only Pro-tier eligible (team members bypass this check —
+            # they inherit eligibility from the primary)
+            if not is_team_member:
+                if (sub.get("subscription_tier") or "") not in ("pro_single", "pro_multi", "pro_enterprise"):
+                    multi_results.append({"user_id": extra_user_id, "ok": False, "error": "not-pro-tier"})
+                    continue
             # Authorization: calling Met must be the primary for this sub,
-            # OR be an admin. Otherwise refuse.
+            # OR be an admin, OR this is a team member of the primary.
+            # Team members inherit Met assignment from the primary.
             is_admin = "admin" in (user.get("roles") or [])
-            if not is_admin and sub.get("primary_met_id") != user["id"]:
+            if not is_admin and not is_team_member and sub.get("primary_met_id") != user["id"]:
                 multi_results.append({"user_id": extra_user_id, "ok": False, "error": "not-your-subscriber"})
                 continue
 
@@ -17052,8 +17549,12 @@ def _post_to_pro_thread(
 
 
 def _is_pro_subscriber(user: dict) -> bool:
-    """True if the user is a Pro-tier subscriber. Pro Threads is a Pro
-    feature; Hobbyists can't access it."""
+    """True if the user is a Pro-tier subscriber OR a team member of a
+    Pro Multi primary. Pro Threads is a Pro feature; Hobbyists can't
+    access it.
+
+    Updated May 20, 2026: team members inherit Pro access from their
+    primary subscriber's Pro Multi plan."""
     if not user:
         return False
     if "subscriber" not in (user.get("roles") or []):
@@ -17065,8 +17566,21 @@ def _is_pro_subscriber(user: dict) -> bool:
                 (user["id"],),
             )
             row = cur.fetchone()
-    tier = (row or {}).get("subscription_tier") or ""
-    return tier in ("pro_single", "pro_multi", "pro_enterprise")
+            tier = (row or {}).get("subscription_tier") or ""
+            if tier in ("pro_single", "pro_multi", "pro_enterprise"):
+                return True
+            # Check if this user is an active team member of a Pro Multi
+            # (or Pro Enterprise) primary.
+            cur.execute(
+                """SELECT 1 FROM pro_multi_memberships pmm
+                   JOIN users primary_u ON primary_u.id = pmm.primary_user_id
+                   WHERE pmm.member_user_id = %s
+                     AND pmm.status = 'active'
+                     AND primary_u.subscription_tier IN ('pro_multi','pro_enterprise')
+                   LIMIT 1""",
+                (user["id"],),
+            )
+            return cur.fetchone() is not None
 
 
 @app.route("/api/v1/me/thread", methods=["OPTIONS"])
@@ -17233,11 +17747,23 @@ def met_threads_list():
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT t.*, u.email AS subscriber_email, u.name AS subscriber_name,
-                          u.subscription_tier AS subscriber_tier
+                          u.subscription_tier AS subscriber_tier,
+                          pmm.role_label AS team_role_label,
+                          primary_u.name AS team_primary_name,
+                          primary_u.id AS team_primary_user_id
                    FROM pro_threads t
                    JOIN users u ON u.id = t.subscriber_user_id
+                   LEFT JOIN pro_multi_memberships pmm
+                          ON pmm.member_user_id = u.id
+                         AND pmm.status = 'active'
+                   LEFT JOIN users primary_u
+                          ON primary_u.id = pmm.primary_user_id
                    WHERE u.is_active = TRUE
-                     AND u.subscription_tier IN ('pro_single','pro_multi','pro_enterprise')
+                     AND (
+                       u.subscription_tier IN ('pro_single','pro_multi','pro_enterprise')
+                       OR (pmm.id IS NOT NULL
+                           AND primary_u.subscription_tier IN ('pro_multi','pro_enterprise'))
+                     )
                    ORDER BY
                      CASE WHEN t.unread_for_met > 0 THEN 0 ELSE 1 END,
                      COALESCE(t.last_message_at, t.created_at) DESC
@@ -17257,6 +17783,13 @@ def met_threads_list():
             "last_message_preview": r["last_message_preview"],
             "last_message_from": r["last_message_from"],
             "unread_for_met": r["unread_for_met"],
+            # Team membership context (May 20, 2026): when this thread
+            # belongs to a Pro Multi team member, give Met the context
+            # of who the primary subscriber is and what role this member
+            # plays on the team.
+            "team_role_label": r.get("team_role_label"),
+            "team_primary_name": r.get("team_primary_name"),
+            "team_primary_user_id": r.get("team_primary_user_id"),
         }
         for r in rows
     ]
