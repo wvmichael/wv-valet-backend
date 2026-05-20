@@ -1662,6 +1662,50 @@ CREATE INDEX IF NOT EXISTS idx_pmm_primary
 CREATE INDEX IF NOT EXISTS idx_pmm_member
     ON pro_multi_memberships(member_user_id, status);
 
+-- ── Storm Shelter Met messages (May 20, 2026) ──
+-- Optional Met-written messages that appear in subscribers' Storm
+-- Shelter during an active warning. Per the May 19 design discussion:
+--   - AI/static safety content does the heavy lifting
+--   - Mets can OPTIONALLY contribute when they have something to say
+--   - One message goes to all subscribers under that warning polygon
+--   - No per-subscriber subsetting (avoids Met cognitive load during
+--     severe weather)
+--   - Messages auto-expire when the warning expires
+--
+-- Schema:
+--   - nws_event_key   - lowercase, simplified key like 'tornado-warning'
+--                       or 'severe-thunderstorm-warning'. Used to match
+--                       subscriber's current warning.
+--   - polygon_areas   - text list of NWS area descriptions
+--                       (e.g. "Boone County, IN; Hamilton County, IN").
+--                       For now used as a coarse match-check.
+--   - target_phase    - 'before' or 'during' (which Storm Shelter tab
+--                       the message appears under). Defaults to 'during'
+--                       since warnings auto-tab to "during" anyway.
+--   - body            - the actual message (plain text, 500 char max)
+--   - met_user_id     - which Met wrote it (for attribution + audit)
+--   - posted_at       - timestamp
+--   - expires_at      - when this message should stop displaying.
+--                       Set to the warning's NWS expires_at on insert.
+--   - is_active       - soft-delete flag. Met or admin can retract a
+--                       message before it expires.
+CREATE TABLE IF NOT EXISTS storm_shelter_messages (
+    id              SERIAL PRIMARY KEY,
+    nws_event_key   TEXT NOT NULL,
+    polygon_areas   TEXT,
+    target_phase    TEXT NOT NULL DEFAULT 'during',
+    body            TEXT NOT NULL,
+    met_user_id     INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    met_name        TEXT,
+    posted_at       BIGINT NOT NULL,
+    expires_at      BIGINT NOT NULL,
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE
+);
+CREATE INDEX IF NOT EXISTS idx_ssm_active
+    ON storm_shelter_messages(is_active, expires_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ssm_event
+    ON storm_shelter_messages(nws_event_key, posted_at DESC);
+
 -- ── Pro Threads (Phase 10 — Met<>Subscriber DMs) ──
 -- One thread per subscriber, holding their conversation with the Met
 -- team. Simpler than per-topic threading: subscribers see one continuous
@@ -18576,6 +18620,310 @@ def met_storm_shelter_active():
             }
             for r in rows
         ],
+    })
+
+
+# ════════════════════════════════════════════════════════════════════
+# Storm Shelter Met messages (May 20, 2026)
+# ════════════════════════════════════════════════════════════════════
+#
+# Mets can OPTIONALLY post a short message into the Storm Shelter
+# during an active warning. Per the May 19 design decision:
+#   - AI / static safety content does the heavy lifting
+#   - Mets contribute when they have something to add ("Storm shifted
+#     east, leading edge to Lebanon in ~8 min")
+#   - No subscriber subsetting — message goes to everyone with an
+#     active warning matching the event_key
+#   - Message auto-expires when the warning expires (NWS expires_at)
+#
+# Endpoints:
+#   POST   /api/v1/met/shelter-messages       — Met posts a new message
+#   GET    /api/v1/met/shelter-messages       — Met sees their recent posts
+#   DELETE /api/v1/met/shelter-messages/<id>  — Met retracts before expiry
+#   GET    /api/v1/me/shelter-messages        — Subscriber reads active messages
+
+@app.route("/api/v1/met/shelter-messages", methods=["OPTIONS"])
+def _met_shelter_messages_preflight():
+    return ("", 204)
+
+
+def _normalize_event_key(event_str: str) -> str:
+    """Map NWS event string to a simplified key. Mirrors the
+    _getEventContentKey function in index.html so Met posts route to
+    the correct subscribers."""
+    ev = (event_str or "").lower()
+    if "tornado warning" in ev:
+        return "tornado-warning"
+    if "tornado watch" in ev:
+        return "tornado-watch"
+    if "severe thunderstorm warning" in ev:
+        return "severe-thunderstorm-warning"
+    if "severe thunderstorm watch" in ev:
+        return "severe-thunderstorm-watch"
+    if "warning" in ev:
+        return "generic-warning"
+    if "watch" in ev:
+        return "generic-watch"
+    return ""
+
+
+@app.post("/api/v1/met/shelter-messages")
+def met_shelter_message_post():
+    """Met posts a Storm Shelter message tied to an active NWS event.
+
+    Body:
+      {
+        "event_key": "tornado-warning",            // normalized event key
+        "body": "Storm shifted east, leading edge...",  // <= 500 chars
+        "target_phase": "during",                   // 'before' or 'during'
+        "polygon_areas": "Boone County, IN",       // optional, for display
+        "expires_at": 1747878900000                 // NWS expires_at (ms)
+      }
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    event_key = (data.get("event_key") or "").strip().lower()
+    if event_key not in (
+        "tornado-warning", "tornado-watch",
+        "severe-thunderstorm-warning", "severe-thunderstorm-watch",
+        "generic-warning", "generic-watch",
+    ):
+        return jsonify({"ok": False, "error": "invalid-event-key"}), 400
+
+    body = (data.get("body") or "").strip()
+    if not body:
+        return jsonify({"ok": False, "error": "empty-message"}), 400
+    if len(body) > 500:
+        return jsonify({"ok": False, "error": "message-too-long",
+                        "message": "Max 500 characters."}), 400
+
+    target_phase = (data.get("target_phase") or "during").strip().lower()
+    if target_phase not in ("before", "during"):
+        target_phase = "during"
+
+    polygon_areas = (data.get("polygon_areas") or "").strip() or None
+
+    # Expiry: prefer client-provided NWS expires_at; if missing, default
+    # to 90 min from now (most warnings expire within that window).
+    now_ms = int(time.time() * 1000)
+    try:
+        expires_at = int(data.get("expires_at") or 0)
+    except (TypeError, ValueError):
+        expires_at = 0
+    if expires_at <= now_ms:
+        # Fallback: 90 min from now
+        expires_at = now_ms + (90 * 60 * 1000)
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO storm_shelter_messages
+                         (nws_event_key, polygon_areas, target_phase,
+                          body, met_user_id, met_name,
+                          posted_at, expires_at, is_active)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE)
+                       RETURNING id""",
+                    (event_key, polygon_areas, target_phase, body,
+                     user["id"], user.get("name") or "",
+                     now_ms, expires_at),
+                )
+                new_id = cur.fetchone()["id"]
+    except Exception as e:
+        print(f"[shelter-msg-post] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+
+    print(
+        f"[shelter-msg-post] id={new_id} met={user.get('name')} "
+        f"event={event_key} phase={target_phase} chars={len(body)}",
+        flush=True,
+    )
+
+    # Audit log so admin can review who posted what during a storm
+    try:
+        _audit_log(
+            actor_user_id=user.get("id"),
+            actor_name=user.get("name") or "met",
+            action="shelter_message.post",
+            target_type="storm_shelter_message",
+            target_id=new_id,
+            details={
+                "event_key": event_key,
+                "target_phase": target_phase,
+                "body_preview": body[:120],
+                "polygon_areas": polygon_areas,
+            },
+        )
+    except Exception as e:
+        print(f"[shelter-msg-post] audit log failed: {e!r}", flush=True)
+
+    return jsonify({
+        "ok": True,
+        "message_id": new_id,
+        "expires_at": expires_at,
+    })
+
+
+@app.get("/api/v1/met/shelter-messages")
+def met_shelter_messages_list():
+    """Met sees recent shelter messages (theirs + others, last 50)."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, nws_event_key, polygon_areas, target_phase,
+                          body, met_user_id, met_name, posted_at,
+                          expires_at, is_active
+                   FROM storm_shelter_messages
+                   ORDER BY posted_at DESC LIMIT 50"""
+            )
+            rows = cur.fetchall()
+
+    return jsonify({
+        "ok": True,
+        "messages": [{
+            "id": r["id"],
+            "event_key": r["nws_event_key"],
+            "polygon_areas": r.get("polygon_areas") or "",
+            "target_phase": r["target_phase"],
+            "body": r["body"],
+            "met_user_id": r.get("met_user_id"),
+            "met_name": r.get("met_name") or "",
+            "posted_at": r["posted_at"],
+            "expires_at": r["expires_at"],
+            "is_active": r["is_active"],
+            "is_currently_visible": r["is_active"] and r["expires_at"] > now_ms,
+            "is_own": r.get("met_user_id") == user["id"],
+        } for r in rows]
+    })
+
+
+@app.route("/api/v1/met/shelter-messages/<int:msg_id>", methods=["OPTIONS"])
+def _met_shelter_message_delete_preflight(msg_id):
+    return ("", 204)
+
+
+@app.delete("/api/v1/met/shelter-messages/<int:msg_id>")
+def met_shelter_message_retract(msg_id: int):
+    """Met retracts their own message (soft delete). Admin can retract
+    anyone's. Once retracted, subscribers stop seeing the message on
+    the next poll."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    is_admin = "admin" in roles
+    if "met" not in roles and not is_admin:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                # Mets can only retract their own; admin can retract any
+                if is_admin:
+                    cur.execute(
+                        """UPDATE storm_shelter_messages
+                           SET is_active = FALSE
+                           WHERE id = %s
+                           RETURNING id, met_user_id""",
+                        (msg_id,),
+                    )
+                else:
+                    cur.execute(
+                        """UPDATE storm_shelter_messages
+                           SET is_active = FALSE
+                           WHERE id = %s AND met_user_id = %s
+                           RETURNING id, met_user_id""",
+                        (msg_id, user["id"]),
+                    )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"ok": False, "error": "not-found-or-not-yours"}), 404
+    except Exception as e:
+        print(f"[shelter-msg-retract] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+
+    try:
+        _audit_log(
+            actor_user_id=user.get("id"),
+            actor_name=user.get("name") or "met",
+            action="shelter_message.retract",
+            target_type="storm_shelter_message",
+            target_id=msg_id,
+            details={},
+        )
+    except Exception:
+        pass
+
+    return jsonify({"ok": True})
+
+
+@app.route("/api/v1/me/shelter-messages", methods=["OPTIONS"])
+def _me_shelter_messages_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/shelter-messages")
+def me_shelter_messages():
+    """Subscriber reads active Met messages for their current event.
+
+    Query param:
+      event_key=tornado-warning  (the subscriber's currently-active key)
+
+    Returns the most recent active messages matching that event_key,
+    newest first. Empty list if no current warning or no messages.
+    """
+    user = _get_current_user()
+    if user is None:
+        # Anonymous users with no primary location wouldn't trigger Storm
+        # Shelter anyway; return empty to be safe.
+        return jsonify({"ok": True, "messages": []})
+
+    event_key = (request.args.get("event_key") or "").strip().lower()
+    if not event_key:
+        return jsonify({"ok": True, "messages": []})
+
+    now_ms = int(time.time() * 1000)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, body, met_name, posted_at, expires_at,
+                              target_phase
+                       FROM storm_shelter_messages
+                       WHERE is_active = TRUE
+                         AND nws_event_key = %s
+                         AND expires_at > %s
+                       ORDER BY posted_at DESC LIMIT 20""",
+                    (event_key, now_ms),
+                )
+                rows = cur.fetchall()
+    except Exception as e:
+        print(f"[me-shelter-msg] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+
+    return jsonify({
+        "ok": True,
+        "messages": [{
+            "id": r["id"],
+            "body": r["body"],
+            "met_name": r.get("met_name") or "Your meteorologist",
+            "posted_at": r["posted_at"],
+            "target_phase": r["target_phase"],
+        } for r in rows]
     })
 
 
