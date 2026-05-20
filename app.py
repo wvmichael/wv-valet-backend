@@ -1706,6 +1706,93 @@ CREATE INDEX IF NOT EXISTS idx_ssm_active
 CREATE INDEX IF NOT EXISTS idx_ssm_event
     ON storm_shelter_messages(nws_event_key, posted_at DESC);
 
+-- ── Crew missions (May 20, 2026) ──
+-- Missions are short tasks a Met or Admin can assign to Crew members
+-- in a region. Examples:
+--   - "Storms forming west — report from the field if you're outside"
+--   - "Fog visibility check at sunrise, post a photo"
+--   - "Hail size report if you're seeing any"
+--
+-- Targeting: simple region match (county OR state OR radius from a lat/lng).
+-- Lifecycle: scheduled → active → expired. Mission auto-activates at
+-- starts_at and expires at expires_at.
+--
+-- Mets create missions in their workspace (Met flow). Admin can also
+-- create + schedule missions up to a week in advance (admin flow).
+CREATE TABLE IF NOT EXISTS crew_missions (
+    id              SERIAL PRIMARY KEY,
+    title           TEXT NOT NULL,
+    description     TEXT NOT NULL,
+    created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_by_role TEXT,                     -- 'met' or 'admin'
+    creator_name    TEXT,                     -- snapshot of creator name
+    target_state    TEXT,                     -- e.g. 'IN', 'KS', NULL = any
+    target_county   TEXT,                     -- e.g. 'Boone County', NULL = any
+    target_lat      DOUBLE PRECISION,         -- center if radius-based
+    target_lng      DOUBLE PRECISION,
+    target_radius_mi NUMERIC,                 -- NULL = no radius limit
+    starts_at       BIGINT NOT NULL,          -- ms epoch
+    expires_at      BIGINT NOT NULL,          -- ms epoch
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at      BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_crew_missions_active
+    ON crew_missions(is_active, starts_at, expires_at);
+CREATE INDEX IF NOT EXISTS idx_crew_missions_creator
+    ON crew_missions(created_by_user_id, created_at DESC);
+
+-- ── Crew mission responses ──
+-- Tracks which Crew members have responded to a mission.
+-- One row per (mission, user). Lets the creator see participation
+-- and lets the Crew member see "I already responded to this."
+CREATE TABLE IF NOT EXISTS crew_mission_responses (
+    id              SERIAL PRIMARY KEY,
+    mission_id      INTEGER NOT NULL REFERENCES crew_missions(id) ON DELETE CASCADE,
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    response_text   TEXT,                     -- what they reported
+    image_url       TEXT,                     -- optional photo (future)
+    submitted_at    BIGINT NOT NULL,
+    UNIQUE (mission_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_crew_mission_resp_mission
+    ON crew_mission_responses(mission_id, submitted_at DESC);
+CREATE INDEX IF NOT EXISTS idx_crew_mission_resp_user
+    ON crew_mission_responses(user_id, submitted_at DESC);
+
+-- ── Crew engagement: check-ins ──
+-- A Crew member's daily check-in. Used to compute streaks and to anchor
+-- "what are you seeing right now" reports. One per (user, date).
+-- The 'date_key' is YYYY-MM-DD in the user's local timezone, so streaks
+-- respect their actual calendar days (not UTC).
+CREATE TABLE IF NOT EXISTS crew_checkins (
+    id              SERIAL PRIMARY KEY,
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    date_key        TEXT NOT NULL,            -- 'YYYY-MM-DD' local
+    conditions      TEXT,                     -- 'clear', 'rain', 'storm', etc.
+    notes           TEXT,                     -- optional free text
+    checked_in_at   BIGINT NOT NULL,
+    UNIQUE (user_id, date_key)
+);
+CREATE INDEX IF NOT EXISTS idx_crew_checkins_user
+    ON crew_checkins(user_id, date_key DESC);
+
+-- ── Crew notification preferences ──
+-- Per-user toggles for what triggers a notification. Defaults are
+-- sensible (verifications + missions + nearby reports) — set on Crew
+-- signup. Each notification type has channel preferences too
+-- (in-app always, plus optional email/text).
+CREATE TABLE IF NOT EXISTS crew_notification_prefs (
+    user_id                INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    notify_on_verify       BOOLEAN NOT NULL DEFAULT TRUE,
+    notify_on_mission      BOOLEAN NOT NULL DEFAULT TRUE,
+    notify_on_nearby_report BOOLEAN NOT NULL DEFAULT FALSE,
+    notify_on_severe_alert BOOLEAN NOT NULL DEFAULT TRUE,
+    notify_on_mission_response BOOLEAN NOT NULL DEFAULT TRUE,
+    notify_via_email       BOOLEAN NOT NULL DEFAULT TRUE,
+    notify_via_text        BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_at             BIGINT NOT NULL
+);
+
 -- ── Pro Threads (Phase 10 — Met<>Subscriber DMs) ──
 -- One thread per subscriber, holding their conversation with the Met
 -- team. Simpler than per-topic threading: subscribers see one continuous
@@ -16113,6 +16200,613 @@ def admin_crew_reject(app_id):
     )
 
     print(f"[crew-reject] application={app_id} rejected by admin={user['id']}", flush=True)
+    return jsonify({"ok": True})
+
+
+# ════════════════════════════════════════════════════════════════════
+# Crew Phase 1 — Engagement endpoints (May 20, 2026)
+# ════════════════════════════════════════════════════════════════════
+#
+# These power the unified Valet Crew page. Each endpoint is lean and
+# returns just what the page needs, designed for fast polling + future
+# native app consumption. All require crew or admin role unless noted
+# (the page itself is accessible read-only by anyone, but personal
+# data endpoints require auth).
+
+# ─── Helpers ────────────────────────────────────────────────────────
+
+def _local_date_key(user_tz: str = "America/Indianapolis") -> str:
+    """Return today's date in YYYY-MM-DD in user's local timezone."""
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(user_tz)
+    except Exception:
+        try:
+            import zoneinfo
+            tz = zoneinfo.ZoneInfo("America/Indianapolis")
+        except Exception:
+            tz = None
+    now = datetime.now(tz) if tz else datetime.utcnow()
+    return now.strftime("%Y-%m-%d")
+
+
+def _compute_streak(user_id: int) -> int:
+    """How many consecutive days has the user checked in (inclusive of today)?
+    Looks back 90 days max for sanity. Stops counting on first missed day.
+    """
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT date_key FROM crew_checkins
+                   WHERE user_id = %s
+                   ORDER BY date_key DESC LIMIT 90""",
+                (user_id,),
+            )
+            rows = cur.fetchall()
+    if not rows:
+        return 0
+    # Compute consecutive day count
+    streak = 0
+    today = datetime.utcnow().date()
+    # Try today first, then walk backward
+    for i, r in enumerate(rows):
+        try:
+            d = datetime.strptime(r["date_key"], "%Y-%m-%d").date()
+        except Exception:
+            continue
+        expected = today - timedelta(days=i)
+        # Allow up to 1 day skew for timezone differences
+        if abs((d - expected).days) <= 1:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def _is_crew_member(user: dict) -> bool:
+    """True if user has the 'crew' role."""
+    if not user:
+        return False
+    return "crew" in (user.get("roles") or [])
+
+
+# ─── Crew personal stats ────────────────────────────────────────────
+
+@app.route("/api/v1/me/crew/stats", methods=["OPTIONS"])
+def _me_crew_stats_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/crew/stats")
+def me_crew_stats():
+    """Return the calling Crew member's personal stats for the sidebar.
+
+    Returns:
+        {
+          "ok": true,
+          "streak_days": 7,
+          "reports_this_week": 12,
+          "reports_verified": 8,
+          "missions_complete": 3,
+          "missions_active": 2,
+          "joined_days_ago": 14,
+          "is_first_day": false,    // true if joined < 24h ago (for welcome card)
+          "checked_in_today": true
+        }
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if not _is_crew_member(user):
+        return jsonify({"ok": False, "error": "not-crew"}), 403
+
+    user_id = user["id"]
+    streak = _compute_streak(user_id)
+
+    # Reports this week + verified
+    seven_days_ago_ms = int(time.time() * 1000) - (7 * 24 * 60 * 60 * 1000)
+    reports_this_week = 0
+    reports_verified = 0
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                # Count this user's reports in last 7 days. The crew_reports
+                # table may or may not exist — try and degrade gracefully.
+                try:
+                    cur.execute(
+                        """SELECT COUNT(*) AS n FROM crew_reports
+                           WHERE user_id = %s AND created_at >= %s""",
+                        (user_id, seven_days_ago_ms),
+                    )
+                    reports_this_week = (cur.fetchone() or {}).get("n", 0)
+                except Exception:
+                    pass
+                try:
+                    cur.execute(
+                        """SELECT COUNT(*) AS n FROM crew_reports
+                           WHERE user_id = %s AND verified_count >= 1""",
+                        (user_id,),
+                    )
+                    reports_verified = (cur.fetchone() or {}).get("n", 0)
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[crew-stats] reports query failed: {e!r}", flush=True)
+
+    # Missions: count active in user's region, count completed by this user
+    missions_active = 0
+    missions_complete = 0
+    now_ms = int(time.time() * 1000)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT COUNT(*) AS n FROM crew_missions
+                       WHERE is_active = TRUE
+                         AND starts_at <= %s AND expires_at > %s""",
+                    (now_ms, now_ms),
+                )
+                missions_active = (cur.fetchone() or {}).get("n", 0)
+                cur.execute(
+                    """SELECT COUNT(*) AS n FROM crew_mission_responses
+                       WHERE user_id = %s""",
+                    (user_id,),
+                )
+                missions_complete = (cur.fetchone() or {}).get("n", 0)
+    except Exception as e:
+        print(f"[crew-stats] missions query failed: {e!r}", flush=True)
+
+    # Joined-days-ago for welcome card logic
+    joined_days_ago = 999
+    is_first_day = False
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT created_at FROM users WHERE id = %s",
+                    (user_id,),
+                )
+                row = cur.fetchone()
+                if row and row.get("created_at"):
+                    age_ms = now_ms - row["created_at"]
+                    joined_days_ago = int(age_ms / (24 * 60 * 60 * 1000))
+                    is_first_day = age_ms < (24 * 60 * 60 * 1000)
+    except Exception:
+        pass
+
+    # Checked in today?
+    today_key = _local_date_key()
+    checked_in_today = False
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT 1 FROM crew_checkins
+                       WHERE user_id = %s AND date_key = %s LIMIT 1""",
+                    (user_id, today_key),
+                )
+                checked_in_today = cur.fetchone() is not None
+    except Exception:
+        pass
+
+    return jsonify({
+        "ok": True,
+        "streak_days": streak,
+        "reports_this_week": reports_this_week,
+        "reports_verified": reports_verified,
+        "missions_complete": missions_complete,
+        "missions_active": missions_active,
+        "joined_days_ago": joined_days_ago,
+        "is_first_day": is_first_day,
+        "checked_in_today": checked_in_today,
+    })
+
+
+# ─── Crew check-in ──────────────────────────────────────────────────
+
+@app.route("/api/v1/me/crew/checkin", methods=["OPTIONS"])
+def _me_crew_checkin_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/me/crew/checkin")
+def me_crew_checkin():
+    """Crew member checks in for the day. Idempotent — second check-in
+    on the same day updates conditions/notes.
+
+    Body:
+      {
+        "conditions": "clear" | "rain" | "storm" | "fog" | ...,
+        "notes": "optional"
+      }
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if not _is_crew_member(user):
+        return jsonify({"ok": False, "error": "not-crew"}), 403
+
+    data = request.get_json(silent=True) or {}
+    conditions = (data.get("conditions") or "").strip()
+    notes = (data.get("notes") or "").strip() or None
+
+    now_ms = int(time.time() * 1000)
+    today_key = _local_date_key()
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO crew_checkins
+                         (user_id, date_key, conditions, notes, checked_in_at)
+                       VALUES (%s, %s, %s, %s, %s)
+                       ON CONFLICT (user_id, date_key) DO UPDATE
+                         SET conditions = EXCLUDED.conditions,
+                             notes = EXCLUDED.notes,
+                             checked_in_at = EXCLUDED.checked_in_at
+                       RETURNING id""",
+                    (user["id"], today_key, conditions, notes, now_ms),
+                )
+                row = cur.fetchone()
+    except Exception as e:
+        print(f"[crew-checkin] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+
+    # Compute new streak after this check-in
+    new_streak = _compute_streak(user["id"])
+
+    return jsonify({
+        "ok": True,
+        "checkin_id": row["id"],
+        "date_key": today_key,
+        "streak_days": new_streak,
+    })
+
+
+# ─── Hyperlocal signal ──────────────────────────────────────────────
+
+@app.route("/api/v1/me/crew/hyperlocal", methods=["OPTIONS"])
+def _me_crew_hyperlocal_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/crew/hyperlocal")
+def me_crew_hyperlocal():
+    """How many Crew reports within X miles of the user in the last hour?
+    Used for the "3 reports near you" signal on the sidebar.
+
+    Query params:
+        radius_mi (default 5)
+        minutes (default 60)
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": True, "count": 0, "radius_mi": 5, "minutes": 60})
+
+    try:
+        radius_mi = float(request.args.get("radius_mi", 5))
+        minutes = int(request.args.get("minutes", 60))
+    except (TypeError, ValueError):
+        radius_mi = 5.0
+        minutes = 60
+
+    # Get user's primary saved location for the centerpoint
+    user_lat = None
+    user_lng = None
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT latitude, longitude FROM saved_locations
+                       WHERE user_id = %s AND is_primary = TRUE LIMIT 1""",
+                    (user["id"],),
+                )
+                row = cur.fetchone()
+                if row:
+                    user_lat = row.get("latitude")
+                    user_lng = row.get("longitude")
+    except Exception:
+        pass
+
+    if user_lat is None or user_lng is None:
+        return jsonify({
+            "ok": True,
+            "count": 0,
+            "radius_mi": radius_mi,
+            "minutes": minutes,
+            "no_location": True,
+        })
+
+    cutoff_ms = int(time.time() * 1000) - (minutes * 60 * 1000)
+    count = 0
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                # Use a haversine-like rough distance filter. Pre-filter
+                # by lat/lng bounding box (cheap) then refine if needed.
+                lat_delta = radius_mi / 69.0
+                lng_delta = radius_mi / (69.0 * max(0.01, abs(_cos_approx(user_lat))))
+                cur.execute(
+                    """SELECT COUNT(*) AS n FROM crew_reports
+                       WHERE created_at >= %s
+                         AND user_id != %s
+                         AND latitude BETWEEN %s AND %s
+                         AND longitude BETWEEN %s AND %s""",
+                    (cutoff_ms, user["id"],
+                     user_lat - lat_delta, user_lat + lat_delta,
+                     user_lng - lng_delta, user_lng + lng_delta),
+                )
+                count = (cur.fetchone() or {}).get("n", 0)
+    except Exception as e:
+        print(f"[crew-hyperlocal] failed: {e!r}", flush=True)
+
+    return jsonify({
+        "ok": True,
+        "count": count,
+        "radius_mi": radius_mi,
+        "minutes": minutes,
+    })
+
+
+def _cos_approx(lat_deg: float) -> float:
+    """Quick cosine approximation for distance bounding box math."""
+    import math
+    return math.cos(math.radians(lat_deg))
+
+
+# ─── Mission list (Crew-facing) ─────────────────────────────────────
+
+@app.route("/api/v1/me/crew/missions", methods=["OPTIONS"])
+def _me_crew_missions_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/crew/missions")
+def me_crew_missions():
+    """Active missions targeting the calling Crew member's region.
+
+    Returns the user's mission inbox: missions that are currently active
+    (between starts_at and expires_at) and target the user's state/county
+    (or have no targeting = global). Each mission includes a 'responded'
+    flag so the UI can show "Already responded" vs "Respond now".
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": True, "missions": []})
+    if not _is_crew_member(user):
+        return jsonify({"ok": True, "missions": []})
+
+    # Get user's state/county for region matching
+    user_state = None
+    user_county = None
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT region_state, region_county FROM saved_locations
+                       WHERE user_id = %s AND is_primary = TRUE LIMIT 1""",
+                    (user["id"],),
+                )
+                row = cur.fetchone()
+                if row:
+                    user_state = row.get("region_state")
+                    user_county = row.get("region_county")
+    except Exception:
+        pass
+
+    now_ms = int(time.time() * 1000)
+    missions = []
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT m.*,
+                              EXISTS(SELECT 1 FROM crew_mission_responses r
+                                     WHERE r.mission_id = m.id
+                                       AND r.user_id = %s) AS responded
+                       FROM crew_missions m
+                       WHERE m.is_active = TRUE
+                         AND m.starts_at <= %s
+                         AND m.expires_at > %s
+                         AND (m.target_state IS NULL OR m.target_state = %s)
+                         AND (m.target_county IS NULL OR m.target_county = %s)
+                       ORDER BY m.starts_at DESC LIMIT 20""",
+                    (user["id"], now_ms, now_ms, user_state, user_county),
+                )
+                missions = cur.fetchall()
+    except Exception as e:
+        print(f"[crew-missions] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+
+    return jsonify({
+        "ok": True,
+        "missions": [{
+            "id": m["id"],
+            "title": m["title"],
+            "description": m["description"],
+            "creator_name": m.get("creator_name") or "WeatherValet",
+            "creator_role": m.get("created_by_role") or "met",
+            "starts_at": m["starts_at"],
+            "expires_at": m["expires_at"],
+            "responded": m.get("responded", False),
+        } for m in missions]
+    })
+
+
+# ─── Mission creation (admin + Met) ─────────────────────────────────
+
+@app.route("/api/v1/missions", methods=["OPTIONS"])
+def _missions_create_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/missions")
+def missions_create():
+    """Create a mission. Admin or Met can call this.
+
+    Body:
+      {
+        "title": "Hail size check",
+        "description": "If you see hail, report size...",
+        "target_state": "IN",            // optional
+        "target_county": "Boone County", // optional
+        "starts_at": 1747900000000,      // ms epoch, defaults to now
+        "expires_at": 1747920000000      // ms epoch, defaults to +6h
+      }
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    is_admin = "admin" in roles
+    is_met = "met" in roles
+    if not (is_admin or is_met):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    title = (data.get("title") or "").strip()
+    description = (data.get("description") or "").strip()
+    if not title or not description:
+        return jsonify({"ok": False, "error": "missing-title-or-description"}), 400
+    if len(title) > 200:
+        return jsonify({"ok": False, "error": "title-too-long"}), 400
+    if len(description) > 1000:
+        return jsonify({"ok": False, "error": "description-too-long"}), 400
+
+    target_state = (data.get("target_state") or "").strip().upper() or None
+    target_county = (data.get("target_county") or "").strip() or None
+
+    now_ms = int(time.time() * 1000)
+    try:
+        starts_at = int(data.get("starts_at") or now_ms)
+    except (TypeError, ValueError):
+        starts_at = now_ms
+    try:
+        expires_at = int(data.get("expires_at") or (now_ms + 6 * 60 * 60 * 1000))
+    except (TypeError, ValueError):
+        expires_at = now_ms + 6 * 60 * 60 * 1000
+
+    if expires_at <= starts_at:
+        return jsonify({"ok": False, "error": "invalid-time-range"}), 400
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO crew_missions
+                         (title, description, created_by_user_id, created_by_role,
+                          creator_name, target_state, target_county,
+                          starts_at, expires_at, is_active, created_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s)
+                       RETURNING id""",
+                    (title, description, user["id"],
+                     "admin" if is_admin else "met",
+                     user.get("name") or "", target_state, target_county,
+                     starts_at, expires_at, now_ms),
+                )
+                new_id = cur.fetchone()["id"]
+    except Exception as e:
+        print(f"[mission-create] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+
+    print(
+        f"[mission-create] id={new_id} title={title[:40]} "
+        f"by user={user.get('name')} (role={'admin' if is_admin else 'met'}) "
+        f"region={target_state}/{target_county}",
+        flush=True,
+    )
+
+    return jsonify({"ok": True, "mission_id": new_id})
+
+
+# ─── Notification preferences ───────────────────────────────────────
+
+@app.route("/api/v1/me/crew/notifications", methods=["OPTIONS"])
+def _me_crew_notif_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/crew/notifications")
+def me_crew_notif_get():
+    """Get notification preferences. Creates defaults if not set."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    now_ms = int(time.time() * 1000)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM crew_notification_prefs WHERE user_id = %s",
+                    (user["id"],),
+                )
+                row = cur.fetchone()
+                if not row:
+                    cur.execute(
+                        """INSERT INTO crew_notification_prefs (user_id, updated_at)
+                           VALUES (%s, %s) RETURNING *""",
+                        (user["id"], now_ms),
+                    )
+                    row = cur.fetchone()
+    except Exception as e:
+        print(f"[crew-notif-get] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+
+    return jsonify({
+        "ok": True,
+        "prefs": {
+            "notify_on_verify": row.get("notify_on_verify", True),
+            "notify_on_mission": row.get("notify_on_mission", True),
+            "notify_on_nearby_report": row.get("notify_on_nearby_report", False),
+            "notify_on_severe_alert": row.get("notify_on_severe_alert", True),
+            "notify_on_mission_response": row.get("notify_on_mission_response", True),
+            "notify_via_email": row.get("notify_via_email", True),
+            "notify_via_text": row.get("notify_via_text", False),
+        }
+    })
+
+
+@app.patch("/api/v1/me/crew/notifications")
+def me_crew_notif_update():
+    """Update notification preferences."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    data = request.get_json(silent=True) or {}
+    allowed_keys = (
+        "notify_on_verify", "notify_on_mission", "notify_on_nearby_report",
+        "notify_on_severe_alert", "notify_on_mission_response",
+        "notify_via_email", "notify_via_text",
+    )
+    updates = {k: bool(v) for k, v in data.items() if k in allowed_keys}
+    if not updates:
+        return jsonify({"ok": False, "error": "no-valid-fields"}), 400
+
+    now_ms = int(time.time() * 1000)
+    set_clauses = ", ".join(f"{k} = %s" for k in updates.keys())
+    params = list(updates.values()) + [now_ms, user["id"]]
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                # Upsert: insert defaults if not exists, then update
+                cur.execute(
+                    """INSERT INTO crew_notification_prefs (user_id, updated_at)
+                       VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING""",
+                    (user["id"], now_ms),
+                )
+                cur.execute(
+                    f"""UPDATE crew_notification_prefs
+                        SET {set_clauses}, updated_at = %s
+                        WHERE user_id = %s""",
+                    params,
+                )
+    except Exception as e:
+        print(f"[crew-notif-update] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+
     return jsonify({"ok": True})
 
 
