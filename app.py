@@ -17143,6 +17143,89 @@ def admin_mission_cancel(mission_id: int):
     return jsonify({"ok": True})
 
 
+# ─── "I was there" log (May 20, 2026) ────────────────────────────────
+# Personal history of every report this Crew member has submitted.
+# Different from the map (which is "what's happening now"). This is
+# "what I've witnessed, all-time." Becomes meaningful over years.
+
+@app.route("/api/v1/me/crew/i-was-there", methods=["OPTIONS"])
+def _me_crew_i_was_there_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/crew/i-was-there")
+def me_crew_i_was_there():
+    """The calling Crew member's personal report history. Most recent first.
+
+    Query params:
+        limit  - max rows (default 50, max 200)
+        offset - pagination offset
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if not _is_crew_member(user):
+        return jsonify({"ok": False, "error": "not-crew"}), 403
+
+    try:
+        limit = int(request.args.get("limit", 50))
+        offset = int(request.args.get("offset", 0))
+        if limit > 200:
+            limit = 200
+        if limit < 1:
+            limit = 50
+        if offset < 0:
+            offset = 0
+    except (TypeError, ValueError):
+        limit = 50
+        offset = 0
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, report_type, latitude, longitude,
+                              notes, image_url, verified_count, created_at,
+                              is_hidden
+                       FROM crew_reports
+                       WHERE user_id = %s
+                       ORDER BY created_at DESC
+                       LIMIT %s OFFSET %s""",
+                    (user["id"], limit, offset),
+                )
+                rows = cur.fetchall()
+                # Also get total count for pagination + lifetime stat
+                cur.execute(
+                    """SELECT COUNT(*) AS total,
+                              COUNT(*) FILTER (WHERE verified_count >= 1) AS verified_total
+                       FROM crew_reports WHERE user_id = %s""",
+                    (user["id"],),
+                )
+                stats = cur.fetchone() or {}
+    except Exception as e:
+        print(f"[i-was-there] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+
+    return jsonify({
+        "ok": True,
+        "reports": [{
+            "id": r["id"],
+            "report_type": r["report_type"],
+            "lat": r["latitude"],
+            "lng": r["longitude"],
+            "notes": r.get("notes") or "",
+            "image_url": r.get("image_url") or "",
+            "verified_count": r.get("verified_count", 0),
+            "created_at": r["created_at"],
+            "is_hidden": r.get("is_hidden", False),
+        } for r in rows],
+        "total": stats.get("total", 0),
+        "verified_total": stats.get("verified_total", 0),
+        "limit": limit,
+        "offset": offset,
+    })
+
+
 # ─── Notification preferences ───────────────────────────────────────
 
 @app.route("/api/v1/me/crew/notifications", methods=["OPTIONS"])
