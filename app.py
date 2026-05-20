@@ -17063,6 +17063,86 @@ def me_crew_mission_respond(mission_id: int):
     return jsonify({"ok": True, "response_id": resp_id})
 
 
+# ─── Admin: list + cancel missions ──────────────────────────────────
+
+@app.route("/api/v1/admin/missions", methods=["OPTIONS"])
+def _admin_missions_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/missions")
+def admin_missions_list():
+    """List all missions (most recent first). Includes response counts."""
+    user, err = _require_admin()
+    if err:
+        return err
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT m.*,
+                              (SELECT COUNT(*) FROM crew_mission_responses r
+                               WHERE r.mission_id = m.id) AS response_count
+                       FROM crew_missions m
+                       ORDER BY m.starts_at DESC
+                       LIMIT 100"""
+                )
+                rows = cur.fetchall()
+    except Exception as e:
+        print(f"[admin-missions-list] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+
+    return jsonify({
+        "ok": True,
+        "missions": [{
+            "id": r["id"],
+            "title": r["title"],
+            "description": r["description"],
+            "creator_name": r.get("creator_name") or "",
+            "creator_role": r.get("created_by_role") or "",
+            "target_state": r.get("target_state") or "",
+            "target_county": r.get("target_county") or "",
+            "starts_at": r["starts_at"],
+            "expires_at": r["expires_at"],
+            "is_active": r["is_active"],
+            "response_count": r.get("response_count", 0),
+            "created_at": r["created_at"],
+        } for r in rows]
+    })
+
+
+@app.route("/api/v1/admin/missions/<int:mission_id>", methods=["OPTIONS"])
+def _admin_mission_delete_preflight(mission_id):
+    return ("", 204)
+
+
+@app.delete("/api/v1/admin/missions/<int:mission_id>")
+def admin_mission_cancel(mission_id: int):
+    """Cancel a mission. Soft-delete via is_active=FALSE so Crew responses
+    are preserved for audit/review."""
+    user, err = _require_admin()
+    if err:
+        return err
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE crew_missions SET is_active = FALSE
+                       WHERE id = %s RETURNING id""",
+                    (mission_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"ok": False, "error": "not-found"}), 404
+    except Exception as e:
+        print(f"[admin-mission-cancel] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+
+    return jsonify({"ok": True})
+
+
 # ─── Notification preferences ───────────────────────────────────────
 
 @app.route("/api/v1/me/crew/notifications", methods=["OPTIONS"])
