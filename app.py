@@ -8954,6 +8954,7 @@ def _serialize_user_for_admin(row):
         "phone": row.get("phone") or "",
         "role": primary_role or "subscriber",
         "all_roles": roles,
+        "subscription_tier": row.get("subscription_tier") or "",
         "last_login": last_login_str,
         "is_active": bool(row.get("is_active", True)),
     }
@@ -8968,6 +8969,7 @@ def admin_list_users():
         cur = conn.cursor()
         cur.execute("""
             SELECT u.id, u.email, u.name, u.phone, u.created_at, u.last_login_at, u.is_active,
+                   u.subscription_tier,
                    ARRAY_REMOVE(ARRAY_AGG(ur.role ORDER BY ur.role), NULL) AS roles
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
@@ -9103,6 +9105,7 @@ def admin_update_user(user_id):
     role_input = data.get("role")
     reset_password = bool(data.get("reset_password"))
     is_active = data.get("is_active")
+    subscription_tier = data.get("subscription_tier")  # May 22, 2026: admin tier override
 
     temp_password = None
 
@@ -9149,6 +9152,19 @@ def admin_update_user(user_id):
                 updates.append("is_active = %s")
                 params.append(bool(is_active))
 
+            # subscription_tier override (May 22, 2026): admin can correct
+            # a subscriber's tier after migration without re-running the
+            # whole import. Stripe billing is NOT touched — admin is
+            # expected to handle Stripe changes manually in the Stripe
+            # dashboard (proration, coupon swap, etc.). This endpoint
+            # only fixes the internal database tier.
+            if subscription_tier is not None:
+                tier_clean = subscription_tier.strip().lower()
+                if tier_clean not in ("hobbyist", "pro_single", "pro_multi"):
+                    return jsonify({"ok": False, "error": "invalid-tier"}), 400
+                updates.append("subscription_tier = %s")
+                params.append(tier_clean)
+
             if reset_password:
                 temp_password = _generate_temp_password()
                 password_hash = _bcrypt.hashpw(temp_password.encode("utf-8"),
@@ -9184,6 +9200,7 @@ def admin_update_user(user_id):
             # Return the refreshed user
             cur.execute("""
                 SELECT u.id, u.email, u.name, u.phone, u.created_at, u.last_login_at, u.is_active,
+                       u.subscription_tier,
                        ARRAY_REMOVE(ARRAY_AGG(ur.role ORDER BY ur.role), NULL) AS roles
                 FROM users u
                 LEFT JOIN user_roles ur ON ur.user_id = u.id
