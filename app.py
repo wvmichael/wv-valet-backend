@@ -5184,10 +5184,15 @@ def _mark_paid_and_notify(request_id: int, *, payment_id: Optional[str] = None,
             )
 
     # Customer SMS — the standby promise. Keep it short, warm, time-bounded.
+    # (Fixed May 22, 2026 — was using a legacy single-Met name var that
+    # defaulted to "your meteorologist", producing awkward output like
+    # "Your is reviewing your plan now". With a multi-Met team, the
+    # specific Met is decided later when one claims the review, so we
+    # use generic "a meteorologist" here.)
     customer_msg = (
-        "WeatherValet: Got it. " + METEOROLOGIST_NAME.split()[0].capitalize()
-        + " is reviewing your plan now and we'll text you when the call is ready "
-        "(usually under 30 minutes). Reply STOP to opt out."
+        "WeatherValet: Got it, a meteorologist is reviewing your plan now "
+        "and we'll text you when the call is ready (usually under 30 minutes). "
+        "Reply STOP to opt out."
     )
     send_sms(row["customer_phone"], customer_msg)
 
