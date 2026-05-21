@@ -1933,6 +1933,78 @@ CREATE INDEX IF NOT EXISTS idx_met_tips_verification
     ON met_tips(verification_request_id);
 CREATE INDEX IF NOT EXISTS idx_met_tips_session
     ON met_tips(stripe_session_id);
+
+-- ── Met scheduling (May 21, 2026) ────────────────────────────────────
+-- Each Met owns a "territory" — a named region they cover by default.
+-- Subscribers belong to one territory; new ones default-assign based
+-- on the Met's region. Mets cover their own territory across three
+-- daily shifts (morning / afternoon / evening). When the primary Met
+-- is off, another Met can claim that shift in the schedule grid.
+--
+-- Phase 1 (this build):
+--  - Territory ownership: 1 Met = 1 territory.
+--  - Subscribers assigned manually (admin) or via migration tool.
+--  - Schedule grid: 7-day view, 3 shifts per day per territory,
+--    plus a national Met Reviews row (anyone signs up).
+--  - Tap to claim empty cell, tap own initials to release.
+--
+-- Phase 2 (later):
+--  - Rosie reminders via Discord
+--  - Gap alerts to team channel
+--  - Met Reviews queue threshold detection
+--  - Recurring patterns ("I'm off every Saturday")
+--  - Multi-territory Mets
+
+CREATE TABLE IF NOT EXISTS met_territories (
+    id                  SERIAL PRIMARY KEY,
+    met_user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name                TEXT NOT NULL,           -- e.g., "Chris's Subscribers"
+    region_label        TEXT NOT NULL,           -- e.g., "Kansas Region"
+    sort_order          INTEGER NOT NULL DEFAULT 0,
+    created_at          BIGINT NOT NULL,
+    UNIQUE (met_user_id)                          -- 1 Met = 1 territory (Phase 1)
+);
+CREATE INDEX IF NOT EXISTS idx_met_territories_sort
+    ON met_territories(sort_order, id);
+
+-- Subscriber's territory assignment. Added as a column on users.
+-- Subscribers without a territory show up as "Unassigned" in admin
+-- so they can be placed.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS territory_id
+    INTEGER REFERENCES met_territories(id) ON DELETE SET NULL;
+
+-- Shift assignments. Each row = one Met covering one (territory + date + shift).
+-- The "territory_id" column is NULL for the special Met Reviews national
+-- queue rows; we use a sentinel "is_reviews_pool" flag instead so reviews
+-- shift coverage and subscriber territory coverage live in the same table.
+--
+-- Multiple Mets can sign up for the SAME Met Reviews shift (national pool).
+-- Only ONE Met can cover a (territory + date + shift) — the unique index
+-- below enforces that for subscriber territories but allows multiples for
+-- the reviews pool.
+CREATE TABLE IF NOT EXISTS shift_assignments (
+    id                  SERIAL PRIMARY KEY,
+    territory_id        INTEGER REFERENCES met_territories(id) ON DELETE CASCADE,
+    is_reviews_pool     BOOLEAN NOT NULL DEFAULT FALSE,
+    shift_date          DATE NOT NULL,
+    shift_type          TEXT NOT NULL CHECK (shift_type IN ('morning','afternoon','evening')),
+    met_user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at          BIGINT NOT NULL,
+    CHECK ((territory_id IS NOT NULL AND is_reviews_pool = FALSE)
+        OR (territory_id IS NULL AND is_reviews_pool = TRUE))
+);
+-- Subscriber-territory shifts: only one Met per (territory, date, shift)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_shift_territory_unique
+    ON shift_assignments(territory_id, shift_date, shift_type)
+    WHERE territory_id IS NOT NULL;
+-- Reviews-pool shifts: a Met can only sign up once per (date, shift)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_shift_reviews_unique
+    ON shift_assignments(met_user_id, shift_date, shift_type)
+    WHERE is_reviews_pool = TRUE;
+CREATE INDEX IF NOT EXISTS idx_shift_date
+    ON shift_assignments(shift_date, shift_type);
+CREATE INDEX IF NOT EXISTS idx_shift_met
+    ON shift_assignments(met_user_id, shift_date);
 """
 
 
@@ -1997,6 +2069,57 @@ def init_db() -> None:
         _rosie_seed_kb()
     except Exception as e:
         print(f"[rosie-kb] seed at init failed: {e}", flush=True)
+    # Seed Met territories on first deploy. Idempotent — only inserts
+    # if the user has a Met role and doesn't already own a territory.
+    try:
+        _seed_met_territories()
+    except Exception as e:
+        print(f"[met-territories] seed at init failed: {e}", flush=True)
+
+
+def _seed_met_territories() -> None:
+    """Seed Chris's Kansas Region and Timmy's Indiana Region territories.
+
+    Idempotent: skips if the Met already owns a territory (UNIQUE constraint
+    on met_territories.met_user_id would catch this anyway, but we check
+    first to avoid noisy errors).
+
+    Looks up the Mets by email (the canonical identifier from migration).
+    If neither Chris nor Timmy has signed up as a Met yet, this is a no-op.
+    """
+    now_ms = int(time.time() * 1000)
+    seed_specs = [
+        # (email_to_find, territory_name, region_label, sort_order)
+        ("sramek@weathervalet.com", "Chris's Subscribers",  "Kansas Region",  10),
+        ("timmy@weathervalet.com",  "Timmy's Subscribers",  "Indiana Region", 20),
+    ]
+    with db() as conn:
+        with conn.cursor() as cur:
+            for email, name, region_label, sort_order in seed_specs:
+                # Find the user
+                cur.execute(
+                    "SELECT id FROM users WHERE LOWER(email) = LOWER(%s) AND is_active = TRUE",
+                    (email,)
+                )
+                user_row = cur.fetchone()
+                if not user_row:
+                    print(f"[met-territories] no user found for {email}, skipping", flush=True)
+                    continue
+                user_id = user_row["id"]
+                # Skip if territory already exists for this Met
+                cur.execute(
+                    "SELECT id FROM met_territories WHERE met_user_id = %s",
+                    (user_id,)
+                )
+                if cur.fetchone():
+                    continue
+                cur.execute(
+                    """INSERT INTO met_territories
+                         (met_user_id, name, region_label, sort_order, created_at)
+                       VALUES (%s, %s, %s, %s, %s)""",
+                    (user_id, name, region_label, sort_order, now_ms),
+                )
+                print(f"[met-territories] seeded {name} for user_id={user_id}", flush=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -24758,6 +24881,536 @@ def admin_commissions(year: int, month: int):
     result = _compute_commissions_for_month(year, month)
     result["ok"] = True
     return jsonify(result)
+
+
+# ════════════════════════════════════════════════════════════════════
+# Met Schedule (May 21, 2026) — Phase 1
+# ════════════════════════════════════════════════════════════════════
+# Territory-based shift scheduling with three daily shifts:
+#   - Morning   (5:30a–12p local)
+#   - Afternoon (12–5p local)
+#   - Evening   (5–10p local)
+# Overnight (10p–5:30a) is intentionally not covered until full-time
+# hires are in place.
+#
+# Each Met owns one territory; subscribers belong to one territory.
+# A separate "Met Reviews — National Queue" lets any Met sign up for
+# review-handling shifts (anyone, no per-shift cap).
+#
+# Phase 1 scope: data + view + tap-to-claim. No Rosie reminders,
+# no gap alerts, no Met Reviews queue threshold — those are Phase 2.
+#
+# Endpoints:
+#   GET  /api/v1/met/schedule?start_date=YYYY-MM-DD
+#        → Returns territories + 7-day shift grid (today through +6).
+#   POST /api/v1/met/schedule/claim
+#        → Met claims an empty shift cell.
+#   POST /api/v1/met/schedule/release
+#        → Met releases their own claimed shift cell.
+#
+# Authorization: must be authenticated AND have 'met' role.
+
+
+@app.route("/api/v1/met/schedule", methods=["OPTIONS"])
+def _met_schedule_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/schedule")
+def met_schedule_get():
+    """Return the 7-day shift grid starting from start_date (default today, US Eastern).
+
+    Response shape:
+      {
+        "ok": true,
+        "start_date": "2026-05-22",
+        "days": ["Thu 5/22", "Fri 5/23", ...]            // 7 entries
+        "shifts": [
+          {"key":"morning","label":"Morning","hours":"5:30a–12p"},
+          {"key":"afternoon","label":"Afternoon","hours":"12–5p"},
+          {"key":"evening","label":"Evening","hours":"5–10p"}
+        ],
+        "territories": [
+          {
+            "id": 1,
+            "name": "Chris's Subscribers",
+            "region_label": "Kansas Region",
+            "met_user_id": 4,
+            "met_initials": "CS",
+            "subscriber_count": 4,
+            "cells": {
+              "2026-05-22": {
+                "morning":   {"met_user_id":4,"initials":"CS","is_default":true},
+                "afternoon": null,
+                "evening":   {"met_user_id":4,"initials":"CS","is_default":true}
+              },
+              ...
+            }
+          }
+        ],
+        "reviews_pool": {
+          "cells": {
+            "2026-05-22": {
+              "morning":   [{"met_user_id":4,"initials":"CS"}, {"met_user_id":7,"initials":"TA"}],
+              "afternoon": [],
+              "evening":   []
+            },
+            ...
+          }
+        },
+        "current_user_id": 4,
+        "current_user_initials": "CS"
+      }
+
+    Note on "is_default": if no explicit assignment exists, the territory
+    owner is shown as the default coverer. The cell is still "claimable"
+    by another Met in the sense that they can drop their initials there
+    on an off-day, but the default fills aren't stored as rows in
+    shift_assignments — they're computed at read time. When a Met drops
+    a shift (releases their default), we store an explicit NULL marker
+    so the cell renders as truly empty.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    import datetime as _dt
+    start_str = request.args.get("start_date", "").strip()
+    if start_str:
+        try:
+            start_date = _dt.date.fromisoformat(start_str)
+        except ValueError:
+            return jsonify({"ok": False, "error": "invalid-start-date"}), 400
+    else:
+        # Default: today in US Eastern (close enough for v1 — most Mets in ET)
+        start_date = _dt.datetime.utcnow().date()
+
+    dates = [start_date + _dt.timedelta(days=i) for i in range(7)]
+    date_strs = [d.isoformat() for d in dates]
+    day_labels = [d.strftime("%a %-m/%-d") if hasattr(d, "strftime") else str(d) for d in dates]
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            # Load all territories with their Met owner + subscriber count
+            cur.execute("""
+                SELECT t.id, t.name, t.region_label, t.met_user_id, t.sort_order,
+                       u.name AS met_name,
+                       (SELECT COUNT(*) FROM users WHERE territory_id = t.id) AS subscriber_count
+                FROM met_territories t
+                JOIN users u ON u.id = t.met_user_id
+                ORDER BY t.sort_order, t.id
+            """)
+            territory_rows = cur.fetchall()
+
+            # Load all shift_assignments in the 7-day window
+            cur.execute("""
+                SELECT id, territory_id, is_reviews_pool, shift_date, shift_type,
+                       met_user_id
+                FROM shift_assignments
+                WHERE shift_date BETWEEN %s AND %s
+            """, (date_strs[0], date_strs[-1]))
+            assignment_rows = cur.fetchall()
+
+            # Build a lookup of Met user_id → initials/name (just the ones referenced)
+            referenced_met_ids = set()
+            for t in territory_rows:
+                referenced_met_ids.add(t["met_user_id"])
+            for a in assignment_rows:
+                referenced_met_ids.add(a["met_user_id"])
+            referenced_met_ids.add(user["id"])
+
+            met_info = {}
+            if referenced_met_ids:
+                placeholders = ",".join(["%s"] * len(referenced_met_ids))
+                cur.execute(
+                    f"SELECT id, name FROM users WHERE id IN ({placeholders})",
+                    tuple(referenced_met_ids)
+                )
+                for row in cur.fetchall():
+                    met_info[row["id"]] = {
+                        "name": row["name"] or "",
+                        "initials": _initials_from_name(row["name"]),
+                    }
+
+    # Bucket assignments by (territory or reviews) + date + shift
+    # For territories: there's at most one Met per cell (DB-enforced unique).
+    # For reviews pool: there can be multiple Mets per cell.
+    # Sentinel met_user_id = -1 means "explicit drop" (default Met released).
+    territory_cells = {}      # (territory_id, date_str, shift_type) -> {met_user_id, initials}
+    territory_drops = set()   # (territory_id, date_str, shift_type) — explicit drops
+    reviews_cells = {}        # (date_str, shift_type) -> [{met_user_id, initials}, ...]
+
+    for a in assignment_rows:
+        date_str = a["shift_date"].isoformat() if hasattr(a["shift_date"], "isoformat") else str(a["shift_date"])
+        shift = a["shift_type"]
+        met_id = a["met_user_id"]
+        info = met_info.get(met_id, {"initials": "?"})
+        if a["is_reviews_pool"]:
+            key = (date_str, shift)
+            reviews_cells.setdefault(key, []).append({
+                "met_user_id": met_id,
+                "initials": info["initials"],
+            })
+        else:
+            tid = a["territory_id"]
+            if met_id == -1:
+                # Explicit drop marker
+                territory_drops.add((tid, date_str, shift))
+            else:
+                territory_cells[(tid, date_str, shift)] = {
+                    "met_user_id": met_id,
+                    "initials": info["initials"],
+                    "is_default": False,
+                }
+
+    # Build the response territories array with default-fill logic
+    territories = []
+    for t in territory_rows:
+        tid = t["id"]
+        owner_id = t["met_user_id"]
+        owner_info = met_info.get(owner_id, {"initials": "?"})
+        cells = {}
+        for date_str in date_strs:
+            day = {}
+            for shift_key in ("morning", "afternoon", "evening"):
+                # Did the Met explicitly drop this shift?
+                if (tid, date_str, shift_key) in territory_drops:
+                    day[shift_key] = None
+                # Explicit non-default assignment?
+                elif (tid, date_str, shift_key) in territory_cells:
+                    day[shift_key] = territory_cells[(tid, date_str, shift_key)]
+                else:
+                    # Default fill: territory owner covers
+                    day[shift_key] = {
+                        "met_user_id": owner_id,
+                        "initials": owner_info["initials"],
+                        "is_default": True,
+                    }
+            cells[date_str] = day
+        territories.append({
+            "id": tid,
+            "name": t["name"],
+            "region_label": t["region_label"],
+            "met_user_id": owner_id,
+            "met_initials": owner_info["initials"],
+            "subscriber_count": int(t["subscriber_count"] or 0),
+            "cells": cells,
+        })
+
+    # Build the reviews_pool response
+    reviews_pool_cells = {}
+    for date_str in date_strs:
+        day = {}
+        for shift_key in ("morning", "afternoon", "evening"):
+            day[shift_key] = reviews_cells.get((date_str, shift_key), [])
+        reviews_pool_cells[date_str] = day
+
+    me_info = met_info.get(user["id"], {"initials": "?"})
+    return jsonify({
+        "ok": True,
+        "start_date": start_date.isoformat(),
+        "days": day_labels,
+        "dates": date_strs,
+        "shifts": [
+            {"key": "morning",   "label": "Morning",   "hours": "5:30a–12p"},
+            {"key": "afternoon", "label": "Afternoon", "hours": "12–5p"},
+            {"key": "evening",   "label": "Evening",   "hours": "5–10p"},
+        ],
+        "territories": territories,
+        "reviews_pool": {"cells": reviews_pool_cells},
+        "current_user_id": user["id"],
+        "current_user_initials": me_info["initials"],
+    })
+
+
+def _initials_from_name(name):
+    """Two-letter initials. 'Chris Sramek' -> 'CS', single name -> first 2 chars."""
+    if not name:
+        return "?"
+    parts = name.strip().split()
+    if len(parts) >= 2:
+        return (parts[0][0] + parts[-1][0]).upper()
+    return (parts[0][:2]).upper() if parts else "?"
+
+
+@app.route("/api/v1/met/schedule/claim", methods=["OPTIONS"])
+def _met_schedule_claim_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/met/schedule/claim")
+def met_schedule_claim():
+    """Met claims an empty shift cell.
+
+    Body:
+      {
+        "scope": "territory" | "reviews_pool",
+        "territory_id": 5,            // required if scope=territory
+        "shift_date": "2026-05-22",
+        "shift_type": "morning" | "afternoon" | "evening"
+      }
+
+    Rules:
+      - Must be authenticated Met
+      - Territory shifts: only claimable if no one has claimed it AND the
+        territory owner has dropped it (or it's not owned by current user
+        and the cell is empty)
+        Simpler: any Met can claim a territory shift that isn't already
+        claimed by another Met. The "default-fill" doesn't block claiming
+        because the owner can be elsewhere.
+        BUT: if the cell already has a real assignment (not just default),
+        we reject. Mets cannot override another Met's claimed shift.
+      - Reviews pool: any Met can sign up. Multiple Mets allowed per shift.
+        Same Met can't sign up twice (DB-enforced unique index).
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    scope = (data.get("scope") or "").strip()
+    shift_date = (data.get("shift_date") or "").strip()
+    shift_type = (data.get("shift_type") or "").strip()
+    territory_id = data.get("territory_id")
+
+    if scope not in ("territory", "reviews_pool"):
+        return jsonify({"ok": False, "error": "invalid-scope"}), 400
+    if shift_type not in ("morning", "afternoon", "evening"):
+        return jsonify({"ok": False, "error": "invalid-shift-type"}), 400
+
+    import datetime as _dt
+    try:
+        _dt.date.fromisoformat(shift_date)
+    except ValueError:
+        return jsonify({"ok": False, "error": "invalid-shift-date"}), 400
+
+    now_ms = int(time.time() * 1000)
+
+    if scope == "territory":
+        if not territory_id:
+            return jsonify({"ok": False, "error": "missing-territory-id"}), 400
+        try:
+            territory_id = int(territory_id)
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "error": "invalid-territory-id"}), 400
+
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    # Check if there's an existing non-drop assignment for this cell
+                    cur.execute("""
+                        SELECT id, met_user_id
+                        FROM shift_assignments
+                        WHERE territory_id = %s
+                          AND shift_date = %s
+                          AND shift_type = %s
+                    """, (territory_id, shift_date, shift_type))
+                    existing = cur.fetchone()
+
+                    if existing:
+                        if existing["met_user_id"] == -1:
+                            # Explicit drop marker exists — remove it, then INSERT real claim
+                            cur.execute(
+                                "DELETE FROM shift_assignments WHERE id = %s",
+                                (existing["id"],)
+                            )
+                        else:
+                            return jsonify({
+                                "ok": False,
+                                "error": "already-claimed",
+                                "message": "Another Met is already covering that shift."
+                            }), 409
+
+                    cur.execute("""
+                        INSERT INTO shift_assignments
+                          (territory_id, is_reviews_pool, shift_date, shift_type,
+                           met_user_id, created_at)
+                        VALUES (%s, FALSE, %s, %s, %s, %s)
+                        RETURNING id
+                    """, (territory_id, shift_date, shift_type, user["id"], now_ms))
+                    new_id = cur.fetchone()["id"]
+                    return jsonify({"ok": True, "id": new_id})
+        except psycopg2.errors.UniqueViolation:
+            return jsonify({
+                "ok": False,
+                "error": "already-claimed",
+                "message": "Another Met claimed it first."
+            }), 409
+        except Exception as e:
+            print(f"[schedule-claim] {e!r}", flush=True)
+            return jsonify({"ok": False, "error": "server-error"}), 500
+    else:
+        # reviews_pool
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    # Check if this Met is already signed up for this shift
+                    cur.execute("""
+                        SELECT id FROM shift_assignments
+                        WHERE is_reviews_pool = TRUE
+                          AND shift_date = %s
+                          AND shift_type = %s
+                          AND met_user_id = %s
+                    """, (shift_date, shift_type, user["id"]))
+                    if cur.fetchone():
+                        return jsonify({
+                            "ok": False,
+                            "error": "already-signed-up",
+                            "message": "You're already signed up for that review shift."
+                        }), 409
+                    cur.execute("""
+                        INSERT INTO shift_assignments
+                          (territory_id, is_reviews_pool, shift_date, shift_type,
+                           met_user_id, created_at)
+                        VALUES (NULL, TRUE, %s, %s, %s, %s)
+                        RETURNING id
+                    """, (shift_date, shift_type, user["id"], now_ms))
+                    row = cur.fetchone()
+                    return jsonify({"ok": True, "id": row["id"]})
+        except Exception as e:
+            print(f"[schedule-claim reviews] {e!r}", flush=True)
+            return jsonify({"ok": False, "error": "server-error"}), 500
+
+
+@app.route("/api/v1/met/schedule/release", methods=["OPTIONS"])
+def _met_schedule_release_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/met/schedule/release")
+def met_schedule_release():
+    """Met releases their own shift assignment.
+
+    Body:
+      {
+        "scope": "territory" | "reviews_pool",
+        "territory_id": 5,            // required if scope=territory
+        "shift_date": "2026-05-22",
+        "shift_type": "morning"
+      }
+
+    For territory scope:
+      - If the Met has an explicit row, delete it.
+      - If the Met is the territory OWNER and there's no explicit row
+        (default-filled), insert a "drop marker" (met_user_id=-1) so the
+        cell renders empty on next load.
+
+    For reviews_pool scope:
+      - Delete the row matching (met_user_id, shift_date, shift_type, is_reviews_pool).
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    scope = (data.get("scope") or "").strip()
+    shift_date = (data.get("shift_date") or "").strip()
+    shift_type = (data.get("shift_type") or "").strip()
+    territory_id = data.get("territory_id")
+
+    if scope not in ("territory", "reviews_pool"):
+        return jsonify({"ok": False, "error": "invalid-scope"}), 400
+    if shift_type not in ("morning", "afternoon", "evening"):
+        return jsonify({"ok": False, "error": "invalid-shift-type"}), 400
+
+    now_ms = int(time.time() * 1000)
+
+    if scope == "territory":
+        if not territory_id:
+            return jsonify({"ok": False, "error": "missing-territory-id"}), 400
+        try:
+            territory_id = int(territory_id)
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "error": "invalid-territory-id"}), 400
+
+        with db() as conn:
+            with conn.cursor() as cur:
+                # Is this Met the territory owner?
+                cur.execute(
+                    "SELECT met_user_id FROM met_territories WHERE id = %s",
+                    (territory_id,)
+                )
+                t = cur.fetchone()
+                if not t:
+                    return jsonify({"ok": False, "error": "territory-not-found"}), 404
+                is_owner = (t["met_user_id"] == user["id"])
+
+                # Check for existing explicit assignment by this Met
+                cur.execute("""
+                    SELECT id FROM shift_assignments
+                    WHERE territory_id = %s
+                      AND shift_date = %s
+                      AND shift_type = %s
+                      AND met_user_id = %s
+                """, (territory_id, shift_date, shift_type, user["id"]))
+                existing = cur.fetchone()
+
+                if existing:
+                    cur.execute(
+                        "DELETE FROM shift_assignments WHERE id = %s",
+                        (existing["id"],)
+                    )
+                    # If they were the owner, they might want the default
+                    # back. To keep simple: deletion = release, fall back
+                    # to default. If they wanted a "real drop", they'd
+                    # release again to insert the drop marker.
+                    return jsonify({"ok": True, "released": "explicit"})
+
+                # No explicit row. If they're the owner, insert drop marker.
+                if is_owner:
+                    # Check if a drop marker already exists for this cell.
+                    # We do this with a SELECT instead of ON CONFLICT because
+                    # partial unique indexes have quirky ON CONFLICT semantics.
+                    cur.execute("""
+                        SELECT id FROM shift_assignments
+                        WHERE territory_id = %s
+                          AND shift_date = %s
+                          AND shift_type = %s
+                    """, (territory_id, shift_date, shift_type))
+                    if not cur.fetchone():
+                        cur.execute("""
+                            INSERT INTO shift_assignments
+                              (territory_id, is_reviews_pool, shift_date, shift_type,
+                               met_user_id, created_at)
+                            VALUES (%s, FALSE, %s, %s, %s, %s)
+                        """, (territory_id, shift_date, shift_type, -1, now_ms))
+                    return jsonify({"ok": True, "released": "default"})
+
+                # Not owner, no explicit assignment — nothing to release
+                return jsonify({
+                    "ok": False,
+                    "error": "nothing-to-release",
+                    "message": "You don't have a claim on that shift."
+                }), 404
+
+    else:
+        # reviews_pool
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    DELETE FROM shift_assignments
+                    WHERE is_reviews_pool = TRUE
+                      AND shift_date = %s
+                      AND shift_type = %s
+                      AND met_user_id = %s
+                    RETURNING id
+                """, (shift_date, shift_type, user["id"]))
+                row = cur.fetchone()
+                if row:
+                    return jsonify({"ok": True})
+                return jsonify({
+                    "ok": False,
+                    "error": "nothing-to-release"
+                }), 404
 
 
 if __name__ == "__main__":
