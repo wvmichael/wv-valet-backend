@@ -137,28 +137,45 @@ except ImportError:
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 
-# ── Stripe Price IDs for subscription tiers (Phase 10 C2) ──
-# Each Stripe Product has a separate monthly and yearly price; for the
-# May 24 launch we only sell monthly. Annual toggle ships later.
+# ── Stripe Price IDs for subscription tiers ──
+# Each Stripe Product has a separate monthly and yearly price.
 #
-# These Price IDs are TEST MODE. When we flip to live mode, the Price
-# IDs change (Stripe regenerates them per environment) — set new env
-# vars or replace these values when the live products are created.
+# These Price IDs were updated May 22, 2026 to LIVE MODE values after
+# we recreated the product catalog in live Stripe. Env vars override
+# these defaults; set STRIPE_PRICE_HOBBYIST_MONTHLY, etc. on Render
+# if you ever need to point this at a different price (e.g. price
+# changes mid-cycle, or rolling out a new tier).
 #
 # Pro Enterprise is intentionally absent — it's a custom-quoted tier
 # sold via a "Talk to us" email handoff, not self-serve Stripe Checkout.
 TIER_PRICE_MAP = {
     "hobbyist":   os.environ.get("STRIPE_PRICE_HOBBYIST_MONTHLY",
-                                 "price_1TVyScGeHM6pFDnVjhT3r2o2"),
+                                 "price_1TZUkpGeHM6pFDnVxWubklvw"),
     "pro_single": os.environ.get("STRIPE_PRICE_PRO_SINGLE_MONTHLY",
-                                 "price_1TVyYuGeHM6pFDnVJRHGYjT7"),
+                                 "price_1TZUn0GeHM6pFDnVNYh4BAc8"),
     "pro_multi":  os.environ.get("STRIPE_PRICE_PRO_MULTI_MONTHLY",
-                                 "price_1TVycGGeHM6pFDnVjIHuTMQR"),
+                                 "price_1TZUo2GeHM6pFDnVxbYqZdZO"),
+}
+
+# Annual price IDs — ready for when annual checkout ships (currently
+# annual is sold via grandfather-pricing migration only, not the public
+# pricing page). When the public toggle goes live, point that flow at
+# these IDs.
+TIER_PRICE_MAP_ANNUAL = {
+    "hobbyist":   os.environ.get("STRIPE_PRICE_HOBBYIST_ANNUAL",
+                                 "price_1TZUljGeHM6pFDnVl1P1YzZR"),
+    "pro_single": os.environ.get("STRIPE_PRICE_PRO_SINGLE_ANNUAL",
+                                 "price_1TZUnHGeHM6pFDnV3Wl0oaHN"),
+    "pro_multi":  os.environ.get("STRIPE_PRICE_PRO_MULTI_ANNUAL",
+                                 "price_1TZUoGGeHM6pFDnV9xv3zac8"),
 }
 
 # Reverse lookup: Price ID → tier key. Used by webhook to know which
 # tier was purchased from the line_items in checkout.session.completed.
+# Includes BOTH monthly and annual price IDs so the webhook recognizes
+# annual subscriptions the same as monthly ones.
 TIER_BY_PRICE_ID = {v: k for k, v in TIER_PRICE_MAP.items()}
+TIER_BY_PRICE_ID.update({v: k for k, v in TIER_PRICE_MAP_ANNUAL.items()})
 
 # ─── $99 Starter Month coupon (sales funnel entry point) ───
 #
