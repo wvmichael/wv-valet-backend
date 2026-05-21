@@ -20871,7 +20871,7 @@ def _rosie_get_my_earnings(met_user_id, args):
     return (
         f"Earnings for {now.strftime('%B %Y')} (month-to-date):\n"
         f"  Reviews: ${my_row['review_cents']/100:.2f} ({my_row['review_count']} reviews)\n"
-        f"  Pro briefs: ${my_row['brief_cents']/100:.2f} ({my_row['brief_count']} brief-days)\n"
+        f"  Daily briefs: ${my_row['brief_cents']/100:.2f} ({my_row['brief_count']} brief-days)\n"
         f"  Tips: ${my_row['tip_cents']/100:.2f} ({my_row['tip_count']} tips)\n"
         f"  Storm Shelter: ${my_row['shelter_cents']/100:.2f} ({my_row['shelter_count']} activations)\n"
         f"  TOTAL: ${my_row['total_cents']/100:.2f}"
@@ -23608,17 +23608,46 @@ def _compute_payroll_for_month(year: int, month: int) -> dict:
 
     # ──────────────────────────────────────────────────────────────────
     # 3. Subscription brief attribution (per-day, per-subscriber)
+    #
+    # Fixed May 22, 2026: previously this used PRO_TIER_MONTHLY_CENTS
+    # (the LIST price) for Pro Single math, which paid Mets 4x too much
+    # for grandfathered customers like Eric who pay $100/mo vs the $400
+    # list. Hobbyists were paid nothing at all because the old code
+    # didn't query daily_brief_tasks. New logic:
+    #
+    #   - Every subscriber has daily_commission_cents set during migration
+    #     (or auto-defaulted from tier list price for new signups).
+    #   - daily_commission_cents IS THE MET'S DAILY SHARE — already
+    #     accounts for the 50% Met / 50% house split at the day level.
+    #   - When a Met sends a brief, that Met earns daily_commission_cents.
+    #     House earns the same amount (matching split).
+    #   - When no brief is sent for a day, no Met earns. The house gets
+    #     2x daily_commission_cents (full daily revenue, no Met cost).
+    #   - Pro briefs are tracked in pro_brief_drafts (status='sent').
+    #   - Hobbyist briefs are tracked in daily_brief_tasks (status='sent').
+    #
+    # House revenue per subscriber per month:
+    #   For Hobbyists: $30/mo flat (or actual grandfathered price; we
+    #     compute from daily_commission_cents × 2 × days_in_month to be
+    #     consistent with what Mets actually earn).
+    #   For Pros: same formula — daily_commission_cents × 2 × days_in_month.
     # ──────────────────────────────────────────────────────────────────
     unattributed_pro_cents = 0
     hobbyist_revenue_cents = 0
 
+    # Pull all subscribers WITH their daily_commission_cents (the
+    # critical change). Also include timezone and tier so we know
+    # which brief table to look at.
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """SELECT u.id AS user_id, u.subscription_tier, u.timezone
+                """SELECT u.id AS user_id, u.subscription_tier,
+                          COALESCE(u.timezone, 'America/Indiana/Indianapolis') AS timezone,
+                          COALESCE(u.daily_commission_cents, 0) AS daily_commission_cents
                    FROM users u
                    WHERE u.subscription_tier IS NOT NULL
                      AND u.subscription_tier != ''
+                     AND u.is_active = TRUE
                      AND EXISTS (
                        SELECT 1 FROM user_roles ur
                        WHERE ur.user_id = u.id AND ur.role = 'subscriber'
@@ -23628,37 +23657,53 @@ def _compute_payroll_for_month(year: int, month: int) -> dict:
 
     for sub in subs:
         tier = sub["subscription_tier"]
+        daily_met_share = int(sub["daily_commission_cents"] or 0)
+        if daily_met_share == 0:
+            # Subscriber wasn't set up with a commission rate. Skip
+            # silently — no Met owes a brief, no house revenue.
+            # (Could happen if a free-tier upgrade slipped through, or
+            # if migration was incomplete. Either way, zero is the
+            # honest answer here.)
+            continue
+
+        # Total daily revenue from this subscriber = Met share + house share.
+        # We treat daily_commission_cents as the Met's 50% share, so the
+        # full daily revenue is 2x. Adjust the multiplier if the share
+        # changes (e.g., go to 60/40 someday).
+        daily_total_cents = daily_met_share * 2
+        daily_house_share = daily_total_cents - daily_met_share
+
+        # Choose which brief table to scan based on tier
         if tier == "hobbyist":
-            hobbyist_revenue_cents += 3000  # $30/month flat
-            continue
-        if tier not in PRO_TIER_MONTHLY_CENTS:
-            continue
+            brief_table_query = """
+                SELECT sent_at_ms AS sent_at, assigned_met_id AS sent_by_user_id
+                FROM daily_brief_tasks
+                WHERE subscriber_user_id = %s
+                  AND status = 'sent'
+                  AND sent_at_ms IS NOT NULL
+                  AND sent_at_ms >= %s AND sent_at_ms < %s
+                ORDER BY sent_at_ms ASC
+            """
+        else:
+            # Pro tiers use pro_brief_drafts
+            brief_table_query = """
+                SELECT sent_at, sent_by_user_id
+                FROM pro_brief_drafts
+                WHERE user_id = %s
+                  AND status = 'sent'
+                  AND sent_at IS NOT NULL
+                  AND sent_at >= %s AND sent_at < %s
+                ORDER BY sent_at ASC
+            """
 
-        monthly_cents = PRO_TIER_MONTHLY_CENTS[tier]
-        daily_cents = monthly_cents // days_in_month
-        # Met's share per attributed day (50% of daily prorate).
-        # The remaining 50% accrues to the house, regardless of whether
-        # the brief was sent or missed. Missed-brief days contribute the
-        # FULL daily_cents to the house (no Met share).
-        daily_met_share = int(daily_cents * MET_PRO_BRIEF_SHARE)
-        daily_house_share = daily_cents - daily_met_share
-
-        user_tz = sub.get("timezone") or "America/Indiana/Indianapolis"
+        user_tz = sub["timezone"]
         with db() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """SELECT sent_at, sent_by_user_id
-                       FROM pro_brief_drafts
-                       WHERE user_id = %s
-                         AND status = 'sent'
-                         AND sent_at IS NOT NULL
-                         AND sent_at >= %s AND sent_at < %s
-                       ORDER BY sent_at ASC""",
-                    (sub["user_id"], period_start_ms, period_end_ms),
-                )
+                cur.execute(brief_table_query,
+                            (sub["user_id"], period_start_ms, period_end_ms))
                 brief_rows = cur.fetchall()
 
-        # Bucket briefs by local date
+        # Bucket briefs by local date (one Met credit per day max)
         briefs_by_local_date = {}
         try:
             sub_zone = ZoneInfo(user_tz)
@@ -23670,19 +23715,27 @@ def _compute_payroll_for_month(year: int, month: int) -> dict:
             if local_date not in briefs_by_local_date:
                 briefs_by_local_date[local_date] = b["sent_by_user_id"]
 
-        # Walk every day; attribute or send to house
+        # Walk every day in the period; attribute the day to a Met if
+        # they sent a brief, or to the house if no brief was sent.
         current_dt = period_start
         while current_dt < period_end:
             local_date = current_dt.astimezone(sub_zone).date()
             sent_by = briefs_by_local_date.get(local_date)
             if sent_by and sent_by in mets_by_id:
-                # Met gets 50% of daily prorate, house keeps the other 50%
+                # Met gets their daily share; house gets matching share
                 mets_by_id[sent_by]["brief_cents"] += daily_met_share
                 mets_by_id[sent_by]["brief_count"] += 1
-                unattributed_pro_cents += daily_house_share
+                if tier == "hobbyist":
+                    hobbyist_revenue_cents += daily_house_share
+                else:
+                    unattributed_pro_cents += daily_house_share
             else:
-                # Missed brief — full daily prorate to house, no Met share
-                unattributed_pro_cents += daily_cents
+                # No brief sent today — house gets full daily revenue
+                # (no Met share owed since nobody did the work)
+                if tier == "hobbyist":
+                    hobbyist_revenue_cents += daily_total_cents
+                else:
+                    unattributed_pro_cents += daily_total_cents
             current_dt += timedelta(days=1)
 
     # ──────────────────────────────────────────────────────────────────
