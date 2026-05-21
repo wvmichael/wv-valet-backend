@@ -8955,6 +8955,8 @@ def _serialize_user_for_admin(row):
         "role": primary_role or "subscriber",
         "all_roles": roles,
         "subscription_tier": row.get("subscription_tier") or "",
+        "primary_met_id": row.get("primary_met_id"),
+        "primary_met_name": row.get("primary_met_name") or "",
         "last_login": last_login_str,
         "is_active": bool(row.get("is_active", True)),
     }
@@ -8970,10 +8972,14 @@ def admin_list_users():
         cur.execute("""
             SELECT u.id, u.email, u.name, u.phone, u.created_at, u.last_login_at, u.is_active,
                    u.subscription_tier,
-                   ARRAY_REMOVE(ARRAY_AGG(ur.role ORDER BY ur.role), NULL) AS roles
+                   sc.primary_met_id,
+                   met_user.name AS primary_met_name,
+                   ARRAY_REMOVE(ARRAY_AGG(DISTINCT ur.role ORDER BY ur.role), NULL) AS roles
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
-            GROUP BY u.id
+            LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
+            LEFT JOIN users met_user ON met_user.id = sc.primary_met_id
+            GROUP BY u.id, sc.primary_met_id, met_user.name
             ORDER BY u.is_active DESC, u.created_at DESC
         """)
         rows = cur.fetchall()
@@ -9106,6 +9112,7 @@ def admin_update_user(user_id):
     reset_password = bool(data.get("reset_password"))
     is_active = data.get("is_active")
     subscription_tier = data.get("subscription_tier")  # May 22, 2026: admin tier override
+    primary_met_id_raw = data.get("primary_met_id")    # May 22, 2026: admin Met assignment
 
     temp_password = None
 
@@ -9192,6 +9199,42 @@ def admin_update_user(user_id):
                     (user_id, new_role, int(_time.time())),
                 )
 
+            # Primary Met assignment (May 22, 2026): admin can assign or
+            # reassign a subscriber's primary meteorologist via the user
+            # list dropdown. Lives in subscriber_coverage, not users, so
+            # this is a separate UPSERT. `null`/empty string clears the
+            # assignment. Validates that the new met is actually a Met.
+            if primary_met_id_raw is not None:
+                # Empty string or 0 means "clear assignment"
+                if primary_met_id_raw == "" or primary_met_id_raw == 0:
+                    new_primary_met = None
+                else:
+                    try:
+                        new_primary_met = int(primary_met_id_raw)
+                    except (ValueError, TypeError):
+                        return jsonify({"ok": False, "error": "invalid-met-id"}), 400
+                    # Validate the target user is actually a Met
+                    cur.execute(
+                        """SELECT u.id
+                           FROM users u
+                           JOIN user_roles ur ON ur.user_id = u.id
+                           WHERE u.id = %s
+                             AND ur.role = 'met'
+                             AND u.is_active = TRUE""",
+                        (new_primary_met,),
+                    )
+                    if not cur.fetchone():
+                        return jsonify({"ok": False, "error": "target-not-a-met"}), 400
+                # UPSERT into subscriber_coverage
+                cur.execute(
+                    """INSERT INTO subscriber_coverage (user_id, primary_met_id, updated_at)
+                       VALUES (%s, %s, %s)
+                       ON CONFLICT (user_id) DO UPDATE
+                       SET primary_met_id = EXCLUDED.primary_met_id,
+                           updated_at = EXCLUDED.updated_at""",
+                    (user_id, new_primary_met, int(_time.time() * 1000)),
+                )
+
             # If password was reset, also kill any active sessions so the
             # user is forced to re-auth with the new temp password.
             if reset_password:
@@ -9201,11 +9244,15 @@ def admin_update_user(user_id):
             cur.execute("""
                 SELECT u.id, u.email, u.name, u.phone, u.created_at, u.last_login_at, u.is_active,
                        u.subscription_tier,
-                       ARRAY_REMOVE(ARRAY_AGG(ur.role ORDER BY ur.role), NULL) AS roles
+                       sc.primary_met_id,
+                       met_user.name AS primary_met_name,
+                       ARRAY_REMOVE(ARRAY_AGG(DISTINCT ur.role ORDER BY ur.role), NULL) AS roles
                 FROM users u
                 LEFT JOIN user_roles ur ON ur.user_id = u.id
+                LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
+                LEFT JOIN users met_user ON met_user.id = sc.primary_met_id
                 WHERE u.id = %s
-                GROUP BY u.id
+                GROUP BY u.id, sc.primary_met_id, met_user.name
             """, (user_id,))
             row = cur.fetchone()
     except Exception as e:
