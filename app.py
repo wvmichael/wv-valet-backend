@@ -5007,12 +5007,24 @@ def create_checkout_session():
             })
         return jsonify({"error": "Stripe not configured on server"}), 500
 
+    # Tier-specific Stripe price IDs. Using pre-created Stripe prices
+    # gives cleaner reporting in Stripe (product name + price unified)
+    # vs. inline price_data. May 22, 2026: $19 single review uses
+    # price_1TZTkcGeHM6pFDnV8iN3K0Tn.
+    tier_price_ids = {
+        "single": "price_1TZTkcGeHM6pFDnV8iN3K0Tn",
+        # day_pass and pro_monthly fall back to inline price_data below
+        # until they get their own Stripe price IDs.
+    }
+    stripe_price_id = tier_price_ids.get(tier_key)
+
     try:
-        session = stripe.checkout.Session.create(
-            mode="payment",  # one-time. For pro_monthly subscription, use 'subscription'
-                             # and pre-create Price IDs in the Stripe dashboard.
-            payment_method_types=["card"],
-            line_items=[{
+        if stripe_price_id:
+            # Use pre-created Stripe price (cleaner reporting)
+            line_items = [{"price": stripe_price_id, "quantity": 1}]
+        else:
+            # Fallback to inline price for tiers without a Stripe price ID yet
+            line_items = [{
                 "price_data": {
                     "currency": "usd",
                     "product_data": {
@@ -5022,14 +5034,20 @@ def create_checkout_session():
                     "unit_amount": tier["price_cents"],
                 },
                 "quantity": 1,
-            }],
+            }]
+        session = stripe.checkout.Session.create(
+            mode="payment",  # one-time. For pro_monthly subscription, use 'subscription'
+                             # and pre-create Price IDs in the Stripe dashboard.
+            payment_method_types=["card"],
+            line_items=line_items,
             customer_email=customer_email or None,
             metadata={
                 "wv_request_id": str(request_id),
                 "wv_tier": tier_key,
+                "wv_product": "met_review",   # Tag for webhook to identify Met Review payments
             },
-            success_url=f"{FRONTEND_BASE_URL}/verification/standby?rid={request_id}&session={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{FRONTEND_BASE_URL}/verification/cancelled?rid={request_id}",
+            success_url=f"{FRONTEND_BASE_URL}/?review_pending=1&rid={request_id}&session={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{FRONTEND_BASE_URL}/?review_cancelled=1&rid={request_id}",
         )
     except Exception as e:
         print(f"[stripe] session create failed: {e}", flush=True)
@@ -5122,21 +5140,128 @@ def _mark_paid_and_notify(request_id: int, *, payment_id: Optional[str] = None,
     )
     send_sms(row["customer_phone"], customer_msg)
 
-    # Meteorologist SMS — the brief + claim link. We send this LAST so the
-    # customer has gotten their confirmation before the meteorologist starts.
-    if METEOROLOGIST_PHONE:
-        claim_url = f"{PUBLIC_BASE_URL}/meteorologist/{row['claim_token']}"
-        plan = row["plan_text"][:80] + ("…" if len(row["plan_text"]) > 80 else "")
-        loc = row["plan_location"] or "(no location)"
-        ai_status = (row["ai_status_key"] or "unknown").upper()
-        met_msg = (
-            f"WV new request #{request_id} ({row['tier']}): {plan}\n"
-            f"Loc: {loc}\n"
-            f"AI verdict: {ai_status}\n"
-            f"Brief + claim: {claim_url}\n"
-            f"30-min SLA. Tap the link."
-        )
-        send_sms(METEOROLOGIST_PHONE, met_msg)
+    # Meteorologist notifications — fan out to all active Mets via SMS
+    # and email. May 22, 2026: upgraded from single METEOROLOGIST_PHONE
+    # to all-Met fan-out so any Met can claim. The legacy single-phone
+    # env var still works as a fallback in case the database lookup fails.
+    claim_url = f"{PUBLIC_BASE_URL}/meteorologist/{row['claim_token']}"
+    plan = row["plan_text"][:80] + ("\u2026" if len(row["plan_text"]) > 80 else "")
+    loc = row["plan_location"] or "(no location)"
+    ai_status = (row["ai_status_key"] or "unknown").upper()
+    met_sms_msg = (
+        f"WV new request #{request_id} ({row['tier']}): {plan}\n"
+        f"Loc: {loc}\n"
+        f"AI verdict: {ai_status}\n"
+        f"Brief + claim: {claim_url}\n"
+        f"30-min SLA. Tap the link."
+    )
+
+    # Pull all active Mets (have 'met' role and is_active=TRUE)
+    notified_count = 0
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT DISTINCT u.id, u.name, u.email, u.phone
+                       FROM users u
+                       JOIN user_roles ur ON ur.user_id = u.id
+                       WHERE ur.role = 'met' AND u.is_active = TRUE"""
+                )
+                mets = cur.fetchall()
+        for m in mets:
+            # SMS if Met has a phone
+            if m.get("phone"):
+                try:
+                    send_sms(m["phone"], met_sms_msg)
+                    notified_count += 1
+                except Exception as e:
+                    print(f"[webhook] Met SMS to {m.get('name')} failed: {e}", flush=True)
+            # Email if Met has an email
+            if m.get("email"):
+                try:
+                    _send_met_review_email(m["email"], m.get("name") or "", request_id, plan, loc, ai_status, claim_url)
+                except Exception as e:
+                    print(f"[webhook] Met email to {m.get('email')} failed: {e}", flush=True)
+        print(f"[webhook] notified {len(mets)} Mets about review #{request_id} ({notified_count} via SMS)", flush=True)
+    except Exception as e:
+        print(f"[webhook] Met fan-out failed: {e}", flush=True)
+
+    # Legacy fallback: also ping METEOROLOGIST_PHONE env var if set, in
+    # case the database fan-out didn't reach the right person. Harmless
+    # duplicate — Mets dedup mentally by request ID.
+    if METEOROLOGIST_PHONE and notified_count == 0:
+        try:
+            send_sms(METEOROLOGIST_PHONE, met_sms_msg)
+        except Exception as e:
+            print(f"[webhook] legacy METEOROLOGIST_PHONE SMS failed: {e}", flush=True)
+
+
+def _send_met_review_email(to_email: str, met_name: str, request_id: int,
+                            plan_excerpt: str, location: str, ai_status: str,
+                            claim_url: str) -> None:
+    """Send a Met an email about a new paid Met Review they can claim.
+
+    Sends directly via Resend API. Best-effort: failures are logged but
+    don't bubble up. (We don't want one bad Met email to block all the
+    others from being notified.)
+    """
+    api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    if not api_key:
+        print(f"[met-email] no RESEND_API_KEY; would have notified {to_email}", flush=True)
+        return
+
+    from_addr = os.environ.get("RESEND_FROM_EMAIL", "WeatherValet <hello@weathervalet.ai>")
+    subject = f"WeatherValet: new $19 review #{request_id} ({ai_status})"
+    first_name = met_name.split()[0] if met_name else "there"
+    body_text = (
+        f"Hi {first_name},\n\n"
+        f"A customer just paid for a meteorologist review. First Met to claim "
+        f"the work gets it.\n\n"
+        f"Plan: {plan_excerpt}\n"
+        f"Location: {location}\n"
+        f"Current AI verdict: {ai_status}\n\n"
+        f"Claim and write the review here:\n{claim_url}\n\n"
+        f"30-minute SLA. Tap the link to start.\n\n"
+        f"-- WeatherValet"
+    )
+    body_html = (
+        f"<div style='font-family:-apple-system,system-ui,sans-serif;max-width:560px;margin:0 auto;padding:24px;'>"
+        f"<h2 style='color:#0E1116;font-size:20px;margin:0 0 14px;'>New $19 review waiting</h2>"
+        f"<p style='color:#3D4148;font-size:15px;line-height:1.6;margin:0 0 16px;'>Hi {_html_escape(first_name)}, a customer just paid for a meteorologist review. First Met to claim the work gets it.</p>"
+        f"<div style='background:#F5F7FB;border-radius:8px;padding:16px;margin:0 0 20px;'>"
+        f"<p style='margin:0 0 8px;'><strong>Plan:</strong> {_html_escape(plan_excerpt)}</p>"
+        f"<p style='margin:0 0 8px;'><strong>Location:</strong> {_html_escape(location)}</p>"
+        f"<p style='margin:0;'><strong>AI verdict:</strong> {_html_escape(ai_status)}</p>"
+        f"</div>"
+        f"<p style='margin:0 0 24px;'><a href='{claim_url}' style='display:inline-block;background:#2E4FB8;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:600;'>Claim and start the review</a></p>"
+        f"<p style='color:#6B7280;font-size:13px;margin:0;'>30-minute SLA. Customer is waiting.</p>"
+        f"</div>"
+    )
+
+    payload = json.dumps({
+        "from": from_addr,
+        "to": [to_email],
+        "subject": subject,
+        "html": body_html,
+        "text": body_text,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "WeatherValet-Backend/1.0 (+https://weathervalet.ai)",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status >= 400:
+                print(f"[met-email] Resend returned {resp.status} for {to_email}", flush=True)
+    except Exception as e:
+        print(f"[met-email] send failed for {to_email}: {e}", flush=True)
 
 
 # ────────────────────────────────────────────────────────────────────────────
