@@ -5124,10 +5124,34 @@ def stripe_webhook():
 
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
-        request_id = int(session.get("metadata", {}).get("wv_request_id", 0))
+        # Stripe library returns StripeObject instances, NOT plain dicts.
+        # They support BOTH attribute access (session.metadata) AND
+        # dict-style access (session["metadata"]), but NOT .get() in
+        # newer versions of the library (stripe-python >= 8.x). Using
+        # dict-style access is the safest cross-version pattern.
+        # (Fixed May 22, 2026 — old .get() pattern caused 500 ERR on every
+        # webhook call.)
+        try:
+            metadata = session["metadata"] if "metadata" in session else {}
+        except Exception:
+            metadata = {}
+        # metadata itself is also a StripeObject; same access rules apply.
+        try:
+            wv_request_id_raw = metadata["wv_request_id"] if "wv_request_id" in metadata else 0
+        except Exception:
+            wv_request_id_raw = 0
+        try:
+            request_id = int(wv_request_id_raw)
+        except (TypeError, ValueError):
+            request_id = 0
         if request_id:
-            payment_id = session.get("payment_intent") or session.get("id")
+            try:
+                payment_id = session["payment_intent"] if "payment_intent" in session else session["id"]
+            except Exception:
+                payment_id = None
             _mark_paid_and_notify(request_id, payment_id=payment_id)
+        else:
+            print(f"[webhook] checkout.session.completed had no wv_request_id; ignoring", flush=True)
 
     # Stripe expects 200 quickly. Other event types we ignore — Stripe is OK
     # with that as long as we acknowledge.
