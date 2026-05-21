@@ -3095,7 +3095,17 @@ def send_sms_from(to: str, body: str, from_number: str) -> bool:
     Used by Rosie so her texts come from her own Twilio number (and replies
     route to her webhook). Falls back to TWILIO_FROM_NUMBER if from_number
     is empty — keeps single-number deploys working.
+
+    May 22, 2026: Rosie's dedicated Twilio number is not yet approved by
+    Twilio A2P. Until approval, FORCE all sends through the main approved
+    number (TWILIO_FROM_NUMBER) regardless of what from_number was
+    requested. This is a TEMPORARY override — when Rosie's number is
+    approved, remove the next 3 lines to re-enable per-number routing.
     """
+    # TEMP override (May 22, 2026) — Rosie's number not yet A2P-approved
+    if TWILIO_FROM_NUMBER:
+        from_number = TWILIO_FROM_NUMBER
+
     sender = from_number or TWILIO_FROM_NUMBER
     if not (TwilioClient and TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and sender):
         print(f"[sms-stub] from={sender or '(none)'} to={to}\n{body}\n", flush=True)
@@ -8912,6 +8922,7 @@ def _serialize_user_for_admin(row):
         "user_id": row["id"],
         "name": row.get("name") or "",
         "email": row["email"],
+        "phone": row.get("phone") or "",
         "role": primary_role or "subscriber",
         "all_roles": roles,
         "last_login": last_login_str,
@@ -8927,7 +8938,7 @@ def admin_list_users():
     with db() as conn:
         cur = conn.cursor()
         cur.execute("""
-            SELECT u.id, u.email, u.name, u.created_at, u.last_login_at, u.is_active,
+            SELECT u.id, u.email, u.name, u.phone, u.created_at, u.last_login_at, u.is_active,
                    ARRAY_REMOVE(ARRAY_AGG(ur.role ORDER BY ur.role), NULL) AS roles
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
@@ -8957,6 +8968,7 @@ def admin_create_user():
     data = request.get_json(silent=True) or {}
     name = (data.get("name") or "").strip()
     email = (data.get("email") or "").strip().lower()
+    phone = (data.get("phone") or "").strip() or None
     role_input = (data.get("role") or "").strip().lower()
 
     if not name:
@@ -8986,10 +8998,10 @@ def admin_create_user():
 
             # Insert user
             cur.execute("""
-                INSERT INTO users (email, password_hash, name, created_at, is_active, password_must_change)
-                VALUES (%s, %s, %s, %s, TRUE, TRUE)
+                INSERT INTO users (email, password_hash, name, phone, created_at, is_active, password_must_change)
+                VALUES (%s, %s, %s, %s, %s, TRUE, TRUE)
                 RETURNING id
-            """, (email, password_hash, name, now))
+            """, (email, password_hash, name, phone, now))
             new_user_id = cur.fetchone()["id"]
 
             # Grant role
@@ -9000,7 +9012,7 @@ def admin_create_user():
 
             # Fetch back the freshly-created user for a consistent response shape
             cur.execute("""
-                SELECT u.id, u.email, u.name, u.created_at, u.last_login_at, u.is_active,
+                SELECT u.id, u.email, u.name, u.phone, u.created_at, u.last_login_at, u.is_active,
                        ARRAY_REMOVE(ARRAY_AGG(ur.role ORDER BY ur.role), NULL) AS roles
                 FROM users u
                 LEFT JOIN user_roles ur ON ur.user_id = u.id
@@ -9058,6 +9070,7 @@ def admin_update_user(user_id):
     data = request.get_json(silent=True) or {}
     name = data.get("name")
     email = data.get("email")
+    phone = data.get("phone")
     role_input = data.get("role")
     reset_password = bool(data.get("reset_password"))
     is_active = data.get("is_active")
@@ -9094,6 +9107,14 @@ def admin_update_user(user_id):
                     return jsonify({"ok": False, "error": "email-already-exists"}), 409
                 updates.append("email = %s")
                 params.append(email_clean)
+
+            if phone is not None:
+                # Phone is optional and can be cleared with empty string.
+                # We store loosely formatted (allow "(317) 555-1234" or
+                # "+13175551234") and normalize at SMS send time.
+                phone_clean = phone.strip()
+                updates.append("phone = %s")
+                params.append(phone_clean if phone_clean else None)
 
             if is_active is not None:
                 updates.append("is_active = %s")
@@ -9133,7 +9154,7 @@ def admin_update_user(user_id):
 
             # Return the refreshed user
             cur.execute("""
-                SELECT u.id, u.email, u.name, u.created_at, u.last_login_at, u.is_active,
+                SELECT u.id, u.email, u.name, u.phone, u.created_at, u.last_login_at, u.is_active,
                        ARRAY_REMOVE(ARRAY_AGG(ur.role ORDER BY ur.role), NULL) AS roles
                 FROM users u
                 LEFT JOIN user_roles ur ON ur.user_id = u.id
@@ -9287,7 +9308,7 @@ def admin_add_user_role(user_id):
 
             # Return fresh user shape
             cur.execute("""
-                SELECT u.id, u.email, u.name, u.created_at, u.last_login_at, u.is_active,
+                SELECT u.id, u.email, u.name, u.phone, u.created_at, u.last_login_at, u.is_active,
                        ARRAY_REMOVE(ARRAY_AGG(ur.role ORDER BY ur.role), NULL) AS roles
                 FROM users u
                 LEFT JOIN user_roles ur ON ur.user_id = u.id
@@ -9342,7 +9363,7 @@ def admin_remove_user_role(user_id, role):
             )
 
             cur.execute("""
-                SELECT u.id, u.email, u.name, u.created_at, u.last_login_at, u.is_active,
+                SELECT u.id, u.email, u.name, u.phone, u.created_at, u.last_login_at, u.is_active,
                        ARRAY_REMOVE(ARRAY_AGG(ur.role ORDER BY ur.role), NULL) AS roles
                 FROM users u
                 LEFT JOIN user_roles ur ON ur.user_id = u.id
