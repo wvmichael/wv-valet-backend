@@ -15017,10 +15017,55 @@ def _process_pending_briefs() -> None:
                     print(f"[brief-scheduler] pro draft insert failed: {e}", flush=True)
                 continue
 
-            # ── Generate the brief ──
-            location_label = c["loc_label"] or c["loc_address"] or "your location"
-            forecast = _fetch_forecast(float(c["loc_lat"]), float(c["loc_lng"]))
-            verdict, snippet, full_body = _generate_ai_brief(location_label, forecast or {})
+            # ── Hobbyist auto-send path ──
+            # Check for a pre-existing draft (pregen from night before or
+            # an early-morning create) so the Met's edits (if any) override
+            # the AI. If a draft exists with status='sent', skip — Met
+            # already sent it before window-start. If 'pending-review' or
+            # 'claimed', use the Met's content (falls back to AI content
+            # if Met didn't edit). If no draft, generate fresh as before.
+            # (May 22, 2026: added Hobbyist override flow.)
+            eighteen_hours_ago_ms = int(time.time() * 1000) - 18 * 60 * 60 * 1000
+            existing_draft = None
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """SELECT id, status, met_verdict, met_snippet, met_body,
+                                      ai_verdict, ai_snippet, ai_body,
+                                      sent_at, sent_by_name
+                               FROM pro_brief_drafts
+                               WHERE user_id = %s AND brief_type = 'morning'
+                                 AND created_at >= %s
+                               ORDER BY created_at DESC LIMIT 1""",
+                            (c["user_id"], eighteen_hours_ago_ms),
+                        )
+                        existing_draft = cur.fetchone()
+            except Exception as e:
+                print(f"[brief-scheduler] hobbyist draft lookup failed: {e}", flush=True)
+
+            if existing_draft and existing_draft["status"] == "sent":
+                # Met already sent the override. Nothing to do.
+                continue
+
+            # ── Generate the brief content ──
+            if existing_draft and existing_draft["status"] in ("pending-review", "claimed"):
+                # Use Met's edits if any, else fall back to AI content
+                verdict = existing_draft["met_verdict"] or existing_draft["ai_verdict"] or "clear"
+                snippet = existing_draft["met_snippet"] or existing_draft["ai_snippet"] or ""
+                full_body = existing_draft["met_body"] or existing_draft["ai_body"] or ""
+                is_met_touched = bool(existing_draft["met_verdict"]
+                                      or existing_draft["met_snippet"]
+                                      or existing_draft["met_body"])
+                met_name_for_record = existing_draft["sent_by_name"] or None
+                location_label = c["loc_label"] or c["loc_address"] or "your location"
+            else:
+                # No draft — generate fresh AI brief (original Hobbyist flow)
+                location_label = c["loc_label"] or c["loc_address"] or "your location"
+                forecast = _fetch_forecast(float(c["loc_lat"]), float(c["loc_lng"]))
+                verdict, snippet, full_body = _generate_ai_brief(location_label, forecast or {})
+                is_met_touched = False
+                met_name_for_record = None
 
             # ── Send via channels ──
             channels = [ch for ch in (c["channels"] or "").split(",") if ch]
@@ -15049,12 +15094,30 @@ def _process_pending_briefs() -> None:
                 full_body=full_body,
                 delivery_status=delivery_status,
                 channels_used=",".join(channels_used),
-                is_met_touched=False,
-                met_name=None,
+                is_met_touched=is_met_touched,
+                met_name=met_name_for_record,
             )
+            # If we sourced from a draft, mark the draft as 'sent' too so
+            # the queue shows it correctly and the duplicate-check skips
+            # it on the next tick.
+            if existing_draft and any_success:
+                try:
+                    now_ms = int(time.time() * 1000)
+                    with db() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """UPDATE pro_brief_drafts
+                                   SET status = 'sent', sent_at = COALESCE(sent_at, %s),
+                                       sent_by_name = COALESCE(sent_by_name, 'WeatherValet AI'),
+                                       final_verdict = %s, final_body = %s
+                                   WHERE id = %s""",
+                                (now_ms, verdict, full_body, existing_draft["id"]),
+                            )
+                except Exception as e:
+                    print(f"[brief-scheduler] hobbyist draft mark-sent failed: {e}", flush=True)
             print(
                 f"[brief-scheduler] delivered user_id={c['user_id']} tier={tier} "
-                f"channels={channels_used} verdict={verdict}",
+                f"channels={channels_used} verdict={verdict} met_touched={is_met_touched}",
                 flush=True,
             )
         except Exception as e:
@@ -15062,15 +15125,19 @@ def _process_pending_briefs() -> None:
 
 
 def _pregenerate_pro_brief_drafts() -> None:
-    """Pre-generate next-morning Pro brief drafts at 8 PM the night before.
+    """Pre-generate next-morning brief drafts at 8 PM the night before.
 
     Added May 22, 2026: Mets requested the ability to start writing
-    Pro briefs the night before. This function runs each scheduler tick
-    and, for each Pro subscriber whose local time is 20:00-20:59
-    (8:00-8:59 PM), pre-generates tomorrow's morning draft if one doesn't
-    already exist. The Met can then claim, edit, and save the draft
-    overnight; it sits in 'claimed' or 'pending-review' status until
-    the Met sends it at the normal morning delivery time.
+    briefs the night before. This function runs each scheduler tick
+    and, for each Pro OR Hobbyist subscriber whose local time is
+    20:00-20:59 (8:00-8:59 PM), pre-generates tomorrow's morning draft
+    if one doesn't already exist.
+
+    Pro draft workflow: Met claims, edits, sends. NO auto-send by AI.
+    Hobbyist draft workflow: Met can claim and override BEFORE the
+        morning window opens. If Met doesn't override, the morning
+        scheduler auto-sends the AI version (Hobbyist commitment is
+        delivery, not Met review).
 
     Forecast staleness: the AI snapshot is from Tuesday evening, but
     weather can shift overnight. We mark the draft so the Met UI can
@@ -15112,7 +15179,7 @@ def _pregenerate_pro_brief_drafts() -> None:
                             ON loc.user_id = u.id AND loc.is_primary = TRUE
                        WHERE u.is_active = TRUE
                          AND bp.morning_enabled = TRUE
-                         AND u.subscription_tier IN ('pro_single', 'pro_multi', 'pro_enterprise')
+                         AND u.subscription_tier IN ('hobbyist', 'pro_single', 'pro_multi', 'pro_enterprise')
                          AND EXISTS (
                            SELECT 1 FROM user_roles ur
                             WHERE ur.user_id = u.id AND ur.role = 'subscriber'
@@ -19437,6 +19504,198 @@ def met_pro_brief_send(draft_id):
         "history_id": history_id,
         "multi_results": multi_results,
         "multi_count": len([r for r in multi_results if r.get("ok")]),
+    })
+
+
+# ════════════════════════════════════════════════════════════════════
+# Ad-hoc Weather Update — Met composes & sends anytime (May 22, 2026)
+# ════════════════════════════════════════════════════════════════════
+#
+# Mets can compose and send a weather update to any subscriber they
+# have visibility for (primary or covering today), 24/7. Used when
+# weather changes mid-day and the subscriber needs a heads-up.
+#
+# Does NOT count toward payroll — only morning briefs earn the daily
+# commission. This is a value-add capability for the team.
+#
+# Creates a row in pro_brief_drafts with brief_type='update', sends
+# immediately via SMS+email, marks status='sent'. The subscriber sees
+# subject "Weather Update — [location]" so they know it's not the
+# daily morning brief.
+
+@app.route("/api/v1/met/pro-briefs/compose-update", methods=["OPTIONS"])
+def _met_pro_brief_compose_update_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/met/pro-briefs/compose-update")
+def met_pro_brief_compose_update():
+    """Compose and immediately send an ad-hoc weather update.
+
+    Body:
+      user_id (int)         — subscriber to send to
+      verdict (str)         — 'clear' | 'caution' | 'risk'
+      snippet (str)         — short headline (also SMS body)
+      body (str)            — full update text (email body)
+      channels (list[str])  — optional override; default uses subscriber's prefs
+
+    Visibility: caller must be the subscriber's primary Met OR a covering
+    Met for today OR an admin. Returns 404 if not visible (to avoid
+    leaking existence).
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    is_admin = "admin" in roles
+    me_id = user["id"]
+
+    data = request.get_json(silent=True) or {}
+    target_user_id = data.get("user_id")
+    try:
+        target_user_id = int(target_user_id)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "invalid-user-id"}), 400
+
+    verdict = (data.get("verdict") or "caution").strip().lower()
+    if verdict not in ("clear", "caution", "risk"):
+        return jsonify({"ok": False, "error": "invalid-verdict"}), 400
+    snippet = (data.get("snippet") or "").strip()
+    body_text = (data.get("body") or "").strip()
+    if not snippet and not body_text:
+        return jsonify({"ok": False, "error": "empty-update",
+                        "message": "Provide a snippet or body."}), 400
+
+    # Visibility check: same logic as Pro Brief queue. We reuse the
+    # _can_met_see_pro_brief pattern but for an arbitrary user_id (no
+    # draft yet). Inline the SQL since the helper expects a draft_id.
+    ET = ZoneInfo("America/New_York")
+    today_et = datetime.now(ET).date().isoformat()
+    if not is_admin:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT 1
+                       FROM subscriber_coverage sc
+                       LEFT JOIN met_territories t ON t.met_user_id = sc.primary_met_id
+                       LEFT JOIN shift_assignments sa
+                            ON sa.territory_id = t.id
+                           AND sa.met_user_id = %s
+                           AND sa.is_drop = FALSE
+                           AND sa.shift_date = %s
+                       WHERE sc.user_id = %s
+                         AND (sc.primary_met_id = %s OR sa.id IS NOT NULL)
+                       LIMIT 1""",
+                    (me_id, today_et, target_user_id, me_id),
+                )
+                visible = cur.fetchone() is not None
+        if not visible:
+            return jsonify({"ok": False, "error": "not-found"}), 404
+
+    # Pull subscriber details for sending
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.email, u.name, u.phone, u.subscription_tier,
+                          bp.channels,
+                          loc.label AS loc_label, loc.address_text AS loc_address,
+                          loc.lat, loc.lng
+                   FROM users u
+                   LEFT JOIN brief_preferences bp ON bp.user_id = u.id
+                   LEFT JOIN saved_locations loc
+                        ON loc.user_id = u.id AND loc.is_primary = TRUE
+                   WHERE u.id = %s AND u.is_active = TRUE""",
+                (target_user_id,),
+            )
+            sub = cur.fetchone()
+    if not sub:
+        return jsonify({"ok": False, "error": "subscriber-not-found"}), 404
+
+    location_label = sub["loc_label"] or sub["loc_address"] or "your location"
+    channels_override = data.get("channels")
+    if channels_override and isinstance(channels_override, list):
+        channels = [c for c in channels_override if c in ("sms", "email")]
+    else:
+        channels = [c for c in (sub["channels"] or "sms,email").split(",") if c]
+
+    # Send via channels. Subject: "Weather Update — [location]"
+    channels_used = []
+    any_success = False
+    update_subject = f"Weather Update — {location_label}"
+    for ch in channels:
+        if ch == "sms" and sub["phone"]:
+            sms_text = "WeatherValet Update: " + (snippet or body_text[:140])
+            if body_text and len(snippet) + len(body_text) < 1200:
+                sms_text = sms_text + "\n\n" + body_text[:1200]
+            ok = send_sms(sub["phone"], sms_text)
+            if ok:
+                channels_used.append("sms")
+                any_success = True
+        elif ch == "email" and sub["email"]:
+            email_body_html = (body_text or snippet).replace("\n", "<br>")
+            email_body_full = (
+                f"<p><strong>{snippet}</strong></p>"
+                f"<p>{email_body_html}</p>"
+                f"<p style='color:#666;font-size:12px;'>Sent by your meteorologist via WeatherValet.</p>"
+            )
+            ok = _send_brief_email(sub["email"], update_subject, email_body_full)
+            if ok:
+                channels_used.append("email")
+                any_success = True
+
+    if not any_success:
+        return jsonify({"ok": False, "error": "send-failed",
+                        "message": "Could not deliver via any channel."}), 502
+
+    # Record the update as a draft row with brief_type='update'. Status='sent'.
+    # This makes it visible in the Met queue's "recently sent" view and in
+    # the subscriber's brief history. It is NOT counted in payroll because
+    # _compute_payroll_for_month filters on brief_type='sent' AND looks at
+    # daily_brief_tasks (Hobbyist) or pro_brief_drafts where brief_type='morning'.
+    now_ms = int(time.time() * 1000)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO pro_brief_drafts
+                         (user_id, brief_type, created_at, window_end_at, status,
+                          user_tier, location_label, location_lat, location_lng,
+                          channels, ai_verdict, ai_snippet, ai_body,
+                          met_verdict, met_snippet, met_body,
+                          sent_at, sent_by_user_id, sent_by_name, final_verdict, final_body)
+                       VALUES (%s, 'update', %s, %s, 'sent',
+                               %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                               %s, %s, %s, %s, %s)
+                       RETURNING id""",
+                    (target_user_id, now_ms, now_ms,
+                     sub["subscription_tier"] or "hobbyist",
+                     location_label,
+                     float(sub["lat"]) if sub["lat"] else 0.0,
+                     float(sub["lng"]) if sub["lng"] else 0.0,
+                     ",".join(channels_used),
+                     verdict, snippet, body_text,
+                     verdict, snippet, body_text,
+                     now_ms, me_id, user.get("name") or user.get("email") or "Met",
+                     verdict, body_text),
+                )
+                draft_id = cur.fetchone()["id"]
+    except Exception as e:
+        print(f"[compose-update] draft insert failed: {e}", flush=True)
+        # Don't return error to user — the update was successfully sent.
+        # Just log the bookkeeping miss.
+        draft_id = None
+
+    print(
+        f"[compose-update] met_user_id={me_id} target_user_id={target_user_id} "
+        f"channels={channels_used} verdict={verdict} draft_id={draft_id}",
+        flush=True,
+    )
+    return jsonify({
+        "ok": True,
+        "channels_used": channels_used,
+        "draft_id": draft_id,
     })
 
 
@@ -24382,11 +24641,14 @@ def _compute_payroll_for_month(year: int, month: int) -> dict:
                 ORDER BY sent_at_ms ASC
             """
         else:
-            # Pro tiers use pro_brief_drafts
+            # Pro tiers use pro_brief_drafts. Only morning briefs count
+            # toward pay; ad-hoc 'update' rows are excluded.
+            # (Filter added May 22, 2026.)
             brief_table_query = """
                 SELECT sent_at, sent_by_user_id
                 FROM pro_brief_drafts
                 WHERE user_id = %s
+                  AND brief_type = 'morning'
                   AND status = 'sent'
                   AND sent_at IS NOT NULL
                   AND sent_at >= %s AND sent_at < %s
