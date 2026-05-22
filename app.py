@@ -19001,6 +19001,211 @@ def _can_met_see_pro_brief(met_user_id: int, draft_id: int, is_admin: bool) -> b
             return cur.fetchone() is not None
 
 
+@app.get("/api/v1/met/pro-subscribers-queue")
+def met_pro_subscribers_queue():
+    """List Pro subscribers visible to this Met, with each one's latest
+    morning brief draft (if any) overlaid.
+
+    Added May 22, 2026 for the Phase 2 queue redesign: Mets see subscriber
+    cards 24/7, not just when drafts exist. They can click any card to
+    compose a brief at any time of day.
+
+    Distinct from /pro-subscribers (which is a simple list for the
+    legacy compose-update modal). This endpoint includes coverage
+    visibility, today's draft state, and next delivery time for sorting.
+
+    Visibility (same rules as /pro-briefs):
+      - Admin: all Pro subscribers
+      - Met: primary subscribers OR subscribers in territories they're
+        covering today (non-drop shift assignment for today)
+
+    Response shape per subscriber:
+      {
+        user_id, name, email, phone, tier,
+        location_label, location_address, timezone,
+        morning_window_start,  // subscriber's delivery time (HH:MM)
+        primary_met_id, primary_met_name,
+        is_covering,            // true if Met sees via coverage, not as primary
+        today_draft: null | {
+          id, status, ai_verdict, met_verdict, met_snippet,
+          sent_at, sent_by_name, ...
+        },
+        next_delivery_at_ms     // UTC ms for sorting; subscriber's next morning_window_start
+      }
+
+    Sorted by next_delivery_at_ms ascending — soonest delivery first.
+    Hobbyists are excluded; this endpoint is Pro-only.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    is_admin = "admin" in roles
+    me_id = user["id"]
+
+    ET = ZoneInfo("America/New_York")
+    today_et = datetime.now(ET).date().isoformat()
+    now_ms = int(time.time() * 1000)
+    eighteen_hours_ago_ms = now_ms - 18 * 60 * 60 * 1000
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            if is_admin:
+                # Admins see ALL Pro subscribers
+                cur.execute(
+                    """SELECT u.id AS user_id, u.email, u.name, u.phone,
+                              u.subscription_tier AS tier,
+                              COALESCE(u.timezone, 'America/Indiana/Indianapolis') AS timezone,
+                              COALESCE(bp.morning_window_start, '07:00') AS morning_window_start,
+                              loc.label AS location_label,
+                              loc.address_text AS location_address,
+                              sc.primary_met_id,
+                              pm.name AS primary_met_name
+                       FROM users u
+                       LEFT JOIN brief_preferences bp ON bp.user_id = u.id
+                       LEFT JOIN saved_locations loc
+                            ON loc.user_id = u.id AND loc.is_primary = TRUE
+                       LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
+                       LEFT JOIN users pm ON pm.id = sc.primary_met_id
+                       WHERE u.is_active = TRUE
+                         AND u.subscription_tier IN ('pro_single', 'pro_multi', 'pro_enterprise')
+                         AND EXISTS (
+                           SELECT 1 FROM user_roles ur
+                           WHERE ur.user_id = u.id AND ur.role = 'subscriber'
+                         )"""
+                )
+            else:
+                # Met sees primary + coverage today
+                cur.execute(
+                    """SELECT u.id AS user_id, u.email, u.name, u.phone,
+                              u.subscription_tier AS tier,
+                              COALESCE(u.timezone, 'America/Indiana/Indianapolis') AS timezone,
+                              COALESCE(bp.morning_window_start, '07:00') AS morning_window_start,
+                              loc.label AS location_label,
+                              loc.address_text AS location_address,
+                              sc.primary_met_id,
+                              pm.name AS primary_met_name
+                       FROM users u
+                       LEFT JOIN brief_preferences bp ON bp.user_id = u.id
+                       LEFT JOIN saved_locations loc
+                            ON loc.user_id = u.id AND loc.is_primary = TRUE
+                       JOIN subscriber_coverage sc ON sc.user_id = u.id
+                       LEFT JOIN users pm ON pm.id = sc.primary_met_id
+                       WHERE u.is_active = TRUE
+                         AND u.subscription_tier IN ('pro_single', 'pro_multi', 'pro_enterprise')
+                         AND EXISTS (
+                           SELECT 1 FROM user_roles ur
+                           WHERE ur.user_id = u.id AND ur.role = 'subscriber'
+                         )
+                         AND (
+                           sc.primary_met_id = %s
+                           OR EXISTS (
+                             SELECT 1
+                             FROM met_territories t
+                             JOIN shift_assignments sa
+                               ON sa.territory_id = t.id
+                             WHERE t.met_user_id = sc.primary_met_id
+                               AND sa.met_user_id = %s
+                               AND sa.is_drop = FALSE
+                               AND sa.shift_date = %s
+                           )
+                         )""",
+                    (me_id, me_id, today_et),
+                )
+            sub_rows = cur.fetchall()
+
+    # For each subscriber, look up their latest pro_brief_drafts row from
+    # the last 18 hours (so we catch tonight's pregen + this morning's draft).
+    subscribers = []
+    for s in sub_rows:
+        # Look up latest draft
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, status, brief_type, created_at,
+                              ai_verdict, ai_snippet, ai_body,
+                              met_verdict, met_snippet, met_body,
+                              bottom_line, weather_details, whats_ahead,
+                              sent_at, sent_by_name, final_verdict,
+                              delivery_time_local
+                       FROM pro_brief_drafts
+                       WHERE user_id = %s
+                         AND created_at >= %s
+                       ORDER BY created_at DESC
+                       LIMIT 1""",
+                    (s["user_id"], eighteen_hours_ago_ms),
+                )
+                draft = cur.fetchone()
+
+        # Compute next delivery time (next morning_window_start in subscriber's timezone)
+        try:
+            sub_tz = ZoneInfo(s["timezone"])
+        except Exception:
+            sub_tz = ZoneInfo("America/Indiana/Indianapolis")
+        try:
+            wh, wm = int(s["morning_window_start"][:2]), int(s["morning_window_start"][3:])
+        except (ValueError, TypeError, IndexError):
+            wh, wm = 7, 0
+        local_now = datetime.now(sub_tz)
+        # Today's window start in subscriber's timezone
+        today_window = local_now.replace(hour=wh, minute=wm, second=0, microsecond=0)
+        if today_window <= local_now:
+            # Already past; next is tomorrow
+            next_delivery = today_window + timedelta(days=1)
+        else:
+            next_delivery = today_window
+        next_delivery_ms = int(next_delivery.timestamp() * 1000)
+
+        # Has today's brief already been sent?
+        today_sent = bool(draft and draft.get("status") == "sent")
+
+        primary_met_id = s.get("primary_met_id")
+        is_covering = (not is_admin) and primary_met_id is not None and primary_met_id != me_id
+
+        subscribers.append({
+            "user_id": s["user_id"],
+            "name": s.get("name") or "",
+            "email": s["email"],
+            "phone": s.get("phone") or "",
+            "tier": s["tier"],
+            "location_label": s.get("location_label") or "",
+            "location_address": s.get("location_address") or "",
+            "timezone": s["timezone"],
+            "morning_window_start": s["morning_window_start"],
+            "primary_met_id": primary_met_id,
+            "primary_met_name": s.get("primary_met_name") or "",
+            "is_covering": is_covering,
+            "next_delivery_at_ms": next_delivery_ms,
+            "today_sent": today_sent,
+            "today_draft": ({
+                "id": draft["id"],
+                "status": draft["status"],
+                "brief_type": draft.get("brief_type") or "morning",
+                "created_at": draft["created_at"],
+                "ai_verdict": draft.get("ai_verdict") or "",
+                "ai_snippet": draft.get("ai_snippet") or "",
+                "ai_body": draft.get("ai_body") or "",
+                "met_verdict": draft.get("met_verdict") or "",
+                "met_snippet": draft.get("met_snippet") or "",
+                "met_body": draft.get("met_body") or "",
+                "bottom_line": draft.get("bottom_line") or "",
+                "weather_details": draft.get("weather_details") or "",
+                "whats_ahead": draft.get("whats_ahead") or "",
+                "sent_at": draft.get("sent_at"),
+                "sent_by_name": draft.get("sent_by_name") or "",
+                "final_verdict": draft.get("final_verdict") or "",
+                "delivery_time_local": draft.get("delivery_time_local") or "",
+            } if draft else None),
+        })
+
+    # Sort by next delivery time ascending — soonest first
+    subscribers.sort(key=lambda s: s["next_delivery_at_ms"])
+    return jsonify({"ok": True, "subscribers": subscribers})
+
+
 @app.get("/api/v1/met/pro-briefs")
 def met_pro_briefs_list():
     """List pending + recently-sent pro brief drafts visible to this Met.
@@ -19170,6 +19375,154 @@ def met_pro_briefs_list():
 @app.route("/api/v1/met/pro-briefs/<int:draft_id>", methods=["OPTIONS"])
 def _met_pro_brief_id_preflight(draft_id):
     return ("", 204)
+
+
+@app.post("/api/v1/met/pro-briefs/create-for-subscriber")
+def met_pro_brief_create_for_subscriber():
+    """Create a fresh Pro brief draft for a specific subscriber, on demand.
+
+    Added May 22, 2026 for the Phase 2 always-visible-card flow: when a
+    Met clicks a subscriber card that has no current draft, this endpoint
+    creates one populated with the current AI forecast so they can edit
+    and send (or schedule) right away.
+
+    Body: { "user_id": <subscriber_id> }
+
+    Visibility: caller must be subscriber's primary Met OR covering today
+    OR admin (same rules as pro-briefs queue).
+
+    Idempotency: if a draft from the last 18 hours already exists in
+    pending-review/claimed status, returns that one instead of creating
+    a duplicate.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    is_admin = "admin" in roles
+    me_id = user["id"]
+
+    data = request.get_json(silent=True) or {}
+    try:
+        target_user_id = int(data.get("user_id"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "invalid-user-id"}), 400
+
+    # Visibility check
+    ET = ZoneInfo("America/New_York")
+    today_et = datetime.now(ET).date().isoformat()
+    if not is_admin:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT 1
+                       FROM subscriber_coverage sc
+                       LEFT JOIN met_territories t ON t.met_user_id = sc.primary_met_id
+                       LEFT JOIN shift_assignments sa
+                            ON sa.territory_id = t.id
+                           AND sa.met_user_id = %s
+                           AND sa.is_drop = FALSE
+                           AND sa.shift_date = %s
+                       WHERE sc.user_id = %s
+                         AND (sc.primary_met_id = %s OR sa.id IS NOT NULL)
+                       LIMIT 1""",
+                    (me_id, today_et, target_user_id, me_id),
+                )
+                visible = cur.fetchone() is not None
+        if not visible:
+            return jsonify({"ok": False, "error": "not-found"}), 404
+
+    # Idempotency check: existing draft in last 18 hours?
+    eighteen_hours_ago_ms = int(time.time() * 1000) - 18 * 60 * 60 * 1000
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, status
+                   FROM pro_brief_drafts
+                   WHERE user_id = %s
+                     AND created_at >= %s
+                     AND status IN ('pending-review', 'claimed')
+                   ORDER BY created_at DESC LIMIT 1""",
+                (target_user_id, eighteen_hours_ago_ms),
+            )
+            existing = cur.fetchone()
+    if existing:
+        return jsonify({"ok": True, "draft_id": existing["id"], "reused": True})
+
+    # Load subscriber data to generate the AI brief
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.email, u.phone, u.subscription_tier,
+                          COALESCE(u.timezone, 'America/Indiana/Indianapolis') AS timezone,
+                          bp.morning_window_end, bp.channels,
+                          loc.label AS loc_label, loc.address_text AS loc_address,
+                          loc.lat, loc.lng
+                   FROM users u
+                   LEFT JOIN brief_preferences bp ON bp.user_id = u.id
+                   LEFT JOIN saved_locations loc
+                        ON loc.user_id = u.id AND loc.is_primary = TRUE
+                   WHERE u.id = %s AND u.is_active = TRUE""",
+                (target_user_id,),
+            )
+            sub = cur.fetchone()
+    if not sub:
+        return jsonify({"ok": False, "error": "subscriber-not-found"}), 404
+    if not sub.get("lat") or not sub.get("lng"):
+        return jsonify({"ok": False, "error": "no-location",
+                        "message": "Subscriber has no saved location."}), 400
+
+    location_label = sub.get("loc_label") or sub.get("loc_address") or "your location"
+    forecast = _fetch_forecast(float(sub["lat"]), float(sub["lng"]))
+    ai_verdict, ai_snippet, ai_body = _generate_ai_brief(
+        location_label, forecast or {}, address=sub.get("loc_address") or "")
+
+    # Window end: subscriber's morning_window_end in local timezone, today
+    try:
+        sub_tz = ZoneInfo(sub["timezone"])
+    except Exception:
+        sub_tz = ZoneInfo("America/Indiana/Indianapolis")
+    local_now = datetime.now(sub_tz)
+    try:
+        eh, em = int((sub.get("morning_window_end") or "07:30")[:2]), int((sub.get("morning_window_end") or "07:30")[3:])
+        window_end_dt = local_now.replace(hour=eh, minute=em, second=0, microsecond=0)
+        if window_end_dt < local_now:
+            window_end_dt = window_end_dt + timedelta(days=1)
+        window_end_ms = int(window_end_dt.timestamp() * 1000)
+    except (ValueError, TypeError, IndexError):
+        window_end_ms = int(time.time() * 1000) + 18 * 60 * 60 * 1000
+
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO pro_brief_drafts
+                     (user_id, brief_type, created_at, window_end_at, status,
+                      user_tier, location_label, location_lat, location_lng,
+                      channels, ai_verdict, ai_snippet, ai_body,
+                      met_verdict, met_snippet, met_body)
+                   VALUES (%s, 'morning', %s, %s, 'pending-review',
+                           %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   RETURNING id""",
+                (target_user_id, now_ms, window_end_ms,
+                 sub["subscription_tier"] or "pro_single",
+                 location_label,
+                 float(sub["lat"]), float(sub["lng"]),
+                 sub.get("channels") or "sms,email",
+                 ai_verdict, ai_snippet, ai_body,
+                 ai_verdict, ai_snippet, ai_body),
+            )
+            new_id = cur.fetchone()["id"]
+
+    print(
+        f"[pro-brief-on-demand] created draft id={new_id} subscriber={target_user_id} "
+        f"by met={me_id} verdict={ai_verdict}",
+        flush=True,
+    )
+    return jsonify({"ok": True, "draft_id": new_id, "reused": False})
 
 
 @app.post("/api/v1/met/pro-briefs/<int:draft_id>/claim")
