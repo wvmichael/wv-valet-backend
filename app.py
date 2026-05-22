@@ -15034,6 +15034,76 @@ def _record_brief_delivery(user_id: int, brief_type: str, verdict: str,
             )
 
 
+def _try_acquire_scheduler_lock(lock_key: int) -> Optional[object]:
+    """Try to acquire a Postgres session-level advisory lock for a scheduler tick.
+
+    Added May 22, 2026 to fix duplicate brief delivery: when Render runs
+    multiple Gunicorn workers, each worker has its own scheduler thread.
+    Without coordination, two workers can simultaneously enter
+    _process_pending_briefs (or _pregenerate_pro_brief_drafts) and both
+    send the same brief.
+
+    Postgres advisory locks are a cluster-wide mutex — only one worker
+    in any process can hold the lock at a time. pg_try_advisory_lock
+    returns true if acquired, false if another session has it.
+
+    Returns the database connection if lock acquired (caller must call
+    _release_scheduler_lock with same connection when done). Returns
+    None if another worker already holds the lock — caller should
+    simply skip this tick.
+
+    Why session-level (not transaction-level) advisory locks: the
+    scheduler operation spans multiple DB transactions (forecast fetch,
+    multiple SQL queries, email sends). A transaction-level lock would
+    release on the first COMMIT. Session-level locks persist for the
+    life of the connection, which we explicitly release at the end.
+
+    Lock keys are arbitrary BIGINTs unique per scheduler job:
+      91234567 — _process_pending_briefs
+      91234568 — _pregenerate_pro_brief_drafts
+      91234569 — _process_severe_alerts
+      91234570 — _check_missed_pro_briefs
+      91234571 — _process_scheduled_messages
+
+    Note: this opens a dedicated long-lived connection (different from
+    the per-request context-managed db() pattern). The connection is
+    closed in _release_scheduler_lock.
+    """
+    try:
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s) AS got", (lock_key,))
+            got_lock = cur.fetchone()["got"]
+        if not got_lock:
+            conn.close()
+            return None
+        return conn
+    except Exception as e:
+        print(f"[scheduler-lock] acquire failed key={lock_key}: {e}", flush=True)
+        return None
+
+
+def _release_scheduler_lock(conn: object, lock_key: int) -> None:
+    """Release the advisory lock acquired by _try_acquire_scheduler_lock.
+
+    Must be called in a try/finally so the lock releases even if the
+    scheduler tick raises an exception. Closes the connection.
+    """
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+    except Exception as e:
+        print(f"[scheduler-lock] release failed key={lock_key}: {e}", flush=True)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def _process_pending_briefs() -> None:
     """Called once per scheduler tick (every 60s). Finds subscribers whose
     morning window matches the current time in THEIR local timezone,
@@ -15049,6 +15119,28 @@ def _process_pending_briefs() -> None:
     HH:MM strings). This is what makes nationwide delivery work — a
     California subscriber's 6 AM window fires at 9 AM Eastern when
     the scheduler ticks during Indianapolis morning.
+
+    Concurrency (May 22, 2026): wrapped in a Postgres advisory lock
+    so multi-worker deployments (Render with 2+ Gunicorn workers)
+    don't fire the scheduler twice and double-send briefs. If another
+    worker holds the lock, this tick is a no-op (the holder will do
+    the work; we'll try again on the next minute).
+    """
+    _LOCK_KEY = 91234567
+    _lock_conn = _try_acquire_scheduler_lock(_LOCK_KEY)
+    if _lock_conn is None:
+        return  # Another worker is processing this tick; skip silently
+    try:
+        _process_pending_briefs_inner()
+    finally:
+        _release_scheduler_lock(_lock_conn, _LOCK_KEY)
+
+
+def _process_pending_briefs_inner() -> None:
+    """Original body of _process_pending_briefs. Extracted May 22, 2026
+    so the outer function can wrap it in an advisory lock without a
+    massive indent change. Do not call this directly — use
+    _process_pending_briefs which handles the lock.
     """
     try:
         with db() as conn:
@@ -15383,6 +15475,25 @@ def _pregenerate_pro_brief_drafts() -> None:
     so the scheduler will run this check ~60 times during that hour.
     The duplicate detection prevents re-generation; only the first tick
     in the window creates the draft.
+
+    Concurrency (May 22, 2026): wrapped in a Postgres advisory lock
+    so multi-worker deployments don't run the pregen twice.
+    """
+    _LOCK_KEY = 91234568
+    _lock_conn = _try_acquire_scheduler_lock(_LOCK_KEY)
+    if _lock_conn is None:
+        return  # Another worker is processing this tick; skip silently
+    try:
+        _pregenerate_pro_brief_drafts_inner()
+    finally:
+        _release_scheduler_lock(_lock_conn, _LOCK_KEY)
+
+
+def _pregenerate_pro_brief_drafts_inner() -> None:
+    """Original body of _pregenerate_pro_brief_drafts. Extracted May 22,
+    2026 so the outer function can wrap it in an advisory lock without
+    a massive indent change. Do not call this directly — use
+    _pregenerate_pro_brief_drafts which handles the lock.
     """
     try:
         with db() as conn:
