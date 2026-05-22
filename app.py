@@ -14591,12 +14591,14 @@ def _process_pending_briefs() -> None:
                 # Compute window_end_at — the scheduler shouldn't send a
                 # "morning brief" at 2pm. Use the user's window_end as the
                 # cutoff; after that, the draft is too stale.
+                # (Fixed May 22, 2026 — was using undefined `now`; should
+                # be `local_now` from line ~14504.)
                 try:
                     eh, em = int(c["morning_window_end"][:2]), int(c["morning_window_end"][3:])
-                    window_end_dt = now.replace(hour=eh, minute=em, second=0, microsecond=0)
-                    if window_end_dt < now:
+                    window_end_dt = local_now.replace(hour=eh, minute=em, second=0, microsecond=0)
+                    if window_end_dt < local_now:
                         # Window ended already (shouldn't happen if we got here, but defend)
-                        window_end_dt = now
+                        window_end_dt = local_now
                     window_end_ms = int(window_end_dt.timestamp() * 1000)
                 except (ValueError, TypeError, IndexError):
                     # Default cutoff: 4 hours from now
