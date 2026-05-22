@@ -14561,10 +14561,13 @@ def _process_pending_briefs() -> None:
             # that, we also check pro_brief_drafts for a pending row.
             tier = c["subscription_tier"] or "hobbyist"
             if tier in ("pro_single", "pro_multi", "pro_enterprise"):
-                # Has a pending draft for today already? If so, skip.
-                today_start_ms = int(datetime.now(timezone.utc)
-                                     .replace(hour=0, minute=0, second=0, microsecond=0)
-                                     .timestamp() * 1000)
+                # Has a pending draft for today's morning already? If so, skip.
+                # We look back 18 hours so that an evening pre-generated draft
+                # (created the night before at 8 PM) is detected when the
+                # morning window fires the next day. Without this, the morning
+                # tick would create a duplicate draft for the same brief day.
+                # (Widened May 22, 2026 to support evening pre-generation.)
+                eighteen_hours_ago_ms = int(time.time() * 1000) - 18 * 60 * 60 * 1000
                 try:
                     with db() as conn:
                         with conn.cursor() as cur:
@@ -14574,7 +14577,7 @@ def _process_pending_briefs() -> None:
                                      AND created_at >= %s
                                      AND status IN ('pending-review','claimed','sent')
                                    LIMIT 1""",
-                                (c["user_id"], today_start_ms),
+                                (c["user_id"], eighteen_hours_ago_ms),
                             )
                             existing = cur.fetchone()
                 except Exception as e:
@@ -14678,6 +14681,152 @@ def _process_pending_briefs() -> None:
             print(f"[brief-scheduler] FAILED for user_id={c.get('user_id')}: {e!r}", flush=True)
 
 
+def _pregenerate_pro_brief_drafts() -> None:
+    """Pre-generate next-morning Pro brief drafts at 8 PM the night before.
+
+    Added May 22, 2026: Mets requested the ability to start writing
+    Pro briefs the night before. This function runs each scheduler tick
+    and, for each Pro subscriber whose local time is 20:00-20:59
+    (8:00-8:59 PM), pre-generates tomorrow's morning draft if one doesn't
+    already exist. The Met can then claim, edit, and save the draft
+    overnight; it sits in 'claimed' or 'pending-review' status until
+    the Met sends it at the normal morning delivery time.
+
+    Forecast staleness: the AI snapshot is from Tuesday evening, but
+    weather can shift overnight. We mark the draft so the Met UI can
+    show a "refresh AI" button. (TODO: wire that button.)
+
+    Duplicate prevention: uses the same 18-hour look-back as the morning
+    scheduler. An 8 PM draft will be detected as "already exists" when
+    the 7 AM morning scheduler runs the next day.
+
+    Idempotency at the hourly level: the 8-9 PM window is one hour wide,
+    so the scheduler will run this check ~60 times during that hour.
+    The duplicate detection prevents re-generation; only the first tick
+    in the window creates the draft.
+    """
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                # Find Pro subscribers with morning brief enabled. Pre-gen
+                # is Pro-only — Hobbyists don't get Met review so there's
+                # nothing to pre-write.
+                cur.execute(
+                    """SELECT
+                          u.id AS user_id,
+                          u.email,
+                          u.phone,
+                          u.name,
+                          u.subscription_tier,
+                          u.timezone,
+                          bp.morning_window_start,
+                          bp.morning_window_end,
+                          bp.channels,
+                          loc.label AS loc_label,
+                          loc.address_text AS loc_address,
+                          loc.lat AS loc_lat,
+                          loc.lng AS loc_lng
+                       FROM users u
+                       JOIN brief_preferences bp ON bp.user_id = u.id
+                       LEFT JOIN saved_locations loc
+                            ON loc.user_id = u.id AND loc.is_primary = TRUE
+                       WHERE u.is_active = TRUE
+                         AND bp.morning_enabled = TRUE
+                         AND u.subscription_tier IN ('pro_single', 'pro_multi', 'pro_enterprise')
+                         AND EXISTS (
+                           SELECT 1 FROM user_roles ur
+                            WHERE ur.user_id = u.id AND ur.role = 'subscriber'
+                         )"""
+                )
+                candidates = cur.fetchall()
+    except Exception as e:
+        print(f"[pregen-pro] query failed: {e}", flush=True)
+        return
+
+    for c in candidates:
+        try:
+            # Check if it's 8 PM in THIS subscriber's local timezone.
+            # 20:00-20:59 local = pre-generation window.
+            user_tz = c.get("timezone") or "America/Indiana/Indianapolis"
+            local_now = _local_now_for_user(user_tz)
+            if local_now.hour != 20:
+                continue
+
+            # No location → can't generate. Skip silently.
+            if not c["loc_lat"] or not c["loc_lng"]:
+                continue
+
+            # Has a draft already been created in the last 18 hours?
+            # If yes, skip — either today's morning draft (still pending)
+            # or one we already pre-generated earlier in this 8 PM hour.
+            eighteen_hours_ago_ms = int(time.time() * 1000) - 18 * 60 * 60 * 1000
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """SELECT id FROM pro_brief_drafts
+                               WHERE user_id = %s AND brief_type = 'morning'
+                                 AND created_at >= %s
+                                 AND status IN ('pending-review','claimed','sent')
+                               LIMIT 1""",
+                            (c["user_id"], eighteen_hours_ago_ms),
+                        )
+                        if cur.fetchone():
+                            continue
+            except Exception as e:
+                print(f"[pregen-pro] dup check failed user_id={c['user_id']}: {e}", flush=True)
+                continue
+
+            # Generate the AI draft for tomorrow morning.
+            location_label = c["loc_label"] or c["loc_address"] or "your location"
+            forecast = _fetch_forecast(float(c["loc_lat"]), float(c["loc_lng"]))
+            ai_verdict, ai_snippet, ai_body = _generate_ai_brief(location_label, forecast or {})
+
+            # Compute window_end_at — tomorrow's morning_window_end in local time.
+            # We use local_now + 1 day, then set the hour to the window_end.
+            try:
+                eh, em = int(c["morning_window_end"][:2]), int(c["morning_window_end"][3:])
+                # Tomorrow in subscriber's local timezone
+                tomorrow_local = local_now + timedelta(days=1)
+                window_end_dt = tomorrow_local.replace(hour=eh, minute=em, second=0, microsecond=0)
+                window_end_ms = int(window_end_dt.timestamp() * 1000)
+            except (ValueError, TypeError, IndexError):
+                # Default cutoff: 18 hours from now (covers 8 PM tonight → ~2 PM tomorrow)
+                window_end_ms = int(time.time() * 1000) + 18 * 60 * 60 * 1000
+
+            now_ms = int(time.time() * 1000)
+            tier = c["subscription_tier"]
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """INSERT INTO pro_brief_drafts
+                               (user_id, brief_type, created_at, window_end_at, status,
+                                user_tier, location_label, location_lat, location_lng,
+                                channels, ai_verdict, ai_snippet, ai_body,
+                                met_verdict, met_snippet, met_body)
+                               VALUES (%s, 'morning', %s, %s, 'pending-review',
+                                       %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                               RETURNING id""",
+                            (c["user_id"], now_ms, window_end_ms,
+                             tier, location_label,
+                             float(c["loc_lat"]), float(c["loc_lng"]),
+                             c["channels"] or "",
+                             ai_verdict, ai_snippet, ai_body,
+                             ai_verdict, ai_snippet, ai_body),
+                        )
+                        new_id = cur.fetchone()["id"]
+                print(
+                    f"[pregen-pro] draft created id={new_id} user_id={c['user_id']} "
+                    f"tier={tier} verdict={ai_verdict} (for tomorrow morning)",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"[pregen-pro] insert failed user_id={c['user_id']}: {e}", flush=True)
+        except Exception as e:
+            print(f"[pregen-pro] FAILED for user_id={c.get('user_id')}: {e!r}", flush=True)
+
+
 def _brief_scheduler_loop() -> None:
     """Main scheduler loop — runs in a daemon thread. Ticks every 60s.
 
@@ -14697,6 +14846,10 @@ def _brief_scheduler_loop() -> None:
             _process_pending_briefs()
         except Exception as e:
             print(f"[brief-scheduler] tick failed: {e!r}", flush=True)
+        try:
+            _pregenerate_pro_brief_drafts()
+        except Exception as e:
+            print(f"[pregen-pro] tick failed: {e!r}", flush=True)
         try:
             _process_severe_alerts()
         except Exception as e:
