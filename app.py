@@ -2005,23 +2005,40 @@ CREATE TABLE IF NOT EXISTS shift_assignments (
     is_reviews_pool     BOOLEAN NOT NULL DEFAULT FALSE,
     shift_date          DATE NOT NULL,
     shift_type          TEXT NOT NULL CHECK (shift_type IN ('morning','afternoon','evening')),
-    met_user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    -- met_user_id is NULL when this row is a drop-marker (the territory
+    -- owner explicitly dropped this shift so they don't get default-filled).
+    -- For actual claims, met_user_id is the claiming Met. For reviews-pool
+    -- sign-ups, met_user_id is the volunteering Met.
+    met_user_id         INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    is_drop             BOOLEAN NOT NULL DEFAULT FALSE,
     created_at          BIGINT NOT NULL,
     CHECK ((territory_id IS NOT NULL AND is_reviews_pool = FALSE)
         OR (territory_id IS NULL AND is_reviews_pool = TRUE))
 );
--- Subscriber-territory shifts: only one Met per (territory, date, shift)
+-- Subscriber-territory shifts: only one row per (territory, date, shift)
+-- regardless of whether it's a claim or a drop marker.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_shift_territory_unique
     ON shift_assignments(territory_id, shift_date, shift_type)
     WHERE territory_id IS NOT NULL;
 -- Reviews-pool shifts: a Met can only sign up once per (date, shift)
 CREATE UNIQUE INDEX IF NOT EXISTS idx_shift_reviews_unique
     ON shift_assignments(met_user_id, shift_date, shift_type)
-    WHERE is_reviews_pool = TRUE;
+    WHERE is_reviews_pool = TRUE AND met_user_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_shift_date
     ON shift_assignments(shift_date, shift_type);
 CREATE INDEX IF NOT EXISTS idx_shift_met
-    ON shift_assignments(met_user_id, shift_date);
+    ON shift_assignments(met_user_id, shift_date)
+    WHERE met_user_id IS NOT NULL;
+
+-- Migration for existing deployments (May 22, 2026):
+-- Drop the NOT NULL on met_user_id and add is_drop column. This runs
+-- idempotently so re-deploys are safe. The original schema had
+-- met_user_id NOT NULL and no is_drop column; the broken -1 drop-marker
+-- pattern caused FK violations. Application logic now handles validity:
+-- drop markers = (met_user_id IS NULL AND is_drop = TRUE), claims =
+-- (met_user_id IS NOT NULL AND is_drop = FALSE).
+ALTER TABLE shift_assignments ALTER COLUMN met_user_id DROP NOT NULL;
+ALTER TABLE shift_assignments ADD COLUMN IF NOT EXISTS is_drop BOOLEAN NOT NULL DEFAULT FALSE;
 """
 
 
@@ -25317,7 +25334,7 @@ def met_schedule_get():
             # Load all shift_assignments in the 7-day window
             cur.execute("""
                 SELECT id, territory_id, is_reviews_pool, shift_date, shift_type,
-                       met_user_id
+                       met_user_id, is_drop
                 FROM shift_assignments
                 WHERE shift_date BETWEEN %s AND %s
             """, (date_strs[0], date_strs[-1]))
@@ -25347,7 +25364,9 @@ def met_schedule_get():
     # Bucket assignments by (territory or reviews) + date + shift
     # For territories: there's at most one Met per cell (DB-enforced unique).
     # For reviews pool: there can be multiple Mets per cell.
-    # Sentinel met_user_id = -1 means "explicit drop" (default Met released).
+    # is_drop=TRUE means "explicit drop" (default Met released). Drops have
+    # met_user_id=NULL since they don't reference a real user.
+    # (Fixed May 22, 2026 — old code used met_user_id=-1 which FK-failed.)
     territory_cells = {}      # (territory_id, date_str, shift_type) -> {met_user_id, initials}
     territory_drops = set()   # (territory_id, date_str, shift_type) — explicit drops
     reviews_cells = {}        # (date_str, shift_type) -> [{met_user_id, initials}, ...]
@@ -25356,8 +25375,12 @@ def met_schedule_get():
         date_str = a["shift_date"].isoformat() if hasattr(a["shift_date"], "isoformat") else str(a["shift_date"])
         shift = a["shift_type"]
         met_id = a["met_user_id"]
-        info = met_info.get(met_id, {"initials": "?"})
+        is_drop = a.get("is_drop") or False
         if a["is_reviews_pool"]:
+            # Reviews pool: drops aren't a concept here (you can either sign up or not)
+            if met_id is None:
+                continue
+            info = met_info.get(met_id, {"initials": "?"})
             key = (date_str, shift)
             reviews_cells.setdefault(key, []).append({
                 "met_user_id": met_id,
@@ -25365,10 +25388,11 @@ def met_schedule_get():
             })
         else:
             tid = a["territory_id"]
-            if met_id == -1:
-                # Explicit drop marker
+            if is_drop:
+                # Explicit drop marker — no met assigned, cell renders empty
                 territory_drops.add((tid, date_str, shift))
-            else:
+            elif met_id is not None:
+                info = met_info.get(met_id, {"initials": "?"})
                 territory_cells[(tid, date_str, shift)] = {
                     "met_user_id": met_id,
                     "initials": info["initials"],
@@ -25514,7 +25538,7 @@ def met_schedule_claim():
                 with conn.cursor() as cur:
                     # Check if there's an existing non-drop assignment for this cell
                     cur.execute("""
-                        SELECT id, met_user_id
+                        SELECT id, met_user_id, is_drop
                         FROM shift_assignments
                         WHERE territory_id = %s
                           AND shift_date = %s
@@ -25523,8 +25547,9 @@ def met_schedule_claim():
                     existing = cur.fetchone()
 
                     if existing:
-                        if existing["met_user_id"] == -1:
-                            # Explicit drop marker exists — remove it, then INSERT real claim
+                        if existing.get("is_drop"):
+                            # Explicit drop marker exists — remove it, then INSERT real claim.
+                            # (Fixed May 22, 2026 — was checking met_user_id == -1.)
                             cur.execute(
                                 "DELETE FROM shift_assignments WHERE id = %s",
                                 (existing["id"],)
@@ -25539,8 +25564,8 @@ def met_schedule_claim():
                     cur.execute("""
                         INSERT INTO shift_assignments
                           (territory_id, is_reviews_pool, shift_date, shift_type,
-                           met_user_id, created_at)
-                        VALUES (%s, FALSE, %s, %s, %s, %s)
+                           met_user_id, is_drop, created_at)
+                        VALUES (%s, FALSE, %s, %s, %s, FALSE, %s)
                         RETURNING id
                     """, (territory_id, shift_date, shift_type, user["id"], now_ms))
                     new_id = cur.fetchone()["id"]
@@ -25607,8 +25632,8 @@ def met_schedule_release():
     For territory scope:
       - If the Met has an explicit row, delete it.
       - If the Met is the territory OWNER and there's no explicit row
-        (default-filled), insert a "drop marker" (met_user_id=-1) so the
-        cell renders empty on next load.
+        (default-filled), insert a drop marker (is_drop=TRUE, met_user_id=NULL)
+        so the cell renders empty on next load.
 
     For reviews_pool scope:
       - Delete the row matching (met_user_id, shift_date, shift_type, is_reviews_pool).
@@ -25686,12 +25711,15 @@ def met_schedule_release():
                           AND shift_type = %s
                     """, (territory_id, shift_date, shift_type))
                     if not cur.fetchone():
+                        # Drop marker: is_drop=TRUE, met_user_id NULL.
+                        # (Fixed May 22, 2026 — was using met_user_id=-1
+                        # which violated the users(id) foreign key.)
                         cur.execute("""
                             INSERT INTO shift_assignments
                               (territory_id, is_reviews_pool, shift_date, shift_type,
-                               met_user_id, created_at)
-                            VALUES (%s, FALSE, %s, %s, %s, %s)
-                        """, (territory_id, shift_date, shift_type, -1, now_ms))
+                               met_user_id, is_drop, created_at)
+                            VALUES (%s, FALSE, %s, %s, NULL, TRUE, %s)
+                        """, (territory_id, shift_date, shift_type, now_ms))
                     return jsonify({"ok": True, "released": "default"})
 
                 # Not owner, no explicit assignment — nothing to release
