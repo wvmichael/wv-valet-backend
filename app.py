@@ -14346,21 +14346,180 @@ def _weather_code_label(code: int) -> str:
     return "Mixed conditions"
 
 
-def _generate_ai_brief(location_label: str, forecast: dict) -> tuple[str, str, str]:
+def _smart_location_label(label: str, address: str) -> str:
+    """Pick the best label for the brief opener.
+
+    May 22, 2026: subscribers often label their primary location as
+    'Home' / 'Work' / 'House' / etc., which reads awkwardly in a brief
+    ('Today in Home...'). When the label is generic, we fall back to
+    extracting a city/state from the address. If neither is usable,
+    we fall back to 'your location'.
+    """
+    generic = {"home", "house", "work", "office", "primary", "main", ""}
+    label_clean = (label or "").strip()
+    if label_clean and label_clean.lower() not in generic:
+        return label_clean
+    # Try to pull a city/state from the address (typical format:
+    # "123 Main St, Newark, NJ 07102" or "Atwood, KS 67730").
+    addr = (address or "").strip()
+    if addr:
+        # Split on commas and take the last 2 meaningful parts that
+        # don't look like zip codes or street addresses.
+        parts = [p.strip() for p in addr.split(",")]
+        # Strip trailing zip if present from the final part
+        if parts:
+            last = parts[-1].split()
+            # If last part ends with digits that look like a zip, drop them
+            if last and last[-1].isdigit() and len(last[-1]) >= 5:
+                parts[-1] = " ".join(last[:-1]).strip()
+        # Drop empty parts and parts that look like street numbers
+        clean_parts = []
+        for p in parts:
+            if not p:
+                continue
+            first_word = p.split()[0] if p.split() else ""
+            if first_word and first_word[0].isdigit():
+                continue  # looks like a street address
+            clean_parts.append(p)
+        if len(clean_parts) >= 2:
+            # City, State
+            return f"{clean_parts[-2]}, {clean_parts[-1]}"
+        if len(clean_parts) == 1:
+            return clean_parts[0]
+    return "your location"
+
+
+def _format_precip_natural(precip: float) -> str:
+    """Convert inches to natural English ('about a third of an inch')."""
+    if precip < 0.05:
+        return ""
+    if precip < 0.15:
+        return "a tenth of an inch"
+    if precip < 0.30:
+        return "about a quarter of an inch"
+    if precip < 0.45:
+        return "about a third of an inch"
+    if precip < 0.65:
+        return "about half an inch"
+    if precip < 0.85:
+        return "about three quarters of an inch"
+    if precip < 1.10:
+        return "about an inch"
+    return f"around {precip:.1f} inches"
+
+
+def _alert_met_on_suppressed_brief(subscriber_user_id: int,
+                                    subscriber_name: str,
+                                    location_label: str,
+                                    reason: str) -> None:
+    """Email the assigned primary Met (or admin fallback) when an AI
+    Hobbyist brief was held back due to bad data.
+
+    Added May 22, 2026 alongside the data quality gate in
+    _generate_ai_brief. The Met can then look at the subscriber's
+    profile, fix the data issue (or wait for the forecast feed to
+    recover), and send the brief manually if appropriate.
+
+    Idempotency: this function sends one email per call. The caller
+    (the scheduler) only invokes it once per suppression event because
+    of the brief_history check downstream. We don't dedupe here.
+    """
+    # Look up the primary Met (or any admin if no Met assigned)
+    met_email = None
+    met_name = None
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT u.email, u.name
+                       FROM subscriber_coverage sc
+                       JOIN users u ON u.id = sc.primary_met_id
+                       WHERE sc.user_id = %s""",
+                    (subscriber_user_id,),
+                )
+                row = cur.fetchone()
+                if row:
+                    met_email = row["email"]
+                    met_name = row["name"]
+                else:
+                    # No primary Met — fall back to first admin
+                    cur.execute(
+                        """SELECT u.email, u.name
+                           FROM users u
+                           JOIN user_roles ur ON ur.user_id = u.id
+                           WHERE ur.role = 'admin' AND u.is_active = TRUE
+                           ORDER BY u.id ASC LIMIT 1"""
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        met_email = row["email"]
+                        met_name = row["name"]
+    except Exception as e:
+        print(f"[alert-suppressed] met lookup failed: {e}", flush=True)
+        return
+
+    if not met_email:
+        print(f"[alert-suppressed] no Met/admin email found for subscriber {subscriber_user_id}", flush=True)
+        return
+
+    subject = f"Hold required: {subscriber_name}'s morning brief flagged"
+    body_text = (
+        f"Hi {met_name or 'team'},\n\n"
+        f"WeatherValet's automated brief generator flagged today's morning brief for "
+        f"{subscriber_name} ({location_label}) as low-confidence. The brief was NOT sent.\n\n"
+        f"Reason: {reason}\n\n"
+        f"Please review the subscriber's data (location coordinates, etc.) and decide "
+        f"whether to send a manual brief, fix the data, or wait for the next scheduled run.\n\n"
+        f"— WeatherValet"
+    )
+    body_html = (
+        f"<p>Hi {_html_escape(met_name or 'team')},</p>"
+        f"<p>WeatherValet's automated brief generator flagged today's morning brief for "
+        f"<strong>{_html_escape(subscriber_name)}</strong> ({_html_escape(location_label)}) "
+        f"as low-confidence. The brief was <strong>NOT sent</strong>.</p>"
+        f"<p><strong>Reason:</strong> {_html_escape(reason)}</p>"
+        f"<p>Please review the subscriber's data (location coordinates, etc.) and decide "
+        f"whether to send a manual brief, fix the data, or wait for the next scheduled run.</p>"
+        f"<p style='color:#666;font-size:12px;'>— WeatherValet</p>"
+    )
+    try:
+        ok = _send_brief_email(met_email, subject, body_html)
+        if ok:
+            print(f"[alert-suppressed] alerted met={met_email} subscriber={subscriber_user_id}", flush=True)
+        else:
+            print(f"[alert-suppressed] email send failed met={met_email}", flush=True)
+    except Exception as e:
+        print(f"[alert-suppressed] send exception met={met_email}: {e}", flush=True)
+
+
+def _generate_ai_brief(location_label: str, forecast: dict,
+                       address: str = "") -> tuple[str, str, str]:
     """Generate a daily brief paragraph.
 
     Returns (verdict, snippet, full_body):
-      verdict — "clear" | "caution" | "risk"
+      verdict — "clear" | "caution" | "risk" | "suppress"
       snippet — first ~140 chars suitable for SMS preview / portal card
-      full_body — the full 2-4 sentence brief
+      full_body — the full brief in complete sentences
 
-    For now this is a rules-based generator that reads the day's
-    high/low/precip/wind from the forecast and writes a deterministic
-    summary. Future: swap to Gemini/Decision Engine for richer prose.
+    May 22, 2026 rewrite: plain English with complete sentences. No
+    editorializing about "you can work today" or "outdoor plans."
+    The brief describes the weather; the subscriber/Met decides what
+    to do with it.
+
+    Data quality: returns verdict='suppress' when the forecast looks
+    unusable (missing high/low/precip, fetch failed, etc.) — callers
+    should NOT send the brief in this case; instead alert the Met or
+    admin so a human can investigate.
+
+    location_label: the label from saved_locations (e.g., "Home"); we
+        upgrade to city/state via address if it's generic.
+    address: optional full address string used to extract city/state
+        when location_label is generic.
     """
+    # Data quality check: forecast must be present and have daily data
     if not forecast or "daily" not in forecast:
-        body = f"Your morning brief for {location_label}: forecast unavailable right now. We'll retry on the next interval."
-        return ("caution", body[:140], body)
+        body = "Today's forecast data is not available right now."
+        return ("suppress", body, body)
 
     daily = forecast["daily"]
     high = (daily.get("temperature_2m_max") or [None])[0]
@@ -14368,10 +14527,31 @@ def _generate_ai_brief(location_label: str, forecast: dict) -> tuple[str, str, s
     precip = (daily.get("precipitation_sum") or [0])[0] or 0
     wind = (daily.get("windspeed_10m_max") or [0])[0] or 0
     code = (daily.get("weathercode") or [0])[0] or 0
+
+    # Data quality: critical fields can't be None
+    if high is None or low is None:
+        body = "Today's high/low temperature data is missing from the forecast feed."
+        return ("suppress", body, body)
+    # Sanity range check
+    try:
+        high_int = int(high)
+        low_int = int(low)
+        if high_int < -60 or high_int > 140 or low_int < -80 or low_int > 130:
+            body = f"Today's forecast data looks out of range (high={high_int}°F, low={low_int}°F)."
+            return ("suppress", body, body)
+        if low_int > high_int:
+            body = f"Today's forecast has low ({low_int}°F) higher than high ({high_int}°F), data may be corrupted."
+            return ("suppress", body, body)
+    except (TypeError, ValueError):
+        body = "Today's temperature data couldn't be parsed."
+        return ("suppress", body, body)
+
     conditions = _weather_code_label(int(code))
+    place = _smart_location_label(location_label, address)
 
     # Verdict logic — conservative thresholds suitable for a "should I
-    # do my outdoor thing today" brief
+    # do my outdoor thing today" brief. Verdict drives the UI badge
+    # color, not the prose itself.
     if precip >= 0.5 or wind >= 30 or code in (95, 96, 99):
         verdict = "risk"
     elif precip >= 0.1 or wind >= 20 or code in (51, 53, 55, 61, 63, 65, 80, 81):
@@ -14379,22 +14559,52 @@ def _generate_ai_brief(location_label: str, forecast: dict) -> tuple[str, str, s
     else:
         verdict = "clear"
 
-    # Compose the brief — 2-3 sentences that read naturally
-    parts = []
-    parts.append(f"Good morning. Your {location_label} brief:")
-    parts.append(f"{conditions}, high {int(high) if high else '?'}°F, low {int(low) if low else '?'}°F.")
-    if precip >= 0.05:
-        parts.append(f"Expect {precip:.2f}\" of precipitation through the day.")
-    if wind >= 15:
-        parts.append(f"Winds gusting to {int(wind)} mph at peak.")
-    if verdict == "clear":
-        parts.append("Solid day for outdoor plans.")
-    elif verdict == "caution":
-        parts.append("Plan around the weather, but you can work today.")
-    else:
-        parts.append("Heads up: conditions are unfavorable for sensitive outdoor work.")
+    # ── Compose the brief in complete sentences ──
+    # No editorializing about what the subscriber should or shouldn't
+    # do. Just describe the weather accurately.
+    sentences = []
 
-    full_body = " ".join(parts)
+    # Opening sentence: conditions + high/low in one natural sentence
+    cond_lower = conditions.lower()
+    if cond_lower == "clear":
+        opener = f"Today in {place} will be clear, with a high of {high_int}°F and a low of {low_int}°F."
+    elif cond_lower == "mostly clear":
+        opener = f"Today in {place} will be mostly clear, with a high of {high_int}°F and a low of {low_int}°F."
+    elif cond_lower == "overcast":
+        opener = f"Today in {place} will be overcast, with a high of {high_int}°F and a low of {low_int}°F."
+    elif cond_lower == "fog":
+        opener = f"Today in {place} starts with fog, then a high of {high_int}°F and a low of {low_int}°F."
+    elif cond_lower in ("drizzle", "rain", "rain showers"):
+        opener = f"Today in {place} brings {cond_lower}, with a high of {high_int}°F and a low of {low_int}°F."
+    elif cond_lower == "freezing rain":
+        opener = f"Today in {place} brings freezing rain, with a high of {high_int}°F and a low of {low_int}°F."
+    elif cond_lower in ("snow", "snow showers"):
+        opener = f"Today in {place} brings {cond_lower}, with a high of {high_int}°F and a low of {low_int}°F."
+    elif cond_lower == "thunderstorms":
+        opener = f"Today in {place} looks unsettled, with thunderstorms expected and a high of {high_int}°F and a low of {low_int}°F."
+    else:
+        opener = f"Today in {place} will be {cond_lower}, with a high of {high_int}°F and a low of {low_int}°F."
+    sentences.append(opener)
+
+    # Precipitation detail sentence
+    precip_phrase = _format_precip_natural(precip)
+    if precip_phrase:
+        # Avoid awkward "Around about three quarters..." when the phrase
+        # already includes "about" or "around".
+        if precip_phrase.startswith("about") or precip_phrase.startswith("around"):
+            sentences.append(f"{precip_phrase.capitalize()} of precipitation is expected through the day.")
+        else:
+            sentences.append(f"Around {precip_phrase} of precipitation is expected through the day.")
+
+    # Wind detail sentence
+    if wind >= 25:
+        sentences.append(f"Winds could gust up to {int(wind)} mph at times.")
+    elif wind >= 15:
+        sentences.append(f"Winds will gust up to {int(wind)} mph at times.")
+    elif wind >= 8:
+        sentences.append(f"Winds will be light, around {int(wind)} mph.")
+
+    full_body = " ".join(sentences)
     snippet = full_body[:140]
     return (verdict, snippet, full_body)
 
@@ -14969,7 +15179,8 @@ def _process_pending_briefs() -> None:
                 # Generate the AI draft using the same generator hobbyists get
                 location_label = c["loc_label"] or c["loc_address"] or "your location"
                 forecast = _fetch_forecast(float(c["loc_lat"]), float(c["loc_lng"]))
-                ai_verdict, ai_snippet, ai_body = _generate_ai_brief(location_label, forecast or {})
+                ai_verdict, ai_snippet, ai_body = _generate_ai_brief(
+                    location_label, forecast or {}, address=c.get("loc_address") or "")
 
                 # Compute window_end_at — the scheduler shouldn't send a
                 # "morning brief" at 2pm. Use the user's window_end as the
@@ -15063,9 +15274,30 @@ def _process_pending_briefs() -> None:
                 # No draft — generate fresh AI brief (original Hobbyist flow)
                 location_label = c["loc_label"] or c["loc_address"] or "your location"
                 forecast = _fetch_forecast(float(c["loc_lat"]), float(c["loc_lng"]))
-                verdict, snippet, full_body = _generate_ai_brief(location_label, forecast or {})
+                verdict, snippet, full_body = _generate_ai_brief(
+                    location_label, forecast or {}, address=c.get("loc_address") or "")
                 is_met_touched = False
                 met_name_for_record = None
+
+            # Data quality gate (May 22, 2026): if AI brief came back with
+            # verdict='suppress', the forecast data was bad. Don't send to
+            # subscriber; instead alert the assigned primary Met (or admin
+            # if none) so a human can investigate.
+            if verdict == "suppress":
+                try:
+                    _alert_met_on_suppressed_brief(
+                        subscriber_user_id=c["user_id"],
+                        subscriber_name=c.get("name") or c.get("email") or "subscriber",
+                        location_label=location_label,
+                        reason=full_body,  # contains the suppression reason
+                    )
+                except Exception as alert_e:
+                    print(f"[brief-scheduler] alert send failed user_id={c['user_id']}: {alert_e}", flush=True)
+                print(
+                    f"[brief-scheduler] SUPPRESSED user_id={c['user_id']} tier={tier} reason={full_body!r}",
+                    flush=True,
+                )
+                continue  # Don't send to subscriber
 
             # ── Send via channels ──
             channels = [ch for ch in (c["channels"] or "").split(",") if ch]
@@ -15227,7 +15459,8 @@ def _pregenerate_pro_brief_drafts() -> None:
             # Generate the AI draft for tomorrow morning.
             location_label = c["loc_label"] or c["loc_address"] or "your location"
             forecast = _fetch_forecast(float(c["loc_lat"]), float(c["loc_lng"]))
-            ai_verdict, ai_snippet, ai_body = _generate_ai_brief(location_label, forecast or {})
+            ai_verdict, ai_snippet, ai_body = _generate_ai_brief(
+                location_label, forecast or {}, address=c.get("loc_address") or "")
 
             # Compute window_end_at — tomorrow's morning_window_end in local time.
             # We use local_now + 1 day, then set the hour to the window_end.
