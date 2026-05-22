@@ -2109,6 +2109,62 @@ def init_db() -> None:
         _seed_met_territories()
     except Exception as e:
         print(f"[met-territories] seed at init failed: {e}", flush=True)
+    # Backfill brief_preferences for migrated subscribers who don't have
+    # them yet (May 22, 2026). The original migration tool didn't create
+    # this row, so the scheduler never picked up migrated Pro/Hobbyist
+    # subscribers. Idempotent — only inserts where missing. Defaults
+    # morning_enabled=TRUE so subscribers get the standard 7:00-7:30 AM
+    # brief window.
+    try:
+        _backfill_brief_preferences()
+    except Exception as e:
+        print(f"[brief-prefs-backfill] failed: {e}", flush=True)
+
+
+def _backfill_brief_preferences() -> None:
+    """One-time backfill for subscribers missing a brief_preferences row.
+
+    Added May 22, 2026 to fix a migration tool gap: subscribers imported
+    via /api/v1/admin/import-subscriber didn't get a brief_preferences
+    row created. Without it, the daily brief scheduler skips them
+    (the SELECT requires bp.morning_enabled = TRUE).
+
+    This backfill creates a default row (morning_enabled=TRUE, 7:00-7:30,
+    sms+email channels) for every subscriber who doesn't already have one.
+    Runs on every deploy but only does work on subscribers without prefs.
+
+    The migration tool itself is also updated to create this row going
+    forward so new imports don't hit the same problem.
+    """
+    inserted = 0
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                now_ms = int(time.time() * 1000)
+                cur.execute(
+                    """INSERT INTO brief_preferences
+                         (user_id, morning_enabled, morning_window_start,
+                          morning_window_end, evening_enabled,
+                          quiet_start, quiet_end, channels, updated_at)
+                       SELECT u.id, TRUE, '07:00', '07:30', FALSE,
+                              '21:00', '05:00', 'sms,email', %s
+                       FROM users u
+                       WHERE EXISTS (
+                         SELECT 1 FROM user_roles ur
+                         WHERE ur.user_id = u.id AND ur.role = 'subscriber'
+                       )
+                       AND NOT EXISTS (
+                         SELECT 1 FROM brief_preferences bp
+                         WHERE bp.user_id = u.id
+                       )
+                       RETURNING user_id""",
+                    (now_ms,),
+                )
+                inserted = len(cur.fetchall())
+        if inserted > 0:
+            print(f"[brief-prefs-backfill] created {inserted} preference rows", flush=True)
+    except Exception as e:
+        print(f"[brief-prefs-backfill] insert failed: {e!r}", flush=True)
 
 
 def _seed_met_territories() -> None:
@@ -25217,6 +25273,36 @@ def admin_import_subscriber():
     except Exception as e:
         warnings.append(f"coverage-set-failed: {e}")
         print(f"[migration] coverage set failed user_id={user_id}: {e!r}", flush=True)
+
+    # ── Set brief_preferences so the scheduler picks them up ──────
+    # Added May 22, 2026: without this row, _process_pending_briefs's
+    # SELECT excludes the subscriber (bp.morning_enabled = TRUE filter).
+    # Defaults to enabled with the 7:00-7:30 standard window. Channels
+    # default to sms+email; subscriber can adjust in their portal.
+    try:
+        # Convert subscriber's brief_time (HH:MM) to a +30-min window.
+        bh, bm = int(brief_time[:2]), int(brief_time[3:])
+        end_minutes = (bh * 60 + bm + 30) % (24 * 60)
+        morning_end = f"{end_minutes // 60:02d}:{end_minutes % 60:02d}"
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO brief_preferences
+                         (user_id, morning_enabled, morning_window_start,
+                          morning_window_end, evening_enabled,
+                          quiet_start, quiet_end, channels, updated_at)
+                       VALUES (%s, TRUE, %s, %s, FALSE,
+                               '21:00', '05:00', 'sms,email', %s)
+                       ON CONFLICT (user_id) DO UPDATE
+                       SET morning_enabled = TRUE,
+                           morning_window_start = EXCLUDED.morning_window_start,
+                           morning_window_end = EXCLUDED.morning_window_end,
+                           updated_at = EXCLUDED.updated_at""",
+                    (user_id, brief_time, morning_end, now_ms),
+                )
+    except Exception as e:
+        warnings.append(f"brief-prefs-set-failed: {e}")
+        print(f"[migration] brief_prefs set failed user_id={user_id}: {e!r}", flush=True)
 
     # ── Modify Stripe subscription ────────────────────────────────
     stripe_modified = False
