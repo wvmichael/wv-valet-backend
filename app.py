@@ -24593,14 +24593,21 @@ def _compute_payroll_for_month(year: int, month: int) -> dict:
 
     # Pull all subscribers WITH their daily_commission_cents (the
     # critical change). Also include timezone and tier so we know
-    # which brief table to look at.
+    # which brief table to look at. Also include morning_window_start
+    # so we can apply the time-of-send pay rule (May 22, 2026):
+    # a Pro brief sent between 5:00 AM and the subscriber's morning
+    # delivery time, in the subscriber's local timezone, counts as
+    # the paid morning brief. Outside that window, the send doesn't
+    # earn commission (it's an ad-hoc update).
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT u.id AS user_id, u.subscription_tier,
                           COALESCE(u.timezone, 'America/Indiana/Indianapolis') AS timezone,
-                          COALESCE(u.daily_commission_cents, 0) AS daily_commission_cents
+                          COALESCE(u.daily_commission_cents, 0) AS daily_commission_cents,
+                          COALESCE(bp.morning_window_start, '07:00') AS morning_window_start
                    FROM users u
+                   LEFT JOIN brief_preferences bp ON bp.user_id = u.id
                    WHERE u.subscription_tier IS NOT NULL
                      AND u.subscription_tier != ''
                      AND u.is_active = TRUE
@@ -24641,14 +24648,18 @@ def _compute_payroll_for_month(year: int, month: int) -> dict:
                 ORDER BY sent_at_ms ASC
             """
         else:
-            # Pro tiers use pro_brief_drafts. Only morning briefs count
-            # toward pay; ad-hoc 'update' rows are excluded.
-            # (Filter added May 22, 2026.)
+            # Pro tiers use pro_brief_drafts. Pay rule (May 22, 2026):
+            # any brief sent between 5:00 AM and the subscriber's
+            # morning_window_start (delivery time) in the subscriber's
+            # local timezone counts as the paid morning brief. First
+            # such brief per day wins; subsequent same-day sends don't
+            # add pay. Outside that window, the send is treated as an
+            # ad-hoc update and doesn't earn commission.
+            # We fetch ALL sends here, then filter by time-of-day below.
             brief_table_query = """
                 SELECT sent_at, sent_by_user_id
                 FROM pro_brief_drafts
                 WHERE user_id = %s
-                  AND brief_type = 'morning'
                   AND status = 'sent'
                   AND sent_at IS NOT NULL
                   AND sent_at >= %s AND sent_at < %s
@@ -24662,7 +24673,17 @@ def _compute_payroll_for_month(year: int, month: int) -> dict:
                             (sub["user_id"], period_start_ms, period_end_ms))
                 brief_rows = cur.fetchall()
 
-        # Bucket briefs by local date (one Met credit per day max)
+        # Parse the subscriber's morning_window_start (their delivery time).
+        # Used as the end-of-pay-window for Pro briefs.
+        try:
+            wh, wm = int(sub["morning_window_start"][:2]), int(sub["morning_window_start"][3:])
+            window_end_minutes = wh * 60 + wm
+        except (ValueError, TypeError, IndexError):
+            window_end_minutes = 7 * 60  # default 7:00 AM
+
+        # Bucket briefs by local date (one Met credit per day max).
+        # For Pro briefs, we apply the time-of-send filter: only count
+        # the FIRST send each day that falls in [5:00 AM, delivery_time].
         briefs_by_local_date = {}
         try:
             sub_zone = ZoneInfo(user_tz)
@@ -24671,6 +24692,11 @@ def _compute_payroll_for_month(year: int, month: int) -> dict:
         for b in brief_rows:
             sent_dt = datetime.fromtimestamp(b["sent_at"] / 1000, tz=timezone.utc).astimezone(sub_zone)
             local_date = sent_dt.date()
+            if tier != "hobbyist":
+                # Apply Pro pay window (May 22, 2026)
+                sent_minutes = sent_dt.hour * 60 + sent_dt.minute
+                if sent_minutes < 5 * 60 or sent_minutes > window_end_minutes:
+                    continue  # outside pay window, doesn't count
             if local_date not in briefs_by_local_date:
                 briefs_by_local_date[local_date] = b["sent_by_user_id"]
 
