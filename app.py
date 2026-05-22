@@ -18161,55 +18161,176 @@ def _met_pro_briefs_preflight():
     return ("", 204)
 
 
-@app.get("/api/v1/met/pro-briefs")
-def met_pro_briefs_list():
-    """List pending + recently-sent pro brief drafts for the Met workspace.
+def _can_met_see_pro_brief(met_user_id: int, draft_id: int, is_admin: bool) -> bool:
+    """Decides whether a Met may view/claim/edit a specific Pro brief draft.
 
-    Met sees all drafts (single-Met operation for launch). Admin sees same.
+    Used by the list, claim, edit, and send endpoints to enforce the
+    subscriber-territory coverage visibility rules added May 22, 2026:
+      - Admins: always TRUE
+      - Mets: TRUE if they're the subscriber's primary Met OR they have a
+        non-drop shift assignment today in the primary Met's territory.
 
-    Returns drafts with subscriber email/name attached for context,
-    sorted: pending-review first (oldest first to fight the queue),
-    then claimed (by anyone), then recently sent.
+    Returns False if the draft doesn't exist; callers should treat
+    "no permission" and "not found" the same way to avoid leaking
+    existence (return 404 either way).
     """
-    user = _get_current_user()
-    if user is None:
-        return jsonify({"ok": False, "error": "not-authenticated"}), 401
-    if "met" not in (user.get("roles") or []) and "admin" not in (user.get("roles") or []):
-        return jsonify({"ok": False, "error": "forbidden"}), 403
+    if is_admin:
+        # Verify the draft exists even for admins so we return 404 cleanly
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM pro_brief_drafts WHERE id = %s", (draft_id,))
+                return cur.fetchone() is not None
+
+    ET = ZoneInfo("America/New_York")
+    today_et = datetime.now(ET).date().isoformat()
 
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """SELECT d.*,
-                          u.email AS subscriber_email, u.name AS subscriber_name,
-                          u.phone AS subscriber_phone,
-                          sc.business_role,
-                          sc.weather_decisions,
-                          sc.peak_need_times,
-                          sc.additional_context
+                """SELECT 1
                    FROM pro_brief_drafts d
-                   JOIN users u ON u.id = d.user_id
-                   LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
-                   WHERE d.status IN ('pending-review', 'claimed')
-                      OR (d.status = 'sent' AND d.sent_at >= %s)
-                   ORDER BY
-                     CASE d.status
-                       WHEN 'pending-review' THEN 0
-                       WHEN 'claimed' THEN 1
-                       ELSE 2
-                     END,
-                     -- Within pending/claimed: earliest delivery time first
-                     -- so Mets work the queue in subscriber-delivery order.
-                     -- NULLS LAST keeps any drafts missing the snapshot
-                     -- at the bottom rather than at the top.
-                     d.delivery_time_local ASC NULLS LAST,
-                     d.created_at ASC""",
-                (int(time.time() * 1000) - 24 * 60 * 60 * 1000,),  # show today's sent for 24h
+                   LEFT JOIN subscriber_coverage sc ON sc.user_id = d.user_id
+                   WHERE d.id = %s
+                     AND (
+                       sc.primary_met_id = %s
+                       OR EXISTS (
+                         SELECT 1
+                         FROM met_territories t
+                         JOIN shift_assignments sa
+                           ON sa.territory_id = t.id
+                         WHERE t.met_user_id = sc.primary_met_id
+                           AND sa.met_user_id = %s
+                           AND sa.is_drop = FALSE
+                           AND sa.shift_date = %s
+                       )
+                     )
+                   LIMIT 1""",
+                (draft_id, met_user_id, met_user_id, today_et),
             )
+            return cur.fetchone() is not None
+
+
+@app.get("/api/v1/met/pro-briefs")
+def met_pro_briefs_list():
+    """List pending + recently-sent pro brief drafts visible to this Met.
+
+    Visibility rules (May 22, 2026 — subscriber territory coverage):
+      - Admins: see all drafts
+      - A Met sees a draft if EITHER:
+        (a) They are the subscriber's primary Met (via subscriber_coverage),
+        (b) They have claimed at least one shift_assignment row TODAY in
+            the primary Met's territory (i.e., they are covering today).
+        Coverage scope is by-day, not by-shift-hour — claiming any shift
+        for the day grants full-day visibility into the territory's
+        subscribers.
+
+      Met Reviews ($19 reviews) are NOT subject to this filter; they have
+      their own national queue and admin oversight.
+
+    Returns drafts with subscriber email/name + primary Met context
+    so the UI can show "Covering for [primary Met]" badges.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    is_admin = "admin" in roles
+    me_id = user["id"]
+
+    # Today's date in Eastern Time (where the business is). Used for the
+    # coverage-shift visibility check. We use ET as a reasonable single
+    # reference for "is this Met covering today"; per-subscriber-timezone
+    # nuance would complicate the query for marginal benefit.
+    ET = ZoneInfo("America/New_York")
+    today_et = datetime.now(ET).date().isoformat()
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            if is_admin:
+                # Admins see all drafts. The visibility CTE collapses to all-true.
+                cur.execute(
+                    """SELECT d.*,
+                              u.email AS subscriber_email, u.name AS subscriber_name,
+                              u.phone AS subscriber_phone,
+                              sc.business_role, sc.weather_decisions,
+                              sc.peak_need_times, sc.additional_context,
+                              sc.primary_met_id,
+                              pm.name AS primary_met_name
+                       FROM pro_brief_drafts d
+                       JOIN users u ON u.id = d.user_id
+                       LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
+                       LEFT JOIN users pm ON pm.id = sc.primary_met_id
+                       WHERE d.status IN ('pending-review', 'claimed')
+                          OR (d.status = 'sent' AND d.sent_at >= %s)
+                       ORDER BY
+                         CASE d.status
+                           WHEN 'pending-review' THEN 0
+                           WHEN 'claimed' THEN 1
+                           ELSE 2
+                         END,
+                         d.delivery_time_local ASC NULLS LAST,
+                         d.created_at ASC""",
+                    (int(time.time() * 1000) - 24 * 60 * 60 * 1000,),
+                )
+            else:
+                # Mets see only drafts where they're the primary OR covering today.
+                # The "covering today" check: this Met has any shift_assignment
+                # row for today in the subscriber's primary Met's territory.
+                # We exclude is_drop rows (those represent the primary explicitly
+                # NOT covering; they don't grant coverage to anyone).
+                cur.execute(
+                    """SELECT d.*,
+                              u.email AS subscriber_email, u.name AS subscriber_name,
+                              u.phone AS subscriber_phone,
+                              sc.business_role, sc.weather_decisions,
+                              sc.peak_need_times, sc.additional_context,
+                              sc.primary_met_id,
+                              pm.name AS primary_met_name
+                       FROM pro_brief_drafts d
+                       JOIN users u ON u.id = d.user_id
+                       LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
+                       LEFT JOIN users pm ON pm.id = sc.primary_met_id
+                       WHERE (d.status IN ('pending-review', 'claimed')
+                              OR (d.status = 'sent' AND d.sent_at >= %s))
+                         AND (
+                           -- (a) I am the primary Met for this subscriber
+                           sc.primary_met_id = %s
+                           -- (b) I'm covering today: I have a non-drop shift
+                           --     assignment in the primary Met's territory
+                           OR EXISTS (
+                             SELECT 1
+                             FROM met_territories t
+                             JOIN shift_assignments sa
+                               ON sa.territory_id = t.id
+                             WHERE t.met_user_id = sc.primary_met_id
+                               AND sa.met_user_id = %s
+                               AND sa.is_drop = FALSE
+                               AND sa.shift_date = %s
+                           )
+                         )
+                       ORDER BY
+                         CASE d.status
+                           WHEN 'pending-review' THEN 0
+                           WHEN 'claimed' THEN 1
+                           ELSE 2
+                         END,
+                         d.delivery_time_local ASC NULLS LAST,
+                         d.created_at ASC""",
+                    (
+                        int(time.time() * 1000) - 24 * 60 * 60 * 1000,
+                        me_id, me_id, today_et,
+                    ),
+                )
             rows = cur.fetchall()
 
-    drafts = [
-        {
+    drafts = []
+    for r in rows:
+        primary_met_id = r.get("primary_met_id")
+        is_covering = (not is_admin) and primary_met_id is not None and primary_met_id != me_id
+        drafts.append({
             "id": r["id"],
             "user_id": r["user_id"],
             "subscriber_email": r["subscriber_email"],
@@ -18244,9 +18365,14 @@ def met_pro_briefs_list():
             "sent_at": r["sent_at"],
             "sent_by_name": r["sent_by_name"],
             "final_verdict": r["final_verdict"],
-        }
-        for r in rows
-    ]
+            # Territory-coverage context (May 22, 2026):
+            # primary_met_name lets the UI show "Covering for Chris Sramek".
+            # is_covering is true if THIS Met is seeing the draft via
+            # coverage rather than primary assignment.
+            "primary_met_id": primary_met_id,
+            "primary_met_name": r.get("primary_met_name") or "",
+            "is_covering": is_covering,
+        })
     return jsonify({"ok": True, "drafts": drafts})
 
 
@@ -18259,12 +18385,21 @@ def _met_pro_brief_id_preflight(draft_id):
 def met_pro_brief_claim(draft_id):
     """Claim a draft for editing. Sets claimed_at + claimed_by_user_id.
     Idempotent if already claimed by current Met.
+
+    Visibility-gated (May 22, 2026): a Met can only claim drafts they
+    can see per the subscriber-territory coverage rules. Returns 404
+    (not 403) for invisible drafts to avoid leaking existence.
     """
     user = _get_current_user()
     if user is None:
         return jsonify({"ok": False, "error": "not-authenticated"}), 401
-    if "met" not in (user.get("roles") or []) and "admin" not in (user.get("roles") or []):
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
         return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    is_admin = "admin" in roles
+    if not _can_met_see_pro_brief(user["id"], draft_id, is_admin):
+        return jsonify({"ok": False, "error": "not-found"}), 404
 
     with db() as conn:
         with conn.cursor() as cur:
@@ -18293,12 +18428,18 @@ def met_pro_brief_claim(draft_id):
 
 @app.patch("/api/v1/met/pro-briefs/<int:draft_id>")
 def met_pro_brief_update(draft_id):
-    """Edit met_verdict / met_snippet / met_body / met_notes. Does NOT send."""
+    """Edit met_verdict / met_snippet / met_body / met_notes. Does NOT send.
+
+    Visibility-gated (May 22, 2026) — covering Met must have access.
+    """
     user = _get_current_user()
     if user is None:
         return jsonify({"ok": False, "error": "not-authenticated"}), 401
-    if "met" not in (user.get("roles") or []) and "admin" not in (user.get("roles") or []):
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
         return jsonify({"ok": False, "error": "forbidden"}), 403
+    if not _can_met_see_pro_brief(user["id"], draft_id, "admin" in roles):
+        return jsonify({"ok": False, "error": "not-found"}), 404
 
     data = request.get_json(silent=True) or {}
     set_clauses = []
@@ -18395,8 +18536,12 @@ def met_pro_brief_send(draft_id):
     user = _get_current_user()
     if user is None:
         return jsonify({"ok": False, "error": "not-authenticated"}), 401
-    if "met" not in (user.get("roles") or []) and "admin" not in (user.get("roles") or []):
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
         return jsonify({"ok": False, "error": "forbidden"}), 403
+    # Visibility-gated (May 22, 2026): covering Met must have access to send
+    if not _can_met_see_pro_brief(user["id"], draft_id, "admin" in roles):
+        return jsonify({"ok": False, "error": "not-found"}), 404
 
     with db() as conn:
         with conn.cursor() as cur:
