@@ -14722,13 +14722,54 @@ def _send_welcome_email_with_temp_password(email: str, name: str,
         return False
 
 
-def _send_brief_email(email: str, subject: str, body_text: str, html: bool = False) -> bool:
+def _get_subscriber_reply_to_email(subscriber_user_id: int) -> Optional[str]:
+    """Look up the email address subscriber replies should route to.
+
+    Added May 22, 2026 to fix the noreply@ vs "Reply to this email" UX
+    contradiction. Subscribers should reply to a real human, not to a
+    no-reply address.
+
+    Resolution order:
+      1. Subscriber's assigned primary Met (subscriber_coverage.primary_met_id)
+      2. None if no primary Met assigned — caller should omit reply_to entirely
+         (which means noreply@ is used and subscribers can't reply usefully;
+         we'd rather drop the broken promise than promise wrong)
+
+    Returns the Met's email from users.email — uses whatever's on file
+    (work email if configured, else personal — admin's call).
+    """
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT u.email
+                       FROM subscriber_coverage sc
+                       JOIN users u ON u.id = sc.primary_met_id
+                       WHERE sc.user_id = %s AND u.is_active = TRUE""",
+                    (subscriber_user_id,),
+                )
+                row = cur.fetchone()
+                if row and row.get("email"):
+                    return row["email"]
+    except Exception as e:
+        print(f"[reply-to-lookup] failed for subscriber {subscriber_user_id}: {e}", flush=True)
+    return None
+
+
+def _send_brief_email(email: str, subject: str, body_text: str,
+                      html: bool = False, reply_to: Optional[str] = None) -> bool:
     """Send a daily brief via Resend. Mirrors _send_magic_link_email but
     for plain text brief content. Stub mode (no API key) logs to console.
 
     If html=True, body_text is treated as a complete HTML email body that
     should be sent as-is (rather than wrapped in the default shell). Used
     for the structured Pro Brief format which builds its own HTML.
+
+    reply_to (added May 22, 2026): when set, the Resend payload includes
+    a reply_to field so subscriber replies land in this address instead
+    of the noreply@ sender. Used to route subscriber replies to the
+    assigned Met's inbox. If None, no reply_to is set and Resend uses
+    sender default (noreply@) which subscribers shouldn't reply to.
     """
     api_key = os.environ.get("RESEND_API_KEY", "").strip()
     from_addr = os.environ.get("EMAIL_FROM", "").strip()
@@ -14744,13 +14785,16 @@ def _send_brief_email(email: str, subject: str, body_text: str, html: bool = Fal
         # Naive HTML-to-text for the plain part — strip tags, collapse whitespace
         plain_text = re.sub(r'<[^>]+>', '', body_text)
         plain_text = re.sub(r'\s+', ' ', plain_text).strip()
-        payload = json.dumps({
+        payload_dict = {
             "from": from_addr,
             "to": [email],
             "subject": subject,
             "html": html_body,
             "text": plain_text[:5000],
-        }).encode("utf-8")
+        }
+        if reply_to:
+            payload_dict["reply_to"] = reply_to
+        payload = json.dumps(payload_dict).encode("utf-8")
     else:
         # Build a nicely-structured HTML body inside the shared email shell.
         # The brief text typically has paragraphs separated by blank lines —
@@ -14783,13 +14827,16 @@ def _send_brief_email(email: str, subject: str, body_text: str, html: bool = Fal
         preheader_text = body_text.replace('\n', ' ').strip()[:90]
         html_body = _email_shell(html_body_inner, preheader=preheader_text)
 
-        payload = json.dumps({
+        payload_dict = {
             "from": from_addr,
             "to": [email],
             "subject": subject,
             "html": html_body,
             "text": body_text,
-        }).encode("utf-8")
+        }
+        if reply_to:
+            payload_dict["reply_to"] = reply_to
+        payload = json.dumps(payload_dict).encode("utf-8")
 
     req = urllib.request.Request(
         "https://api.resend.com/emails",
@@ -15402,8 +15449,15 @@ def _process_pending_briefs_inner() -> None:
                         channels_used.append("sms")
                         any_success = True
                 elif ch == "email" and c["email"]:
-                    subject = f"Your WeatherValet brief, {location_label}"
-                    ok = _send_brief_email(c["email"], subject, full_body)
+                    # Phase 3 (May 22, 2026): smart subject + reply-to-Met.
+                    # Subject uses city/state when label is generic ("Home" etc.).
+                    # reply_to routes subscriber replies to their assigned Met.
+                    smart_label = _smart_location_label(
+                        c.get("loc_label") or "",
+                        c.get("loc_address") or "")
+                    subject = f"Your WeatherValet brief, {smart_label}"
+                    reply_to = _get_subscriber_reply_to_email(c["user_id"])
+                    ok = _send_brief_email(c["email"], subject, full_body, reply_to=reply_to)
                     if ok:
                         channels_used.append("email")
                         any_success = True
@@ -19691,9 +19745,12 @@ def met_pro_brief_send(draft_id):
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT d.*, u.email AS sub_email, u.phone AS sub_phone,
-                          u.name AS sub_name
+                          u.name AS sub_name,
+                          loc.address_text AS location_address
                    FROM pro_brief_drafts d
                    JOIN users u ON u.id = d.user_id
+                   LEFT JOIN saved_locations loc
+                        ON loc.user_id = u.id AND loc.is_primary = TRUE
                    WHERE d.id = %s""",
                 (draft_id,),
             )
@@ -19821,7 +19878,12 @@ def met_pro_brief_send(draft_id):
             except Exception as e:
                 print(f"[pro-brief-send] SMS failed user={row['user_id']}: {e}", flush=True)
         elif ch == "email" and row["sub_email"]:
-            subject = f"Your WeatherValet brief, {location_label}"
+            # Phase 3 (May 22, 2026): smart subject + reply-to-Met.
+            smart_label = _smart_location_label(
+                row.get("location_label") or "",
+                row.get("location_address") or "")
+            subject = f"Your WeatherValet brief, {smart_label}"
+            reply_to = _get_subscriber_reply_to_email(row["user_id"])
             try:
                 # Build rich HTML email for structured briefs
                 if is_structured:
@@ -19833,16 +19895,16 @@ def met_pro_brief_send(draft_id):
                         whats_ahead=whats_ahead,
                         image_url=image_url,
                         met_name=met_name,
-                        location_label=location_label,
+                        location_label=smart_label,
                         subscriber_name=row.get("sub_name") or "",
                         web_url=web_url,
                     )
-                    if _send_brief_email(row["sub_email"], subject, html_body, html=True):
+                    if _send_brief_email(row["sub_email"], subject, html_body, html=True, reply_to=reply_to):
                         channels_used.append("email")
                         any_success = True
                 else:
                     # Legacy plain-text email
-                    if _send_brief_email(row["sub_email"], subject, full_body):
+                    if _send_brief_email(row["sub_email"], subject, full_body, reply_to=reply_to):
                         channels_used.append("email")
                         any_success = True
             except Exception as e:
@@ -20001,7 +20063,8 @@ def met_pro_brief_send(draft_id):
                                   u.subscription_tier,
                                   bp.channels,
                                   sc.primary_met_id,
-                                  loc.label AS loc_label
+                                  loc.label AS loc_label,
+                                  loc.address_text AS loc_address
                            FROM users u
                            LEFT JOIN brief_preferences bp ON bp.user_id = u.id
                            LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
@@ -20111,7 +20174,12 @@ def met_pro_brief_send(draft_id):
                     except Exception as e:
                         print(f"[pro-brief-send] multi SMS failed user={extra_user_id}: {e}", flush=True)
                 elif ch == "email" and sub.get("email"):
-                    extra_subject = f"Your WeatherValet brief, {sub_loc_label}"
+                    # Phase 3 (May 22, 2026): smart subject + reply-to-Met.
+                    sub_smart_label = _smart_location_label(
+                        sub.get("loc_label") or "",
+                        sub.get("loc_address") or "")
+                    extra_subject = f"Your WeatherValet brief, {sub_smart_label}"
+                    extra_reply_to = _get_subscriber_reply_to_email(extra_user_id)
                     try:
                         if is_structured:
                             extra_html = _render_pro_brief_email_html(
@@ -20122,15 +20190,15 @@ def met_pro_brief_send(draft_id):
                                 whats_ahead=whats_ahead,
                                 image_url=image_url,
                                 met_name=met_name,
-                                location_label=sub_loc_label,
+                                location_label=sub_smart_label,
                                 subscriber_name=sub.get("name") or "",
                                 web_url=extra_web_url,
                             )
-                            if _send_brief_email(sub["email"], extra_subject, extra_html, html=True):
+                            if _send_brief_email(sub["email"], extra_subject, extra_html, html=True, reply_to=extra_reply_to):
                                 extra_channels_used.append("email")
                                 extra_any_success = True
                         else:
-                            if _send_brief_email(sub["email"], extra_subject, full_body):
+                            if _send_brief_email(sub["email"], extra_subject, full_body, reply_to=extra_reply_to):
                                 extra_channels_used.append("email")
                                 extra_any_success = True
                     except Exception as e:
@@ -20189,6 +20257,12 @@ def met_pro_brief_send(draft_id):
                 f"channels={extra_channels_used} status={extra_delivery_status}",
                 flush=True,
             )
+
+            # Phase 3 (May 22, 2026): rate-limit pacing for Resend.
+            # Pause briefly between sends if email actually went out, to
+            # stay under Resend's 10/sec limit on large multi-sends.
+            if "email" in extra_channels_used:
+                time.sleep(0.11)
 
         except Exception as e:
             print(f"[pro-brief-send] multi-send failed user={extra_user_id}: {e}", flush=True)
@@ -20318,9 +20392,14 @@ def met_pro_brief_compose_update():
         channels = [c for c in (sub["channels"] or "sms,email").split(",") if c]
 
     # Send via channels. Subject: "Weather Update — [location]"
+    # Phase 3 (May 22, 2026): smart subject + reply-to-Met.
+    smart_label = _smart_location_label(
+        sub.get("loc_label") or "",
+        sub.get("loc_address") or "")
     channels_used = []
     any_success = False
-    update_subject = f"Weather Update — {location_label}"
+    update_subject = f"Weather Update — {smart_label}"
+    update_reply_to = _get_subscriber_reply_to_email(target_user_id)
     for ch in channels:
         if ch == "sms" and sub["phone"]:
             sms_text = "WeatherValet Update: " + (snippet or body_text[:140])
@@ -20337,7 +20416,7 @@ def met_pro_brief_compose_update():
                 f"<p>{email_body_html}</p>"
                 f"<p style='color:#666;font-size:12px;'>Sent by your meteorologist via WeatherValet.</p>"
             )
-            ok = _send_brief_email(sub["email"], update_subject, email_body_full)
+            ok = _send_brief_email(sub["email"], update_subject, email_body_full, reply_to=update_reply_to)
             if ok:
                 channels_used.append("email")
                 any_success = True
@@ -20603,7 +20682,11 @@ def nws_page_confirm(response_token: str):
                 print(f"[nws-confirm] SMS failed user={s['id']}: {e}", flush=True)
         if s.get("email"):
             try:
-                if _send_brief_email(s["email"], email_subject, email_body):
+                # Phase 3 (May 22, 2026): reply-to goes to the Met who
+                # sent this NWS confirmation. Falls back gracefully if
+                # the Met isn't signed in (no actor) → noreply default.
+                nws_reply_to = actor.get("email") if actor else None
+                if _send_brief_email(s["email"], email_subject, email_body, reply_to=nws_reply_to):
                     any_channel = True
             except Exception as e:
                 print(f"[nws-confirm] email failed user={s['id']}: {e}", flush=True)
@@ -21270,7 +21353,11 @@ def met_thread_send(thread_id):
             # Use _send_brief_email with html=True; it sends html_body as-is.
             # Text fallback is stripped from the HTML, which is fine for
             # this format (it'll roughly match the structure we built).
-            _send_brief_email(sub_email, email_subject, html_body, html=True)
+            # Phase 3 (May 22, 2026): reply-to goes to the Met who's
+            # messaging the subscriber, so subscriber replies in email
+            # land in the Met's inbox.
+            thread_reply_to = user.get("email") if user else None
+            _send_brief_email(sub_email, email_subject, html_body, html=True, reply_to=thread_reply_to)
     except Exception as e:
         print(f"[pro-thread] subscriber notify failed: {e}", flush=True)
 
@@ -25976,8 +26063,30 @@ def _publish_daily_brief_internal(content: dict, audience: dict | None,
             email_body_parts.append(f"\n- {published_by_name}, WeatherValet meteorologist")
         email_body = "\n\n".join(email_body_parts)
 
+        # Phase 3 (May 22, 2026): look up the publishing Met's email
+        # ONCE so we can route subscriber replies back to them. Doing
+        # this outside the per-recipient loop avoids 1 query per send.
+        publish_reply_to = None
+        if published_by_user_id:
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT email FROM users WHERE id = %s AND is_active = TRUE",
+                            (published_by_user_id,),
+                        )
+                        prow = cur.fetchone()
+                        if prow and prow.get("email"):
+                            publish_reply_to = prow["email"]
+            except Exception as e:
+                print(f"[daily-brief-fire] reply-to lookup failed: {e}", flush=True)
+
         delivered_count = 0
         failed_count = 0
+        # Phase 3 (May 22, 2026): small per-recipient delay to avoid
+        # Resend rate limit 429s on large fan-outs. Resend's default
+        # limit is 10 emails/sec; 110ms keeps us safely under.
+        # (Only relevant for the loop's email path; SMS goes via Twilio.)
         for r in recipients:
             try:
                 # Default to SMS + email if no preferences set
@@ -25997,10 +26106,16 @@ def _publish_daily_brief_internal(content: dict, audience: dict | None,
                             print(f"[daily-brief-fire] SMS failed user_id={r['id']}: {e}", flush=True)
                     elif ch == "email" and r.get("email"):
                         try:
-                            ok = _send_brief_email(r["email"], email_subject, email_body)
+                            ok = _send_brief_email(r["email"], email_subject, email_body,
+                                                    reply_to=publish_reply_to)
                             if ok:
                                 channels_used.append("email")
                                 any_success = True
+                            # Small delay to keep us under Resend's 10/sec limit.
+                            # Only delay if email actually sent; failures are usually
+                            # fast and don't count against the bucket.
+                            if ok:
+                                time.sleep(0.11)
                         except Exception as e:
                             print(f"[daily-brief-fire] email failed user_id={r['id']}: {e}", flush=True)
 
