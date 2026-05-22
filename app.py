@@ -1234,6 +1234,18 @@ CREATE TABLE IF NOT EXISTS brief_preferences (
     updated_at           BIGINT NOT NULL
 );
 
+-- ── Onboarding tracking (May 22, 2026) ──
+-- user_configured_at: NULL means brief_preferences is the system default
+-- (likely set by our backfill or signup boilerplate). NOT NULL means the
+-- subscriber explicitly saved settings via the portal. Used by the admin
+-- onboarding column to surface subscribers who haven't engaged.
+ALTER TABLE brief_preferences ADD COLUMN IF NOT EXISTS user_configured_at BIGINT;
+
+-- welcome_sent_at: timestamp of the most recent welcome email send. Used by
+-- the admin onboarding column to surface subscribers who never got the
+-- welcome (or whose send bounced). NULL means no welcome ever sent.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS welcome_sent_at BIGINT;
+
 -- ── Subscriber portal: threshold alerts (Phase 10) ──
 -- Custom alert rules a subscriber sets up. e.g. "tell me when wind
 -- exceeds 25 mph at my saved location." Each alert is independent.
@@ -2119,6 +2131,52 @@ def init_db() -> None:
         _backfill_brief_preferences()
     except Exception as e:
         print(f"[brief-prefs-backfill] failed: {e}", flush=True)
+    # Backfill welcome_sent_at for migrated subscribers (May 22, 2026).
+    # All 10 migrated subscribers received welcome emails as part of
+    # the migration tool's flow. Mark them as sent so the new admin
+    # onboarding column doesn't flag them as "never sent". Idempotent —
+    # only sets the column where it's currently NULL.
+    try:
+        _backfill_welcome_sent_at()
+    except Exception as e:
+        print(f"[welcome-backfill] failed: {e}", flush=True)
+
+
+def _backfill_welcome_sent_at() -> None:
+    """One-time backfill: set users.welcome_sent_at for subscribers whose
+    welcome email was already sent (proxy: they have migrated_at set, or
+    they have a password_must_change=FALSE flag indicating they already
+    logged in).
+
+    For each match, sets welcome_sent_at to migrated_at if available
+    (the migration sent the welcome immediately), or to now if not.
+
+    Idempotent: only updates where welcome_sent_at IS NULL. Safe to run
+    every deploy.
+    """
+    updated = 0
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                now_ms = int(time.time() * 1000)
+                cur.execute(
+                    """UPDATE users
+                       SET welcome_sent_at = COALESCE(migrated_at, %s)
+                       WHERE welcome_sent_at IS NULL
+                         AND (migrated_at IS NOT NULL
+                              OR password_must_change = FALSE)
+                         AND EXISTS (
+                           SELECT 1 FROM user_roles ur
+                           WHERE ur.user_id = users.id AND ur.role = 'subscriber'
+                         )
+                       RETURNING id""",
+                    (now_ms,),
+                )
+                updated = len(cur.fetchall())
+        if updated > 0:
+            print(f"[welcome-backfill] marked {updated} subscribers as welcome-sent", flush=True)
+    except Exception as e:
+        print(f"[welcome-backfill] update failed: {e!r}", flush=True)
 
 
 def _backfill_brief_preferences() -> None:
@@ -9032,6 +9090,9 @@ def _serialize_user_for_admin(row):
         "primary_met_name": row.get("primary_met_name") or "",
         "last_login": last_login_str,
         "is_active": bool(row.get("is_active", True)),
+        # Onboarding (May 22, 2026) — let admin UI show ✓/✗ per subscriber
+        "welcome_sent_at": row.get("welcome_sent_at"),
+        "user_configured_at": row.get("user_configured_at"),
     }
 
 
@@ -9039,12 +9100,20 @@ def _serialize_user_for_admin(row):
 @require_role("admin")
 def admin_list_users():
     """List all users with their roles. Returns active and inactive both;
-    the frontend handles visual grey-out for inactive ones."""
+    the frontend handles visual grey-out for inactive ones.
+
+    Phase 3 (May 22, 2026): includes onboarding status for subscribers:
+      - welcome_sent_at: when their welcome email was last sent (NULL = never)
+      - user_configured_at: when they last saved notification settings
+        (NULL = still on defaults from backfill / signup)
+    """
     with db() as conn:
         cur = conn.cursor()
         cur.execute("""
             SELECT u.id, u.email, u.name, u.phone, u.created_at, u.last_login_at, u.is_active,
                    u.subscription_tier,
+                   u.welcome_sent_at,
+                   bp.user_configured_at,
                    sc.primary_met_id,
                    met_user.name AS primary_met_name,
                    ARRAY_REMOVE(ARRAY_AGG(DISTINCT ur.role ORDER BY ur.role), NULL) AS roles
@@ -9052,13 +9121,96 @@ def admin_list_users():
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
             LEFT JOIN users met_user ON met_user.id = sc.primary_met_id
-            GROUP BY u.id, sc.primary_met_id, met_user.name
+            LEFT JOIN brief_preferences bp ON bp.user_id = u.id
+            GROUP BY u.id, sc.primary_met_id, met_user.name, bp.user_configured_at
             ORDER BY u.is_active DESC, u.created_at DESC
         """)
         rows = cur.fetchall()
 
     members = [_serialize_user_for_admin(row) for row in rows]
     return jsonify({"ok": True, "members": members})
+
+
+@app.route("/api/v1/admin/users/<int:user_id>/nudge", methods=["OPTIONS"])
+def _admin_nudge_preflight(user_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/users/<int:user_id>/nudge")
+@require_role("admin")
+def admin_nudge_user(user_id):
+    """Send a reminder email to a subscriber who hasn't configured their
+    notification settings yet.
+
+    Added May 22, 2026 (Phase 3 onboarding tracking). The admin clicks
+    "Nudge" on a row showing ✗ for Settings configured; this fires a
+    short email asking the subscriber to log into the portal and set
+    their preferred delivery time + channels.
+
+    Idempotency: each call sends a fresh email (no dedupe). If the
+    subscriber gets nudged twice it's not great but not harmful.
+    Logged to admin_audit_log so we can see who nudged whom.
+    """
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.email, u.name, u.phone, u.is_active,
+                          bp.user_configured_at
+                   FROM users u
+                   LEFT JOIN brief_preferences bp ON bp.user_id = u.id
+                   WHERE u.id = %s""",
+                (user_id,),
+            )
+            sub = cur.fetchone()
+
+    if not sub:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    if not sub["is_active"]:
+        return jsonify({"ok": False, "error": "user-inactive"}), 400
+    if not sub.get("email"):
+        return jsonify({"ok": False, "error": "no-email"}), 400
+
+    portal_url = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/") + "/?portal=1"
+    subject = "Quick step: set your morning brief delivery time"
+    first_name = (sub.get("name") or "").split(" ")[0] or "there"
+    body = (
+        f"Hi {first_name},\n\n"
+        f"We noticed you haven't set your morning brief delivery time and "
+        f"notification preferences yet. It only takes a minute and ensures "
+        f"your brief arrives exactly when you want it.\n\n"
+        f"Log into your subscriber portal here:\n{portal_url}\n\n"
+        f"In Settings, choose:\n"
+        f"  - Preferred delivery time (between 5:00 AM and 10:00 AM local)\n"
+        f"  - SMS, email, or both\n\n"
+        f"If you have any questions, just reply to this email.\n\n"
+        f"- The WeatherValet team"
+    )
+
+    actor = _get_current_user()
+    actor_reply_to = actor.get("email") if actor else None
+    ok = _send_brief_email(sub["email"], subject, body, reply_to=actor_reply_to)
+
+    # Audit log
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO admin_audit_log
+                       (created_at, actor_user_id, actor_name, action, target_kind,
+                        target_id, details)
+                       VALUES (%s, %s, %s, 'nudge_subscriber', 'user', %s, %s)""",
+                    (int(time.time() * 1000),
+                     actor["id"] if actor else None,
+                     actor.get("name") if actor else "system",
+                     user_id,
+                     json.dumps({"email": sub["email"], "sent": bool(ok)})),
+                )
+    except Exception as e:
+        print(f"[admin-nudge] audit log failed: {e}", flush=True)
+
+    if not ok:
+        return jsonify({"ok": False, "error": "send-failed"}), 502
+    return jsonify({"ok": True, "sent_to": sub["email"]})
 
 
 @app.post("/api/v1/admin/users")
@@ -24390,6 +24542,31 @@ def me_set_brief_delivery():
                        daily_brief_timezone = EXCLUDED.daily_brief_timezone,
                        updated_at = EXCLUDED.updated_at""",
                 (user["id"], new_time, new_tz, now_ms),
+            )
+            # Phase 3 (May 22, 2026): mark brief_preferences as user-configured
+            # so the admin onboarding column can distinguish defaults from
+            # explicit user choice. Also propagate the new time to the
+            # morning_window so the scheduler picks it up correctly.
+            # Compute morning_window_end = start + 30 min.
+            try:
+                bh = int(new_time[:2])
+                bm = int(new_time[3:])
+                end_minutes = (bh * 60 + bm + 30) % (24 * 60)
+                morning_end = f"{end_minutes // 60:02d}:{end_minutes % 60:02d}"
+            except (ValueError, IndexError):
+                morning_end = "07:30"
+            cur.execute(
+                """INSERT INTO brief_preferences
+                     (user_id, morning_enabled, morning_window_start,
+                      morning_window_end, channels, updated_at,
+                      user_configured_at)
+                   VALUES (%s, TRUE, %s, %s, 'sms,email', %s, %s)
+                   ON CONFLICT (user_id) DO UPDATE
+                   SET morning_window_start = EXCLUDED.morning_window_start,
+                       morning_window_end = EXCLUDED.morning_window_end,
+                       updated_at = EXCLUDED.updated_at,
+                       user_configured_at = EXCLUDED.user_configured_at""",
+                (user["id"], new_time, morning_end, now_ms, now_ms),
             )
     return jsonify({"ok": True})
 
