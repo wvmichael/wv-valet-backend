@@ -9545,6 +9545,330 @@ def admin_remove_user_role(user_id, role):
 
 
 # ════════════════════════════════════════════════════════════════════
+# Admin "View as Met" — read-only diagnostic (May 22, 2026)
+# ════════════════════════════════════════════════════════════════════
+#
+# Lets the admin see what a specific Met's portal would show without
+# any session swap or impersonation. Pure READ — admin cannot click
+# buttons "as" the Met. Used to:
+#   - Verify a Met's queue/schedule/earnings render correctly
+#   - Diagnose bugs reported by a specific Met
+#   - Confirm coverage permissions before launch day
+#
+# Bundles data from several Met-portal endpoints into one response so
+# the admin UI can render all tabs at once without N round-trips.
+#
+# Endpoint: GET /api/v1/admin/view-as-met/<int:met_user_id>
+# Returns: {ok, met: {...}, schedule: {...}, pro_briefs: [...],
+#          met_reviews_queue: [...], tasks: [...], earnings: {...}}
+@app.route("/api/v1/admin/view-as-met/<int:met_user_id>", methods=["OPTIONS"])
+def _admin_view_as_met_preflight(met_user_id):
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/view-as-met/<int:met_user_id>")
+def admin_view_as_met(met_user_id):
+    """Return a snapshot of what the target Met's portal would show.
+
+    This is the diagnostic tool the admin uses to verify a Met's
+    experience without logging in as them. Every query is run with
+    the target Met's permissions baked in (e.g., the Pro Brief query
+    uses _can_met_see_pro_brief logic for that Met).
+
+    Auth: admin role required (caller, not target).
+
+    Returns sections matching the Met Portal tab structure:
+      - met: basic info (name, email, roles, tier perspective)
+      - schedule: their personal schedule (claimed shifts for next 7 days)
+      - pro_briefs: drafts visible to them under coverage rules
+      - met_reviews_queue: the national $19 queue (same for all Mets)
+      - tasks: their hobbyist daily-brief tasks for today
+      - earnings: their current-month earnings
+      - coverage_today: which territories they're covering today (if any)
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    # Verify the target user exists and has the met role
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.email, u.name, u.phone, u.is_active,
+                          ARRAY_REMOVE(ARRAY_AGG(ur.role ORDER BY ur.role), NULL) AS roles
+                   FROM users u
+                   LEFT JOIN user_roles ur ON ur.user_id = u.id
+                   WHERE u.id = %s
+                   GROUP BY u.id""",
+                (met_user_id,),
+            )
+            met_row = cur.fetchone()
+    if not met_row:
+        return jsonify({"ok": False, "error": "user-not-found"}), 404
+    target_roles = met_row["roles"] or []
+    if "met" not in target_roles and "admin" not in target_roles:
+        return jsonify({
+            "ok": False, "error": "target-not-a-met",
+            "message": f"User {met_user_id} doesn't have the met role. Roles: {target_roles}"
+        }), 400
+
+    result = {
+        "ok": True,
+        "viewing_as": {
+            "user_id": met_row["id"],
+            "name": met_row["name"] or "",
+            "email": met_row["email"],
+            "phone": met_row["phone"] or "",
+            "roles": target_roles,
+            "is_active": met_row["is_active"],
+        },
+    }
+
+    ET = ZoneInfo("America/New_York")
+    today_et = datetime.now(ET).date().isoformat()
+
+    # ── Pro Briefs visible to this Met (with coverage filter) ──
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT d.id, d.user_id, d.status, d.created_at,
+                              d.ai_verdict, d.ai_snippet,
+                              d.met_verdict, d.met_snippet,
+                              d.location_label, d.user_tier,
+                              d.delivery_time_local,
+                              u.email AS subscriber_email,
+                              u.name AS subscriber_name,
+                              sc.primary_met_id,
+                              pm.name AS primary_met_name
+                       FROM pro_brief_drafts d
+                       JOIN users u ON u.id = d.user_id
+                       LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
+                       LEFT JOIN users pm ON pm.id = sc.primary_met_id
+                       WHERE (d.status IN ('pending-review', 'claimed')
+                              OR (d.status = 'sent' AND d.sent_at >= %s))
+                         AND (
+                           sc.primary_met_id = %s
+                           OR EXISTS (
+                             SELECT 1
+                             FROM met_territories t
+                             JOIN shift_assignments sa
+                               ON sa.territory_id = t.id
+                             WHERE t.met_user_id = sc.primary_met_id
+                               AND sa.met_user_id = %s
+                               AND sa.is_drop = FALSE
+                               AND sa.shift_date = %s
+                           )
+                         )
+                       ORDER BY d.created_at DESC
+                       LIMIT 50""",
+                    (int(time.time() * 1000) - 24 * 60 * 60 * 1000,
+                     met_user_id, met_user_id, today_et),
+                )
+                rows = cur.fetchall()
+        result["pro_briefs"] = [
+            {
+                "id": r["id"],
+                "subscriber_user_id": r["user_id"],
+                "subscriber_email": r["subscriber_email"],
+                "subscriber_name": r["subscriber_name"] or "",
+                "status": r["status"],
+                "user_tier": r["user_tier"],
+                "location_label": r["location_label"] or "",
+                "delivery_time_local": r["delivery_time_local"] or "",
+                "ai_verdict": r["ai_verdict"] or "",
+                "ai_snippet": r["ai_snippet"] or "",
+                "met_verdict": r["met_verdict"] or "",
+                "met_snippet": r["met_snippet"] or "",
+                "primary_met_id": r["primary_met_id"],
+                "primary_met_name": r["primary_met_name"] or "",
+                "is_covering": r["primary_met_id"] is not None and r["primary_met_id"] != met_user_id,
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        result["pro_briefs_error"] = f"{e!r}"
+        result["pro_briefs"] = []
+
+    # ── Met Reviews queue (paid + claimed). Same for all Mets. ──
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, created_at, status, tier, price_cents,
+                              customer_email, customer_phone, plan_text,
+                              plan_industry, plan_location, plan_window
+                       FROM verification_requests
+                       WHERE status IN ('paid', 'claimed')
+                       ORDER BY created_at ASC
+                       LIMIT 20"""
+                )
+                rows = cur.fetchall()
+        result["met_reviews_queue"] = [
+            {
+                "id": r["id"],
+                "status": r["status"],
+                "tier": r["tier"],
+                "price_cents": r["price_cents"],
+                "customer_email": r["customer_email"] or "",
+                "customer_phone": r["customer_phone"] or "",
+                "plan_text": r["plan_text"] or "",
+                "plan_industry": r["plan_industry"] or "",
+                "plan_location": r["plan_location"] or "",
+                "plan_window": r["plan_window"] or "",
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        result["met_reviews_queue_error"] = f"{e!r}"
+        result["met_reviews_queue"] = []
+
+    # ── Today's daily brief tasks assigned to this Met (Hobbyist briefs) ──
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                today_start_ms = int(datetime.now(timezone.utc)
+                                     .replace(hour=0, minute=0, second=0, microsecond=0)
+                                     .timestamp() * 1000)
+                cur.execute(
+                    """SELECT t.id, t.subscriber_user_id, t.status,
+                              t.created_at, t.sent_at_ms,
+                              u.email AS subscriber_email,
+                              u.name AS subscriber_name
+                       FROM daily_brief_tasks t
+                       JOIN users u ON u.id = t.subscriber_user_id
+                       WHERE t.assigned_met_id = %s
+                         AND t.created_at >= %s
+                       ORDER BY t.created_at ASC""",
+                    (met_user_id, today_start_ms),
+                )
+                rows = cur.fetchall()
+        result["tasks_today"] = [
+            {
+                "id": r["id"],
+                "subscriber_email": r["subscriber_email"],
+                "subscriber_name": r["subscriber_name"] or "",
+                "status": r["status"],
+                "sent_at_ms": r["sent_at_ms"],
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        result["tasks_today_error"] = f"{e!r}"
+        result["tasks_today"] = []
+
+    # ── Schedule: their personal claimed shifts for next 7 days ──
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT sa.id, sa.shift_date, sa.shift_type,
+                              sa.territory_id, sa.is_reviews_pool, sa.is_drop,
+                              t.name AS territory_name,
+                              t.met_user_id AS territory_owner_id,
+                              owner.name AS territory_owner_name
+                       FROM shift_assignments sa
+                       LEFT JOIN met_territories t ON t.id = sa.territory_id
+                       LEFT JOIN users owner ON owner.id = t.met_user_id
+                       WHERE sa.met_user_id = %s
+                         AND sa.is_drop = FALSE
+                         AND sa.shift_date >= %s
+                         AND sa.shift_date < (DATE %s + INTERVAL '7 days')
+                       ORDER BY sa.shift_date, sa.shift_type""",
+                    (met_user_id, today_et, today_et),
+                )
+                rows = cur.fetchall()
+        result["schedule_my_shifts"] = [
+            {
+                "id": r["id"],
+                "shift_date": str(r["shift_date"]),
+                "shift_type": r["shift_type"],
+                "territory_id": r["territory_id"],
+                "territory_name": r["territory_name"] or "(reviews pool)" if r["is_reviews_pool"] else (r["territory_name"] or "?"),
+                "is_reviews_pool": r["is_reviews_pool"],
+                "is_covering": r["territory_owner_id"] is not None and r["territory_owner_id"] != met_user_id,
+                "territory_owner_name": r["territory_owner_name"] or "",
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        result["schedule_my_shifts_error"] = f"{e!r}"
+        result["schedule_my_shifts"] = []
+
+    # ── Earnings: current month for this Met ──
+    try:
+        now_dt = datetime.now()
+        payroll = _compute_payroll_for_month(now_dt.year, now_dt.month)
+        my_row = None
+        for met_payroll in payroll.get("mets", []):
+            if met_payroll.get("user_id") == met_user_id:
+                my_row = met_payroll
+                break
+        if my_row:
+            result["earnings_mtd"] = {
+                "review_cents": my_row.get("review_cents", 0),
+                "review_count": my_row.get("review_count", 0),
+                "brief_cents": my_row.get("brief_cents", 0),
+                "brief_count": my_row.get("brief_count", 0),
+                "tip_cents": my_row.get("tip_cents", 0),
+                "tip_count": my_row.get("tip_count", 0),
+                "shelter_cents": my_row.get("shelter_cents", 0),
+                "shelter_count": my_row.get("shelter_count", 0),
+                "total_cents": my_row.get("total_cents", 0),
+                "month": now_dt.strftime("%B %Y"),
+            }
+        else:
+            result["earnings_mtd"] = {
+                "review_cents": 0, "review_count": 0,
+                "brief_cents": 0, "brief_count": 0,
+                "tip_cents": 0, "tip_count": 0,
+                "shelter_cents": 0, "shelter_count": 0,
+                "total_cents": 0,
+                "month": now_dt.strftime("%B %Y"),
+            }
+    except Exception as e:
+        result["earnings_mtd_error"] = f"{e!r}"
+        result["earnings_mtd"] = None
+
+    # ── Primary subscribers (the Met's "home" subscribers, regardless of coverage) ──
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT u.id, u.email, u.name, u.subscription_tier,
+                              u.is_active, sc.daily_brief_time
+                       FROM subscriber_coverage sc
+                       JOIN users u ON u.id = sc.user_id
+                       WHERE sc.primary_met_id = %s
+                       ORDER BY u.name NULLS LAST, u.email""",
+                    (met_user_id,),
+                )
+                rows = cur.fetchall()
+        result["primary_subscribers"] = [
+            {
+                "user_id": r["id"],
+                "email": r["email"],
+                "name": r["name"] or "",
+                "tier": r["subscription_tier"] or "",
+                "is_active": r["is_active"],
+                "daily_brief_time": r["daily_brief_time"] or "",
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        result["primary_subscribers_error"] = f"{e!r}"
+        result["primary_subscribers"] = []
+
+    return jsonify(result)
+
+
+
+# ════════════════════════════════════════════════════════════════════
 # Crew confessionals (Phase 4a — May 14)
 # ════════════════════════════════════════════════════════════════════
 #
