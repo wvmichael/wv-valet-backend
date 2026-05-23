@@ -19427,6 +19427,255 @@ def met_pro_subscribers_queue():
     return jsonify({"ok": True, "subscribers": subscribers})
 
 
+# ════════════════════════════════════════════════════════════════════
+# Daily Brief tab — audience & territory data (May 22, 2026, Phase A)
+# ════════════════════════════════════════════════════════════════════
+#
+# The Daily Brief tab is the broadcast composer for Hobbyist-tier
+# subscribers (state/county based). Phase A replaces hardcoded mock
+# numbers in the UI with real backend queries. Phase B (later) will
+# wire the publish button to actually send broadcasts.
+#
+# Until Phase B ships, the publish button is intentionally inert —
+# the UI shows a warning so Mets don't think clicking does anything.
+
+@app.route("/api/v1/met/daily-brief/audience-count", methods=["OPTIONS"])
+def _met_daily_brief_audience_count_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/daily-brief/audience-count")
+def met_daily_brief_audience_count():
+    """Count active subscribers in selected state-county pairs.
+
+    Query param: counties=IN:Boone,IN:Hamilton  (comma-separated,
+                 each item is STATE_ABBR:CountyName, no " County" suffix)
+
+    Matches subscribers whose primary saved_location has the matching
+    county name AND whose address_text contains the state abbreviation.
+    Not perfect (a subscriber whose address omits the state would miss),
+    but pragmatic for launch — the migration tool sets address_text from
+    Nominatim which always includes state.
+
+    Auth: met or admin role required.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    counties_param = (request.args.get("counties") or "").strip()
+    if not counties_param:
+        return jsonify({"ok": True, "count": 0, "by_county": {}})
+
+    # Parse "IN:Boone,IN:Hamilton" → [("IN","boone"), ("IN","hamilton")]
+    pairs = []
+    for item in counties_param.split(","):
+        item = item.strip()
+        if not item or ":" not in item:
+            continue
+        state, county = item.split(":", 1)
+        state = state.strip().upper()
+        county = county.strip().lower().replace(" county", "")
+        if len(state) == 2 and county:
+            pairs.append((state, county))
+    if not pairs:
+        return jsonify({"ok": True, "count": 0, "by_county": {}})
+
+    # Group by state to minimize queries: one query per state, fetch all
+    # subscribers in that state, then filter by county client-side.
+    by_state = {}
+    for state, county in pairs:
+        by_state.setdefault(state, set()).add(county)
+
+    total = 0
+    by_county = {}
+    seen_user_ids = set()  # avoid double-counting if subscriber matches multiple
+
+    for state, counties in by_state.items():
+        # Build a state filter: address_text contains ", <STATE>" or ends with state
+        # e.g., "Lebanon, IN" or "Lebanon, IN 46052" or "Lebanon, IN, USA"
+        state_pattern = f"%, {state}%"
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT u.id, loc.county, loc.address_text
+                           FROM users u
+                           JOIN saved_locations loc ON loc.user_id = u.id
+                                AND loc.is_primary = TRUE
+                           WHERE u.is_active = TRUE
+                             AND loc.county IS NOT NULL
+                             AND loc.address_text ILIKE %s
+                             AND EXISTS (
+                               SELECT 1 FROM user_roles ur
+                               WHERE ur.user_id = u.id AND ur.role = 'subscriber'
+                             )""",
+                        (state_pattern,),
+                    )
+                    rows = cur.fetchall()
+        except Exception as e:
+            print(f"[daily-brief-audience] query failed state={state}: {e!r}", flush=True)
+            continue
+
+        for r in rows:
+            if r["id"] in seen_user_ids:
+                continue
+            raw_county = (r.get("county") or "").lower().replace(" county", "").strip()
+            if not raw_county:
+                continue
+            if raw_county in counties:
+                seen_user_ids.add(r["id"])
+                key = f"{state}:{raw_county}"
+                by_county[key] = by_county.get(key, 0) + 1
+                total += 1
+
+    return jsonify({"ok": True, "count": total, "by_county": by_county})
+
+
+@app.route("/api/v1/met/daily-brief/territory-stats", methods=["OPTIONS"])
+def _met_daily_brief_territory_stats_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/daily-brief/territory-stats")
+def met_daily_brief_territory_stats():
+    """Return real territory-wide stats for the Daily Brief sidebar.
+
+    No filter args — returns global totals. The UI shows these as
+    "Active in territory" reference numbers.
+
+    Returns:
+      active_subscribers_with_location: int
+      nws_alerts_active: int  (count of active alerts across system)
+      crew_reports_last_30min: int  (verified + unverified)
+
+    Auth: met or admin role required.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    active_subs = 0
+    nws_alerts = 0
+    crew_reports = 0
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT COUNT(DISTINCT u.id) AS n
+                       FROM users u
+                       JOIN saved_locations loc ON loc.user_id = u.id
+                            AND loc.is_primary = TRUE
+                       WHERE u.is_active = TRUE
+                         AND EXISTS (
+                           SELECT 1 FROM user_roles ur
+                           WHERE ur.user_id = u.id AND ur.role = 'subscriber'
+                         )"""
+                )
+                row = cur.fetchone()
+                active_subs = row["n"] if row else 0
+    except Exception as e:
+        print(f"[territory-stats] active_subs failed: {e!r}", flush=True)
+
+    # NWS alerts — table may or may not exist depending on phase
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT COUNT(*) AS n FROM nws_alerts
+                       WHERE expires_at_ms IS NULL
+                          OR expires_at_ms > %s""",
+                    (int(time.time() * 1000),),
+                )
+                row = cur.fetchone()
+                nws_alerts = row["n"] if row else 0
+    except Exception as e:
+        # Table may not exist yet — silent fallback to 0
+        nws_alerts = 0
+
+    # Crew reports in last 30 min
+    try:
+        thirty_min_ago_ms = int(time.time() * 1000) - 30 * 60 * 1000
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT COUNT(*) AS n FROM crew_reports
+                       WHERE created_at >= %s""",
+                    (thirty_min_ago_ms,),
+                )
+                row = cur.fetchone()
+                crew_reports = row["n"] if row else 0
+    except Exception as e:
+        crew_reports = 0
+
+    return jsonify({
+        "ok": True,
+        "active_subscribers_with_location": active_subs,
+        "nws_alerts_active": nws_alerts,
+        "crew_reports_last_30min": crew_reports,
+    })
+
+
+@app.route("/api/v1/met/daily-brief/last-broadcast", methods=["OPTIONS"])
+def _met_daily_brief_last_broadcast_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/daily-brief/last-broadcast")
+def met_daily_brief_last_broadcast():
+    """Return the most recent broadcast brief.
+
+    Phase A note (May 22, 2026): broadcast storage doesn't exist yet
+    (Phase B builds the broadcast_briefs table + publish endpoint).
+    Until then this returns null so the UI can show "No broadcasts yet."
+
+    Auth: met or admin role required.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    # Phase A: no storage yet. Try the table optimistically in case
+    # Phase B already shipped; fall back cleanly.
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, headline, summary, counties, sent_at, sent_by_name
+                       FROM broadcast_briefs
+                       ORDER BY sent_at DESC
+                       LIMIT 1"""
+                )
+                row = cur.fetchone()
+        if row:
+            return jsonify({
+                "ok": True,
+                "broadcast": {
+                    "id": row["id"],
+                    "headline": row["headline"] or "",
+                    "summary": row["summary"] or "",
+                    "counties": row["counties"] or "",
+                    "sent_at": row["sent_at"],
+                    "sent_by_name": row["sent_by_name"] or "",
+                },
+            })
+    except Exception:
+        # Table doesn't exist yet (expected in Phase A)
+        pass
+
+    return jsonify({"ok": True, "broadcast": None})
+
+
 @app.get("/api/v1/met/pro-briefs")
 def met_pro_briefs_list():
     """List pending + recently-sent pro brief drafts visible to this Met.
