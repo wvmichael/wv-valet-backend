@@ -1386,6 +1386,62 @@ CREATE TABLE IF NOT EXISTS brief_history (
 );
 CREATE INDEX IF NOT EXISTS idx_brief_history_user ON brief_history(user_id, delivered_at DESC);
 
+-- ── Brief outcomes / Met accuracy tracking (May 23, 2026) ──
+-- One row per graded brief. Created by the nightly grader job, which
+-- walks yesterday's brief_history entries and compares each Met's
+-- verdict (clear/caution/risk) against NWS alerts that fired in the
+-- subscriber's area during the coverage window.
+--
+-- Grading rubric (safety-bias, floor-at-zero):
+--   - clear + no_alert            → accurate          score 1.0
+--   - clear + medium_alert        → under_called      score 0.5
+--   - clear + high_alert          → critical_miss     score 0.0
+--   - caution + no_alert          → over_called       score 0.8
+--   - caution + medium_alert      → accurate          score 1.0
+--   - caution + high_alert        → under_called      score 0.5
+--   - risk + no_alert             → over_called       score 0.8
+--   - risk + medium_alert         → accurate          score 1.0
+--   - risk + high_alert           → accurate          score 1.0
+--
+-- High-severity (county-based, polygon): Tornado Warning, Severe
+-- Thunderstorm Warning, Flash Flood Warning, Hurricane Warning,
+-- Blizzard Warning, Ice Storm Warning, Snow Squall Warning,
+-- Extreme Wind Warning.
+-- Medium-severity (any watch, any advisory).
+-- No alert: nothing matched.
+--
+-- attributed_met_id: who gets credit/blame. Pulled at grading time:
+--   - is_met_touched=true → the Met who sent the Pro brief
+--   - is_met_touched=false (AI auto-send) → subscriber's primary Met
+--     for Hobbyists; null for unassigned (no grading)
+--   - broadcasts: attribution is via daily_brief_tasks.assigned_met_id
+--
+-- Idempotent: UNIQUE (brief_history_id) — re-running the grader for
+-- the same day won't create duplicate rows. Use admin/regrade-day to
+-- force re-evaluation (deletes then re-inserts).
+
+CREATE TABLE IF NOT EXISTS brief_outcomes (
+    id                   SERIAL PRIMARY KEY,
+    brief_history_id     INTEGER NOT NULL UNIQUE REFERENCES brief_history(id) ON DELETE CASCADE,
+    subscriber_user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    attributed_met_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    delivered_at         BIGINT NOT NULL,                -- denormalized from brief_history
+    verdict_assigned     TEXT NOT NULL,                  -- 'clear' | 'caution' | 'risk'
+    actual_severity      TEXT NOT NULL,                  -- 'none' | 'medium' | 'high'
+    grade                TEXT NOT NULL,                  -- 'accurate' | 'over_called' | 'under_called' | 'critical_miss'
+    score                REAL NOT NULL,                  -- 0.0 to 1.0
+    nws_alert_summary    TEXT,                           -- "Severe Thunderstorm Warning, Tornado Watch"
+    nws_alert_ids        TEXT,                           -- comma-sep list of NWS alert IDs that matched
+    graded_at_ms         BIGINT NOT NULL,
+    notes                TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_brief_outcomes_met
+    ON brief_outcomes(attributed_met_id, delivered_at DESC);
+CREATE INDEX IF NOT EXISTS idx_brief_outcomes_subscriber
+    ON brief_outcomes(subscriber_user_id, delivered_at DESC);
+CREATE INDEX IF NOT EXISTS idx_brief_outcomes_delivered
+    ON brief_outcomes(delivered_at DESC);
+
 -- ── Mission deployments (Phase 10 Item #4) ──
 -- One row per mission fired (or queued for approval) by a Met.
 -- A "mission" is a directed prompt sent to Crew members in a polygon
@@ -16461,6 +16517,10 @@ def _brief_scheduler_loop() -> None:
             _rosie_proactive_check_tick()
         except Exception as e:
             print(f"[rosie-proactive] tick failed: {e!r}", flush=True)
+        try:
+            _maybe_run_nightly_brief_grader()
+        except Exception as e:
+            print(f"[brief-grader] tick failed: {e!r}", flush=True)
         time.sleep(60)
 
 
@@ -26964,6 +27024,418 @@ MET_REVIEW_SHARE_PCT = 0.65
 STORM_SHELTER_PAYOUT_CENTS = 2500
 
 
+# ═══════════════════════════════════════════════════════════════════
+# Met accuracy tracking (May 23, 2026 — Tier 1)
+# ═══════════════════════════════════════════════════════════════════
+#
+# The nightly grader runs at 01:00 ET each day and grades every brief
+# delivered the previous day in Eastern Time. For each brief, it
+# fetches the NWS alerts that fired in the subscriber's area during
+# the brief's coverage window (24 hours from delivery), classifies
+# them as high / medium / no-alert, and produces a grade + score per
+# the rubric in the brief_outcomes table comment.
+#
+# Tier 1 ships:
+#   - brief_outcomes table
+#   - _grade_brief()           — pure function (unit-testable)
+#   - _classify_nws_event()    — string → 'high' | 'medium'
+#   - _fetch_alerts_for_point()— calls api.weather.gov
+#   - _run_brief_grader_for_day(date) — the nightly job body
+#   - GET /api/v1/me/accuracy
+#   - GET /api/v1/admin/accuracy
+#   - POST /api/v1/admin/grade-day/<YYYY-MM-DD>
+#
+# Tier 2 will add the Rosie email composer + scheduler.
+# Tier 3 will add NWS observations as a second signal.
+#
+# Future-Claude note: NWS doesn't retain expired alerts indefinitely.
+# Backfilling beyond a few days from the live API isn't reliable. The
+# grader job must run daily once deployed; missed days stay ungraded.
+
+# High-severity events (county-based polygon products): the Met called
+# 'risk' or higher → these reward accuracy. Calling 'clear' through
+# any of these is the worst category of miss.
+NWS_HIGH_SEVERITY_EVENTS = {
+    "Tornado Warning",
+    "Severe Thunderstorm Warning",
+    "Flash Flood Warning",
+    "Flood Warning",
+    "Hurricane Warning",
+    "Tropical Storm Warning",
+    "Blizzard Warning",
+    "Ice Storm Warning",
+    "Snow Squall Warning",
+    "Extreme Wind Warning",
+    "Tsunami Warning",
+    "Tornado Emergency",
+    "Flash Flood Emergency",
+}
+
+
+def _classify_nws_event(event_name: str) -> str:
+    """Map an NWS event name to 'high', 'medium', or 'none'.
+
+    'high' = county-based polygon warnings (immediate danger).
+    'medium' = any zone-based watch/advisory (heads-up, not imminent).
+    Returns 'none' for unknown / non-alerting strings.
+    """
+    if not event_name:
+        return "none"
+    name = event_name.strip()
+    if name in NWS_HIGH_SEVERITY_EVENTS:
+        return "high"
+    # Watches, advisories, statements — medium severity.
+    lower = name.lower()
+    if "watch" in lower or "advisory" in lower or "statement" in lower:
+        return "medium"
+    # Catch-all warning that isn't on our high list — treat as medium
+    # rather than dropping it. Safer to surface than silently ignore.
+    if "warning" in lower:
+        return "medium"
+    return "none"
+
+
+def _grade_brief(verdict: str, actual_severity: str) -> tuple:
+    """Pure grading function. Takes the Met's verdict and the highest
+    NWS severity that fired in the coverage window. Returns
+    (grade, score) per the safety-bias rubric, floored at 0.
+
+    Grades:
+      'accurate'       — called it right
+      'over_called'    — predicted worse than actual (forgivable)
+      'under_called'   — predicted better than actual (concerning)
+      'critical_miss'  — said 'clear' when high-severity fired
+
+    Scores follow the table in brief_outcomes schema comment.
+    """
+    v = (verdict or "").lower().strip()
+    s = (actual_severity or "none").lower().strip()
+
+    if v == "clear":
+        if s == "none":
+            return ("accurate", 1.0)
+        if s == "medium":
+            return ("under_called", 0.5)
+        return ("critical_miss", 0.0)  # s == 'high'
+
+    if v == "caution":
+        if s == "none":
+            return ("over_called", 0.8)
+        if s == "medium":
+            return ("accurate", 1.0)
+        return ("under_called", 0.5)  # s == 'high'
+
+    if v == "risk":
+        if s == "none":
+            return ("over_called", 0.8)
+        return ("accurate", 1.0)  # medium or high — risk was justified
+
+    # Unknown verdict (null, empty, weird string) — can't grade.
+    # Return a neutral score so the brief shows up in queries with
+    # an explanation but doesn't move the Met's average.
+    return ("ungradable", 1.0)
+
+
+def _fetch_alerts_for_point(lat: float, lng: float, start_ms: int, end_ms: int) -> list:
+    """Query NWS for alerts whose effective window intersects
+    [start_ms, end_ms] at the given point.
+
+    NWS API: GET /alerts?point={lat},{lng}&start={iso}&end={iso}
+    Returns a list of dicts with keys: id, event, severity, effective,
+    expires, ended, headline, description.
+
+    Returns [] on any failure (network, parse, etc.) — failed lookup
+    should not crash the grader. The brief gets graded as if no
+    alerts fired, and we log the failure.
+    """
+    try:
+        # NWS limits to 4 decimal places of precision
+        lat_s = f"{float(lat):.4f}"
+        lng_s = f"{float(lng):.4f}"
+        # ISO 8601 with Z suffix
+        start_iso = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_iso = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        url = (
+            f"https://api.weather.gov/alerts"
+            f"?point={lat_s},{lng_s}"
+            f"&start={start_iso}"
+            f"&end={end_iso}"
+        )
+        headers = {
+            "User-Agent": "WeatherValet (michael@weathervalet.com)",
+            "Accept": "application/geo+json",
+        }
+        import urllib.request
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        features = data.get("features") or []
+        out = []
+        for f in features:
+            props = f.get("properties") or {}
+            out.append({
+                "id": props.get("id") or "",
+                "event": props.get("event") or "",
+                "severity": props.get("severity") or "",
+                "effective": props.get("effective") or "",
+                "expires": props.get("expires") or "",
+                "ended": props.get("ends") or "",
+                "headline": props.get("headline") or "",
+            })
+        return out
+    except Exception as e:
+        print(f"[grader] NWS alerts fetch failed for {lat},{lng}: {e!r}", flush=True)
+        return []
+
+
+def _resolve_attributed_met_for_brief(brief_history_id: int, subscriber_user_id: int,
+                                       delivered_at: int, is_met_touched: bool,
+                                       met_name: Optional[str]) -> Optional[int]:
+    """Figure out which Met to attribute this brief's grade to.
+
+    Priority (per the rubric: 'Everyone for everything they touched'):
+      1. If Met-touched, look up the Met by name (snapshot in brief_history)
+      2. Else: check daily_brief_tasks for the day — assigned_met_id wins
+      3. Else: subscriber's primary Met (Hobbyist case)
+      4. Else: None (unassigned, doesn't grade)
+    """
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                # Step 1: Met-touched. The Met name was snapshotted at
+                # send time but ID wasn't. Look up by name.
+                if is_met_touched and met_name:
+                    cur.execute(
+                        """SELECT u.id FROM users u
+                           JOIN user_roles ur ON ur.user_id = u.id
+                           WHERE u.name = %s AND ur.role = 'met'
+                             AND u.is_active = TRUE
+                           LIMIT 1""",
+                        (met_name,),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return row["id"]
+                # Step 2: daily_brief_tasks for the day
+                delivered_dt = datetime.fromtimestamp(delivered_at / 1000, tz=timezone.utc)
+                # Use subscriber's TZ-local date for the task lookup
+                cur.execute(
+                    """SELECT COALESCE(loc.lat, 0) AS lat,
+                              COALESCE(loc.lng, 0) AS lng
+                       FROM users u
+                       LEFT JOIN saved_locations loc
+                         ON loc.user_id = u.id AND loc.is_primary = TRUE
+                       WHERE u.id = %s""",
+                    (subscriber_user_id,),
+                )
+                _ = cur.fetchone()  # not used here, but kept for symmetry
+                cur.execute(
+                    """SELECT assigned_met_id FROM daily_brief_tasks
+                       WHERE subscriber_user_id = %s
+                         AND ABS(sent_at_ms - %s) < 86400000
+                         AND status = 'sent'
+                       ORDER BY ABS(sent_at_ms - %s) ASC
+                       LIMIT 1""",
+                    (subscriber_user_id, delivered_at, delivered_at),
+                )
+                row = cur.fetchone()
+                if row and row.get("assigned_met_id"):
+                    return row["assigned_met_id"]
+                # Step 3: subscriber's primary Met (Hobbyist case)
+                cur.execute(
+                    """SELECT sc.primary_met_id FROM subscriber_coverage sc
+                       JOIN users u ON u.id = sc.primary_met_id
+                       WHERE sc.user_id = %s AND u.is_active = TRUE""",
+                    (subscriber_user_id,),
+                )
+                row = cur.fetchone()
+                if row and row.get("primary_met_id"):
+                    return row["primary_met_id"]
+    except Exception as e:
+        print(f"[grader] met attribution failed brief={brief_history_id}: {e!r}", flush=True)
+    return None
+
+
+def _run_brief_grader_for_day(grade_date: str, force_regrade: bool = False) -> dict:
+    """Grade every brief delivered on the given local-Eastern date.
+
+    grade_date: 'YYYY-MM-DD' in Eastern Time.
+    force_regrade: if True, delete existing outcomes for this day
+                   before re-grading (used by admin regrade endpoint).
+
+    Returns a summary dict.
+    """
+    ET = ZoneInfo("America/New_York")
+    try:
+        y, m, d = [int(x) for x in grade_date.split("-")]
+        day_start = datetime(y, m, d, 0, 0, 0, tzinfo=ET)
+    except Exception:
+        return {"ok": False, "error": "invalid-date"}
+    day_end = day_start + timedelta(days=1)
+    day_start_ms = int(day_start.timestamp() * 1000)
+    day_end_ms = int(day_end.timestamp() * 1000)
+
+    # Pull all sent morning briefs from that day
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                if force_regrade:
+                    cur.execute(
+                        """DELETE FROM brief_outcomes
+                           WHERE delivered_at >= %s AND delivered_at < %s""",
+                        (day_start_ms, day_end_ms),
+                    )
+                cur.execute(
+                    """SELECT bh.id, bh.user_id, bh.delivered_at, bh.verdict,
+                              bh.is_met_touched, bh.met_name,
+                              COALESCE(loc.lat, 0) AS lat,
+                              COALESCE(loc.lng, 0) AS lng
+                       FROM brief_history bh
+                       JOIN users u ON u.id = bh.user_id
+                       LEFT JOIN saved_locations loc
+                         ON loc.user_id = u.id AND loc.is_primary = TRUE
+                       WHERE bh.brief_type = 'morning'
+                         AND bh.delivery_status = 'sent'
+                         AND bh.delivered_at >= %s AND bh.delivered_at < %s
+                         AND bh.verdict IN ('clear', 'caution', 'risk')
+                       ORDER BY bh.delivered_at ASC""",
+                    (day_start_ms, day_end_ms),
+                )
+                briefs = cur.fetchall()
+    except Exception as e:
+        return {"ok": False, "error": f"db-fetch-failed: {e}"}
+
+    graded = 0
+    skipped_no_outcome = 0
+    skipped_no_location = 0
+    already_present = 0
+    errors = 0
+    grade_counts = {"accurate": 0, "over_called": 0, "under_called": 0,
+                    "critical_miss": 0, "ungradable": 0}
+
+    for b in briefs:
+        try:
+            # Existence check (only matters when not forcing)
+            if not force_regrade:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT 1 FROM brief_outcomes WHERE brief_history_id = %s",
+                            (b["id"],),
+                        )
+                        if cur.fetchone():
+                            already_present += 1
+                            continue
+
+            if not b["lat"] or not b["lng"]:
+                skipped_no_location += 1
+                continue
+
+            # Coverage window: from delivery to 24 hours later
+            cov_start = b["delivered_at"]
+            cov_end = b["delivered_at"] + (24 * 3600 * 1000)
+            alerts = _fetch_alerts_for_point(b["lat"], b["lng"], cov_start, cov_end)
+
+            # Classify the highest-severity alert seen
+            highest = "none"
+            event_names = []
+            alert_ids = []
+            for a in alerts:
+                sev = _classify_nws_event(a.get("event", ""))
+                if sev == "high":
+                    highest = "high"
+                elif sev == "medium" and highest != "high":
+                    highest = "medium"
+                if sev != "none":
+                    event_names.append(a.get("event") or "")
+                    if a.get("id"):
+                        alert_ids.append(a["id"])
+
+            grade, score = _grade_brief(b["verdict"], highest)
+            grade_counts[grade] = grade_counts.get(grade, 0) + 1
+
+            attributed_met_id = _resolve_attributed_met_for_brief(
+                b["id"], b["user_id"], b["delivered_at"],
+                bool(b["is_met_touched"]), b.get("met_name"),
+            )
+
+            # Unique events only (one alert id may match multiple times if NWS amends)
+            event_summary = ", ".join(sorted(set(e for e in event_names if e)))[:500] or None
+            ids_str = ",".join(alert_ids[:20]) or None
+
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO brief_outcomes
+                             (brief_history_id, subscriber_user_id, attributed_met_id,
+                              delivered_at, verdict_assigned, actual_severity,
+                              grade, score, nws_alert_summary, nws_alert_ids,
+                              graded_at_ms)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                           ON CONFLICT (brief_history_id) DO NOTHING""",
+                        (b["id"], b["user_id"], attributed_met_id,
+                         b["delivered_at"], b["verdict"], highest,
+                         grade, score, event_summary, ids_str,
+                         int(time.time() * 1000)),
+                    )
+            graded += 1
+            # Be polite to NWS: small pause between requests
+            time.sleep(0.4)
+        except Exception as e:
+            errors += 1
+            print(f"[grader] failed brief={b.get('id')}: {e!r}", flush=True)
+
+    print(f"[grader] {grade_date}: graded={graded} already={already_present} "
+          f"no_loc={skipped_no_location} errors={errors} dist={grade_counts}", flush=True)
+
+    return {
+        "ok": True,
+        "date": grade_date,
+        "briefs_scanned": len(briefs),
+        "graded": graded,
+        "already_present": already_present,
+        "skipped_no_location": skipped_no_location,
+        "errors": errors,
+        "grade_distribution": grade_counts,
+    }
+
+
+# In-memory tracker: last date we ran the grader. Persists for the
+# lifetime of the process. A server restart can cause a re-run on the
+# same day, but the ON CONFLICT DO NOTHING in _run_brief_grader_for_day
+# makes that a no-op rather than a duplicate.
+_LAST_GRADER_RUN_DATE = None
+
+
+def _maybe_run_nightly_brief_grader() -> None:
+    """Fires once per day around 01:00 ET. Grades yesterday's briefs.
+
+    Why 01:00 ET specifically: every morning brief sent the prior day
+    has had at least an hour past its 24-hour coverage window close
+    (a brief sent at midnight covers through midnight the next day,
+    so by 01:00 ET we're guaranteed all coverage windows have closed
+    and NWS alerts that fired during them are visible in the API).
+    """
+    global _LAST_GRADER_RUN_DATE
+    try:
+        ET = ZoneInfo("America/New_York")
+        now_et = datetime.now(tz=ET)
+        # Only run between 01:00 and 02:00 ET — one-hour window so a
+        # slow tick doesn't miss it.
+        if now_et.hour != 1:
+            return
+        today_str = now_et.strftime("%Y-%m-%d")
+        if _LAST_GRADER_RUN_DATE == today_str:
+            return
+        yesterday = (now_et - timedelta(days=1)).strftime("%Y-%m-%d")
+        print(f"[brief-grader] nightly run firing — grading {yesterday}", flush=True)
+        result = _run_brief_grader_for_day(yesterday, force_regrade=False)
+        print(f"[brief-grader] nightly result: {result}", flush=True)
+        _LAST_GRADER_RUN_DATE = today_str
+    except Exception as e:
+        print(f"[brief-grader] _maybe_run_nightly failed: {e!r}", flush=True)
+
+
 def _compute_payroll_for_month(year: int, month: int) -> dict:
     """Computes per-Met earnings + house revenue for the given month
     in Eastern Time. Returns a dict ready for JSON serialization.
@@ -27497,6 +27969,214 @@ def admin_payroll_backfill_hobbyist(year: int, month: int):
         "by_met": by_met_named,
         "no_met_subscriber_ids": sorted(list(no_met_subscribers)),
     })
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Met accuracy endpoints (May 23, 2026, Tier 1)
+# ─────────────────────────────────────────────────────────────────────
+
+@app.route("/api/v1/me/accuracy", methods=["OPTIONS"])
+def _me_accuracy_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/accuracy")
+def me_accuracy():
+    """Return MY accuracy stats over the last 7 and 30 days.
+
+    Counts briefs where I was the attributed Met, grouped by grade.
+    Score is the average of per-brief scores, expressed as a percentage.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles:
+        return jsonify({"ok": False, "error": "not-a-met"}), 403
+
+    now_ms = int(time.time() * 1000)
+    cutoff_7d = now_ms - (7 * 24 * 3600 * 1000)
+    cutoff_30d = now_ms - (30 * 24 * 3600 * 1000)
+
+    def _stats_for_window(cutoff_ms: int) -> dict:
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT grade, COUNT(*) AS n, AVG(score) AS avg_score
+                           FROM brief_outcomes
+                           WHERE attributed_met_id = %s
+                             AND delivered_at >= %s
+                           GROUP BY grade""",
+                        (user["id"], cutoff_ms),
+                    )
+                    rows = cur.fetchall()
+        except Exception as e:
+            print(f"[me-accuracy] query failed: {e!r}", flush=True)
+            return {"total": 0, "accuracy_pct": None, "grades": {}}
+        total = 0
+        weighted_sum = 0.0
+        grade_counts = {"accurate": 0, "over_called": 0, "under_called": 0,
+                        "critical_miss": 0, "ungradable": 0}
+        for r in rows:
+            g = r["grade"]
+            n = int(r["n"])
+            grade_counts[g] = grade_counts.get(g, 0) + n
+            total += n
+            weighted_sum += float(r["avg_score"]) * n
+        pct = round(100.0 * weighted_sum / total, 1) if total > 0 else None
+        return {"total": total, "accuracy_pct": pct, "grades": grade_counts}
+
+    return jsonify({
+        "ok": True,
+        "last_7d": _stats_for_window(cutoff_7d),
+        "last_30d": _stats_for_window(cutoff_30d),
+    })
+
+
+@app.route("/api/v1/admin/accuracy", methods=["OPTIONS"])
+def _admin_accuracy_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/accuracy")
+def admin_accuracy():
+    """Return accuracy stats for all Mets over a configurable window.
+
+    Query params: ?period=7d (default) or ?period=30d
+    Returns: per-Met breakdown + team-wide summary + recent critical misses.
+    """
+    actor, err = _require_admin()
+    if err:
+        return err
+
+    period = (request.args.get("period") or "7d").lower()
+    days = 30 if period == "30d" else 7
+    now_ms = int(time.time() * 1000)
+    cutoff_ms = now_ms - (days * 24 * 3600 * 1000)
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                # Per-Met breakdown
+                cur.execute(
+                    """SELECT bo.attributed_met_id AS met_id,
+                              COALESCE(u.name, u.email, '(unattributed)') AS met_name,
+                              bo.grade,
+                              COUNT(*) AS n,
+                              AVG(bo.score) AS avg_score
+                       FROM brief_outcomes bo
+                       LEFT JOIN users u ON u.id = bo.attributed_met_id
+                       WHERE bo.delivered_at >= %s
+                       GROUP BY bo.attributed_met_id, u.name, u.email, bo.grade
+                       ORDER BY bo.attributed_met_id NULLS LAST, bo.grade""",
+                    (cutoff_ms,),
+                )
+                rows = cur.fetchall()
+
+                # Recent critical misses (most concerning entries)
+                cur.execute(
+                    """SELECT bo.id, bo.delivered_at, bo.verdict_assigned,
+                              bo.actual_severity, bo.grade, bo.score,
+                              bo.nws_alert_summary,
+                              COALESCE(u.name, u.email) AS met_name,
+                              COALESCE(sub.name, sub.email) AS subscriber_name
+                       FROM brief_outcomes bo
+                       LEFT JOIN users u ON u.id = bo.attributed_met_id
+                       LEFT JOIN users sub ON sub.id = bo.subscriber_user_id
+                       WHERE bo.delivered_at >= %s
+                         AND bo.grade IN ('critical_miss', 'under_called')
+                       ORDER BY bo.delivered_at DESC
+                       LIMIT 20""",
+                    (cutoff_ms,),
+                )
+                miss_rows = cur.fetchall()
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"query-failed: {e}"}), 500
+
+    # Aggregate per Met
+    mets = {}
+    for r in rows:
+        mid = r["met_id"]
+        if mid not in mets:
+            mets[mid] = {
+                "met_id": mid,
+                "met_name": r["met_name"],
+                "total": 0,
+                "weighted_sum": 0.0,
+                "grades": {"accurate": 0, "over_called": 0, "under_called": 0,
+                           "critical_miss": 0, "ungradable": 0},
+            }
+        n = int(r["n"])
+        mets[mid]["total"] += n
+        mets[mid]["weighted_sum"] += float(r["avg_score"]) * n
+        mets[mid]["grades"][r["grade"]] = mets[mid]["grades"].get(r["grade"], 0) + n
+
+    met_list = []
+    team_total = 0
+    team_weighted = 0.0
+    for mid, m in mets.items():
+        pct = round(100.0 * m["weighted_sum"] / m["total"], 1) if m["total"] > 0 else None
+        team_total += m["total"]
+        team_weighted += m["weighted_sum"]
+        met_list.append({
+            "met_id": m["met_id"],
+            "met_name": m["met_name"],
+            "total_briefs": m["total"],
+            "accuracy_pct": pct,
+            "grades": m["grades"],
+        })
+    met_list.sort(key=lambda x: (x["accuracy_pct"] is None, -(x["accuracy_pct"] or 0)))
+
+    team_pct = round(100.0 * team_weighted / team_total, 1) if team_total > 0 else None
+
+    misses = [{
+        "outcome_id": m["id"],
+        "delivered_at_ms": m["delivered_at"],
+        "met_name": m["met_name"] or "(unattributed)",
+        "subscriber_name": m["subscriber_name"] or "(unknown)",
+        "verdict_called": m["verdict_assigned"],
+        "actual_severity": m["actual_severity"],
+        "grade": m["grade"],
+        "nws_summary": m["nws_alert_summary"] or "",
+    } for m in miss_rows]
+
+    return jsonify({
+        "ok": True,
+        "period_days": days,
+        "team": {
+            "total_briefs": team_total,
+            "accuracy_pct": team_pct,
+        },
+        "mets": met_list,
+        "recent_misses": misses,
+    })
+
+
+@app.route("/api/v1/admin/grade-day/<grade_date>", methods=["OPTIONS"])
+def _admin_grade_day_preflight(grade_date):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/grade-day/<grade_date>")
+def admin_grade_day(grade_date: str):
+    """Manual one-shot grading for a specific date.
+
+    Path param: YYYY-MM-DD (Eastern Time).
+    Query param: ?force=1 to delete existing outcomes and regrade.
+
+    NWS doesn't reliably keep historical alerts more than a few days,
+    so this is mostly useful for re-grading the last day or two with
+    new rubric logic.
+    """
+    actor, err = _require_admin()
+    if err:
+        return err
+    force = (request.args.get("force") or "").lower() in ("1", "true", "yes")
+    result = _run_brief_grader_for_day(grade_date, force_regrade=force)
+    if not result.get("ok"):
+        return jsonify(result), 400
+    return jsonify(result)
 
 
 @app.route("/api/v1/me/earnings/<int:year>/<int:month>", methods=["OPTIONS"])
