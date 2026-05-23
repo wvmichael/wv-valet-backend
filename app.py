@@ -549,6 +549,18 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS crew_active BOOLEAN NOT NULL DEFAULT 
 -- yet (show the card); timestamp = already dismissed (hide).
 ALTER TABLE users ADD COLUMN IF NOT EXISTS met_onboarded_at BIGINT;
 
+-- Met accuracy email preference (May 23, 2026 — Tier 2).
+-- Default TRUE: every Met receives Rosie's daily accuracy email at
+-- 08:00 ET. Mets can opt out via /me/preferences in the workspace
+-- or via the one-click unsubscribe link in the email footer.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS accuracy_email_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+
+-- Last date (YYYY-MM-DD ET) we sent this Met a Rosie accuracy email.
+-- Used as the idempotency key: if today's date already matches, skip.
+-- Belt-and-suspenders alongside the _LAST_ACCURACY_EMAIL_RUN_DATE
+-- in-memory guard.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS accuracy_email_last_sent_date TEXT;
+
 -- Phase 10 timezone support: every user has a timezone (IANA name like
 -- "America/Indiana/Indianapolis"). Used by the brief scheduler to deliver
 -- in the subscriber's local time, not UTC. Defaults to Indianapolis
@@ -16521,6 +16533,10 @@ def _brief_scheduler_loop() -> None:
             _maybe_run_nightly_brief_grader()
         except Exception as e:
             print(f"[brief-grader] tick failed: {e!r}", flush=True)
+        try:
+            _maybe_run_accuracy_emails()
+        except Exception as e:
+            print(f"[accuracy-email] tick failed: {e!r}", flush=True)
         time.sleep(60)
 
 
@@ -27436,6 +27452,425 @@ def _maybe_run_nightly_brief_grader() -> None:
         print(f"[brief-grader] _maybe_run_nightly failed: {e!r}", flush=True)
 
 
+# ═══════════════════════════════════════════════════════════════════
+# Tier 2: Rosie daily accuracy email (May 23, 2026)
+# ═══════════════════════════════════════════════════════════════════
+#
+# Each morning at 08:00 ET, Rosie emails every active Met (with
+# accuracy_email_enabled = TRUE) a plaintext summary of yesterday's
+# briefs and how they held up against NWS. Critical misses get a
+# 2-line callout at the top. Footer has a one-click unsubscribe link.
+#
+# Send safety: idempotency is enforced two ways
+#   1. _LAST_ACCURACY_EMAIL_RUN_DATE — in-memory, prevents same-process re-fires
+#   2. users.accuracy_email_last_sent_date — DB-persisted per Met, prevents
+#      cross-process re-fires (e.g., if Render restarts the worker during
+#      the 08:00 window)
+
+# Signing key for unsubscribe tokens. Reuses the SESSION_SECRET if set
+# (which it is in prod). Stable across restarts.
+def _accuracy_unsub_secret() -> str:
+    return os.environ.get("SESSION_SECRET") or os.environ.get("WV_ADMIN_PASS") or "wv-accuracy-unsub-fallback-secret"
+
+
+def _make_unsub_token(user_id: int) -> str:
+    """Generate a signed unsubscribe token for the given user_id.
+    Format: {user_id}.{hex_signature_first_16_chars}
+    Stateless — verified by recomputing the signature.
+    """
+    import hmac, hashlib
+    msg = f"accuracy-unsub:{user_id}".encode("utf-8")
+    sig = hmac.new(_accuracy_unsub_secret().encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    return f"{user_id}.{sig[:16]}"
+
+
+def _verify_unsub_token(token: str) -> Optional[int]:
+    """Verify a token and return the user_id, or None if invalid."""
+    try:
+        parts = token.split(".")
+        if len(parts) != 2:
+            return None
+        user_id = int(parts[0])
+        expected = _make_unsub_token(user_id)
+        if expected == token:
+            return user_id
+    except Exception:
+        pass
+    return None
+
+
+def _compose_accuracy_email(met_user_id: int, met_name: str, grade_date: str) -> Optional[dict]:
+    """Build the email payload for one Met for one day's outcomes.
+
+    Returns {subject, body_text, total_briefs} or None if there's
+    nothing to send (zero briefs attributed). Pure compose function;
+    no I/O beyond the DB read.
+    """
+    ET = ZoneInfo("America/New_York")
+    try:
+        y, m, d = [int(x) for x in grade_date.split("-")]
+        day_start = datetime(y, m, d, 0, 0, 0, tzinfo=ET)
+    except Exception:
+        return None
+    day_end = day_start + timedelta(days=1)
+    day_start_ms = int(day_start.timestamp() * 1000)
+    day_end_ms = int(day_end.timestamp() * 1000)
+
+    # Pull yesterday's outcomes for this Met + subscriber details
+    rows = []
+    seven_d_total = 0
+    seven_d_weighted = 0.0
+    thirty_d_total = 0
+    thirty_d_weighted = 0.0
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT bo.id, bo.delivered_at, bo.verdict_assigned,
+                              bo.actual_severity, bo.grade, bo.score,
+                              bo.nws_alert_summary,
+                              COALESCE(sub.name, sub.email, '(subscriber)') AS subscriber_name,
+                              COALESCE(loc.address_text, loc.county, '') AS location_label
+                       FROM brief_outcomes bo
+                       LEFT JOIN users sub ON sub.id = bo.subscriber_user_id
+                       LEFT JOIN saved_locations loc
+                         ON loc.user_id = bo.subscriber_user_id AND loc.is_primary = TRUE
+                       WHERE bo.attributed_met_id = %s
+                         AND bo.delivered_at >= %s AND bo.delivered_at < %s
+                       ORDER BY bo.delivered_at ASC""",
+                    (met_user_id, day_start_ms, day_end_ms),
+                )
+                rows = cur.fetchall()
+                # Rolling stats
+                now_ms = int(time.time() * 1000)
+                cutoff_7d = now_ms - (7 * 24 * 3600 * 1000)
+                cutoff_30d = now_ms - (30 * 24 * 3600 * 1000)
+                cur.execute(
+                    """SELECT COUNT(*) AS n, AVG(score) AS avg_score
+                       FROM brief_outcomes
+                       WHERE attributed_met_id = %s AND delivered_at >= %s""",
+                    (met_user_id, cutoff_7d),
+                )
+                r = cur.fetchone()
+                if r and r["n"]:
+                    seven_d_total = int(r["n"])
+                    seven_d_weighted = float(r["avg_score"]) * seven_d_total
+                cur.execute(
+                    """SELECT COUNT(*) AS n, AVG(score) AS avg_score
+                       FROM brief_outcomes
+                       WHERE attributed_met_id = %s AND delivered_at >= %s""",
+                    (met_user_id, cutoff_30d),
+                )
+                r = cur.fetchone()
+                if r and r["n"]:
+                    thirty_d_total = int(r["n"])
+                    thirty_d_weighted = float(r["avg_score"]) * thirty_d_total
+    except Exception as e:
+        print(f"[accuracy-email] DB read failed for met={met_user_id}: {e!r}", flush=True)
+        return None
+
+    if not rows:
+        return None  # Nothing to send
+
+    # Tally yesterday
+    total = len(rows)
+    accurate = sum(1 for r in rows if r["grade"] == "accurate")
+    under_called = sum(1 for r in rows if r["grade"] == "under_called")
+    over_called = sum(1 for r in rows if r["grade"] == "over_called")
+    critical = sum(1 for r in rows if r["grade"] == "critical_miss")
+    ungradable = sum(1 for r in rows if r["grade"] == "ungradable")
+    day_score = sum(float(r["score"]) for r in rows)
+    day_pct = round(100.0 * day_score / total, 1) if total > 0 else 0
+
+    # Subject — keep concise, no all-caps. "X of Y accurate" is the headline.
+    if critical > 0:
+        subject = f"Yesterday's forecasts — {critical} critical miss, {accurate} of {total} accurate"
+    else:
+        subject = f"Yesterday's forecasts — {accurate} of {total} accurate"
+
+    # Greeting
+    first_name = met_name.split()[0] if met_name else "there"
+    pretty_date = day_start.strftime("%A, %B %-d")
+
+    # Build the body
+    lines = []
+    lines.append(f"Good morning {first_name},")
+    lines.append("")
+
+    # Critical-miss callout at the top
+    if critical > 0:
+        lines.append(f"!! {critical} critical miss yesterday — see below.")
+        lines.append("   A 'clear' verdict on a day a high-severity warning fired.")
+        lines.append("")
+
+    # Lead line
+    if total == 1:
+        lines.append(f"You had 1 brief attributed to you on {pretty_date}.")
+    else:
+        lines.append(f"You had {total} briefs attributed to you on {pretty_date}.")
+    lines.append("Here's how each held up against NWS:")
+    lines.append("")
+
+    # Per-brief walkthrough
+    GLYPH = {
+        "accurate":      "[OK]",
+        "over_called":   "[--]",
+        "under_called":  "[!!]",
+        "critical_miss": "[XX]",
+        "ungradable":    "[??]",
+    }
+    GRADE_LABEL = {
+        "accurate":      "Accurate.",
+        "over_called":   "Over-called.",
+        "under_called":  "Under-called.",
+        "critical_miss": "CRITICAL MISS.",
+        "ungradable":    "Could not grade.",
+    }
+    for r in rows:
+        verdict = (r["verdict_assigned"] or "").upper()
+        sub_label = r["subscriber_name"]
+        loc = r["location_label"] or ""
+        loc_str = f" ({loc})" if loc else ""
+        nws = r["nws_alert_summary"] or "no alerts"
+        glyph = GLYPH.get(r["grade"], "[ ?]")
+        gradel = GRADE_LABEL.get(r["grade"], "")
+        # Two-line entry for readability
+        lines.append(f"  {glyph} {sub_label}{loc_str}")
+        lines.append(f"        You called {verdict}. NWS: {nws}. {gradel}")
+    lines.append("")
+
+    # Yesterday's score
+    lines.append(f"Score: {day_pct}% ({total} brief{'s' if total != 1 else ''})")
+    if over_called or under_called or critical or ungradable:
+        breakdown_parts = []
+        if accurate: breakdown_parts.append(f"{accurate} accurate")
+        if over_called: breakdown_parts.append(f"{over_called} over-called")
+        if under_called: breakdown_parts.append(f"{under_called} under-called")
+        if critical: breakdown_parts.append(f"{critical} critical")
+        if ungradable: breakdown_parts.append(f"{ungradable} ungradable")
+        lines.append("  Breakdown: " + ", ".join(breakdown_parts) + ".")
+    lines.append("")
+
+    # Rolling
+    if seven_d_total > 0:
+        pct7 = round(100.0 * seven_d_weighted / seven_d_total, 1)
+        lines.append(f"7-day accuracy:  {pct7}% ({seven_d_total} briefs)")
+    if thirty_d_total > 0:
+        pct30 = round(100.0 * thirty_d_weighted / thirty_d_total, 1)
+        lines.append(f"30-day accuracy: {pct30}% ({thirty_d_total} briefs)")
+    lines.append("")
+
+    # Footer
+    lines.append("— Rosie")
+    lines.append("")
+    lines.append("---")
+    unsub_token = _make_unsub_token(met_user_id)
+    base_url = os.environ.get("PUBLIC_BASE_URL", "https://weathervalet.ai").rstrip("/")
+    unsub_url = f"{base_url}/api/v1/preferences/unsubscribe?type=accuracy&token={unsub_token}"
+    lines.append(f"You're getting this because accuracy emails are on for your Met account.")
+    lines.append(f"One-click unsubscribe: {unsub_url}")
+    lines.append(f"You can also toggle this in your Met Workspace > Email preferences.")
+
+    body_text = "\n".join(lines)
+    return {
+        "subject": subject,
+        "body_text": body_text,
+        "total_briefs": total,
+        "critical": critical,
+        "unsub_url": unsub_url,
+        "unsub_token": unsub_token,
+    }
+
+
+def _send_accuracy_email_to_met(met_user_id: int, met_email: str, met_name: str,
+                                 grade_date: str) -> dict:
+    """Compose + send Rosie's accuracy email to one Met for one day.
+
+    Returns {ok, skipped, reason} dict. Skipped means there was nothing
+    to send (zero attributed briefs).
+    """
+    composed = _compose_accuracy_email(met_user_id, met_name, grade_date)
+    if not composed:
+        return {"ok": True, "skipped": True, "reason": "no-attributed-briefs"}
+
+    api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    from_addr = os.environ.get("EMAIL_FROM", "").strip()
+
+    # Stub fallback: just log the email
+    if not api_key or not from_addr:
+        print(
+            f"[accuracy-email-stub] To: {met_email}\n"
+            f"Subject: {composed['subject']}\n"
+            f"--- body ---\n{composed['body_text']}\n"
+            f"--- end ---\n"
+            f"(no RESEND_API_KEY / EMAIL_FROM set; logging only)",
+            flush=True,
+        )
+        return {"ok": True, "skipped": False, "stub": True}
+
+    # Use a friendly "Rosie" display name with the existing from address
+    display_from = f"Rosie at WeatherValet <{from_addr}>"
+
+    payload_dict = {
+        "from": display_from,
+        "to": [met_email],
+        "subject": composed["subject"],
+        "text": composed["body_text"],
+        # Resend supports custom headers — this gives Gmail/Outlook
+        # the one-click unsubscribe button next to the sender name.
+        "headers": {
+            "List-Unsubscribe": f"<{composed['unsub_url']}>",
+            "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+        },
+    }
+    payload = json.dumps(payload_dict).encode("utf-8")
+
+    import urllib.request
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "WeatherValet-Backend/1.0 (+https://weathervalet.ai)",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            ok = 200 <= resp.status < 300
+            return {"ok": ok, "skipped": False, "total_briefs": composed["total_briefs"]}
+    except Exception as e:
+        print(f"[accuracy-email] FAILED to={met_email}: {type(e).__name__}: {e}", flush=True)
+        return {"ok": False, "skipped": False, "error": str(e)}
+
+
+def _run_accuracy_emails_for_day(grade_date: str, force: bool = False) -> dict:
+    """Send Rosie's accuracy email to every active Met with the
+    preference enabled, for the given grade_date.
+
+    force: if True, ignore accuracy_email_last_sent_date (re-send to
+           Mets who already got today's email). Used by admin manual fire.
+    """
+    sent = 0
+    skipped_no_briefs = 0
+    skipped_opt_out = 0
+    skipped_already_sent = 0
+    errors = 0
+    results = []
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT u.id, u.email, u.name,
+                              u.accuracy_email_enabled,
+                              u.accuracy_email_last_sent_date
+                       FROM users u
+                       JOIN user_roles ur ON ur.user_id = u.id
+                       WHERE ur.role = 'met'
+                         AND u.is_active = TRUE
+                         AND COALESCE(u.email, '') <> ''
+                       ORDER BY u.id ASC""",
+                )
+                mets = cur.fetchall()
+    except Exception as e:
+        return {"ok": False, "error": f"db-fetch-failed: {e}"}
+
+    for m in mets:
+        if not m.get("accuracy_email_enabled"):
+            skipped_opt_out += 1
+            results.append({"met": m["email"], "status": "opt-out"})
+            continue
+        if not force and m.get("accuracy_email_last_sent_date") == grade_date:
+            skipped_already_sent += 1
+            results.append({"met": m["email"], "status": "already-sent"})
+            continue
+
+        try:
+            r = _send_accuracy_email_to_met(
+                m["id"], m["email"], m.get("name") or "", grade_date
+            )
+            if r.get("skipped"):
+                skipped_no_briefs += 1
+                results.append({"met": m["email"], "status": "no-briefs"})
+                # Still mark as "sent for this date" so a same-day re-tick doesn't recompute
+                try:
+                    with db() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE users SET accuracy_email_last_sent_date = %s WHERE id = %s",
+                                (grade_date, m["id"]),
+                            )
+                except Exception:
+                    pass
+            elif r.get("ok"):
+                sent += 1
+                results.append({"met": m["email"], "status": "sent",
+                                "total_briefs": r.get("total_briefs", 0)})
+                try:
+                    with db() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE users SET accuracy_email_last_sent_date = %s WHERE id = %s",
+                                (grade_date, m["id"]),
+                            )
+                except Exception as e:
+                    print(f"[accuracy-email] failed to mark sent for met={m['id']}: {e!r}", flush=True)
+            else:
+                errors += 1
+                results.append({"met": m["email"], "status": "error",
+                                "error": r.get("error", "send-failed")})
+        except Exception as e:
+            errors += 1
+            print(f"[accuracy-email] unexpected error for met={m['id']}: {e!r}", flush=True)
+            results.append({"met": m["email"], "status": "error", "error": str(e)})
+
+    print(f"[accuracy-email] {grade_date}: sent={sent} no-briefs={skipped_no_briefs} "
+          f"opt-out={skipped_opt_out} already-sent={skipped_already_sent} "
+          f"errors={errors}", flush=True)
+
+    return {
+        "ok": True,
+        "date": grade_date,
+        "sent": sent,
+        "skipped_no_briefs": skipped_no_briefs,
+        "skipped_opt_out": skipped_opt_out,
+        "skipped_already_sent": skipped_already_sent,
+        "errors": errors,
+        "results": results,
+    }
+
+
+_LAST_ACCURACY_EMAIL_RUN_DATE = None
+
+
+def _maybe_run_accuracy_emails() -> None:
+    """Fires once per day around 08:00 ET. Sends Rosie's daily accuracy
+    email to every Met for yesterday's outcomes.
+
+    Why 08:00: the grader runs at 01:00, so by 08:00 yesterday's data
+    is fully graded. 08:00 ET is also a reasonable arrival time for
+    East Coast and Midwest Mets — coffee + first check of the day.
+    """
+    global _LAST_ACCURACY_EMAIL_RUN_DATE
+    try:
+        ET = ZoneInfo("America/New_York")
+        now_et = datetime.now(tz=ET)
+        if now_et.hour != 8:
+            return
+        today_str = now_et.strftime("%Y-%m-%d")
+        if _LAST_ACCURACY_EMAIL_RUN_DATE == today_str:
+            return
+        yesterday = (now_et - timedelta(days=1)).strftime("%Y-%m-%d")
+        print(f"[accuracy-email] daily run firing — grade_date={yesterday}", flush=True)
+        result = _run_accuracy_emails_for_day(yesterday, force=False)
+        print(f"[accuracy-email] daily run result: {result}", flush=True)
+        _LAST_ACCURACY_EMAIL_RUN_DATE = today_str
+    except Exception as e:
+        print(f"[accuracy-email] _maybe_run_accuracy_emails failed: {e!r}", flush=True)
+
+
 def _compute_payroll_for_month(year: int, month: int) -> dict:
     """Computes per-Met earnings + house revenue for the given month
     in Eastern Time. Returns a dict ready for JSON serialization.
@@ -28174,6 +28609,169 @@ def admin_grade_day(grade_date: str):
         return err
     force = (request.args.get("force") or "").lower() in ("1", "true", "yes")
     result = _run_brief_grader_for_day(grade_date, force_regrade=force)
+    if not result.get("ok"):
+        return jsonify(result), 400
+    return jsonify(result)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Met email preferences (May 23, 2026 — Tier 2)
+# ─────────────────────────────────────────────────────────────────────
+
+@app.route("/api/v1/me/preferences", methods=["OPTIONS"])
+def _me_preferences_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/preferences")
+def me_preferences_get():
+    """Return current user's email/SMS preferences."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT accuracy_email_enabled, accuracy_email_last_sent_date
+                       FROM users WHERE id = %s""",
+                    (user["id"],),
+                )
+                row = cur.fetchone()
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"db-failed: {e}"}), 500
+    if not row:
+        return jsonify({"ok": False, "error": "user-not-found"}), 404
+    return jsonify({
+        "ok": True,
+        "preferences": {
+            "accuracy_email_enabled": bool(row.get("accuracy_email_enabled")),
+            "accuracy_email_last_sent_date": row.get("accuracy_email_last_sent_date"),
+        },
+    })
+
+
+@app.post("/api/v1/me/preferences")
+def me_preferences_set():
+    """Update current user's email/SMS preferences.
+
+    Accepts JSON body: {accuracy_email_enabled: bool}.
+    Only fields present in the body are updated.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    data = request.get_json(silent=True) or {}
+    updates = []
+    params = []
+    if "accuracy_email_enabled" in data:
+        updates.append("accuracy_email_enabled = %s")
+        params.append(bool(data["accuracy_email_enabled"]))
+    if not updates:
+        return jsonify({"ok": False, "error": "no-fields"}), 400
+    params.append(user["id"])
+    sql = f"UPDATE users SET {', '.join(updates)} WHERE id = %s"
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(params))
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"db-failed: {e}"}), 500
+    return jsonify({"ok": True})
+
+
+@app.route("/api/v1/preferences/unsubscribe", methods=["OPTIONS"])
+def _preferences_unsub_preflight():
+    return ("", 204)
+
+
+@app.route("/api/v1/preferences/unsubscribe", methods=["GET", "POST"])
+def preferences_unsubscribe():
+    """One-click unsubscribe link used in email footers.
+
+    Query params: ?type=accuracy&token=<signed_token>
+    Verifies the signed token (no auth required — the token IS the auth).
+    Sets the matching preference to FALSE and returns a plain-text
+    confirmation page.
+
+    POST is also supported because the RFC 8058 List-Unsubscribe-Post
+    header triggers Gmail/Outlook to POST when the user clicks the
+    list-unsubscribe button next to the sender.
+    """
+    unsub_type = (request.args.get("type") or "").lower()
+    token = request.args.get("token") or ""
+    if unsub_type != "accuracy":
+        return ("Unknown preference type.\n", 400, {"Content-Type": "text/plain"})
+    user_id = _verify_unsub_token(token)
+    if not user_id:
+        return ("Invalid or expired unsubscribe link.\n", 400,
+                {"Content-Type": "text/plain"})
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET accuracy_email_enabled = FALSE WHERE id = %s",
+                    (user_id,),
+                )
+    except Exception as e:
+        print(f"[unsub] DB update failed user={user_id}: {e!r}", flush=True)
+        return ("Could not process unsubscribe. Please contact michael@weathervalet.com.\n",
+                500, {"Content-Type": "text/plain"})
+    body = (
+        "You're unsubscribed from the daily accuracy email.\n\n"
+        "If this was a mistake, sign in to your Met Workspace and toggle\n"
+        "'Daily accuracy email' back on under Email preferences.\n\n"
+        "— WeatherValet\n"
+    )
+    return (body, 200, {"Content-Type": "text/plain"})
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Admin: manually fire accuracy emails for a given grade date
+# ─────────────────────────────────────────────────────────────────────
+
+@app.route("/api/v1/admin/send-accuracy-emails/<grade_date>", methods=["OPTIONS"])
+def _admin_send_accuracy_preflight(grade_date):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/send-accuracy-emails/<grade_date>")
+def admin_send_accuracy_emails(grade_date: str):
+    """Manually fire Rosie's accuracy emails for a specific date.
+
+    Path param: YYYY-MM-DD (Eastern Time).
+    Query param: ?force=1 to ignore the last-sent guard (re-send to
+                 Mets who already got today's email — for testing).
+    Query param: ?to=<email> to send ONLY to one specific Met (testing).
+    """
+    actor, err = _require_admin()
+    if err:
+        return err
+    force = (request.args.get("force") or "").lower() in ("1", "true", "yes")
+    only_email = (request.args.get("to") or "").strip().lower()
+
+    if only_email:
+        # Test-mode: just send to one Met
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT u.id, u.email, u.name
+                           FROM users u
+                           JOIN user_roles ur ON ur.user_id = u.id
+                           WHERE LOWER(u.email) = %s AND ur.role = 'met'
+                             AND u.is_active = TRUE""",
+                        (only_email,),
+                    )
+                    m = cur.fetchone()
+        except Exception as e:
+            return jsonify({"ok": False, "error": f"db: {e}"}), 500
+        if not m:
+            return jsonify({"ok": False, "error": "met-not-found"}), 404
+        r = _send_accuracy_email_to_met(m["id"], m["email"], m.get("name") or "", grade_date)
+        return jsonify({"ok": True, "single_send": True, "met_email": m["email"], "result": r})
+
+    result = _run_accuracy_emails_for_day(grade_date, force=force)
     if not result.get("ok"):
         return jsonify(result), 400
     return jsonify(result)
