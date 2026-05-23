@@ -837,6 +837,70 @@ CREATE INDEX IF NOT EXISTS idx_dbt_due ON daily_brief_tasks(status, due_at_ms);
 
 
 -- ──────────────────────────────────────────────────────────────────────
+-- Broadcast briefs (May 22, 2026, Phase B)
+-- ──────────────────────────────────────────────────────────────────────
+-- The Daily Brief tab in the Met Portal lets a Met send ONE broadcast
+-- to many Hobbyist subscribers at once, filtered by state/county (and
+-- optionally a Leaflet polygon). The Met composes a headline, summary,
+-- verdict, and selects counties; clicking Publish creates a row here
+-- and one delivery row per matching subscriber.
+--
+-- Modes:
+--   'routine'  — daily brief broadcast, normal subject line
+--   'severe'   — weather alert broadcast, prefixed urgency in subject
+--
+-- Counties stored as a comma-separated list of "STATE:CountyName"
+-- entries (e.g., "IN:Boone,IN:Hamilton"). This matches the format
+-- the audience-count endpoint already uses.
+--
+-- polygon_geojson stores the optional drawn polygon as a GeoJSON
+-- Feature string. NULL if Met didn't draw a shape. When present,
+-- subscribers are filtered by point-in-polygon in addition to county.
+CREATE TABLE IF NOT EXISTS broadcast_briefs (
+    id                  SERIAL PRIMARY KEY,
+    sent_by_user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE SET NULL,
+    sent_by_name        TEXT,                          -- snapshot at send time
+    mode                TEXT NOT NULL DEFAULT 'routine'
+                          CHECK (mode IN ('routine', 'severe')),
+    verdict             TEXT NOT NULL DEFAULT 'caution'
+                          CHECK (verdict IN ('clear', 'mixed', 'active', 'caution', 'risk')),
+    headline            TEXT,                          -- short, becomes email subject suffix
+    summary             TEXT,                          -- main body text shown to subscribers
+    time_windows        TEXT,                          -- optional "Time windows of concern"
+    counties            TEXT NOT NULL,                 -- "IN:Boone,IN:Hamilton"
+    polygon_geojson     TEXT,                          -- NULL if no polygon drawn
+    crew_post           TEXT,                          -- optional companion Crew feed message
+    sent_at             BIGINT NOT NULL,               -- UTC ms
+    recipient_count     INTEGER NOT NULL DEFAULT 0,
+    delivered_count     INTEGER NOT NULL DEFAULT 0,
+    failed_count        INTEGER NOT NULL DEFAULT 0,
+    created_at          BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_broadcast_briefs_sent_at
+    ON broadcast_briefs(sent_at DESC);
+CREATE INDEX IF NOT EXISTS idx_broadcast_briefs_sent_by
+    ON broadcast_briefs(sent_by_user_id, sent_at DESC);
+
+-- Per-recipient delivery records. One row per (broadcast, subscriber).
+-- Used for payroll attribution (Chunk 3) and delivery analytics.
+CREATE TABLE IF NOT EXISTS broadcast_brief_deliveries (
+    id                  SERIAL PRIMARY KEY,
+    broadcast_id        INTEGER NOT NULL REFERENCES broadcast_briefs(id) ON DELETE CASCADE,
+    subscriber_user_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    channels_used       TEXT NOT NULL DEFAULT '',      -- "sms,email" or "sms" etc.
+    delivery_status     TEXT NOT NULL DEFAULT 'pending'
+                          CHECK (delivery_status IN ('pending', 'sent', 'failed', 'skipped')),
+    skip_reason         TEXT,                          -- e.g., "already_got_morning_brief"
+    sent_at             BIGINT,                        -- when this specific delivery fired
+    error_detail        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_bbd_broadcast
+    ON broadcast_brief_deliveries(broadcast_id);
+CREATE INDEX IF NOT EXISTS idx_bbd_subscriber_sent
+    ON broadcast_brief_deliveries(subscriber_user_id, sent_at DESC);
+
+
+-- ──────────────────────────────────────────────────────────────────────
 -- Storm Shelter activations (Met-pay event, $25 per activation)
 -- ──────────────────────────────────────────────────────────────────────
 -- When NWS issues a tornado/severe-thunderstorm warning that affects
@@ -19674,6 +19738,310 @@ def met_daily_brief_last_broadcast():
         pass
 
     return jsonify({"ok": True, "broadcast": None})
+
+
+@app.route("/api/v1/met/broadcast-brief", methods=["OPTIONS"])
+def _met_broadcast_brief_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/met/broadcast-brief")
+def met_broadcast_brief_send():
+    """Publish a broadcast Daily Brief to all matching Hobbyist subscribers.
+
+    Phase B, May 22, 2026 — Chunk 1.
+
+    Body JSON:
+      mode            'routine' | 'severe'  (default 'routine')
+      verdict         'clear' | 'mixed' | 'active' | 'caution' | 'risk'
+      headline        short text (becomes email subject suffix)
+      summary         main body shown to subscribers
+      time_windows    optional context
+      counties        "IN:Boone,IN:Hamilton"  (state:county pairs, no
+                      " County" suffix on the county name)
+      polygon_geojson optional GeoJSON Feature string (Chunk 5 wires this;
+                      Chunk 1 accepts it and stores it but doesn't filter)
+      crew_post       optional companion Crew feed message
+      channels        optional ['sms','email'] override; default both
+
+    Subscriber filter:
+      - active subscribers (user_roles has 'subscriber', users.is_active)
+      - primary saved_location.county matches one of the selected counties
+      - address_text contains the state abbreviation
+      - (polygon filter applied in Chunk 5)
+
+    Delivery:
+      - Sends SMS + email immediately (sequential, with small delay to
+        avoid Twilio/Resend rate limits)
+      - Records a broadcast_briefs row + one delivery row per subscriber
+      - Returns recipient count and breakdown
+
+    Payroll: not yet attributed in Chunk 1. Chunk 3 will credit the
+    sending Met for each delivered Hobbyist within the 5-10 AM local
+    pay window.
+
+    Auth: met or admin role required.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    mode = (data.get("mode") or "routine").strip().lower()
+    if mode not in ("routine", "severe"):
+        return jsonify({"ok": False, "error": "invalid-mode"}), 400
+    verdict = (data.get("verdict") or "caution").strip().lower()
+    if verdict not in ("clear", "mixed", "active", "caution", "risk"):
+        return jsonify({"ok": False, "error": "invalid-verdict"}), 400
+    headline = (data.get("headline") or "").strip()
+    summary = (data.get("summary") or "").strip()
+    time_windows = (data.get("time_windows") or "").strip()
+    counties_raw = (data.get("counties") or "").strip()
+    polygon_geojson = data.get("polygon_geojson")
+    if polygon_geojson and not isinstance(polygon_geojson, str):
+        # Frontend may send a parsed object; serialize it for storage
+        try:
+            polygon_geojson = json.dumps(polygon_geojson)
+        except Exception:
+            polygon_geojson = None
+    crew_post = (data.get("crew_post") or "").strip()
+
+    if not counties_raw:
+        return jsonify({"ok": False, "error": "no-counties",
+                        "message": "Select at least one county before publishing."}), 400
+    if not summary and not headline:
+        return jsonify({"ok": False, "error": "empty-brief",
+                        "message": "Add a summary or headline before publishing."}), 400
+
+    # Parse counties into (state, county_norm) pairs
+    pairs = []
+    for item in counties_raw.split(","):
+        item = item.strip()
+        if not item or ":" not in item:
+            continue
+        state, county = item.split(":", 1)
+        state = state.strip().upper()
+        county = county.strip().lower().replace(" county", "")
+        if len(state) == 2 and county:
+            pairs.append((state, county))
+    if not pairs:
+        return jsonify({"ok": False, "error": "invalid-counties"}), 400
+
+    # Channels override (default both)
+    channels_in = data.get("channels")
+    if channels_in and isinstance(channels_in, list):
+        channels = [c for c in channels_in if c in ("sms", "email")]
+    else:
+        channels = ["sms", "email"]
+    if not channels:
+        return jsonify({"ok": False, "error": "no-channels"}), 400
+
+    # Group counties by state for efficient querying
+    by_state = {}
+    for state, county in pairs:
+        by_state.setdefault(state, set()).add(county)
+
+    # Build the recipient list. Same matching logic as audience-count.
+    candidates = []  # list of dicts: id, email, phone, name, channels_pref
+    seen_user_ids = set()
+    for state, counties_set in by_state.items():
+        state_pattern = f"%, {state}%"
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT u.id, u.email, u.name, u.phone,
+                                  bp.channels AS channels_pref,
+                                  loc.county, loc.address_text,
+                                  loc.lat, loc.lng
+                           FROM users u
+                           JOIN saved_locations loc ON loc.user_id = u.id
+                                AND loc.is_primary = TRUE
+                           LEFT JOIN brief_preferences bp ON bp.user_id = u.id
+                           WHERE u.is_active = TRUE
+                             AND loc.county IS NOT NULL
+                             AND loc.address_text ILIKE %s
+                             AND EXISTS (
+                               SELECT 1 FROM user_roles ur
+                               WHERE ur.user_id = u.id AND ur.role = 'subscriber'
+                             )""",
+                        (state_pattern,),
+                    )
+                    rows = cur.fetchall()
+        except Exception as e:
+            print(f"[broadcast-brief] candidate query failed state={state}: {e!r}", flush=True)
+            continue
+        for r in rows:
+            if r["id"] in seen_user_ids:
+                continue
+            raw_county = (r.get("county") or "").lower().replace(" county", "").strip()
+            if raw_county in counties_set:
+                seen_user_ids.add(r["id"])
+                candidates.append(r)
+
+    if not candidates:
+        return jsonify({"ok": False, "error": "no-recipients",
+                        "message": "No subscribers found matching those counties.",
+                        "recipient_count": 0}), 200
+
+    # Polygon filter — Chunk 5 will implement; for Chunk 1, store and skip
+    # TODO Chunk 5: if polygon_geojson, filter candidates by point-in-polygon
+
+    # Create the broadcast row first so we can attach delivery rows to it
+    now_ms = int(time.time() * 1000)
+    sender_name = user.get("name") or user.get("email") or "Met"
+    broadcast_id = None
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO broadcast_briefs
+                         (sent_by_user_id, sent_by_name, mode, verdict,
+                          headline, summary, time_windows, counties,
+                          polygon_geojson, crew_post, sent_at,
+                          recipient_count, delivered_count, failed_count,
+                          created_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                               %s, %s, %s, %s, %s)
+                       RETURNING id""",
+                    (user["id"], sender_name, mode, verdict,
+                     headline, summary, time_windows, counties_raw,
+                     polygon_geojson, crew_post, now_ms,
+                     len(candidates), 0, 0, now_ms),
+                )
+                broadcast_id = cur.fetchone()["id"]
+    except Exception as e:
+        print(f"[broadcast-brief] insert broadcast row failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "storage-failed",
+                        "message": str(e)}), 500
+
+    # Build the message content
+    if mode == "severe":
+        email_subject = f"\u26a0 WEATHER ALERT: {headline}" if headline else "\u26a0 WEATHER ALERT"
+        sms_prefix = "ALERT: "
+    else:
+        email_subject = f"WeatherValet brief: {headline}" if headline else "Your WeatherValet daily brief"
+        sms_prefix = "WeatherValet: "
+
+    # SMS combines headline + summary, capped at ~300 chars total
+    sms_text = sms_prefix + (headline or summary or "Weather update")
+    if summary and headline:
+        # Append summary if there's room
+        extra = "\n\n" + summary
+        if len(sms_text) + len(extra) <= 320:
+            sms_text += extra
+        else:
+            sms_text += "\n\n" + summary[: 320 - len(sms_text) - 10] + "..."
+    if time_windows:
+        tw_addition = "\n\nTiming: " + time_windows
+        if len(sms_text) + len(tw_addition) <= 320:
+            sms_text += tw_addition
+
+    # Email body (simple HTML)
+    summary_html = _html_module.escape(summary or "").replace("\n", "<br>")
+    time_windows_html = _html_module.escape(time_windows or "").replace("\n", "<br>")
+    headline_html = _html_module.escape(headline or "Daily brief")
+    email_html = (
+        f"<p><strong>{headline_html}</strong></p>"
+        f"<p>{summary_html}</p>"
+        + (f"<p><em>Timing:</em> {time_windows_html}</p>" if time_windows else "")
+        + f"<p style='color:#666;font-size:12px;'>Sent by your meteorologist via WeatherValet.</p>"
+    )
+
+    # Send to each candidate. Small delay between sends to avoid rate
+    # limit bursts (we hit Resend 429s earlier on Met fan-outs).
+    delivered = 0
+    failed = 0
+    SEND_DELAY_S = 0.15  # 150ms between recipients
+    for r in candidates:
+        # Honor subscriber's channel preferences if set, otherwise use
+        # both. Intersect with the Met's channels override.
+        sub_channels_pref = (r.get("channels_pref") or "sms,email").split(",")
+        sub_channels_pref = [c.strip() for c in sub_channels_pref if c.strip()]
+        effective_channels = [c for c in channels if c in sub_channels_pref]
+        if not effective_channels:
+            effective_channels = channels  # fallback if subscriber's prefs filter all out
+
+        channels_used = []
+        any_success = False
+        error_msgs = []
+
+        for ch in effective_channels:
+            if ch == "sms" and r["phone"]:
+                try:
+                    ok = send_sms(r["phone"], sms_text)
+                    if ok:
+                        channels_used.append("sms")
+                        any_success = True
+                    else:
+                        error_msgs.append("sms-failed")
+                except Exception as e:
+                    error_msgs.append(f"sms-err:{e!r}")
+            elif ch == "email" and r["email"]:
+                try:
+                    ok = _send_brief_email(r["email"], email_subject, email_html)
+                    if ok:
+                        channels_used.append("email")
+                        any_success = True
+                    else:
+                        error_msgs.append("email-failed")
+                except Exception as e:
+                    error_msgs.append(f"email-err:{e!r}")
+
+        delivery_status = "sent" if any_success else "failed"
+        if any_success:
+            delivered += 1
+        else:
+            failed += 1
+
+        # Record the per-recipient delivery row
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO broadcast_brief_deliveries
+                             (broadcast_id, subscriber_user_id, channels_used,
+                              delivery_status, sent_at, error_detail)
+                           VALUES (%s, %s, %s, %s, %s, %s)""",
+                        (broadcast_id, r["id"], ",".join(channels_used),
+                         delivery_status, now_ms if any_success else None,
+                         "; ".join(error_msgs) if error_msgs else None),
+                    )
+        except Exception as e:
+            print(f"[broadcast-brief] delivery row insert failed user={r['id']}: {e!r}", flush=True)
+
+        time.sleep(SEND_DELAY_S)
+
+    # Update broadcast totals
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE broadcast_briefs
+                       SET delivered_count = %s, failed_count = %s
+                       WHERE id = %s""",
+                    (delivered, failed, broadcast_id),
+                )
+    except Exception as e:
+        print(f"[broadcast-brief] totals update failed: {e!r}", flush=True)
+
+    print(
+        f"[broadcast-brief] id={broadcast_id} by={user['id']} mode={mode} "
+        f"counties={counties_raw} recipients={len(candidates)} "
+        f"delivered={delivered} failed={failed}",
+        flush=True,
+    )
+
+    return jsonify({
+        "ok": True,
+        "broadcast_id": broadcast_id,
+        "recipient_count": len(candidates),
+        "delivered_count": delivered,
+        "failed_count": failed,
+    })
 
 
 @app.get("/api/v1/met/pro-briefs")
