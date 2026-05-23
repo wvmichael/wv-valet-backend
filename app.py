@@ -2564,7 +2564,8 @@ def _send_magic_link_email(email: str, magic_link_url: str, intent: str = "sign-
     Requires two environment variables on Render:
       RESEND_API_KEY  — server token from resend.com/api-keys
       EMAIL_FROM      — sender address at a verified domain
-                        (e.g., noreply@weathervalet.ai)
+                        (e.g., hello@weathervalet.ai — replies are
+                        forwarded to michael@weathervalet.com via Ionos)
 
     If RESEND_API_KEY is not set, falls back to printing the magic link
     to server logs (development/stub mode). This lets local dev and
@@ -9271,11 +9272,11 @@ def admin_nudge_user(user_id):
     base_url = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
     magic_link_url = f"{base_url}/?auth=verify&token={raw_token}&intent=new-account"
 
-    subject = "WeatherValet: Set Your New Account"
+    subject = "Quick step: set your morning brief delivery time"
     first_name = (sub.get("name") or "").split(" ")[0] or "there"
     body = (
         f"Hi {first_name},\n\n"
-        f"We noticed you haven't logged into our new portal nor set your morning brief delivery time and "
+        f"We noticed you haven't set your morning brief delivery time and "
         f"notification preferences yet. It only takes a minute and ensures "
         f"your brief arrives exactly when you want it.\n\n"
         f"Click here to sign in and finish setting up your account:\n"
@@ -9287,7 +9288,7 @@ def admin_nudge_user(user_id):
         f"  - SMS, email, or both\n\n"
         f"This link is good for 72 hours. If it's expired by the time you "
         f"get to it, just reply and we'll send a fresh one.\n\n"
-        f"Reach out to us with any questions.\n\n"
+        f"If you have any questions, just reply to this email.\n\n"
         f"- The WeatherValet team"
     )
 
@@ -15267,15 +15268,18 @@ def _send_welcome_email_with_temp_password(email: str, name: str,
 def _get_subscriber_reply_to_email(subscriber_user_id: int) -> Optional[str]:
     """Look up the email address subscriber replies should route to.
 
-    Added May 22, 2026 to fix the noreply@ vs "Reply to this email" UX
-    contradiction. Subscribers should reply to a real human, not to a
-    no-reply address.
+    Added May 22, 2026. Pairs with the EMAIL_FROM = hello@weathervalet.ai
+    sender (set May 23, 2026 — Ionos forwards hello@ to
+    michael@weathervalet.com). Subscribers should reply to a real human
+    on the team, ideally the Met handling them, rather than the general
+    inbox.
 
     Resolution order:
       1. Subscriber's assigned primary Met (subscriber_coverage.primary_met_id)
-      2. None if no primary Met assigned — caller should omit reply_to entirely
-         (which means noreply@ is used and subscribers can't reply usefully;
-         we'd rather drop the broken promise than promise wrong)
+      2. None if no primary Met assigned — caller should omit reply_to
+         entirely. Resend will fall back to the From: address
+         (hello@weathervalet.ai), which still reaches a human via the
+         Ionos forwarding rule.
 
     Returns the Met's email from users.email — uses whatever's on file
     (work email if configured, else personal — admin's call).
@@ -15309,9 +15313,10 @@ def _send_brief_email(email: str, subject: str, body_text: str,
 
     reply_to (added May 22, 2026): when set, the Resend payload includes
     a reply_to field so subscriber replies land in this address instead
-    of the noreply@ sender. Used to route subscriber replies to the
-    assigned Met's inbox. If None, no reply_to is set and Resend uses
-    sender default (noreply@) which subscribers shouldn't reply to.
+    of going to the From: sender. Used to route replies to the assigned
+    Met's inbox. If None, Resend falls back to the From: address
+    (hello@weathervalet.ai), which still forwards to a human via the
+    Ionos forwarding rule.
     """
     api_key = os.environ.get("RESEND_API_KEY", "").strip()
     from_addr = os.environ.get("EMAIL_FROM", "").strip()
@@ -22157,7 +22162,8 @@ def nws_page_confirm(response_token: str):
             try:
                 # Phase 3 (May 22, 2026): reply-to goes to the Met who
                 # sent this NWS confirmation. Falls back gracefully if
-                # the Met isn't signed in (no actor) → noreply default.
+                # the Met isn't signed in (no actor) → uses the From:
+                # default (hello@weathervalet.ai) which forwards to a human.
                 nws_reply_to = actor.get("email") if actor else None
                 if _send_brief_email(s["email"], email_subject, email_body, reply_to=nws_reply_to):
                     any_channel = True
