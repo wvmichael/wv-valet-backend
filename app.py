@@ -1454,6 +1454,35 @@ CREATE INDEX IF NOT EXISTS idx_brief_outcomes_subscriber
 CREATE INDEX IF NOT EXISTS idx_brief_outcomes_delivered
     ON brief_outcomes(delivered_at DESC);
 
+-- ── NWS station cache (May 23, 2026 — Tier 3) ──
+-- Maps a subscriber's user_id to the nearest NWS observation station.
+-- Populated lazily by the grader: first time we need observations for
+-- a subscriber, we call /points/{lat},{lng}/stations, pick the nearest
+-- (filtered by distance_mi <= NWS_OBS_MAX_DISTANCE_MI), and cache it
+-- here forever (or until the subscriber's saved_location changes).
+--
+-- distance_mi: if NULL or > NWS_OBS_MAX_DISTANCE_MI, we skip observations
+-- for this subscriber and rely only on NWS alerts for grading.
+--
+-- Invalidation: the grader compares cached lat/lng vs current
+-- saved_locations.lat/lng. If they differ by more than 0.01 degrees
+-- (~0.7 mi), we re-lookup. Saves us most lookups while still tracking
+-- when someone moves.
+CREATE TABLE IF NOT EXISTS nws_station_cache (
+    user_id          INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    station_id       TEXT,                -- e.g. 'KIND' for Indianapolis Intl
+    station_name     TEXT,
+    station_lat      DOUBLE PRECISION,
+    station_lng      DOUBLE PRECISION,
+    distance_mi      DOUBLE PRECISION,
+    cached_for_lat   DOUBLE PRECISION,    -- subscriber lat at lookup time
+    cached_for_lng   DOUBLE PRECISION,    -- subscriber lng at lookup time
+    updated_at_ms    BIGINT NOT NULL,
+    lookup_status    TEXT                 -- 'ok' | 'too_far' | 'no_stations' | 'error'
+);
+CREATE INDEX IF NOT EXISTS idx_nws_station_cache_station
+    ON nws_station_cache(station_id);
+
 -- ── Mission deployments (Phase 10 Item #4) ──
 -- One row per mission fired (or queued for approval) by a Met.
 -- A "mission" is a directed prompt sent to Crew members in a polygon
@@ -27204,6 +27233,294 @@ def _fetch_alerts_for_point(lat: float, lng: float, start_ms: int, end_ms: int) 
         return []
 
 
+# ═══════════════════════════════════════════════════════════════════
+# Tier 3: NWS observations layer (May 23, 2026)
+# ═══════════════════════════════════════════════════════════════════
+#
+# Adds a second signal to the grader: when NWS alerts say "nothing
+# happened" we look at actual observations from the nearest ASOS
+# station during the brief's coverage window. If conditions exceeded
+# the thresholds below, we upgrade actual_severity from 'none' to
+# 'medium'. We never upgrade to 'high' or downgrade — observations
+# only catch the gap between "perfectly clear" and "NWS-advisory level."
+#
+# Why this matters: a Met says "caution, scattered T-storms" and is
+# right about the rain even though NWS doesn't bother with an advisory.
+# Without observations, that's over_called. With observations, accurate.
+
+# Thresholds for upgrading 'none' to 'medium' based on observations.
+NWS_OBS_THRESHOLDS = {
+    "precip_in":         0.10,   # >= 0.10" total during window
+    "wind_sustained_mph": 20.0,  # >= 20 mph at any hourly obs
+    "wind_gust_mph":     30.0,   # >= 30 mph at any hourly obs
+    "temp_swing_f":      25.0,   # >= 25°F max-to-min during window
+    "temp_max_f":        95.0,   # max temp >= 95°F
+    "temp_min_f":        20.0,   # min temp <= 20°F
+}
+
+# Beyond this distance, the station's microclimate diverges enough
+# that we don't trust it for grading. Skip observations entirely
+# and rely on NWS alerts only.
+NWS_OBS_MAX_DISTANCE_MI = 30.0
+
+
+def _haversine_miles(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Great-circle distance in statute miles."""
+    import math
+    R_MI = 3958.7613
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lng2 - lng1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R_MI * c
+
+
+def _find_nearest_nws_station(lat: float, lng: float) -> Optional[dict]:
+    """Query NWS /points/{lat},{lng}/stations and return the nearest
+    station within NWS_OBS_MAX_DISTANCE_MI as
+    {station_id, station_name, station_lat, station_lng, distance_mi}.
+
+    Returns None if no station within range or fetch fails.
+    """
+    try:
+        lat_s = f"{float(lat):.4f}"
+        lng_s = f"{float(lng):.4f}"
+        url = f"https://api.weather.gov/points/{lat_s},{lng_s}/stations"
+        headers = {
+            "User-Agent": "WeatherValet (michael@weathervalet.com)",
+            "Accept": "application/geo+json",
+        }
+        import urllib.request
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        features = data.get("features") or []
+        best = None
+        for f in features:
+            props = f.get("properties") or {}
+            geom = f.get("geometry") or {}
+            coords = geom.get("coordinates") or []
+            if len(coords) < 2:
+                continue
+            s_lng, s_lat = coords[0], coords[1]
+            try:
+                dist = _haversine_miles(lat, lng, float(s_lat), float(s_lng))
+            except Exception:
+                continue
+            if best is None or dist < best["distance_mi"]:
+                best = {
+                    "station_id": props.get("stationIdentifier") or "",
+                    "station_name": props.get("name") or "",
+                    "station_lat": float(s_lat),
+                    "station_lng": float(s_lng),
+                    "distance_mi": dist,
+                }
+        if best and best["distance_mi"] <= NWS_OBS_MAX_DISTANCE_MI and best["station_id"]:
+            return best
+        return None
+    except Exception as e:
+        print(f"[grader] station lookup failed {lat},{lng}: {e!r}", flush=True)
+        return None
+
+
+def _get_or_cache_station_for_subscriber(user_id: int, lat: float, lng: float) -> Optional[dict]:
+    """Read from nws_station_cache, or do a live lookup and cache it.
+
+    Returns the station dict, or None if no usable station.
+    """
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT station_id, station_name, station_lat, station_lng,
+                              distance_mi, cached_for_lat, cached_for_lng,
+                              lookup_status
+                       FROM nws_station_cache
+                       WHERE user_id = %s""",
+                    (user_id,),
+                )
+                cached = cur.fetchone()
+    except Exception as e:
+        print(f"[grader] cache read failed user={user_id}: {e!r}", flush=True)
+        cached = None
+
+    # Hit: cached for the same location (within ~0.7 mi)
+    if cached and cached.get("cached_for_lat") is not None:
+        if (abs(cached["cached_for_lat"] - lat) < 0.01
+                and abs(cached["cached_for_lng"] - lng) < 0.01):
+            status = cached.get("lookup_status")
+            if status == "ok" and cached.get("station_id"):
+                return {
+                    "station_id": cached["station_id"],
+                    "station_name": cached["station_name"],
+                    "station_lat": cached["station_lat"],
+                    "station_lng": cached["station_lng"],
+                    "distance_mi": cached["distance_mi"],
+                }
+            # Cached negative results (too_far, no_stations, error):
+            # don't re-query, just return None this run.
+            return None
+
+    # Miss or moved: live lookup
+    found = _find_nearest_nws_station(lat, lng)
+    status = "ok" if found else "too_far_or_no_stations"
+    now_ms = int(time.time() * 1000)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO nws_station_cache
+                         (user_id, station_id, station_name, station_lat, station_lng,
+                          distance_mi, cached_for_lat, cached_for_lng,
+                          updated_at_ms, lookup_status)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                       ON CONFLICT (user_id) DO UPDATE
+                       SET station_id     = EXCLUDED.station_id,
+                           station_name   = EXCLUDED.station_name,
+                           station_lat    = EXCLUDED.station_lat,
+                           station_lng    = EXCLUDED.station_lng,
+                           distance_mi    = EXCLUDED.distance_mi,
+                           cached_for_lat = EXCLUDED.cached_for_lat,
+                           cached_for_lng = EXCLUDED.cached_for_lng,
+                           updated_at_ms  = EXCLUDED.updated_at_ms,
+                           lookup_status  = EXCLUDED.lookup_status""",
+                    (user_id,
+                     (found or {}).get("station_id"),
+                     (found or {}).get("station_name"),
+                     (found or {}).get("station_lat"),
+                     (found or {}).get("station_lng"),
+                     (found or {}).get("distance_mi"),
+                     lat, lng, now_ms, status),
+                )
+    except Exception as e:
+        print(f"[grader] cache write failed user={user_id}: {e!r}", flush=True)
+    return found
+
+
+def _fetch_observations_for_station(station_id: str, start_ms: int, end_ms: int) -> list:
+    """Query NWS for observations from this station between start/end.
+
+    NWS API: GET /stations/{station_id}/observations?start={iso}&end={iso}
+    Returns a list of dicts with keys: timestamp_ms, temp_f, wind_speed_mph,
+    wind_gust_mph, precip_in. Missing values are None.
+    """
+    try:
+        start_iso = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_iso = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        url = (f"https://api.weather.gov/stations/{station_id}/observations"
+               f"?start={start_iso}&end={end_iso}")
+        headers = {
+            "User-Agent": "WeatherValet (michael@weathervalet.com)",
+            "Accept": "application/geo+json",
+        }
+        import urllib.request
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        features = data.get("features") or []
+        out = []
+        for f in features:
+            props = f.get("properties") or {}
+            ts_str = props.get("timestamp") or ""
+            # Parse ISO 8601 timestamp → ms epoch
+            ts_ms = None
+            try:
+                # NWS uses formats like "2026-05-22T15:53:00+00:00"
+                # Python 3.11+ datetime.fromisoformat handles this directly
+                dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                ts_ms = int(dt.timestamp() * 1000)
+            except Exception:
+                pass
+
+            # Each measurement is a dict with 'value' and 'unitCode'.
+            # Temperature in °C → convert to °F.
+            temp = (props.get("temperature") or {}).get("value")
+            temp_f = (temp * 9.0 / 5.0 + 32.0) if temp is not None else None
+            # Wind speed in km/h → convert to mph (1 km/h = 0.621371 mph)
+            wind = (props.get("windSpeed") or {}).get("value")
+            wind_mph = (wind * 0.621371) if wind is not None else None
+            gust = (props.get("windGust") or {}).get("value")
+            gust_mph = (gust * 0.621371) if gust is not None else None
+            # precipitationLastHour: in mm → convert to inches (1 mm = 0.0393701 in)
+            precip_mm = (props.get("precipitationLastHour") or {}).get("value")
+            precip_in = (precip_mm * 0.0393701) if precip_mm is not None else None
+
+            out.append({
+                "timestamp_ms": ts_ms,
+                "temp_f": temp_f,
+                "wind_speed_mph": wind_mph,
+                "wind_gust_mph": gust_mph,
+                "precip_in": precip_in,
+            })
+        return out
+    except Exception as e:
+        print(f"[grader] obs fetch failed station={station_id}: {e!r}", flush=True)
+        return []
+
+
+def _classify_observations(observations: list) -> tuple:
+    """Inspect observations against NWS_OBS_THRESHOLDS.
+
+    Returns ('medium' | 'none', summary_string).
+    summary_string is human-readable, like "1.4\" rain, wind gust 33 mph"
+    or "" when nothing notable.
+    """
+    if not observations:
+        return ("none", "")
+
+    # Aggregate
+    total_precip = 0.0
+    max_sustained_wind = 0.0
+    max_gust = 0.0
+    temps = []
+    for o in observations:
+        if o.get("precip_in") is not None:
+            try:
+                total_precip += float(o["precip_in"])
+            except Exception:
+                pass
+        if o.get("wind_speed_mph") is not None:
+            try:
+                max_sustained_wind = max(max_sustained_wind, float(o["wind_speed_mph"]))
+            except Exception:
+                pass
+        if o.get("wind_gust_mph") is not None:
+            try:
+                max_gust = max(max_gust, float(o["wind_gust_mph"]))
+            except Exception:
+                pass
+        if o.get("temp_f") is not None:
+            try:
+                temps.append(float(o["temp_f"]))
+            except Exception:
+                pass
+
+    temp_max = max(temps) if temps else None
+    temp_min = min(temps) if temps else None
+    temp_swing = (temp_max - temp_min) if (temp_max is not None and temp_min is not None) else 0.0
+
+    th = NWS_OBS_THRESHOLDS
+    findings = []
+    if total_precip >= th["precip_in"]:
+        findings.append(f"{total_precip:.2f}\" precipitation")
+    if max_sustained_wind >= th["wind_sustained_mph"]:
+        findings.append(f"sustained wind {max_sustained_wind:.0f} mph")
+    if max_gust >= th["wind_gust_mph"]:
+        findings.append(f"wind gust {max_gust:.0f} mph")
+    if temp_swing >= th["temp_swing_f"]:
+        findings.append(f"{temp_swing:.0f}\u00b0F temp swing")
+    if temp_max is not None and temp_max >= th["temp_max_f"]:
+        findings.append(f"max temp {temp_max:.0f}\u00b0F")
+    if temp_min is not None and temp_min <= th["temp_min_f"]:
+        findings.append(f"min temp {temp_min:.0f}\u00b0F")
+
+    if findings:
+        return ("medium", "Observations: " + ", ".join(findings))
+    return ("none", "")
+
+
 def _resolve_attributed_met_for_brief(brief_history_id: int, subscriber_user_id: int,
                                        delivered_at: int, is_met_touched: bool,
                                        met_name: Optional[str]) -> Optional[int]:
@@ -27367,6 +27684,31 @@ def _run_brief_grader_for_day(grade_date: str, force_regrade: bool = False) -> d
                     if a.get("id"):
                         alert_ids.append(a["id"])
 
+            # ── Tier 3 (May 23, 2026): Layer observations ──
+            # If alerts said 'none', check the nearest ASOS station's
+            # observations during the coverage window. If conditions
+            # exceeded thresholds, upgrade to 'medium'. Never upgrades
+            # to 'high' and never downgrades — observations only catch
+            # the gap between "perfectly clear" and "NWS-advisory level."
+            obs_summary = ""
+            if highest == "none":
+                try:
+                    station = _get_or_cache_station_for_subscriber(
+                        b["user_id"], b["lat"], b["lng"]
+                    )
+                    if station:
+                        observations = _fetch_observations_for_station(
+                            station["station_id"], cov_start, cov_end
+                        )
+                        obs_severity, obs_summary = _classify_observations(observations)
+                        if obs_severity == "medium":
+                            highest = "medium"
+                            # Be polite to NWS between two extra calls
+                            time.sleep(0.2)
+                except Exception as e:
+                    print(f"[grader] observations layer failed brief={b.get('id')}: "
+                          f"{e!r}", flush=True)
+
             grade, score = _grade_brief(b["verdict"], highest)
             grade_counts[grade] = grade_counts.get(grade, 0) + 1
 
@@ -27377,6 +27719,13 @@ def _run_brief_grader_for_day(grade_date: str, force_regrade: bool = False) -> d
 
             # Unique events only (one alert id may match multiple times if NWS amends)
             event_summary = ", ".join(sorted(set(e for e in event_names if e)))[:500] or None
+            # If observations contributed, append the obs summary so the
+            # email shows what was observed (e.g., "Observations: 1.4\" rain").
+            if obs_summary:
+                if event_summary:
+                    event_summary = (event_summary + "; " + obs_summary)[:500]
+                else:
+                    event_summary = obs_summary[:500]
             ids_str = ",".join(alert_ids[:20]) or None
 
             with db() as conn:
