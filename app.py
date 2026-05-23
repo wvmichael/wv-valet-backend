@@ -10085,6 +10085,286 @@ def admin_view_as_met(met_user_id):
 
 
 # ════════════════════════════════════════════════════════════════════
+# Daily Brief diagnostic endpoints (May 22, 2026, Phase B follow-up)
+# ════════════════════════════════════════════════════════════════════
+#
+# These help diagnose why a known subscriber isn't matching a county
+# in the broadcast endpoint. The root cause is usually one of:
+#   1. saved_locations.county is NULL (geocoder didn't return admin2)
+#   2. saved_locations.county is set but address_text omits the state
+#   3. Subscriber has no primary saved_location at all
+#
+# subscriber-locations: lists all active subscribers with their primary
+# location, county, lat/lng — useful for spotting bad data fast.
+#
+# regeocode-subscriber: re-runs geocoding on a subscriber's primary
+# location and updates county/lat/lng. Use this to fix bad rows.
+#
+# recent-broadcasts: list of last 20 broadcast briefs sent. Lets the
+# admin verify a broadcast actually fired and see who got it.
+
+
+@app.route("/api/v1/admin/subscriber-locations", methods=["OPTIONS"])
+def _admin_subscriber_locations_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/subscriber-locations")
+def admin_subscriber_locations():
+    """Return primary saved_location for every active subscriber.
+
+    Used by the admin Daily Brief diagnostic view to see what's actually
+    stored for each subscriber — county name, address, lat/lng. If a
+    subscriber is missing county or has weird data, this is where the
+    admin spots it.
+
+    Auth: admin role required.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT u.id AS user_id,
+                              u.email,
+                              u.name,
+                              u.subscription_tier,
+                              u.is_active,
+                              loc.id AS location_id,
+                              loc.label AS location_label,
+                              loc.address_text,
+                              loc.county,
+                              loc.lat,
+                              loc.lng
+                       FROM users u
+                       LEFT JOIN saved_locations loc
+                            ON loc.user_id = u.id AND loc.is_primary = TRUE
+                       WHERE EXISTS (
+                         SELECT 1 FROM user_roles ur
+                         WHERE ur.user_id = u.id AND ur.role = 'subscriber'
+                       )
+                       ORDER BY u.is_active DESC, u.name NULLS LAST, u.email"""
+                )
+                rows = cur.fetchall()
+    except Exception as e:
+        return jsonify({"ok": False, "error": "query-failed",
+                        "message": str(e)}), 500
+
+    subscribers = []
+    for r in rows:
+        county_raw = r.get("county") or ""
+        county_norm = county_raw.lower().replace(" county", "").strip()
+        # Diagnose: does this subscriber match audience-count's filters?
+        # Need: is_active, has county, address has state abbreviation
+        addr = r.get("address_text") or ""
+        # Try to detect state from address (rough: look for ", XX" pattern)
+        import re as _re
+        state_match = _re.search(r",\s*([A-Z]{2})(?:\b|,)", addr)
+        detected_state = state_match.group(1) if state_match else None
+        issues = []
+        if not r.get("is_active"):
+            issues.append("inactive")
+        if not r.get("location_id"):
+            issues.append("no_primary_location")
+        if not county_raw:
+            issues.append("county_missing")
+        if not detected_state:
+            issues.append("state_not_in_address")
+        if not r.get("lat") or not r.get("lng"):
+            issues.append("no_coords")
+        subscribers.append({
+            "user_id": r["user_id"],
+            "email": r["email"],
+            "name": r.get("name") or "",
+            "tier": r.get("subscription_tier") or "",
+            "is_active": bool(r.get("is_active")),
+            "location_id": r.get("location_id"),
+            "location_label": r.get("location_label") or "",
+            "address_text": addr,
+            "county_raw": county_raw,
+            "county_norm": county_norm,
+            "detected_state": detected_state,
+            "lat": float(r["lat"]) if r.get("lat") is not None else None,
+            "lng": float(r["lng"]) if r.get("lng") is not None else None,
+            "issues": issues,
+        })
+
+    return jsonify({"ok": True, "subscribers": subscribers})
+
+
+@app.route("/api/v1/admin/regeocode-subscriber/<int:user_id>", methods=["OPTIONS"])
+def _admin_regeocode_subscriber_preflight(user_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/regeocode-subscriber/<int:user_id>")
+def admin_regeocode_subscriber(user_id):
+    """Re-geocode a subscriber's primary location, updating county + lat/lng.
+
+    Looks up the subscriber's primary saved_location, runs geocoding on
+    the address_text (falling back to label if needed), and writes back
+    county / lat / lng if the geocoder returned them. Also fills in a
+    state abbreviation in address_text if missing.
+
+    Auth: admin role required.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    body = request.get_json(silent=True) or {}
+    override_address = (body.get("address_text") or "").strip()
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, label, address_text, lat, lng, county
+                   FROM saved_locations
+                   WHERE user_id = %s AND is_primary = TRUE
+                   LIMIT 1""",
+                (user_id,),
+            )
+            loc = cur.fetchone()
+    if not loc:
+        return jsonify({"ok": False, "error": "no-primary-location"}), 404
+
+    address_for_geocode = override_address or loc["address_text"] or loc["label"] or ""
+    if not address_for_geocode.strip():
+        return jsonify({"ok": False, "error": "no-address",
+                        "message": "Subscriber has no address to geocode."}), 400
+
+    geo = _geocode_address(address_for_geocode)
+    if not geo:
+        return jsonify({"ok": False, "error": "geocode-failed",
+                        "message": f"Could not geocode: {address_for_geocode}"}), 400
+
+    new_lat = geo.get("lat")
+    new_lng = geo.get("lng")
+    new_county = geo.get("admin2") or loc.get("county")
+    # If address didn't have state abbreviation, augment with it from geocoder
+    new_address = override_address or loc["address_text"] or address_for_geocode
+    state_full = geo.get("admin1") or ""
+    # Map full state name to abbreviation (only common ones; if absent we
+    # leave address as-is and admin can edit manually)
+    state_abbr_map = {
+        "Indiana": "IN", "Illinois": "IL", "Ohio": "OH", "Kentucky": "KY",
+        "Michigan": "MI", "Wisconsin": "WI", "Iowa": "IA", "Missouri": "MO",
+        "Tennessee": "TN", "Kansas": "KS", "Nebraska": "NE", "Oklahoma": "OK",
+        "Texas": "TX", "California": "CA", "New York": "NY", "Florida": "FL",
+        "Pennsylvania": "PA", "Georgia": "GA", "New Jersey": "NJ",
+        "North Carolina": "NC", "Virginia": "VA", "Washington": "WA",
+        "Massachusetts": "MA", "Arizona": "AZ", "Colorado": "CO",
+        "Maryland": "MD", "Minnesota": "MN", "South Carolina": "SC",
+        "Alabama": "AL", "Louisiana": "LA", "Oregon": "OR", "Connecticut": "CT",
+    }
+    state_abbr = state_abbr_map.get(state_full, "")
+    if state_abbr and f", {state_abbr}" not in (new_address or ""):
+        # Append ", XX" so audience-count's state filter matches
+        if "," in new_address:
+            new_address = new_address.rstrip() + f", {state_abbr}"
+        else:
+            new_address = (new_address + f", {state_abbr}").strip()
+
+    now_ms = int(time.time() * 1000)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE saved_locations
+                       SET address_text = %s, lat = %s, lng = %s,
+                           county = %s, updated_at = %s
+                       WHERE id = %s""",
+                    (new_address, new_lat, new_lng, new_county, now_ms, loc["id"]),
+                )
+    except Exception as e:
+        return jsonify({"ok": False, "error": "update-failed",
+                        "message": str(e)}), 500
+
+    return jsonify({
+        "ok": True,
+        "updated": {
+            "user_id": user_id,
+            "address_text": new_address,
+            "lat": new_lat,
+            "lng": new_lng,
+            "county": new_county,
+            "geocoder_result": {
+                "admin1_state": state_full,
+                "admin2_county": geo.get("admin2"),
+                "name": geo.get("name"),
+            },
+        },
+    })
+
+
+@app.route("/api/v1/met/daily-brief/recent-broadcasts", methods=["OPTIONS"])
+def _met_daily_brief_recent_broadcasts_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/daily-brief/recent-broadcasts")
+def met_daily_brief_recent_broadcasts():
+    """List the last 20 broadcast briefs sent.
+
+    Used by the admin/Met UI to confirm a broadcast actually fired and
+    see delivery counts. Each entry includes recipient and delivered
+    counts so the admin can spot failed sends quickly.
+
+    Auth: met or admin role required.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, sent_by_user_id, sent_by_name, mode, verdict,
+                              headline, summary, counties,
+                              recipient_count, delivered_count, failed_count,
+                              sent_at
+                       FROM broadcast_briefs
+                       ORDER BY sent_at DESC
+                       LIMIT 20"""
+                )
+                rows = cur.fetchall()
+    except Exception as e:
+        # Table may not exist yet — return empty list cleanly
+        print(f"[recent-broadcasts] query failed: {e!r}", flush=True)
+        return jsonify({"ok": True, "broadcasts": []})
+
+    broadcasts = []
+    for r in rows:
+        broadcasts.append({
+            "id": r["id"],
+            "sent_by_name": r.get("sent_by_name") or "",
+            "mode": r.get("mode") or "routine",
+            "verdict": r.get("verdict") or "",
+            "headline": r.get("headline") or "",
+            "summary": r.get("summary") or "",
+            "counties": r.get("counties") or "",
+            "recipient_count": r.get("recipient_count") or 0,
+            "delivered_count": r.get("delivered_count") or 0,
+            "failed_count": r.get("failed_count") or 0,
+            "sent_at": r.get("sent_at"),
+        })
+    return jsonify({"ok": True, "broadcasts": broadcasts})
+
+
+# ════════════════════════════════════════════════════════════════════
 # Crew confessionals (Phase 4a — May 14)
 # ════════════════════════════════════════════════════════════════════
 #
