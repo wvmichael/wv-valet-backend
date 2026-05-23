@@ -9271,11 +9271,11 @@ def admin_nudge_user(user_id):
     base_url = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
     magic_link_url = f"{base_url}/?auth=verify&token={raw_token}&intent=new-account"
 
-    subject = "Quick step: set your morning brief delivery time"
+    subject = "WeatherValet: Set Your New Account"
     first_name = (sub.get("name") or "").split(" ")[0] or "there"
     body = (
         f"Hi {first_name},\n\n"
-        f"We noticed you haven't set your morning brief delivery time and "
+        f"We noticed you haven't logged into our new portal nor set your morning brief delivery time and "
         f"notification preferences yet. It only takes a minute and ensures "
         f"your brief arrives exactly when you want it.\n\n"
         f"Click here to sign in and finish setting up your account:\n"
