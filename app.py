@@ -20013,6 +20013,38 @@ def met_broadcast_brief_send():
         except Exception as e:
             print(f"[broadcast-brief] delivery row insert failed user={r['id']}: {e!r}", flush=True)
 
+        # ── Chunk 4 dedup hook (May 22, 2026, Phase B) ──
+        # Also write a brief_history row with brief_type='daily_brief' so
+        # the Hobbyist AI scheduler's existing cancellation check (which
+        # looks at brief_history for daily_brief rows in last 24h) sees
+        # this delivery and skips the AI auto-send.
+        #
+        # Why this works: _process_pending_briefs_inner has a check that
+        # runs BEFORE the Hobbyist auto-send path. If it finds any
+        # brief_history row with brief_type='daily_brief' in the last 24h
+        # for this user, it logs "skipping AI auto-brief" and continues.
+        # By writing here, we hook that existing path without modifying
+        # the scheduler. Clean, reversible, well-isolated.
+        #
+        # We only write on actual successful delivery (any_success=True)
+        # so that a failed broadcast doesn't suppress the AI fallback —
+        # the subscriber would otherwise get no brief at all.
+        if any_success:
+            try:
+                _record_brief_delivery(
+                    user_id=r["id"],
+                    brief_type="daily_brief",
+                    verdict=verdict,
+                    snippet=headline or (summary[:140] if summary else ""),
+                    full_body=summary or "",
+                    delivery_status="sent",
+                    channels_used=",".join(channels_used),
+                    is_met_touched=True,
+                    met_name=sender_name,
+                )
+            except Exception as e:
+                print(f"[broadcast-brief] brief_history write failed user={r['id']}: {e!r}", flush=True)
+
         time.sleep(SEND_DELAY_S)
 
     # Update broadcast totals
