@@ -9531,6 +9531,86 @@ def admin_nudge_user(user_id):
     return jsonify({"ok": True, "sent_to": sub["email"]})
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Admin: set a user's password (May 23, 2026 — Todo #37)
+# ─────────────────────────────────────────────────────────────────────
+# Session-cookie counterpart to the legacy /admin/set-password endpoint
+# (which uses HTTP Basic auth). This one is callable from the admin
+# Users list UI: admin clicks "Set password" → prompt for new password
+# → POST here. Mirrors the legacy endpoint's hash + update logic.
+#
+# Use case: a user is locked out (forgot password, magic-link broken,
+# iOS Safari ITP eating the session cookie during set-password flow,
+# etc.) and admin needs to hand them a working password directly.
+#
+# Security: same authority as /admin/grant-role and /admin/users —
+# session cookie + admin role. The legacy Basic-auth endpoint stays
+# unchanged for curl/bootstrap use.
+
+@app.route("/api/v1/admin/users/<int:user_id>/set-password", methods=["OPTIONS"])
+def _admin_user_set_password_preflight(user_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/users/<int:user_id>/set-password")
+@require_role("admin")
+def admin_user_set_password(user_id: int):
+    """Set a user's password directly. Admin-only.
+
+    Request body: {"password": "new-password"}
+    Returns: 200 {"ok": true, "user_id": <id>, "email": "<email>"}
+             400 on missing field, too-short password, or invalid input
+             404 if user doesn't exist
+    """
+    data = request.get_json(silent=True) or {}
+    password = data.get("password") or ""
+
+    if not password:
+        return jsonify({"ok": False, "error": "missing-password"}), 400
+    if len(password) < 8:
+        return jsonify({"ok": False, "error": "password-too-short"}), 400
+    if len(password) > 256:
+        # Defensive: bcrypt has a 72-byte input limit, and even allowing
+        # generous slack a 256+ char password is almost certainly bad input.
+        return jsonify({"ok": False, "error": "password-too-long"}), 400
+
+    new_hash = hash_password(password)
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE users SET password_hash = %s
+                       WHERE id = %s
+                       RETURNING id, email""",
+                    (new_hash, user_id),
+                )
+                row = cur.fetchone()
+    except Exception as e:
+        print(f"[admin] set-password DB failure user_id={user_id}: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-failed"}), 500
+
+    if row is None:
+        return jsonify({"ok": False, "error": "no-such-user"}), 404
+
+    # Kill active sessions so the user must sign in with the new password.
+    # Matches the pattern from the admin user-edit endpoint when reset_password is set.
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM sessions WHERE user_id = %s", (user_id,))
+    except Exception as e:
+        # Non-fatal: password was set, sessions cleanup just failed.
+        print(f"[admin] set-password session cleanup failed user_id={user_id}: {e!r}", flush=True)
+
+    print(f"[admin] password set via UI for user_id={row['id']} email={row['email']}", flush=True)
+    return jsonify({
+        "ok": True,
+        "user_id": row["id"],
+        "email": row["email"],
+    }), 200
+
+
 @app.post("/api/v1/admin/users")
 @require_role("admin")
 def admin_create_user():
