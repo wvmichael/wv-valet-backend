@@ -9234,7 +9234,43 @@ def admin_nudge_user(user_id):
     if not sub.get("email"):
         return jsonify({"ok": False, "error": "no-email"}), 400
 
-    portal_url = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/") + "/?portal=1"
+    # Generate a magic link so the subscriber can sign in with one click.
+    # (Added May 23, 2026 — many nudged subscribers have "never joined"
+    # status: they came in via Stripe checkout but never set a password,
+    # so a plain "log into your portal" link would dead-end at the login
+    # screen with no clear path forward.)
+    #
+    # TTL: 72 hours instead of the default 15 minutes. Nudges aren't
+    # time-sensitive auth challenges — they can sit in an inbox for a
+    # day or two before the subscriber reads them. 72 hours is the
+    # balance between "long enough to be useful" and "short enough that
+    # an old email isn't a permanent backdoor".
+    #
+    # Intent: 'new-account' since most nudged users haven't completed
+    # account setup. The email framing is "set your password" rather
+    # than "sign in", which matches their actual mental state.
+    NUDGE_TOKEN_TTL_SECONDS = 72 * 60 * 60  # 72 hours
+    raw_token = new_secure_token()
+    token_hash = hash_token(raw_token)
+    now_secs = now_ts()
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO magic_link_tokens
+                       (token_hash, user_id, created_at, expires_at, ip_requested)
+                       VALUES (%s, %s, %s, %s, %s)""",
+                    (token_hash, sub["id"], now_secs,
+                     now_secs + NUDGE_TOKEN_TTL_SECONDS,
+                     get_client_ip()),
+                )
+    except Exception as e:
+        print(f"[admin-nudge] token insert failed: {e}", flush=True)
+        return jsonify({"ok": False, "error": "token-failed"}), 500
+
+    base_url = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+    magic_link_url = f"{base_url}/?auth=verify&token={raw_token}&intent=new-account"
+
     subject = "Quick step: set your morning brief delivery time"
     first_name = (sub.get("name") or "").split(" ")[0] or "there"
     body = (
@@ -9242,10 +9278,15 @@ def admin_nudge_user(user_id):
         f"We noticed you haven't set your morning brief delivery time and "
         f"notification preferences yet. It only takes a minute and ensures "
         f"your brief arrives exactly when you want it.\n\n"
-        f"Log into your subscriber portal here:\n{portal_url}\n\n"
-        f"In Settings, choose:\n"
+        f"Click here to sign in and finish setting up your account:\n"
+        f"{magic_link_url}\n\n"
+        f"(This link signs you in automatically. If you'd like to set or "
+        f"change your password, you can do that from Settings once you're in.)\n\n"
+        f"Once you're signed in, head to Settings to choose:\n"
         f"  - Preferred delivery time (between 5:00 AM and 10:00 AM local)\n"
         f"  - SMS, email, or both\n\n"
+        f"This link is good for 72 hours. If it's expired by the time you "
+        f"get to it, just reply and we'll send a fresh one.\n\n"
         f"If you have any questions, just reply to this email.\n\n"
         f"- The WeatherValet team"
     )
@@ -9267,7 +9308,12 @@ def admin_nudge_user(user_id):
                      actor["id"] if actor else None,
                      actor.get("name") if actor else "system",
                      user_id,
-                     json.dumps({"email": sub["email"], "sent": bool(ok)})),
+                     json.dumps({
+                         "email": sub["email"],
+                         "sent": bool(ok),
+                         "magic_link_issued": True,
+                         "magic_link_ttl_hours": 72,
+                     })),
                 )
     except Exception as e:
         print(f"[admin-nudge] audit log failed: {e}", flush=True)
