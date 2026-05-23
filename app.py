@@ -16132,6 +16132,79 @@ def _process_pending_briefs_inner() -> None:
                 is_met_touched=is_met_touched,
                 met_name=met_name_for_record,
             )
+
+            # ── Payroll attribution for Hobbyists (May 23, 2026) ──
+            # Per the corrected pay rule: the assigned primary Met earns
+            # 50% of the daily Hobbyist revenue EVERY day, even when AI
+            # auto-sends the brief (no human Met touched it). The brief
+            # is the Met's product — they're the assigned owner of that
+            # subscriber relationship.
+            #
+            # _compute_payroll_for_month reads daily_brief_tasks for
+            # Hobbyist attribution. Without a row here, the primary Met
+            # gets $0 for AI-only days and the house keeps everything.
+            #
+            # Pro tiers are NOT attributed here — Pro pay is per
+            # Met-sent morning brief in pro_brief_drafts. The scheduler
+            # only AI-sends Hobbyists; Pro tier sends always go through
+            # the workspace endpoint which has its own attribution.
+            #
+            # Upsert pattern matches the broadcast flow (line ~20708):
+            # if a row already exists for today with status='sent', we
+            # preserve it (first successful send wins). Otherwise we
+            # write 'sent' with the primary Met from subscriber_coverage.
+            if any_success and tier == "hobbyist":
+                try:
+                    now_ms_dbt = int(time.time() * 1000)
+                    # Compute task_date in subscriber's local timezone
+                    try:
+                        sub_zone_dbt = ZoneInfo(c.get("timezone") or "America/Indiana/Indianapolis")
+                    except Exception:
+                        sub_zone_dbt = ZoneInfo("America/Indiana/Indianapolis")
+                    local_dt_dbt = datetime.fromtimestamp(
+                        now_ms_dbt / 1000, tz=timezone.utc
+                    ).astimezone(sub_zone_dbt)
+                    task_date_dbt = local_dt_dbt.strftime("%Y-%m-%d")
+                    # Look up the subscriber's primary Met (may be None
+                    # if admin hasn't assigned one — then no Met earns,
+                    # which is the correct outcome).
+                    primary_met_id_dbt = None
+                    with db() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """SELECT sc.primary_met_id
+                                   FROM subscriber_coverage sc
+                                   JOIN users u ON u.id = sc.primary_met_id
+                                   WHERE sc.user_id = %s AND u.is_active = TRUE""",
+                                (c["user_id"],),
+                            )
+                            row_dbt = cur.fetchone()
+                            if row_dbt:
+                                primary_met_id_dbt = row_dbt.get("primary_met_id")
+                            cur.execute(
+                                """INSERT INTO daily_brief_tasks
+                                     (subscriber_user_id, task_date, assigned_met_id,
+                                      due_at_ms, status, sent_at_ms)
+                                   VALUES (%s, %s, %s, %s, 'sent', %s)
+                                   ON CONFLICT (subscriber_user_id, task_date) DO UPDATE
+                                   SET assigned_met_id = CASE
+                                           WHEN daily_brief_tasks.status = 'sent' THEN daily_brief_tasks.assigned_met_id
+                                           ELSE EXCLUDED.assigned_met_id
+                                       END,
+                                       status = 'sent',
+                                       sent_at_ms = CASE
+                                           WHEN daily_brief_tasks.status = 'sent' THEN daily_brief_tasks.sent_at_ms
+                                           ELSE EXCLUDED.sent_at_ms
+                                       END""",
+                                (c["user_id"], task_date_dbt, primary_met_id_dbt,
+                                 now_ms_dbt, now_ms_dbt),
+                            )
+                except Exception as e:
+                    # Don't fail the send over a payroll bookkeeping issue.
+                    # Backfill endpoint can recover if this fails.
+                    print(f"[brief-scheduler] daily_brief_tasks upsert failed "
+                          f"user={c.get('user_id')}: {e!r}", flush=True)
+
             # If we sourced from a draft, mark the draft as 'sent' too so
             # the queue shows it correctly and the duplicate-check skips
             # it on the next tick.
@@ -27224,6 +27297,206 @@ def admin_payroll(year: int, month: int):
     result = _compute_payroll_for_month(year, month)
     result["ok"] = True
     return jsonify(result)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Admin: backfill missing daily_brief_tasks rows for past Hobbyist sends
+# ─────────────────────────────────────────────────────────────────────
+# Added May 23, 2026.
+#
+# Why this exists: before today's fix, the scheduler's AI auto-send
+# path wrote brief_history rows but did NOT write daily_brief_tasks
+# rows. _compute_payroll_for_month attributes Hobbyist daily commission
+# by reading daily_brief_tasks. So every Hobbyist day delivered by AI
+# auto-send went uncredited and the house kept the whole revenue.
+#
+# This endpoint walks brief_history for Hobbyist morning sends in the
+# given month and upserts the missing daily_brief_tasks rows using the
+# subscriber's current primary_met_id from subscriber_coverage.
+#
+# Idempotent: re-running won't double-credit. The UPSERT preserves any
+# existing 'sent' row (first send wins, matching the live attribution
+# rule). Safe to run multiple times.
+#
+# Run once for each historical month that needs correction. Going
+# forward, the scheduler fix ensures new sends are attributed correctly.
+
+@app.route("/api/v1/admin/payroll-backfill-hobbyist/<int:year>/<int:month>",
+           methods=["OPTIONS"])
+def _admin_payroll_backfill_hobbyist_preflight(year, month):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/payroll-backfill-hobbyist/<int:year>/<int:month>")
+def admin_payroll_backfill_hobbyist(year: int, month: int):
+    """One-shot: backfill daily_brief_tasks rows for Hobbyist morning
+    sends that were recorded in brief_history but never written to
+    daily_brief_tasks (pre-May-23-2026 bug).
+
+    Path params: /YYYY/MM (e.g. /2026/5 for May 2026)
+
+    Returns a JSON summary: how many brief_history rows scanned, how
+    many rows inserted, how many were already present, how many had no
+    primary Met assigned (so no credit could be issued).
+    """
+    actor, err = _require_admin()
+    if err:
+        return err
+
+    if month < 1 or month > 12:
+        return jsonify({"ok": False, "error": "invalid-month"}), 400
+    if year < 2020 or year > 2100:
+        return jsonify({"ok": False, "error": "invalid-year"}), 400
+
+    # Define the month period in Eastern Time (matches payroll computer).
+    ET = ZoneInfo("America/New_York")
+    period_start = datetime(year, month, 1, 0, 0, 0, tzinfo=ET)
+    if month == 12:
+        period_end = datetime(year + 1, 1, 1, 0, 0, 0, tzinfo=ET)
+    else:
+        period_end = datetime(year, month + 1, 1, 0, 0, 0, tzinfo=ET)
+    period_start_ms = int(period_start.timestamp() * 1000)
+    period_end_ms = int(period_end.timestamp() * 1000)
+
+    # Pull every Hobbyist morning send that was actually delivered in
+    # the period. We deliberately INCLUDE Met-touched sends — those
+    # likely already have a daily_brief_tasks row, and the upsert is
+    # a no-op for those (preserving the existing row).
+    scanned = 0
+    inserted = 0
+    already_present = 0
+    no_primary_met = 0
+    errors = 0
+    by_met = {}  # met_id -> count of days credited
+    no_met_subscribers = set()  # subscriber ids missing primary Met
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT bh.id, bh.user_id, bh.delivered_at,
+                              COALESCE(u.timezone, 'America/Indiana/Indianapolis') AS timezone,
+                              u.subscription_tier,
+                              sc.primary_met_id
+                       FROM brief_history bh
+                       JOIN users u ON u.id = bh.user_id
+                       LEFT JOIN subscriber_coverage sc ON sc.user_id = bh.user_id
+                       WHERE bh.brief_type = 'morning'
+                         AND bh.delivery_status = 'sent'
+                         AND bh.delivered_at >= %s AND bh.delivered_at < %s
+                         AND u.subscription_tier = 'hobbyist'
+                       ORDER BY bh.delivered_at ASC""",
+                    (period_start_ms, period_end_ms),
+                )
+                rows = cur.fetchall()
+    except Exception as e:
+        return jsonify({"ok": False, "error": "scan-failed", "detail": str(e)}), 500
+
+    for r in rows:
+        scanned += 1
+        subscriber_user_id = r["user_id"]
+        delivered_at = r["delivered_at"]
+        primary_met_id = r.get("primary_met_id")
+
+        if primary_met_id is None:
+            no_primary_met += 1
+            no_met_subscribers.add(subscriber_user_id)
+            # Continue and still write the row so the day is marked
+            # 'sent' (prevents the row from being created later with a
+            # different Met from a retroactive assignment). But no Met
+            # gets credit — the house keeps the day, which matches the
+            # current payroll behavior when assigned_met_id is null.
+
+        # Compute task_date in subscriber's local timezone
+        try:
+            sub_zone = ZoneInfo(r["timezone"])
+        except Exception:
+            sub_zone = ZoneInfo("America/Indiana/Indianapolis")
+        local_dt = datetime.fromtimestamp(delivered_at / 1000, tz=timezone.utc).astimezone(sub_zone)
+        task_date = local_dt.strftime("%Y-%m-%d")
+
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    # Check whether a row already exists (informational
+                    # for the response — the upsert below is idempotent
+                    # either way).
+                    cur.execute(
+                        """SELECT status, assigned_met_id FROM daily_brief_tasks
+                           WHERE subscriber_user_id = %s AND task_date = %s""",
+                        (subscriber_user_id, task_date),
+                    )
+                    existing = cur.fetchone()
+                    pre_existed_as_sent = bool(existing and existing.get("status") == "sent")
+
+                    cur.execute(
+                        """INSERT INTO daily_brief_tasks
+                             (subscriber_user_id, task_date, assigned_met_id,
+                              due_at_ms, status, sent_at_ms)
+                           VALUES (%s, %s, %s, %s, 'sent', %s)
+                           ON CONFLICT (subscriber_user_id, task_date) DO UPDATE
+                           SET assigned_met_id = CASE
+                                   WHEN daily_brief_tasks.status = 'sent' THEN daily_brief_tasks.assigned_met_id
+                                   ELSE EXCLUDED.assigned_met_id
+                               END,
+                               status = 'sent',
+                               sent_at_ms = CASE
+                                   WHEN daily_brief_tasks.status = 'sent' THEN daily_brief_tasks.sent_at_ms
+                                   ELSE EXCLUDED.sent_at_ms
+                               END""",
+                        (subscriber_user_id, task_date, primary_met_id,
+                         delivered_at, delivered_at),
+                    )
+            if pre_existed_as_sent:
+                already_present += 1
+            else:
+                inserted += 1
+                if primary_met_id is not None:
+                    by_met[primary_met_id] = by_met.get(primary_met_id, 0) + 1
+        except Exception as e:
+            errors += 1
+            print(f"[backfill-hobbyist] failed subscriber={subscriber_user_id} "
+                  f"date={task_date}: {e!r}", flush=True)
+
+    # Look up Met names for the summary
+    by_met_named = []
+    if by_met:
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    met_ids = list(by_met.keys())
+                    placeholders = ",".join(["%s"] * len(met_ids))
+                    cur.execute(
+                        f"SELECT id, name, email FROM users WHERE id IN ({placeholders})",
+                        met_ids,
+                    )
+                    name_rows = cur.fetchall()
+                    name_by_id = {n["id"]: (n.get("name") or n.get("email") or "") for n in name_rows}
+            for met_id, count in sorted(by_met.items(), key=lambda kv: -kv[1]):
+                by_met_named.append({
+                    "met_id": met_id,
+                    "met_name": name_by_id.get(met_id, ""),
+                    "days_credited": count,
+                })
+        except Exception as e:
+            print(f"[backfill-hobbyist] name lookup failed: {e!r}", flush=True)
+
+    print(f"[backfill-hobbyist] {year}-{month}: scanned={scanned} "
+          f"inserted={inserted} already={already_present} "
+          f"no_primary_met={no_primary_met} errors={errors}", flush=True)
+
+    return jsonify({
+        "ok": True,
+        "year": year,
+        "month": month,
+        "scanned": scanned,
+        "inserted": inserted,
+        "already_present": already_present,
+        "no_primary_met": no_primary_met,
+        "errors": errors,
+        "by_met": by_met_named,
+        "no_met_subscriber_ids": sorted(list(no_met_subscribers)),
+    })
 
 
 @app.route("/api/v1/me/earnings/<int:year>/<int:month>", methods=["OPTIONS"])
