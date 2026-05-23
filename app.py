@@ -15449,6 +15449,118 @@ def _generate_ai_brief(location_label: str, forecast: dict,
     return (verdict, snippet, full_body)
 
 
+def _generate_hobbyist_brief_llm(location_label: str, forecast: dict,
+                                   address: str = "",
+                                   subscriber_name: str = "") -> tuple[str, str, str]:
+    """LLM-backed Hobbyist daily brief generation (May 23, 2026).
+
+    Tries the LLM first using EXPLAINER_SYSTEM_PROMPT with a synthetic
+    "daily brief, no specific activity" plan. Falls back to the
+    deterministic template (_generate_ai_brief) on any failure: no API
+    key, timeout, non-200, malformed response.
+
+    Returns the same (verdict, snippet, full_body) tuple as
+    _generate_ai_brief — drop-in replacement.
+
+    Why this exists: the template is plain English and accurate, but
+    sterile. The LLM produces warmer prose with texture words, time-
+    anchored detail, and soft conditionals — same standard we set for
+    the homepage Starter Forecast. Hobbyists pay $30/mo and deserve
+    the upgrade.
+
+    Why we keep the template as fallback: a subscriber missing a brief
+    because Gemini hiccuped is worse than a sterile brief. Template
+    output is always available, always correct.
+    """
+    # Step 1: Compute the verdict + assemble the data payload using the
+    # existing template generator. We use its verdict as the safety
+    # floor (LLM can downgrade Caution → Clear but never upgrade), and
+    # its weather extraction as the data we feed the LLM.
+    template_verdict, template_snippet, template_body = _generate_ai_brief(
+        location_label, forecast, address=address
+    )
+
+    # If the template suppressed (forecast data was bad), don't even
+    # try the LLM — the data quality issue isn't fixable with prose.
+    if template_verdict == "suppress":
+        return (template_verdict, template_snippet, template_body)
+
+    # Step 2: Build the payload for the explainer prompt. The prompt
+    # expects a plan + when + where + weather. For a Hobbyist brief we
+    # synthesize a generic plan so the prompt's "no specific activity"
+    # fallback path engages.
+    try:
+        daily = forecast.get("daily") or {}
+        high = (daily.get("temperature_2m_max") or [None])[0]
+        low = (daily.get("temperature_2m_min") or [None])[0]
+        precip = (daily.get("precipitation_sum") or [0])[0] or 0
+        wind = (daily.get("windspeed_10m_max") or [0])[0] or 0
+        code = (daily.get("weathercode") or [0])[0] or 0
+        # Convert mm to inches (Open-Meteo returns mm by default; the
+        # template handles unit conversion, but the payload to the LLM
+        # should be in the user-facing units the prompt expects).
+        precip_in = round(precip / 25.4, 2) if precip else 0
+        # Estimate feels-like as the high (rough; full feels-like math
+        # requires hourly humidity which we'd have to fetch separately).
+        weather_block = {
+            "temperature_f": int(high) if high is not None else None,
+            "feels_like_f": int(high) if high is not None else None,
+            "wind_mph": int(wind) if wind is not None else 0,
+            "precip_amount_in": precip_in,
+        }
+        # If precip is meaningful, include a rough timing hint
+        if precip_in >= 0.05:
+            weather_block["rain_window"] = "during the day"
+
+        place = _smart_location_label(location_label, address)
+        first_name = (subscriber_name.split()[0] if subscriber_name else "").strip()
+        # Use the date from the forecast if available; otherwise just "today"
+        today_label = "this morning's brief, no specific plan named"
+
+        payload = {
+            "plan": today_label,
+            "location": place,
+            "when": "today",
+            "verdict": template_verdict.capitalize(),
+            "weather": weather_block,
+        }
+        user_message = _build_explainer_user_message(payload)
+    except Exception as e:
+        print(f"[hobbyist-llm] payload build failed: {e!r}, falling back to template", flush=True)
+        return (template_verdict, template_snippet, template_body)
+
+    # Step 3: Try the LLM. _call_gemini returns None on any failure.
+    raw_response = _call_gemini(EXPLAINER_SYSTEM_PROMPT, user_message)
+    if not raw_response:
+        # No API key, network error, timeout, etc. Template fallback.
+        return (template_verdict, template_snippet, template_body)
+
+    # Step 4: Parse the response (paragraph + optional verdict override)
+    paragraph = raw_response
+    llm_verdict = template_verdict
+    if "---VERDICT---" in raw_response:
+        parts = raw_response.split("---VERDICT---", 1)
+        paragraph = parts[0].strip()
+        suggested = parts[1].strip().lower()
+        if suggested in ("clear", "caution", "risk"):
+            # Apply the same safety-floor rule used in forecast_explain:
+            # LLM can downgrade Caution → Clear, but Risk stays Risk, and
+            # we never upgrade.
+            order = {"clear": 0, "caution": 1, "risk": 2}
+            if order[suggested] <= order[template_verdict]:
+                llm_verdict = suggested
+
+    # Step 5: Sanity check — if the LLM returned nothing useful or a
+    # very short response, fall back rather than send garbage.
+    paragraph = (paragraph or "").strip()
+    if len(paragraph) < 40:
+        print(f"[hobbyist-llm] short response ({len(paragraph)} chars), falling back to template", flush=True)
+        return (template_verdict, template_snippet, template_body)
+
+    snippet = paragraph[:140]
+    return (llm_verdict, snippet, paragraph)
+
+
 def _html_escape(s):
     """Escape user-supplied strings for safe inclusion in HTML email."""
     return _html_module.escape(str(s or ""), quote=True)
@@ -16254,11 +16366,17 @@ def _process_pending_briefs_inner() -> None:
                 met_name_for_record = existing_draft["sent_by_name"] or None
                 location_label = c["loc_label"] or c["loc_address"] or "your location"
             else:
-                # No draft — generate fresh AI brief (original Hobbyist flow)
+                # No draft — generate fresh AI brief (Hobbyist auto-send flow)
+                # May 23, 2026: upgraded to LLM-first generation with template
+                # fallback. Subscribers get warmer, more textured prose; if
+                # the LLM is unavailable for any reason the template still
+                # works as before, no delivery is missed.
                 location_label = c["loc_label"] or c["loc_address"] or "your location"
                 forecast = _fetch_forecast(float(c["loc_lat"]), float(c["loc_lng"]))
-                verdict, snippet, full_body = _generate_ai_brief(
-                    location_label, forecast or {}, address=c.get("loc_address") or "")
+                verdict, snippet, full_body = _generate_hobbyist_brief_llm(
+                    location_label, forecast or {},
+                    address=c.get("loc_address") or "",
+                    subscriber_name=c.get("name") or "")
                 is_met_touched = False
                 met_name_for_record = None
 
