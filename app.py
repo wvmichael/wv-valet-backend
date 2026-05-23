@@ -18237,6 +18237,130 @@ def _cos_approx(lat_deg: float) -> float:
     return math.cos(math.radians(lat_deg))
 
 
+# ─── Geo helpers for broadcast polygon filtering (May 22, 2026, Phase B Chunk 5) ───
+
+def _point_in_polygon_ring(lng: float, lat: float, ring) -> bool:
+    """Ray-cast point-in-polygon for a single linear ring.
+
+    Args:
+      lng, lat: test point
+      ring: list of [lng, lat] coordinate pairs forming a closed ring
+            (GeoJSON convention; first and last vertex usually equal)
+
+    Returns True if (lng, lat) lies inside the ring.
+
+    The ray-casting algorithm: shoot a horizontal ray from (lng, lat) to
+    the right (+x). Count how many edges of the polygon the ray crosses.
+    Odd = inside; even = outside. Works for both convex and concave
+    rings. Edge cases (point exactly on an edge) are not strictly
+    handled — they're approximately resolved based on tiny float
+    differences, which is fine for our use (subscribers near a polygon
+    boundary are intentionally near-edge, not a correctness concern).
+    """
+    inside = False
+    n = len(ring)
+    if n < 3:
+        return False
+    j = n - 1
+    for i in range(n):
+        xi, yi = ring[i][0], ring[i][1]
+        xj, yj = ring[j][0], ring[j][1]
+        # Test if the ray from (lng, lat) horizontally crosses edge i-j
+        if ((yi > lat) != (yj > lat)) and \
+           (lng < (xj - xi) * (lat - yi) / (yj - yi + 1e-12) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _point_in_polygon_geometry(lng: float, lat: float, geometry: dict) -> bool:
+    """Check if (lng, lat) is inside a GeoJSON Polygon or MultiPolygon
+    geometry. Returns False on unrecognized geometry types or invalid
+    structure (silently — we want broadcast sends to fail-open rather
+    than fail-closed on a malformed shape: better to over-send than
+    skip subscribers due to a parsing quirk).
+    """
+    if not isinstance(geometry, dict):
+        return False
+    gtype = geometry.get("type")
+    coords = geometry.get("coordinates")
+    if gtype == "Polygon":
+        # coordinates: [outer_ring, hole1, hole2, ...]
+        # We only check the outer ring (holes are unusual for our use
+        # case; Leaflet Draw never produces them via the standard UI).
+        if not coords or not isinstance(coords, list):
+            return False
+        return _point_in_polygon_ring(lng, lat, coords[0])
+    elif gtype == "MultiPolygon":
+        # coordinates: [polygon1, polygon2, ...]; each polygon is [rings]
+        if not coords or not isinstance(coords, list):
+            return False
+        for poly in coords:
+            if poly and _point_in_polygon_ring(lng, lat, poly[0]):
+                return True
+        return False
+    return False
+
+
+def _haversine_meters(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Great-circle distance between two lat/lng points, in meters.
+    Used to test whether a subscriber falls inside a circular broadcast
+    target. Standard haversine formula on a spherical Earth (R = 6371 km).
+    """
+    import math
+    R = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lng2 - lng1)
+    a = (math.sin(dphi / 2) ** 2
+         + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2)
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+
+def _point_inside_broadcast_shape(lat: float, lng: float, polygon_geojson_str: str) -> bool:
+    """True if (lat, lng) lies inside the broadcast's drawn shape.
+
+    The frontend serializes drawn shapes with a `properties.shape_type`
+    tag: 'polygon', 'rectangle', or 'circle'. Polygons and rectangles
+    use a standard GeoJSON Polygon geometry; circles serialize as a
+    GeoJSON Point with `properties.radius_meters` and `properties.center`.
+
+    Fail-open: if the GeoJSON is malformed or missing, returns True so
+    the subscriber is included. Over-delivering one broadcast is much
+    better than silently dropping subscribers due to a parsing bug.
+    """
+    if not polygon_geojson_str:
+        return True  # no polygon filter
+    try:
+        feature = json.loads(polygon_geojson_str) if isinstance(polygon_geojson_str, str) else polygon_geojson_str
+    except (ValueError, TypeError) as e:
+        print(f"[broadcast-polygon] parse failed: {e!r}; fail-open", flush=True)
+        return True
+
+    if not isinstance(feature, dict):
+        return True
+
+    props = feature.get("properties") or {}
+    shape_type = props.get("shape_type")
+
+    if shape_type == "circle":
+        # Read center + radius from properties
+        center = props.get("center")  # [lng, lat]
+        radius = props.get("radius_meters")
+        if (not isinstance(center, list) or len(center) != 2
+                or not isinstance(radius, (int, float))):
+            return True  # malformed, fail-open
+        c_lng, c_lat = float(center[0]), float(center[1])
+        dist = _haversine_meters(lat, lng, c_lat, c_lng)
+        return dist <= float(radius)
+
+    # Polygon / rectangle / unrecognized: use the geometry
+    geometry = feature.get("geometry") or feature
+    return _point_in_polygon_geometry(lng, lat, geometry)
+
+
 # ─── Crew reports (list + submit + verify) ──────────────────────────
 
 @app.route("/api/v1/crew/reports", methods=["OPTIONS"])
@@ -19512,14 +19636,16 @@ def _met_daily_brief_audience_count_preflight():
 def met_daily_brief_audience_count():
     """Count active subscribers in selected state-county pairs.
 
-    Query param: counties=IN:Boone,IN:Hamilton  (comma-separated,
-                 each item is STATE_ABBR:CountyName, no " County" suffix)
+    Query params:
+      counties=IN:Boone,IN:Hamilton  (comma-separated state-county pairs,
+                                       no " County" suffix on county name)
+      polygon_geojson=<URL-encoded JSON>  optional Leaflet Draw shape;
+                                          if present, narrows the count
+                                          to subscribers inside the shape
 
-    Matches subscribers whose primary saved_location has the matching
-    county name AND whose address_text contains the state abbreviation.
-    Not perfect (a subscriber whose address omits the state would miss),
-    but pragmatic for launch — the migration tool sets address_text from
-    Nominatim which always includes state.
+    Polygon shape types supported (May 22, 2026, Phase B Chunk 5):
+      - 'polygon' / 'rectangle' (GeoJSON Polygon)
+      - 'circle' (GeoJSON Point + radius_meters property)
 
     Auth: met or admin role required.
     """
@@ -19531,6 +19657,7 @@ def met_daily_brief_audience_count():
         return jsonify({"ok": False, "error": "forbidden"}), 403
 
     counties_param = (request.args.get("counties") or "").strip()
+    polygon_param = (request.args.get("polygon_geojson") or "").strip()
     if not counties_param:
         return jsonify({"ok": True, "count": 0, "by_county": {}})
 
@@ -19565,8 +19692,10 @@ def met_daily_brief_audience_count():
         try:
             with db() as conn:
                 with conn.cursor() as cur:
+                    # Include lat/lng for polygon filtering (Chunk 5).
                     cur.execute(
-                        """SELECT u.id, loc.county, loc.address_text
+                        """SELECT u.id, loc.county, loc.address_text,
+                                  loc.lat, loc.lng
                            FROM users u
                            JOIN saved_locations loc ON loc.user_id = u.id
                                 AND loc.is_primary = TRUE
@@ -19590,11 +19719,27 @@ def met_daily_brief_audience_count():
             raw_county = (r.get("county") or "").lower().replace(" county", "").strip()
             if not raw_county:
                 continue
-            if raw_county in counties:
-                seen_user_ids.add(r["id"])
-                key = f"{state}:{raw_county}"
-                by_county[key] = by_county.get(key, 0) + 1
-                total += 1
+            if raw_county not in counties:
+                continue
+            # Polygon filter (Chunk 5): if a shape was provided, narrow
+            # the count further. Subscriber must be in the county AND
+            # inside the drawn shape.
+            if polygon_param:
+                try:
+                    lat = float(r["lat"]) if r.get("lat") is not None else None
+                    lng = float(r["lng"]) if r.get("lng") is not None else None
+                except (ValueError, TypeError):
+                    lat = lng = None
+                if lat is None or lng is None:
+                    # Can't evaluate polygon — exclude from count for
+                    # consistency with the send endpoint's behavior.
+                    continue
+                if not _point_inside_broadcast_shape(lat, lng, polygon_param):
+                    continue
+            seen_user_ids.add(r["id"])
+            key = f"{state}:{raw_county}"
+            by_county[key] = by_county.get(key, 0) + 1
+            total += 1
 
     return jsonify({"ok": True, "count": total, "by_county": by_county})
 
@@ -19889,8 +20034,48 @@ def met_broadcast_brief_send():
                         "message": "No subscribers found matching those counties.",
                         "recipient_count": 0}), 200
 
-    # Polygon filter — Chunk 5 will implement; for Chunk 1, store and skip
-    # TODO Chunk 5: if polygon_geojson, filter candidates by point-in-polygon
+    # Polygon filter (May 22, 2026, Phase B Chunk 5).
+    # If the Met drew a shape (polygon, rectangle, or circle), narrow
+    # the candidates list to only those inside it. The shape is
+    # intersected with the county selection — both filters must pass.
+    #
+    # Fail-open: if the GeoJSON can't be parsed, we keep all candidates
+    # and log. Better to over-deliver than drop subscribers silently.
+    if polygon_geojson:
+        filtered = []
+        skipped_outside = 0
+        skipped_no_loc = 0
+        for r in candidates:
+            try:
+                lat = float(r["lat"]) if r.get("lat") is not None else None
+                lng = float(r["lng"]) if r.get("lng") is not None else None
+            except (ValueError, TypeError):
+                lat = lng = None
+            if lat is None or lng is None:
+                # Subscriber matched the county join but has no lat/lng on
+                # the primary location. Polygon filter can't evaluate them
+                # so we exclude them — being conservative because the Met
+                # explicitly narrowed the audience with a shape.
+                skipped_no_loc += 1
+                continue
+            if _point_inside_broadcast_shape(lat, lng, polygon_geojson):
+                filtered.append(r)
+            else:
+                skipped_outside += 1
+        print(
+            f"[broadcast-polygon] polygon filter applied: "
+            f"before={len(candidates)} after={len(filtered)} "
+            f"outside={skipped_outside} no_loc={skipped_no_loc}",
+            flush=True,
+        )
+        candidates = filtered
+        if not candidates:
+            return jsonify({
+                "ok": False, "error": "no-recipients",
+                "message": "No subscribers fall inside the drawn shape "
+                           "within the selected counties.",
+                "recipient_count": 0,
+            }), 200
 
     # Create the broadcast row first so we can attach delivery rows to it
     now_ms = int(time.time() * 1000)
