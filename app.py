@@ -1105,6 +1105,36 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 
+-- ── Password-set tokens — short-lived authorization for /set-password ──
+-- Why this exists (added May 23, 2026): iOS Safari Intelligent Tracking
+-- Prevention can drop cross-origin session cookies between page-load
+-- and the next fetch. Steven Smith hit this: he verified a magic link
+-- successfully (cookie set on the response), but 27 seconds later when
+-- he POSTed his new password, Safari didn't send the cookie and the
+-- backend returned 401 "session expired."
+--
+-- Fix: when /auth/verify is called for a new-account or password-reset
+-- intent, we ALSO mint a one-time password-set token, return its raw
+-- value in the JSON response body (NOT a cookie), and the frontend
+-- stashes it in JS memory. The /auth/set-password endpoint accepts
+-- EITHER the session cookie OR this token. ITP can't drop the token
+-- because it never lives in a cookie.
+--
+-- Lifecycle:
+--   1. /auth/verify (intent=new-account|password-reset) creates a row
+--   2. Frontend stashes raw token in window.__wvPendingPasswordSetToken
+--   3. /auth/set-password validates it, marks used_at, sets password
+--   4. After 15 minutes the row is dead even if not used
+CREATE TABLE IF NOT EXISTS password_set_tokens (
+    token_hash      TEXT PRIMARY KEY,           -- SHA-256 of the raw token, hex
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at      BIGINT NOT NULL,
+    expires_at      BIGINT NOT NULL,            -- created_at + 900 (15 min)
+    used_at         BIGINT                      -- null until consumed
+);
+CREATE INDEX IF NOT EXISTS idx_password_set_tokens_user ON password_set_tokens(user_id);
+CREATE INDEX IF NOT EXISTS idx_password_set_tokens_expires ON password_set_tokens(expires_at);
+
 -- ── Login attempts — append-only audit log for password-based logins ──
 -- Both successful and failed attempts get rows here. Two purposes:
 --   1. Rate limiting: we count failed attempts per IP in the last 15
@@ -4485,6 +4515,23 @@ def auth_verify():
         # Create the session (inserts a row, returns the raw session ID)
         raw_session_id = _create_session(row["user_id"], conn)
 
+        # Mint a password-set authorization token (added May 23, 2026
+        # for iOS Safari ITP resistance). The frontend stashes this in
+        # JS memory and submits it with /auth/set-password — bypasses
+        # the cross-origin cookie path that Safari sometimes drops.
+        # We mint unconditionally; the frontend only uses it for
+        # new-account / password-reset flows. Cost is one row per
+        # successful magic-link verify, garbage-collectable later.
+        raw_pwset_token = new_secure_token()
+        pwset_token_hash = hash_token(raw_pwset_token)
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO password_set_tokens
+                   (token_hash, user_id, created_at, expires_at)
+                   VALUES (%s, %s, %s, %s)""",
+                (pwset_token_hash, row["user_id"], now, now + 900),
+            )
+
     # Build response with user info and workspace list
     roles = [r["role"] for r in role_rows]
     workspaces = _roles_to_workspaces(roles)
@@ -4497,6 +4544,7 @@ def auth_verify():
             "name": row["name"],
         },
         "workspaces": workspaces,
+        "password_set_token": raw_pwset_token,
     })
     _set_session_cookie(response, raw_session_id)
 
@@ -4520,22 +4568,32 @@ def _auth_set_password_preflight():
 def auth_set_password():
     """Set a new password for the currently signed-in user.
 
-    Used as the second step of the password-reset flow:
+    Used as the second step of the password-reset / new-account flow:
       1. User clicks magic link in their email
-      2. Frontend calls /api/v1/auth/verify → user is now signed in
+      2. Frontend calls /api/v1/auth/verify → user is now signed in,
+         backend also returns a one-time password_set_token
       3. Frontend shows "Set a new password" form
-      4. Frontend POSTs {"new_password": "..."} to THIS endpoint
+      4. Frontend POSTs {"new_password": "...", "password_set_token": "..."}
       5. Backend hashes + stores the password, clears password_must_change
       6. User is now signed in AND has a fresh password
 
-    Authentication: session cookie (the verify step created it). We
-    deliberately do NOT require the old password — this endpoint is
-    used precisely when the user has forgotten or never set a password.
-    A session cookie already proves they hold the magic-link token,
-    which was emailed to the verified address; that's the authentication.
+    Authentication: accepts EITHER
+      a) the session cookie set by /auth/verify, OR
+      b) a password_set_token in the request body (minted by /auth/verify)
+
+    The token path exists because iOS Safari Intelligent Tracking
+    Prevention can silently drop cross-origin session cookies between
+    page load and the next fetch. The token rides in JSON memory and
+    bypasses the cookie path entirely. Steven Smith hit this on
+    May 23, 2026 — verify succeeded, set-password failed 401 because
+    Safari didn't send the cookie. The token is single-use, 15-minute
+    TTL, and is invalidated as soon as we use it.
 
     Request body:
-        {"new_password": "their-chosen-password"}
+        {
+          "new_password": "their-chosen-password",
+          "password_set_token": "..."   <-- optional, used if cookie missing
+        }
 
     Returns:
         200 {"ok": true}
@@ -4543,12 +4601,48 @@ def auth_set_password():
         400 {"ok": false, "error": "missing-fields"}
         401 {"ok": false, "error": "not-authenticated"}
     """
-    user = _get_current_user()
-    if user is None:
-        return jsonify({"ok": False, "error": "not-authenticated"}), 401
-
     data = request.get_json(silent=True) or {}
     new_password = (data.get("new_password") or "")
+    pwset_token = (data.get("password_set_token") or "").strip()
+
+    # Resolve the authenticated user via session cookie first; if no
+    # session, fall back to the password-set token. Both paths converge
+    # on a verified user_id we can update.
+    user_id = None
+    user = _get_current_user()
+    if user is not None:
+        user_id = user["id"]
+    elif pwset_token:
+        token_hash = hash_token(pwset_token)
+        now = now_ts()
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT user_id, expires_at, used_at
+                       FROM password_set_tokens
+                       WHERE token_hash = %s""",
+                    (token_hash,),
+                )
+                row = cur.fetchone()
+            if row is None:
+                print(f"[auth] set-password token: no match (hash={token_hash[:8]}...)", flush=True)
+                return jsonify({"ok": False, "error": "not-authenticated"}), 401
+            if row["used_at"] is not None:
+                print(f"[auth] set-password token: already used (user_id={row['user_id']})", flush=True)
+                return jsonify({"ok": False, "error": "not-authenticated"}), 401
+            if row["expires_at"] < now:
+                print(f"[auth] set-password token: expired (user_id={row['user_id']})", flush=True)
+                return jsonify({"ok": False, "error": "not-authenticated"}), 401
+            # Mark used immediately to prevent replay (single-use).
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE password_set_tokens SET used_at = %s WHERE token_hash = %s",
+                    (now, token_hash),
+                )
+            user_id = row["user_id"]
+
+    if user_id is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
 
     if not new_password:
         return jsonify({"ok": False, "error": "missing-fields"}), 400
@@ -4560,7 +4654,6 @@ def auth_set_password():
         return jsonify({"ok": False, "error": "password-too-short"}), 400
 
     new_hash = hash_password(new_password)
-    user_id = user["id"]
 
     with db() as conn:
         with conn.cursor() as cur:
@@ -4572,12 +4665,29 @@ def auth_set_password():
                 (new_hash, user_id),
             )
 
+    # If the user authenticated via password-set-token (no session), the
+    # frontend has no session cookie. Mint one now so they're signed in
+    # going forward without needing to log in with their fresh password.
+    response_payload = {"ok": True}
+    auth_via_token = (user is None)
+    if auth_via_token:
+        with db() as conn:
+            raw_session_id = _create_session(user_id, conn)
+        response = jsonify(response_payload)
+        _set_session_cookie(response, raw_session_id)
+        print(
+            f"[auth] set-password succeeded via token: user_id={user_id} "
+            f"ip={get_client_ip()} (session minted)",
+            flush=True,
+        )
+        return response, 200
+
     print(
         f"[auth] set-password succeeded: user_id={user_id} ip={get_client_ip()}",
         flush=True,
     )
 
-    return jsonify({"ok": True}), 200
+    return jsonify(response_payload), 200
 
 
 def _roles_to_workspaces(roles: list) -> list:
