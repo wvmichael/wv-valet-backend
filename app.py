@@ -19854,6 +19854,8 @@ def met_broadcast_brief_send():
                 with conn.cursor() as cur:
                     cur.execute(
                         """SELECT u.id, u.email, u.name, u.phone,
+                                  u.subscription_tier,
+                                  COALESCE(u.timezone, 'America/Indiana/Indianapolis') AS timezone,
                                   bp.channels AS channels_pref,
                                   loc.county, loc.address_text,
                                   loc.lat, loc.lng
@@ -20044,6 +20046,60 @@ def met_broadcast_brief_send():
                 )
             except Exception as e:
                 print(f"[broadcast-brief] brief_history write failed user={r['id']}: {e!r}", flush=True)
+
+        # ── Chunk 3 payroll attribution (May 22, 2026, Phase B) ──
+        # For HOBBYIST recipients, UPSERT a daily_brief_tasks row so the
+        # payroll computer sees this broadcast as the Met's daily delivery.
+        # _compute_payroll_for_month reads daily_brief_tasks for Hobbyists
+        # and attributes the day's commission to assigned_met_id when
+        # status='sent'. Without this, the broadcasting Met gets no credit
+        # for delivering the daily brief to this subscriber.
+        #
+        # Pro tiers: NOT attributed here. Pro pay is per-subscriber morning
+        # brief in pro_brief_drafts, not broadcasts. If a Pro happens to
+        # be in a broadcast county, they get the broadcast as informational
+        # content but the Met still owes them a per-subscriber Pro brief.
+        #
+        # Conflict handling: if a daily_brief_tasks row already exists for
+        # today (e.g., AI fallback queued one earlier), UPSERT updates it
+        # to status='sent' and attributes to this Met. The earlier
+        # assigned_met_id (if any) is preserved only when the new
+        # status is also 'sent' AND there's already a sent row — first
+        # successful send wins, like the Pro pay rule.
+        recipient_tier = (r.get("subscription_tier") or "hobbyist").lower()
+        if any_success and recipient_tier == "hobbyist":
+            try:
+                # Compute task_date in subscriber's local timezone
+                try:
+                    sub_zone_chunk3 = ZoneInfo(r["timezone"])
+                except Exception:
+                    sub_zone_chunk3 = ZoneInfo("America/Indiana/Indianapolis")
+                local_dt = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).astimezone(sub_zone_chunk3)
+                task_date = local_dt.strftime("%Y-%m-%d")
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """INSERT INTO daily_brief_tasks
+                                 (subscriber_user_id, task_date, assigned_met_id,
+                                  due_at_ms, status, sent_at_ms)
+                               VALUES (%s, %s, %s, %s, 'sent', %s)
+                               ON CONFLICT (subscriber_user_id, task_date) DO UPDATE
+                               SET assigned_met_id = CASE
+                                       WHEN daily_brief_tasks.status = 'sent' THEN daily_brief_tasks.assigned_met_id
+                                       ELSE EXCLUDED.assigned_met_id
+                                   END,
+                                   status = 'sent',
+                                   sent_at_ms = CASE
+                                       WHEN daily_brief_tasks.status = 'sent' THEN daily_brief_tasks.sent_at_ms
+                                       ELSE EXCLUDED.sent_at_ms
+                                   END""",
+                            (r["id"], task_date, user["id"], now_ms, now_ms),
+                        )
+            except Exception as e:
+                # Don't fail the broadcast over a payroll bookkeeping issue.
+                # Log so we can backfill if needed.
+                print(f"[broadcast-brief] daily_brief_tasks upsert failed "
+                      f"user={r['id']}: {e!r}", flush=True)
 
         time.sleep(SEND_DELAY_S)
 
@@ -26397,8 +26453,13 @@ def _compute_payroll_for_month(year: int, month: int) -> dict:
             window_end_minutes = 7 * 60  # default 7:00 AM
 
         # Bucket briefs by local date (one Met credit per day max).
-        # For Pro briefs, we apply the time-of-send filter: only count
-        # the FIRST send each day that falls in [5:00 AM, delivery_time].
+        # For BOTH Pro and Hobbyist briefs, we apply the time-of-send
+        # filter: only count the FIRST send each day that falls in
+        # [5:00 AM, delivery_time] in the subscriber's local timezone.
+        # Sends outside this window don't earn the daily commission;
+        # they're treated as ad-hoc and the Met gets no pay credit.
+        # (Window extended to Hobbyists May 22, 2026 per spec — same
+        # rule for both tiers since both pay per daily morning brief.)
         briefs_by_local_date = {}
         try:
             sub_zone = ZoneInfo(user_tz)
@@ -26407,11 +26468,10 @@ def _compute_payroll_for_month(year: int, month: int) -> dict:
         for b in brief_rows:
             sent_dt = datetime.fromtimestamp(b["sent_at"] / 1000, tz=timezone.utc).astimezone(sub_zone)
             local_date = sent_dt.date()
-            if tier != "hobbyist":
-                # Apply Pro pay window (May 22, 2026)
-                sent_minutes = sent_dt.hour * 60 + sent_dt.minute
-                if sent_minutes < 5 * 60 or sent_minutes > window_end_minutes:
-                    continue  # outside pay window, doesn't count
+            # Apply pay window for both Pro and Hobbyist
+            sent_minutes = sent_dt.hour * 60 + sent_dt.minute
+            if sent_minutes < 5 * 60 or sent_minutes > window_end_minutes:
+                continue  # outside pay window, doesn't count
             if local_date not in briefs_by_local_date:
                 briefs_by_local_date[local_date] = b["sent_by_user_id"]
 
