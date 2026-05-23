@@ -9287,7 +9287,7 @@ def admin_nudge_user(user_id):
         f"  - SMS, email, or both\n\n"
         f"This link is good for 72 hours. If it's expired by the time you "
         f"get to it, just reply and we'll send a fresh one.\n\n"
-        f"If you have any questions, just reply to this email.\n\n"
+        f"Reach out to us with any questions.\n\n"
         f"- The WeatherValet team"
     )
 
