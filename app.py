@@ -9381,6 +9381,15 @@ def _serialize_user_for_admin(row):
         # Onboarding (May 22, 2026) — let admin UI show ✓/✗ per subscriber
         "welcome_sent_at": row.get("welcome_sent_at"),
         "user_configured_at": row.get("user_configured_at"),
+        # Primary location (May 23, 2026) — for admin to see at-a-glance
+        # which subscribers have real locations vs migrated placeholders
+        # like "Lebanon, IN" with default coords. None across all four
+        # fields = no saved_locations row exists at all.
+        "primary_loc_label":   row.get("primary_loc_label") or "",
+        "primary_loc_address": row.get("primary_loc_address") or "",
+        "primary_loc_lat":     row.get("primary_loc_lat"),
+        "primary_loc_lng":     row.get("primary_loc_lng"),
+        "primary_loc_county":  row.get("primary_loc_county") or "",
     }
 
 
@@ -9404,13 +9413,21 @@ def admin_list_users():
                    bp.user_configured_at,
                    sc.primary_met_id,
                    met_user.name AS primary_met_name,
+                   loc.label        AS primary_loc_label,
+                   loc.address_text AS primary_loc_address,
+                   loc.lat          AS primary_loc_lat,
+                   loc.lng          AS primary_loc_lng,
+                   loc.county       AS primary_loc_county,
                    ARRAY_REMOVE(ARRAY_AGG(DISTINCT ur.role ORDER BY ur.role), NULL) AS roles
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
             LEFT JOIN users met_user ON met_user.id = sc.primary_met_id
             LEFT JOIN brief_preferences bp ON bp.user_id = u.id
-            GROUP BY u.id, sc.primary_met_id, met_user.name, bp.user_configured_at
+            LEFT JOIN saved_locations loc
+              ON loc.user_id = u.id AND loc.is_primary = TRUE
+            GROUP BY u.id, sc.primary_met_id, met_user.name, bp.user_configured_at,
+                     loc.label, loc.address_text, loc.lat, loc.lng, loc.county
             ORDER BY u.is_active DESC, u.created_at DESC
         """)
         rows = cur.fetchall()
