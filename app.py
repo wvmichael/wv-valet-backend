@@ -3307,7 +3307,8 @@ def _get_current_user() -> Optional[dict]:
             cur.execute(
                 """SELECT s.user_id, s.expires_at, s.idle_expires_at,
                           u.email, u.name, u.is_active,
-                          u.password_hash, u.password_must_change
+                          u.password_hash, u.password_must_change,
+                          u.subscription_tier
                    FROM sessions s
                    JOIN users u ON u.id = s.user_id
                    WHERE s.session_id_hash = %s""",
@@ -3375,6 +3376,7 @@ def _get_current_user() -> Optional[dict]:
         "name": row["name"],
         "roles": [r["role"] for r in role_rows],
         "must_set_password": must_set_password,
+        "subscription_tier": row.get("subscription_tier") or "",
     }
 
 
