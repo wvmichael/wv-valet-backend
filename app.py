@@ -4553,7 +4553,7 @@ def auth_verify():
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """SELECT t.user_id, t.expires_at, t.used_at,
+                """SELECT t.user_id, t.expires_at, t.used_at, t.ip_requested,
                           u.email, u.name, u.is_active
                    FROM magic_link_tokens t
                    JOIN users u ON u.id = t.user_id
@@ -4624,6 +4624,35 @@ def auth_verify():
                    WHERE member_user_id = %s AND status = 'pending'""",
                 (int(time.time() * 1000), row["user_id"]),
             )
+
+            # If this magic link was minted for a Crew application (the
+            # ip_requested column was tagged 'crew-verify' at apply time),
+            # grant the 'crew' role and mark the application active.
+            # Added May 24, 2026 — self-service Crew verification flow.
+            # The token row itself was already marked used above, so this
+            # only fires on the first successful click; subsequent reads
+            # of the same row come back with used=TRUE and won't reach here.
+            if row.get("ip_requested") == "crew-verify":
+                now_ms_crew = int(time.time() * 1000)
+                cur.execute(
+                    """INSERT INTO user_roles (user_id, role, granted_at)
+                       VALUES (%s, 'crew', %s)
+                       ON CONFLICT (user_id, role) DO NOTHING""",
+                    (row["user_id"], now_ms_crew),
+                )
+                # Mark the matching pending application as approved and
+                # link to the user that was created/activated.
+                cur.execute(
+                    """UPDATE crew_applications
+                       SET status='approved',
+                           reviewed_at=%s,
+                           created_user_id=%s,
+                           updated_at=%s
+                       WHERE email = (SELECT email FROM users WHERE id = %s)
+                         AND status = 'pending'""",
+                    (now_ms_crew, row["user_id"], now_ms_crew, row["user_id"]),
+                )
+                print(f"[crew-verify] role granted user_id={row['user_id']}", flush=True)
 
         # Create the session (inserts a row, returns the raw session ID)
         raw_session_id = _create_session(row["user_id"], conn)
@@ -18728,12 +18757,176 @@ def crew_apply_submit():
                      mission_interests, hours, notify),
                 )
                 row = cur.fetchone()
+                application_id = row["id"]
 
-        print(f"[crew-apply] new application id={row['id']} email={email}", flush=True)
-        return jsonify({"ok": True, "application_id": row["id"]})
+        # ── Self-service verification flow (May 24, 2026) ───────────
+        # Per product decision: applications no longer wait for admin
+        # approval. We create the user row immediately (with no roles
+        # yet), mint a magic-link token tagged 'crew-verify', and email
+        # the applicant a verification link. When they click the link,
+        # the magic-link verify endpoint detects the pending Crew
+        # application for this user and grants the 'crew' role.
+        #
+        # This is the "lightweight quality filter" model:
+        #   - Anyone can apply, but they must verify their email to
+        #     actually become a Crew member
+        #   - Bot/spam applications never verify, so role is never
+        #     granted; the pending row just sits in the DB
+        #   - Real applicants are in within a click
+        #
+        # If anything in this block fails, we still return success to
+        # the user (the application row exists). The verify email can
+        # be resent by re-submitting the same application.
+        magic_link_url = None
+        try:
+            with db() as conn:
+                # 1. Create the user shell account (no roles yet)
+                applicant_user_id = _get_or_create_user(email, conn)
+                # 2. Fill in name + phone if user is brand new with no data
+                with conn.cursor() as cur:
+                    if name:
+                        cur.execute(
+                            """UPDATE users SET name = %s
+                               WHERE id = %s AND (name IS NULL OR name = '')""",
+                            (name, applicant_user_id),
+                        )
+                    if phone:
+                        cur.execute(
+                            """UPDATE users SET phone = %s
+                               WHERE id = %s AND (phone IS NULL OR phone = '')""",
+                            (phone, applicant_user_id),
+                        )
+
+                # 3. Mint a magic-link token tagged 'crew-verify'
+                #    so the verify endpoint can recognize and grant
+                #    the Crew role when the user clicks the link.
+                raw_token = new_secure_token()
+                token_hash = hash_token(raw_token)
+                now_seconds = int(time.time())
+                seven_days = 7 * 24 * 60 * 60
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO magic_link_tokens
+                             (token_hash, user_id, created_at, expires_at, ip_requested)
+                           VALUES (%s, %s, %s, %s, %s)""",
+                        (token_hash, applicant_user_id, now_seconds,
+                         now_seconds + seven_days, "crew-verify"),
+                    )
+
+            # 4. Build the verification link
+            base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai")
+            magic_link_url = f"{base}/?auth=verify&token={raw_token}&intent=crew-verify"
+
+            # 5. Send the applicant a verification email
+            try:
+                _send_crew_verify_email(email, magic_link_url,
+                                        applicant_name=name)
+            except Exception as e:
+                print(f"[crew-apply] verify email send failed: {e!r}", flush=True)
+        except Exception as e:
+            print(f"[crew-apply] verification setup failed: {e!r}", flush=True)
+
+        # 6. Notify admin (you) by email so you don't miss applications
+        try:
+            admin_email = os.environ.get("ADMIN_NOTIFY_EMAIL", "").strip()
+            if not admin_email:
+                admin_email = "hello@weathervalet.ai"
+            admin_subject = f"New Valet Crew application: {name}"
+            admin_body = (
+                f"Someone applied to the Valet Crew.\n\n"
+                f"Name: {name}\n"
+                f"Email: {email}\n"
+                f"Handle: {handle or '(none)'}\n"
+                f"Phone: {phone or '(none)'}\n"
+                f"County: {county or '(none)'}\n"
+                f"Interests: {mission_interests or '(none)'}\n"
+                f"Hours: {hours}\n"
+                f"Notify: {notify}\n\n"
+                f"They've been emailed a verification link. The Crew role "
+                f"is granted automatically when they click it.\n\n"
+                f"Application ID: {application_id}\n"
+            )
+            _send_brief_email(admin_email, admin_subject, admin_body, html=False)
+        except Exception as e:
+            print(f"[crew-apply] admin notify failed: {e!r}", flush=True)
+
+        print(f"[crew-apply] new application id={application_id} email={email}", flush=True)
+        return jsonify({"ok": True, "application_id": application_id})
     except Exception as e:
         print(f"[crew-apply] insert failed for {email}: {e!r}", flush=True)
         return jsonify({"ok": False, "error": "internal-error"}), 500
+
+
+def _send_crew_verify_email(email: str, magic_link_url: str,
+                            applicant_name: str = "") -> bool:
+    """Send a Valet Crew application verification email. Returns True
+    if Resend accepted the request.
+
+    Added May 24, 2026 as part of the self-service Crew flow. The user
+    applies, lands on a "check your email" success state, then clicks
+    this email's link. On click, the magic-link verify endpoint grants
+    them the 'crew' role and signs them in.
+
+    Token TTL is 7 days. If they wait too long, they can re-submit the
+    application form to get a fresh link.
+    """
+    RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
+    if not RESEND_API_KEY:
+        print(f"[crew-verify-email] RESEND_API_KEY not set. Link for {email}: {magic_link_url}", flush=True)
+        return False
+    try:
+        greeting = f"Hi {applicant_name.split()[0]}," if applicant_name else "Hi,"
+        subject = "Verify your Valet Crew application"
+        html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style="margin:0;padding:0;background:#F8F9FB;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#0E1116;">
+  <div style="max-width:560px;margin:32px auto;padding:32px 28px;background:#fff;border-radius:12px;box-shadow:0 1px 3px rgba(15,17,22,0.06);">
+    <h1 style="font-size:22px;font-weight:600;margin:0 0 16px;">{greeting}</h1>
+    <p style="font-size:15px;line-height:1.55;color:rgba(15,17,22,0.75);margin:0 0 14px;">
+      Thanks for applying to the Valet Crew &mdash; the community of weather watchers helping our meteorologists keep an eye on the ground.
+    </p>
+    <p style="font-size:15px;line-height:1.55;color:rgba(15,17,22,0.75);margin:0 0 22px;">
+      Tap the button below to verify your email and finish joining. You&rsquo;ll be signed in and able to start submitting reports right away.
+    </p>
+    <div style="text-align:center;margin:28px 0;">
+      <a href="{magic_link_url}" style="display:inline-block;background:#2E4FB8;color:#fff;text-decoration:none;padding:13px 28px;border-radius:8px;font-weight:600;font-size:15px;">Verify and join the Crew</a>
+    </div>
+    <p style="font-size:13px;line-height:1.55;color:rgba(15,17,22,0.55);margin:22px 0 0;">
+      This link is valid for 7 days. If it expires, just submit the application again at <a href="https://weathervalet.ai/crew" style="color:#2E4FB8;">weathervalet.ai/crew</a> for a fresh link.
+    </p>
+    <p style="font-size:13px;line-height:1.55;color:rgba(15,17,22,0.55);margin:14px 0 0;">
+      Questions? Just reply to this email and a human will read it.
+    </p>
+  </div>
+</body></html>"""
+        text = (f"{greeting}\n\n"
+                "Thanks for applying to the Valet Crew — the community of "
+                "weather watchers helping our meteorologists keep an eye "
+                "on the ground.\n\n"
+                "Tap the link below to verify your email and finish joining. "
+                "You'll be signed in and able to start submitting reports "
+                f"right away.\n\n{magic_link_url}\n\n"
+                "This link is valid for 7 days. If it expires, just submit "
+                "the application again at https://weathervalet.ai/crew for "
+                "a fresh link.\n\n"
+                "Questions? Just reply to this email and a human will read it.")
+        resend_headers = {
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        resend_body = {
+            "from": "WeatherValet <hello@weathervalet.ai>",
+            "to": [email],
+            "subject": subject,
+            "html": html,
+            "text": text,
+        }
+        resp = requests.post("https://api.resend.com/emails",
+                              json=resend_body, headers=resend_headers, timeout=10)
+        return resp.status_code in (200, 201, 202)
+    except Exception as e:
+        print(f"[crew-verify-email] failed: {e!r}", flush=True)
+        return False
 
 
 # ════════════════════════════════════════════════════════════════════
