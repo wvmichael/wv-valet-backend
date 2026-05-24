@@ -9687,6 +9687,116 @@ def admin_nudge_user(user_id):
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Admin: SMS nudge a subscriber (May 24, 2026)
+# ─────────────────────────────────────────────────────────────────────
+# Parallel to the email nudge above. For subscribers who haven't
+# configured notification settings AND have a phone on file, the admin
+# can send a short SMS pointing them at the magic-link sign-in URL.
+# Useful when a subscriber isn't checking email.
+#
+# Idempotency: each call sends a fresh SMS (no dedupe). Logged to
+# admin_audit_log so we can see who SMS-nudged whom.
+
+@app.route("/api/v1/admin/users/<int:user_id>/nudge-sms", methods=["OPTIONS"])
+def _admin_nudge_sms_preflight(user_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/users/<int:user_id>/nudge-sms")
+@require_role("admin")
+def admin_nudge_user_sms(user_id):
+    """Send a reminder SMS to a subscriber who hasn't configured their
+    notification settings yet. Same admin gating as the email nudge."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.email, u.name, u.phone, u.is_active,
+                          bp.user_configured_at
+                   FROM users u
+                   LEFT JOIN brief_preferences bp ON bp.user_id = u.id
+                   WHERE u.id = %s""",
+                (user_id,),
+            )
+            sub = cur.fetchone()
+
+    if not sub:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    if not sub["is_active"]:
+        return jsonify({"ok": False, "error": "user-inactive"}), 400
+    phone = (sub.get("phone") or "").strip()
+    if not phone:
+        return jsonify({"ok": False, "error": "no-phone"}), 400
+
+    # Mint a magic-link token, same TTL and intent as the email nudge.
+    # The SMS body uses this so a tap on the link signs them in
+    # without needing to remember a password.
+    NUDGE_TOKEN_TTL_SECONDS = 72 * 60 * 60  # 72 hours
+    raw_token = new_secure_token()
+    token_hash = hash_token(raw_token)
+    now_secs = now_ts()
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO magic_link_tokens
+                       (token_hash, user_id, created_at, expires_at, ip_requested)
+                       VALUES (%s, %s, %s, %s, %s)""",
+                    (token_hash, sub["id"], now_secs,
+                     now_secs + NUDGE_TOKEN_TTL_SECONDS,
+                     get_client_ip()),
+                )
+    except Exception as e:
+        print(f"[admin-nudge-sms] token insert failed: {e}", flush=True)
+        return jsonify({"ok": False, "error": "token-failed"}), 500
+
+    base_url = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+    magic_link_url = f"{base_url}/?auth=verify&token={raw_token}&intent=new-account"
+
+    # Short SMS-friendly body. The magic link does the heavy lifting.
+    first_name = (sub.get("name") or "").split(" ")[0] or "there"
+    sms_body = (
+        f"WeatherValet: Hi {first_name}, finish setting up your morning brief "
+        f"delivery time and notification preferences here (good for 72h): "
+        f"{magic_link_url} "
+        f"Reply STOP to opt out."
+    )
+
+    ok = False
+    try:
+        ok = send_sms(phone, sms_body)
+    except Exception as e:
+        print(f"[admin-nudge-sms] send_sms threw: {e}", flush=True)
+
+    # Audit log
+    actor = _get_current_user()
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO admin_audit_log
+                       (created_at, actor_user_id, actor_name, action, target_kind,
+                        target_id, details)
+                       VALUES (%s, %s, %s, 'nudge_subscriber_sms', 'user', %s, %s)""",
+                    (int(time.time() * 1000),
+                     actor["id"] if actor else None,
+                     actor.get("name") if actor else "system",
+                     user_id,
+                     json.dumps({
+                         "phone": phone,
+                         "sent": bool(ok),
+                         "magic_link_issued": True,
+                         "magic_link_ttl_hours": 72,
+                     })),
+                )
+    except Exception as e:
+        print(f"[admin-nudge-sms] audit log failed: {e}", flush=True)
+
+    if not ok:
+        return jsonify({"ok": False, "error": "send-failed"}), 502
+    return jsonify({"ok": True, "sent_to": phone})
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Admin: set a user's password (May 23, 2026 — Todo #37)
 # ─────────────────────────────────────────────────────────────────────
 # Session-cookie counterpart to the legacy /admin/set-password endpoint
