@@ -19912,6 +19912,110 @@ def crew_report_verify(report_id: int):
     })
 
 
+# ─── Hide a report (Crew toggle-off) ─────────────────────────────────
+#
+# When a Crew member toggles a condition off (e.g. "it stopped raining"),
+# the frontend calls this to mark their currently-active report of that
+# type as hidden. The map filters hidden reports, so the pulse goes
+# away. The row stays in the DB for historical purposes.
+#
+# Auth: Crew only, and only their OWN reports.
+
+@app.route("/api/v1/crew/reports/<int:report_id>/hide", methods=["OPTIONS"])
+def _crew_report_hide_preflight(report_id: int):
+    return ("", 204)
+
+
+@app.post("/api/v1/crew/reports/<int:report_id>/hide")
+def crew_report_hide(report_id: int):
+    """Crew member hides one of their own reports. Used by the
+    toggle-off behavior on the workspace: clicking an active condition
+    again removes its pulse from the map. The report row is preserved
+    (soft hide) so Mets can still see the history if needed.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if not _is_crew_member(user):
+        return jsonify({"ok": False, "error": "not-crew"}), 403
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT user_id, is_hidden FROM crew_reports WHERE id = %s",
+                    (report_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"ok": False, "error": "report-not-found"}), 404
+                if row["user_id"] != user["id"]:
+                    return jsonify({"ok": False, "error": "not-your-report"}), 403
+                if row.get("is_hidden"):
+                    # Already hidden — idempotent success
+                    return jsonify({"ok": True, "already_hidden": True})
+                cur.execute(
+                    "UPDATE crew_reports SET is_hidden = TRUE WHERE id = %s",
+                    (report_id,),
+                )
+    except Exception as e:
+        print(f"[crew-hide] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+    return jsonify({"ok": True})
+
+
+# ─── My active reports (Crew workspace toggle state) ────────────────
+#
+# Returns the calling Crew member's currently-active reports (last 60
+# minutes, not hidden). Used by the workspace on load to pre-highlight
+# the buttons matching what they've already posted.
+
+@app.route("/api/v1/me/crew/active-reports", methods=["OPTIONS"])
+def _me_crew_active_reports_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/crew/active-reports")
+def me_crew_active_reports():
+    """Returns this user's reports in the last 60 minutes that aren't
+    hidden. Used by the workspace to highlight which condition buttons
+    are currently 'active' for this Crew member.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if not _is_crew_member(user):
+        return jsonify({"ok": False, "error": "not-crew"}), 403
+
+    cutoff_ms = int(time.time() * 1000) - (60 * 60 * 1000)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, report_type, notes, created_at
+                       FROM crew_reports
+                       WHERE user_id = %s
+                         AND is_hidden = FALSE
+                         AND created_at >= %s
+                       ORDER BY created_at DESC""",
+                    (user["id"], cutoff_ms),
+                )
+                rows = cur.fetchall()
+    except Exception as e:
+        print(f"[crew-active-reports] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+
+    return jsonify({
+        "ok": True,
+        "reports": [{
+            "id": r["id"],
+            "report_type": r["report_type"],
+            "notes": r.get("notes") or "",
+            "created_at": r["created_at"],
+        } for r in rows]
+    })
+
+
 # ─── Mission list (Crew-facing) ─────────────────────────────────────
 
 @app.route("/api/v1/me/crew/missions", methods=["OPTIONS"])
