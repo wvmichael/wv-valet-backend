@@ -18892,7 +18892,7 @@ def _send_crew_verify_email(email: str, magic_link_url: str,
   <div style="max-width:560px;margin:32px auto;padding:32px 28px;background:#fff;border-radius:12px;box-shadow:0 1px 3px rgba(15,17,22,0.06);">
     <h1 style="font-size:22px;font-weight:600;margin:0 0 16px;">{greeting}</h1>
     <p style="font-size:15px;line-height:1.55;color:rgba(15,17,22,0.75);margin:0 0 14px;">
-      Thanks for applying to the Valet Crew &mdash; the community of weather watchers helping our meteorologists keep an eye on the ground.
+      Thanks for applying to the Valet Crew. We&rsquo;re a community of weather watchers helping our meteorologists keep an eye on the ground.
     </p>
     <p style="font-size:15px;line-height:1.55;color:rgba(15,17,22,0.75);margin:0 0 22px;">
       Tap the button below to verify your email and finish joining. You&rsquo;ll be signed in and able to start submitting reports right away.
@@ -18909,7 +18909,7 @@ def _send_crew_verify_email(email: str, magic_link_url: str,
   </div>
 </body></html>"""
         text = (f"{greeting}\n\n"
-                "Thanks for applying to the Valet Crew — the community of "
+                "Thanks for applying to the Valet Crew. We're a community of "
                 "weather watchers helping our meteorologists keep an eye "
                 "on the ground.\n\n"
                 "Tap the link below to verify your email and finish joining. "
