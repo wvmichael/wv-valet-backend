@@ -2338,6 +2338,69 @@ def init_db() -> None:
         _backfill_welcome_sent_at()
     except Exception as e:
         print(f"[welcome-backfill] failed: {e}", flush=True)
+    # Backfill phone/name from approved crew applications to users
+    # (May 24, 2026). The crew-verify endpoint was not copying phone
+    # to users.phone, so existing approved Crew can't receive mission
+    # SMS. This backfill runs once at startup and is idempotent.
+    try:
+        _backfill_crew_user_phone()
+    except Exception as e:
+        print(f"[crew-phone-backfill] failed: {e}", flush=True)
+
+
+def _backfill_crew_user_phone() -> None:
+    """One-time backfill: copy phone, name, and county from approved
+    crew_applications rows to the matched users row, but only where
+    the user's field is currently NULL or empty. Idempotent: re-running
+    is safe and is a no-op for any user that's already got the data."""
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                # Update phone where users.phone is NULL/empty and the
+                # approved application has a phone.
+                cur.execute(
+                    """UPDATE users u
+                       SET phone = ca.phone
+                       FROM crew_applications ca
+                       WHERE ca.email = u.email
+                         AND ca.status = 'approved'
+                         AND ca.phone IS NOT NULL
+                         AND ca.phone <> ''
+                         AND (u.phone IS NULL OR u.phone = '')"""
+                )
+                phone_updated = cur.rowcount
+                # Same for crew_home_label (we save county there)
+                cur.execute(
+                    """UPDATE users u
+                       SET crew_home_label = ca.county
+                       FROM crew_applications ca
+                       WHERE ca.email = u.email
+                         AND ca.status = 'approved'
+                         AND ca.county IS NOT NULL
+                         AND ca.county <> ''
+                         AND (u.crew_home_label IS NULL OR u.crew_home_label = '')"""
+                )
+                county_updated = cur.rowcount
+                # Same for name (best-effort, don't clobber set names)
+                cur.execute(
+                    """UPDATE users u
+                       SET name = ca.name
+                       FROM crew_applications ca
+                       WHERE ca.email = u.email
+                         AND ca.status = 'approved'
+                         AND ca.name IS NOT NULL
+                         AND ca.name <> ''
+                         AND (u.name IS NULL OR u.name = '')"""
+                )
+                name_updated = cur.rowcount
+                if phone_updated or county_updated or name_updated:
+                    print(
+                        f"[crew-phone-backfill] phone={phone_updated} "
+                        f"county={county_updated} name={name_updated}",
+                        flush=True,
+                    )
+    except Exception as e:
+        print(f"[crew-phone-backfill] query failed: {e}", flush=True)
 
 
 def _backfill_welcome_sent_at() -> None:
@@ -4652,6 +4715,35 @@ def auth_verify():
                          AND status = 'pending'""",
                     (now_ms_crew, row["user_id"], now_ms_crew, row["user_id"]),
                 )
+                # Copy phone, name, and county from the application row
+                # to the users table. Without this, the user's phone is
+                # NULL and they never receive mission SMS. Only updates
+                # fields that aren't already set on the user, so we don't
+                # clobber anything the user has changed in their profile.
+                cur.execute(
+                    """SELECT name, phone, county
+                       FROM crew_applications
+                       WHERE email = (SELECT email FROM users WHERE id = %s)
+                         AND status = 'approved'
+                       ORDER BY updated_at DESC
+                       LIMIT 1""",
+                    (row["user_id"],),
+                )
+                app_row = cur.fetchone()
+                if app_row:
+                    cur.execute(
+                        """UPDATE users
+                           SET name = COALESCE(NULLIF(name, ''), %s),
+                               phone = COALESCE(NULLIF(phone, ''), %s),
+                               crew_home_label = COALESCE(NULLIF(crew_home_label, ''), %s)
+                           WHERE id = %s""",
+                        (
+                            app_row.get("name"),
+                            app_row.get("phone"),
+                            app_row.get("county"),
+                            row["user_id"],
+                        ),
+                    )
                 print(f"[crew-verify] role granted user_id={row['user_id']}", flush=True)
 
         # Create the session (inserts a row, returns the raw session ID)
