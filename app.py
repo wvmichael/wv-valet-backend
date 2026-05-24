@@ -9645,6 +9645,177 @@ def admin_user_set_password(user_id: int):
     }), 200
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Admin: set a subscriber's primary saved location (May 23, 2026)
+# ─────────────────────────────────────────────────────────────────────
+# Use case: subscribers migrated from old system have only a placeholder
+# city/state. Admin enters the real address; we geocode it and write to
+# the subscriber's primary saved_locations row (creating it if none
+# exists). After this, the subscriber's daily brief uses the real
+# location instead of the migration placeholder.
+#
+# Behavior:
+#   - Geocoding failure → reject with error, no partial write.
+#   - If subscriber already has a primary location → update in place.
+#   - If they have no primary → create a new row, mark as primary.
+#   - The brief grader's nws_station_cache auto-invalidates when
+#     lat/lng changes by >0.01° — so the next brief uses the right
+#     station too. No additional cleanup needed.
+
+@app.route("/api/v1/admin/users/<int:user_id>/set-location", methods=["OPTIONS"])
+def _admin_user_set_location_preflight(user_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/users/<int:user_id>/set-location")
+@require_role("admin")
+def admin_user_set_location(user_id: int):
+    """Set or update a subscriber's primary saved location. Admin-only.
+
+    Request body: {"address": "1234 Main St, Lebanon, IN"}
+                  optional: "label" (e.g. "Office"; defaults to "Home")
+
+    Returns: 200 {"ok": true, "user_id": <id>, "location": {...}}
+             400 on missing/invalid address or geocoding failure
+             404 if user doesn't exist
+    """
+    data = request.get_json(silent=True) or {}
+    address = (data.get("address") or "").strip()
+    label = (data.get("label") or "").strip() or "Home"
+
+    if not address:
+        return jsonify({"ok": False, "error": "missing-address"}), 400
+    if len(address) < 4:
+        return jsonify({"ok": False, "error": "address-too-short"}), 400
+    if len(address) > 500:
+        return jsonify({"ok": False, "error": "address-too-long"}), 400
+
+    # Verify user exists before spending a geocoder call
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, email FROM users WHERE id = %s", (user_id,))
+                target_user = cur.fetchone()
+    except Exception as e:
+        print(f"[admin-set-location] user lookup failed user={user_id}: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-failed"}), 500
+    if not target_user:
+        return jsonify({"ok": False, "error": "no-such-user"}), 404
+
+    # Geocode the address. Returns None on no match or network failure.
+    geo = _geocode_address(address)
+    if not geo:
+        return jsonify({
+            "ok": False,
+            "error": "geocoding-failed",
+            "message": "Couldn't find that address. Try adding more detail or fixing the spelling.",
+        }), 400
+
+    lat = geo.get("lat")
+    lng = geo.get("lng")
+    county = geo.get("admin2") or None
+    if lat is None or lng is None:
+        return jsonify({"ok": False, "error": "geocoding-incomplete"}), 400
+
+    now_ms = int(time.time() * 1000)
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                # Look for existing primary location for this user.
+                cur.execute(
+                    """SELECT id FROM saved_locations
+                       WHERE user_id = %s AND is_primary = TRUE
+                       LIMIT 1""",
+                    (user_id,),
+                )
+                existing = cur.fetchone()
+
+                if existing:
+                    # Update in place — keep label unless caller provided one
+                    if data.get("label"):
+                        cur.execute(
+                            """UPDATE saved_locations
+                               SET label = %s, address_text = %s,
+                                   lat = %s, lng = %s, county = %s,
+                                   updated_at = %s
+                               WHERE id = %s
+                               RETURNING id, label, address_text, lat, lng, county""",
+                            (label, address, lat, lng, county, now_ms, existing["id"]),
+                        )
+                    else:
+                        cur.execute(
+                            """UPDATE saved_locations
+                               SET address_text = %s,
+                                   lat = %s, lng = %s, county = %s,
+                                   updated_at = %s
+                               WHERE id = %s
+                               RETURNING id, label, address_text, lat, lng, county""",
+                            (address, lat, lng, county, now_ms, existing["id"]),
+                        )
+                    loc_row = cur.fetchone()
+                else:
+                    # Create a new primary location. Make sure no other
+                    # primary exists (shouldn't, but be defensive).
+                    cur.execute(
+                        """UPDATE saved_locations
+                           SET is_primary = FALSE
+                           WHERE user_id = %s AND is_primary = TRUE""",
+                        (user_id,),
+                    )
+                    cur.execute(
+                        """INSERT INTO saved_locations
+                             (user_id, label, address_text, lat, lng, county,
+                              is_primary, created_at, updated_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, TRUE, %s, %s)
+                           RETURNING id, label, address_text, lat, lng, county""",
+                        (user_id, label, address, lat, lng, county, now_ms, now_ms),
+                    )
+                    loc_row = cur.fetchone()
+    except Exception as e:
+        print(f"[admin-set-location] DB write failed user={user_id}: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-failed"}), 500
+
+    # Audit log
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                actor = _get_current_user()
+                cur.execute(
+                    """INSERT INTO admin_audit_log
+                       (created_at, actor_user_id, actor_name, action, target_kind,
+                        target_id, details)
+                       VALUES (%s, %s, %s, 'set_location', 'user', %s, %s)""",
+                    (now_ms,
+                     actor["id"] if actor else None,
+                     actor.get("name") if actor else "system",
+                     user_id,
+                     json.dumps({
+                         "email": target_user.get("email"),
+                         "address": address,
+                         "lat": float(lat),
+                         "lng": float(lng),
+                         "county": county,
+                     })),
+                )
+    except Exception as e:
+        print(f"[admin-set-location] audit log failed: {e!r}", flush=True)
+
+    print(f"[admin-set-location] set location for user={user_id} email={target_user.get('email')} → {address[:60]}", flush=True)
+    return jsonify({
+        "ok": True,
+        "user_id": user_id,
+        "location": {
+            "id": loc_row["id"],
+            "label": loc_row["label"],
+            "address": loc_row["address_text"],
+            "lat": float(loc_row["lat"]),
+            "lng": float(loc_row["lng"]),
+            "county": loc_row.get("county") or "",
+        },
+    }), 200
+
+
 @app.post("/api/v1/admin/users")
 @require_role("admin")
 def admin_create_user():
