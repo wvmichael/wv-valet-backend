@@ -19358,10 +19358,23 @@ def me_crew_stats():
                     (user_id,),
                 )
                 row = cur.fetchone()
-                if row and row.get("created_at"):
-                    age_ms = now_ms - row["created_at"]
-                    joined_days_ago = int(age_ms / (24 * 60 * 60 * 1000))
-                    is_first_day = age_ms < (24 * 60 * 60 * 1000)
+                if row:
+                    existing_created = row.get("created_at") or 0
+                    # Auto-heal: if created_at is missing or clearly
+                    # bogus (pre Jan 1, 2024), backfill to now. Matches
+                    # the same auto-heal in _get_or_create_user.
+                    if existing_created < 1704067200000:  # Jan 1, 2024 UTC
+                        with conn.cursor() as cur2:
+                            cur2.execute(
+                                "UPDATE users SET created_at = %s WHERE id = %s AND (created_at IS NULL OR created_at < %s)",
+                                (now_ms, user_id, 1704067200000),
+                            )
+                        joined_days_ago = 0
+                        is_first_day = True
+                    else:
+                        age_ms = now_ms - existing_created
+                        joined_days_ago = int(age_ms / (24 * 60 * 60 * 1000))
+                        is_first_day = age_ms < (24 * 60 * 60 * 1000)
     except Exception:
         pass
 
