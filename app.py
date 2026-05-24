@@ -18832,21 +18832,32 @@ def crew_apply_submit():
             if not admin_email:
                 admin_email = "hello@weathervalet.ai"
             admin_subject = f"New Valet Crew application: {name}"
-            admin_body = (
-                f"Someone applied to the Valet Crew.\n\n"
-                f"Name: {name}\n"
-                f"Email: {email}\n"
-                f"Handle: {handle or '(none)'}\n"
-                f"Phone: {phone or '(none)'}\n"
-                f"County: {county or '(none)'}\n"
-                f"Interests: {mission_interests or '(none)'}\n"
-                f"Hours: {hours}\n"
-                f"Notify: {notify}\n\n"
-                f"They've been emailed a verification link. The Crew role "
-                f"is granted automatically when they click it.\n\n"
-                f"Application ID: {application_id}\n"
+            # Build minimal HTML directly so we bypass the subscriber-portal
+            # auto-footer that _send_brief_email injects when html=False.
+            # This is an admin internal notification, not a subscriber email.
+            admin_html = (
+                '<!DOCTYPE html><html><body style="font-family:-apple-system,'
+                'BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;color:#0E1116;'
+                'max-width:560px;margin:24px auto;padding:0 16px;">'
+                f'<h2 style="font-size:18px;margin:0 0 14px;">New Valet Crew application</h2>'
+                '<table style="border-collapse:collapse;font-size:14px;'
+                'line-height:1.55;color:#0E1116;">'
+                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Name</td><td>{_html_escape(name)}</td></tr>'
+                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Email</td><td><a href="mailto:{_html_escape(email)}">{_html_escape(email)}</a></td></tr>'
+                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Handle</td><td>{_html_escape(handle or "(none)")}</td></tr>'
+                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Phone</td><td>{_html_escape(phone or "(none)")}</td></tr>'
+                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">County</td><td>{_html_escape(county or "(none)")}</td></tr>'
+                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Interests</td><td>{_html_escape(mission_interests or "(none)")}</td></tr>'
+                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Hours</td><td>{_html_escape(hours)}</td></tr>'
+                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Notify</td><td>{_html_escape(notify)}</td></tr>'
+                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">App ID</td><td>{application_id}</td></tr>'
+                '</table>'
+                '<p style="font-size:13px;color:#6E7682;margin:18px 0 0;line-height:1.55;">'
+                'They&rsquo;ve been emailed a verification link. The Crew role is granted '
+                'automatically when they click it.</p>'
+                '</body></html>'
             )
-            _send_brief_email(admin_email, admin_subject, admin_body, html=False)
+            _send_brief_email(admin_email, admin_subject, admin_html, html=True)
         except Exception as e:
             print(f"[crew-apply] admin notify failed: {e!r}", flush=True)
 
