@@ -18697,6 +18697,92 @@ def crew_apply_submit():
 
     now_ms = int(time.time() * 1000)
 
+    def _crew_send_verify_and_notify(application_id_inner):
+        """Inner helper: mint a fresh magic-link token, send the verify
+        email to the applicant, and send admin notification. Called from
+        BOTH the pending-update path and the new-application path so
+        applicants get a fresh link each time they submit, even if a
+        prior application already existed.
+
+        Wrapped in its own try/except. Failures here don't block the
+        API response — the application row already exists.
+        """
+        # Verification email setup
+        try:
+            print(f"[crew-apply] starting verify setup for {email} (app_id={application_id_inner})", flush=True)
+            with db() as conn:
+                applicant_user_id = _get_or_create_user(email, conn)
+                print(f"[crew-apply] user_id={applicant_user_id} for {email}", flush=True)
+                with conn.cursor() as cur:
+                    if name:
+                        cur.execute(
+                            """UPDATE users SET name = %s
+                               WHERE id = %s AND (name IS NULL OR name = '')""",
+                            (name, applicant_user_id),
+                        )
+                    if phone:
+                        cur.execute(
+                            """UPDATE users SET phone = %s
+                               WHERE id = %s AND (phone IS NULL OR phone = '')""",
+                            (phone, applicant_user_id),
+                        )
+                raw_token = new_secure_token()
+                token_hash = hash_token(raw_token)
+                now_seconds = int(time.time())
+                seven_days = 7 * 24 * 60 * 60
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO magic_link_tokens
+                             (token_hash, user_id, created_at, expires_at, ip_requested)
+                           VALUES (%s, %s, %s, %s, %s)""",
+                        (token_hash, applicant_user_id, now_seconds,
+                         now_seconds + seven_days, "crew-verify"),
+                    )
+                print(f"[crew-apply] magic link token minted for user_id={applicant_user_id}", flush=True)
+            base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai")
+            magic_link_url = f"{base}/?auth=verify&token={raw_token}&intent=crew-verify"
+            print(f"[crew-apply] calling _send_crew_verify_email for {email}", flush=True)
+            try:
+                send_result = _send_crew_verify_email(email, magic_link_url,
+                                                     applicant_name=name)
+                print(f"[crew-apply] _send_crew_verify_email returned {send_result} for {email}", flush=True)
+            except Exception as e:
+                print(f"[crew-apply] verify email send failed: {e!r}", flush=True)
+        except Exception as e:
+            print(f"[crew-apply] verification setup failed: {e!r}", flush=True)
+
+        # Admin notification
+        try:
+            admin_email = os.environ.get("ADMIN_NOTIFY_EMAIL", "").strip()
+            if not admin_email:
+                admin_email = "hello@weathervalet.ai"
+            admin_subject = f"New Valet Crew application: {name}"
+            admin_html = (
+                '<!DOCTYPE html><html><body style="font-family:-apple-system,'
+                'BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;color:#0E1116;'
+                'max-width:560px;margin:24px auto;padding:0 16px;">'
+                f'<h2 style="font-size:18px;margin:0 0 14px;">New Valet Crew application</h2>'
+                '<table style="border-collapse:collapse;font-size:14px;'
+                'line-height:1.55;color:#0E1116;">'
+                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Name</td><td>{_html_escape(name)}</td></tr>'
+                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Email</td><td><a href="mailto:{_html_escape(email)}">{_html_escape(email)}</a></td></tr>'
+                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Handle</td><td>{_html_escape(handle or "(none)")}</td></tr>'
+                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Phone</td><td>{_html_escape(phone or "(none)")}</td></tr>'
+                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">County</td><td>{_html_escape(county or "(none)")}</td></tr>'
+                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Interests</td><td>{_html_escape(mission_interests or "(none)")}</td></tr>'
+                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Hours</td><td>{_html_escape(hours)}</td></tr>'
+                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Notify</td><td>{_html_escape(notify)}</td></tr>'
+                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">App ID</td><td>{application_id_inner}</td></tr>'
+                '</table>'
+                '<p style="font-size:13px;color:#6E7682;margin:18px 0 0;line-height:1.55;">'
+                'They&rsquo;ve been emailed a verification link. The Crew role is granted '
+                'automatically when they click it.</p>'
+                '</body></html>'
+            )
+            _send_brief_email(admin_email, admin_subject, admin_html, html=True)
+        except Exception as e:
+            print(f"[crew-apply] admin notify failed: {e!r}", flush=True)
+
     try:
         with db() as conn:
             with conn.cursor() as cur:
@@ -18724,11 +18810,20 @@ def crew_apply_submit():
                             (name, handle, phone, county, mission_interests, hours,
                              notify, now_ms, existing["id"]),
                         )
-                        return jsonify({
-                            "ok": True,
-                            "application_id": existing["id"],
-                            "updated": True,
-                        })
+        # Pending re-submission: send a fresh verify email so they can
+        # finish joining. Previously this branch silently exited without
+        # sending anything, leaving the applicant stuck.
+        if existing and existing["status"] == "pending":
+            _crew_send_verify_and_notify(existing["id"])
+            return jsonify({
+                "ok": True,
+                "application_id": existing["id"],
+                "updated": True,
+            })
+
+        with db() as conn:
+            with conn.cursor() as cur:
+                if existing and existing["status"] == "rejected":
                     # 'rejected' — allow them to re-apply by clearing rejection
                     cur.execute(
                         """UPDATE crew_applications
@@ -18740,129 +18835,26 @@ def crew_apply_submit():
                         (name, handle, phone, county, mission_interests, hours,
                          notify, now_ms, existing["id"]),
                     )
-                    return jsonify({
-                        "ok": True,
-                        "application_id": existing["id"],
-                        "reapplied": True,
-                    })
-
-                # New application
-                cur.execute(
-                    """INSERT INTO crew_applications
-                       (created_at, updated_at, status, name, handle, email, phone,
-                        county, mission_interests, hours, notify)
-                       VALUES (%s, %s, 'pending', %s, %s, %s, %s, %s, %s, %s, %s)
-                       RETURNING id""",
-                    (now_ms, now_ms, name, handle, email, phone, county,
-                     mission_interests, hours, notify),
-                )
-                row = cur.fetchone()
-                application_id = row["id"]
-
-        # ── Self-service verification flow (May 24, 2026) ───────────
-        # Per product decision: applications no longer wait for admin
-        # approval. We create the user row immediately (with no roles
-        # yet), mint a magic-link token tagged 'crew-verify', and email
-        # the applicant a verification link. When they click the link,
-        # the magic-link verify endpoint detects the pending Crew
-        # application for this user and grants the 'crew' role.
-        #
-        # This is the "lightweight quality filter" model:
-        #   - Anyone can apply, but they must verify their email to
-        #     actually become a Crew member
-        #   - Bot/spam applications never verify, so role is never
-        #     granted; the pending row just sits in the DB
-        #   - Real applicants are in within a click
-        #
-        # If anything in this block fails, we still return success to
-        # the user (the application row exists). The verify email can
-        # be resent by re-submitting the same application.
-        magic_link_url = None
-        try:
-            with db() as conn:
-                # 1. Create the user shell account (no roles yet)
-                applicant_user_id = _get_or_create_user(email, conn)
-                # 2. Fill in name + phone if user is brand new with no data
-                with conn.cursor() as cur:
-                    if name:
-                        cur.execute(
-                            """UPDATE users SET name = %s
-                               WHERE id = %s AND (name IS NULL OR name = '')""",
-                            (name, applicant_user_id),
-                        )
-                    if phone:
-                        cur.execute(
-                            """UPDATE users SET phone = %s
-                               WHERE id = %s AND (phone IS NULL OR phone = '')""",
-                            (phone, applicant_user_id),
-                        )
-
-                # 3. Mint a magic-link token tagged 'crew-verify'
-                #    so the verify endpoint can recognize and grant
-                #    the Crew role when the user clicks the link.
-                raw_token = new_secure_token()
-                token_hash = hash_token(raw_token)
-                now_seconds = int(time.time())
-                seven_days = 7 * 24 * 60 * 60
-                with conn.cursor() as cur:
+                    reapply_id = existing["id"]
+                else:
+                    # New application
                     cur.execute(
-                        """INSERT INTO magic_link_tokens
-                             (token_hash, user_id, created_at, expires_at, ip_requested)
-                           VALUES (%s, %s, %s, %s, %s)""",
-                        (token_hash, applicant_user_id, now_seconds,
-                         now_seconds + seven_days, "crew-verify"),
+                        """INSERT INTO crew_applications
+                           (created_at, updated_at, status, name, handle, email, phone,
+                            county, mission_interests, hours, notify)
+                           VALUES (%s, %s, 'pending', %s, %s, %s, %s, %s, %s, %s, %s)
+                           RETURNING id""",
+                        (now_ms, now_ms, name, handle, email, phone, county,
+                         mission_interests, hours, notify),
                     )
+                    row = cur.fetchone()
+                    reapply_id = row["id"]
 
-            # 4. Build the verification link
-            base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai")
-            magic_link_url = f"{base}/?auth=verify&token={raw_token}&intent=crew-verify"
+        # Send verify + notify admin for both new applications and rejected-reapplies.
+        _crew_send_verify_and_notify(reapply_id)
 
-            # 5. Send the applicant a verification email
-            try:
-                _send_crew_verify_email(email, magic_link_url,
-                                        applicant_name=name)
-            except Exception as e:
-                print(f"[crew-apply] verify email send failed: {e!r}", flush=True)
-        except Exception as e:
-            print(f"[crew-apply] verification setup failed: {e!r}", flush=True)
-
-        # 6. Notify admin (you) by email so you don't miss applications
-        try:
-            admin_email = os.environ.get("ADMIN_NOTIFY_EMAIL", "").strip()
-            if not admin_email:
-                admin_email = "hello@weathervalet.ai"
-            admin_subject = f"New Valet Crew application: {name}"
-            # Build minimal HTML directly so we bypass the subscriber-portal
-            # auto-footer that _send_brief_email injects when html=False.
-            # This is an admin internal notification, not a subscriber email.
-            admin_html = (
-                '<!DOCTYPE html><html><body style="font-family:-apple-system,'
-                'BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;color:#0E1116;'
-                'max-width:560px;margin:24px auto;padding:0 16px;">'
-                f'<h2 style="font-size:18px;margin:0 0 14px;">New Valet Crew application</h2>'
-                '<table style="border-collapse:collapse;font-size:14px;'
-                'line-height:1.55;color:#0E1116;">'
-                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Name</td><td>{_html_escape(name)}</td></tr>'
-                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Email</td><td><a href="mailto:{_html_escape(email)}">{_html_escape(email)}</a></td></tr>'
-                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Handle</td><td>{_html_escape(handle or "(none)")}</td></tr>'
-                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Phone</td><td>{_html_escape(phone or "(none)")}</td></tr>'
-                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">County</td><td>{_html_escape(county or "(none)")}</td></tr>'
-                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Interests</td><td>{_html_escape(mission_interests or "(none)")}</td></tr>'
-                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Hours</td><td>{_html_escape(hours)}</td></tr>'
-                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Notify</td><td>{_html_escape(notify)}</td></tr>'
-                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">App ID</td><td>{application_id}</td></tr>'
-                '</table>'
-                '<p style="font-size:13px;color:#6E7682;margin:18px 0 0;line-height:1.55;">'
-                'They&rsquo;ve been emailed a verification link. The Crew role is granted '
-                'automatically when they click it.</p>'
-                '</body></html>'
-            )
-            _send_brief_email(admin_email, admin_subject, admin_html, html=True)
-        except Exception as e:
-            print(f"[crew-apply] admin notify failed: {e!r}", flush=True)
-
-        print(f"[crew-apply] new application id={application_id} email={email}", flush=True)
-        return jsonify({"ok": True, "application_id": application_id})
+        print(f"[crew-apply] application id={reapply_id} email={email}", flush=True)
+        return jsonify({"ok": True, "application_id": reapply_id})
     except Exception as e:
         print(f"[crew-apply] insert failed for {email}: {e!r}", flush=True)
         return jsonify({"ok": False, "error": "internal-error"}), 500
@@ -18880,11 +18872,17 @@ def _send_crew_verify_email(email: str, magic_link_url: str,
 
     Token TTL is 7 days. If they wait too long, they can re-submit the
     application form to get a fresh link.
+
+    Diagnostic logging: prints entry, API key presence, and the Resend
+    response status/body to Render logs. Helps debug why an email
+    didn't arrive (rejected sender, throttled, etc.).
     """
+    print(f"[crew-verify-email] ENTER email={email} link_len={len(magic_link_url)}", flush=True)
     RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
     if not RESEND_API_KEY:
         print(f"[crew-verify-email] RESEND_API_KEY not set. Link for {email}: {magic_link_url}", flush=True)
         return False
+    print(f"[crew-verify-email] API key present (len={len(RESEND_API_KEY)})", flush=True)
     try:
         greeting = f"Hi {applicant_name.split()[0]}," if applicant_name else "Hi,"
         subject = "Verify your Valet Crew application"
@@ -18932,11 +18930,19 @@ def _send_crew_verify_email(email: str, magic_link_url: str,
             "html": html,
             "text": text,
         }
+        print(f"[crew-verify-email] POSTing to Resend for {email}", flush=True)
         resp = requests.post("https://api.resend.com/emails",
                               json=resend_body, headers=resend_headers, timeout=10)
-        return resp.status_code in (200, 201, 202)
+        ok = resp.status_code in (200, 201, 202)
+        if ok:
+            print(f"[crew-verify-email] Resend OK status={resp.status_code} for {email}", flush=True)
+        else:
+            # Print body so we know WHY Resend rejected (bad domain, throttled, etc.)
+            body_preview = resp.text[:500] if resp.text else "(empty body)"
+            print(f"[crew-verify-email] Resend REJECTED status={resp.status_code} for {email}: {body_preview}", flush=True)
+        return ok
     except Exception as e:
-        print(f"[crew-verify-email] failed: {e!r}", flush=True)
+        print(f"[crew-verify-email] EXCEPTION for {email}: {e!r}", flush=True)
         return False
 
 
