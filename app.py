@@ -18922,6 +18922,7 @@ def _send_crew_verify_email(email: str, magic_link_url: str,
         resend_headers = {
             "Authorization": f"Bearer {RESEND_API_KEY}",
             "Content-Type": "application/json",
+            "User-Agent": "WeatherValet-Backend/1.0 (+https://weathervalet.ai)",
         }
         resend_body = {
             "from": "WeatherValet <hello@weathervalet.ai>",
@@ -18930,17 +18931,34 @@ def _send_crew_verify_email(email: str, magic_link_url: str,
             "html": html,
             "text": text,
         }
+        payload = json.dumps(resend_body).encode("utf-8")
         print(f"[crew-verify-email] POSTing to Resend for {email}", flush=True)
-        resp = requests.post("https://api.resend.com/emails",
-                              json=resend_body, headers=resend_headers, timeout=10)
-        ok = resp.status_code in (200, 201, 202)
-        if ok:
-            print(f"[crew-verify-email] Resend OK status={resp.status_code} for {email}", flush=True)
-        else:
-            # Print body so we know WHY Resend rejected (bad domain, throttled, etc.)
-            body_preview = resp.text[:500] if resp.text else "(empty body)"
-            print(f"[crew-verify-email] Resend REJECTED status={resp.status_code} for {email}: {body_preview}", flush=True)
-        return ok
+        req = urllib.request.Request(
+            "https://api.resend.com/emails",
+            data=payload,
+            method="POST",
+            headers=resend_headers,
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                ok = 200 <= resp.status < 300
+                if ok:
+                    print(f"[crew-verify-email] Resend OK status={resp.status} for {email}", flush=True)
+                else:
+                    body_preview = resp.read(500).decode("utf-8", errors="replace")
+                    print(f"[crew-verify-email] Resend REJECTED status={resp.status} for {email}: {body_preview}", flush=True)
+                return ok
+        except urllib.error.HTTPError as e:
+            body_preview = ""
+            try:
+                body_preview = e.read(500).decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            print(f"[crew-verify-email] Resend HTTPError status={e.code} for {email}: {body_preview}", flush=True)
+            return False
+        except Exception as e:
+            print(f"[crew-verify-email] urlopen failed for {email}: {type(e).__name__}: {e}", flush=True)
+            return False
     except Exception as e:
         print(f"[crew-verify-email] EXCEPTION for {email}: {e!r}", flush=True)
         return False
