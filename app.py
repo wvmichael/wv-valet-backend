@@ -561,6 +561,13 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS accuracy_email_enabled BOOLEAN NOT NU
 -- in-memory guard.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS accuracy_email_last_sent_date TEXT;
 
+-- Team cap override (May 23, 2026). NULL = use tier default
+-- (3 for Pro Single, 10 for Pro Multi, 0 for any other tier).
+-- Set to an integer to grant a specific subscriber a larger team
+-- (e.g. an enterprise customer that bought additional seats).
+-- Only admins can set this; no portal UI exposes it.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS team_cap_override INTEGER;
+
 -- Phase 10 timezone support: every user has a timezone (IANA name like
 -- "America/Indiana/Indianapolis"). Used by the brief scheduler to deliver
 -- in the subscriber's local time, not UTC. Defaults to Indianapolis
@@ -11992,6 +11999,50 @@ def me_met_context_save():
 #   'active'   — member has accepted (logged in via magic link)
 #   'removed'  — primary removed them; row kept for audit
 
+
+# Tier defaults for team-member caps. Matches the pricing page:
+#   Pro Single → 3 team members
+#   Pro Multi  → 10 team members
+# Pro Enterprise is open-ended; default it generously and rely on the
+# admin override for anything past that.
+# Updated May 23, 2026 — was hardcoded at 25 across the board. Now
+# tier-aware so the system actually matches what we sell.
+TEAM_CAP_BY_TIER = {
+    "pro_single":     3,
+    "pro_multi":      10,
+    "pro_enterprise": 25,
+}
+
+
+def _team_cap_for_user(user_id: int, tier: str) -> int:
+    """Resolve the effective team-member cap for this user.
+
+    Priority:
+      1. users.team_cap_override (admin-granted, supersedes everything)
+      2. TEAM_CAP_BY_TIER[tier] (matches pricing page)
+      3. 0 (no tier match → not allowed)
+    """
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT team_cap_override FROM users WHERE id = %s",
+                    (user_id,),
+                )
+                row = cur.fetchone()
+                if row and row.get("team_cap_override") is not None:
+                    return int(row["team_cap_override"])
+    except Exception as e:
+        print(f"[team-cap] override lookup failed user={user_id}: {e!r}", flush=True)
+    return TEAM_CAP_BY_TIER.get((tier or "").lower(), 0)
+
+
+# Set of tiers where team-member management is available at all.
+# Marketing page commits Pro Single + Pro Multi (and we honor existing
+# Pro Enterprise the same way). Updated May 23, 2026 — was Pro Multi only.
+TEAM_ELIGIBLE_TIERS = {"pro_single", "pro_multi", "pro_enterprise"}
+
+
 @app.route("/api/v1/me/team", methods=["OPTIONS"])
 def _me_team_preflight():
     return ("", 204)
@@ -12009,13 +12060,15 @@ def me_team_list():
     if user is None:
         return jsonify({"ok": False, "error": "not-authenticated"}), 401
 
-    # Only Pro Multi subscribers can manage a team
+    # Pro Single + Pro Multi (and Pro Enterprise) can manage teams.
+    # Updated May 23, 2026 — was Pro Multi only, but the pricing page
+    # commits Pro Single to "up to 3 users" as well.
     tier = (user.get("subscription_tier") or "").lower()
-    if tier != "pro_multi":
+    if tier not in TEAM_ELIGIBLE_TIERS:
         return jsonify({
             "ok": False,
-            "error": "not-pro-multi",
-            "message": "Team members are a Pro Multi feature. Your current tier doesn't include this.",
+            "error": "not-team-eligible",
+            "message": "Team members are a Pro feature. Your current tier doesn't include this.",
         }), 403
 
     try:
@@ -12045,6 +12098,8 @@ def me_team_list():
 
     return jsonify({
         "ok": True,
+        "tier": tier,
+        "cap": _team_cap_for_user(user["id"], tier),
         "team": [{
             "membership_id": r["membership_id"],
             "member_user_id": r["member_user_id"],
@@ -12093,11 +12148,11 @@ def me_team_invite():
         return jsonify({"ok": False, "error": "not-authenticated"}), 401
 
     tier = (user.get("subscription_tier") or "").lower()
-    if tier != "pro_multi":
+    if tier not in TEAM_ELIGIBLE_TIERS:
         return jsonify({
             "ok": False,
-            "error": "not-pro-multi",
-            "message": "Team invites are a Pro Multi feature.",
+            "error": "not-team-eligible",
+            "message": "Team invites are a Pro feature.",
         }), 403
 
     data = request.get_json(silent=True) or {}
@@ -12124,18 +12179,28 @@ def me_team_invite():
     try:
         with db() as conn:
             with conn.cursor() as cur:
-                # ── Check team-size cap ───────────────────────────────
+                # ── Check team-size cap (tier-aware May 23, 2026) ─────
+                # Pro Single: 3, Pro Multi: 10, Enterprise: 25.
+                # users.team_cap_override (admin-set) supersedes the tier
+                # default if non-null.
+                effective_cap = _team_cap_for_user(user["id"], tier)
                 cur.execute(
                     """SELECT COUNT(*) AS n FROM pro_multi_memberships
                        WHERE primary_user_id = %s
                          AND status IN ('pending', 'active')""",
                     (user["id"],),
                 )
-                if cur.fetchone()["n"] >= 25:
+                current_count = cur.fetchone()["n"]
+                if current_count >= effective_cap:
                     return jsonify({
                         "ok": False,
                         "error": "team-cap-reached",
-                        "message": "You've reached the 25-member team cap. Remove an inactive member to add a new one.",
+                        "message": (
+                            f"You've reached your team cap of {effective_cap} "
+                            f"member{'s' if effective_cap != 1 else ''}. "
+                            f"Remove an inactive member to add a new one, "
+                            f"or contact support to upgrade your plan."
+                        ),
                     }), 400
 
                 # ── Create or update member's user row ────────────────
@@ -12271,8 +12336,8 @@ def me_team_remove(membership_id: int):
         return jsonify({"ok": False, "error": "not-authenticated"}), 401
 
     tier = (user.get("subscription_tier") or "").lower()
-    if tier != "pro_multi":
-        return jsonify({"ok": False, "error": "not-pro-multi"}), 403
+    if tier not in TEAM_ELIGIBLE_TIERS:
+        return jsonify({"ok": False, "error": "not-team-eligible"}), 403
 
     now_ms = int(time.time() * 1000)
 
