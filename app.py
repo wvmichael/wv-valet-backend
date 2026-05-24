@@ -21406,6 +21406,11 @@ def met_daily_brief_territory_stats():
     try:
         with db() as conn:
             with conn.cursor() as cur:
+                # Count distinct active subscribers with a primary
+                # location, EXCLUDING team-invite members (Pro Multi/
+                # Single tag-alongs). Those users share a Met-served
+                # brief with their primary subscriber and don't
+                # represent a separate household for coverage planning.
                 cur.execute(
                     """SELECT COUNT(DISTINCT u.id) AS n
                        FROM users u
@@ -21415,6 +21420,11 @@ def met_daily_brief_territory_stats():
                          AND EXISTS (
                            SELECT 1 FROM user_roles ur
                            WHERE ur.user_id = u.id AND ur.role = 'subscriber'
+                         )
+                         AND NOT EXISTS (
+                           SELECT 1 FROM pro_multi_memberships pmm
+                           WHERE pmm.member_user_id = u.id
+                             AND pmm.status IN ('pending', 'active')
                          )"""
                 )
                 row = cur.fetchone()
