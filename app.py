@@ -22260,7 +22260,7 @@ def met_pro_brief_send(draft_id):
                        JOIN users primary_u ON primary_u.id = pmm.primary_user_id
                        WHERE pmm.primary_user_id = %s
                          AND pmm.status = 'active'
-                         AND primary_u.subscription_tier = 'pro_multi'""",
+                         AND primary_u.subscription_tier IN ('pro_single','pro_multi','pro_enterprise')""",
                     (row["user_id"],),
                 )
                 team_rows = cur.fetchall()
@@ -23176,14 +23176,17 @@ def _is_pro_subscriber(user: dict) -> bool:
             tier = (row or {}).get("subscription_tier") or ""
             if tier in ("pro_single", "pro_multi", "pro_enterprise"):
                 return True
-            # Check if this user is an active team member of a Pro Multi
-            # (or Pro Enterprise) primary.
+            # Check if this user is an active team member of any Pro
+            # primary (Pro Single, Pro Multi, or Pro Enterprise).
+            # Updated May 23, 2026 — was Pro Multi/Enterprise only, but
+            # Pro Single now invites team members too. Their members
+            # need the same access to Pro features as the primary.
             cur.execute(
                 """SELECT 1 FROM pro_multi_memberships pmm
                    JOIN users primary_u ON primary_u.id = pmm.primary_user_id
                    WHERE pmm.member_user_id = %s
                      AND pmm.status = 'active'
-                     AND primary_u.subscription_tier IN ('pro_multi','pro_enterprise')
+                     AND primary_u.subscription_tier IN ('pro_single','pro_multi','pro_enterprise')
                    LIMIT 1""",
                 (user["id"],),
             )
@@ -23369,7 +23372,7 @@ def met_threads_list():
                      AND (
                        u.subscription_tier IN ('pro_single','pro_multi','pro_enterprise')
                        OR (pmm.id IS NOT NULL
-                           AND primary_u.subscription_tier IN ('pro_multi','pro_enterprise'))
+                           AND primary_u.subscription_tier IN ('pro_single','pro_multi','pro_enterprise'))
                      )
                    ORDER BY
                      CASE WHEN t.unread_for_met > 0 THEN 0 ELSE 1 END,
