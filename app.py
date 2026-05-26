@@ -1770,6 +1770,24 @@ ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS image_url TEXT;
 -- if they change their preferred time later.
 ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS delivery_time_local TEXT;
 
+-- ── Forecast snapshot at draft time (May 26, 2026 — Phase 3) ──
+-- Captured by the night-before scheduler when it creates the draft.
+-- These represent what the AI/Met saw when the brief was first
+-- written, NOT a fresh forecast at send time. Grading reflects the
+-- Met's actual decision-making context.
+--
+-- If the Met clicks "Refresh AI" later, these columns are updated to
+-- the refreshed forecast so the stored snapshot stays accurate to
+-- whatever the Met saw last.
+--
+-- Send-time fetch (Phase 2 behavior) is kept as a fallback — if
+-- these columns are NULL when the brief is sent (e.g. older drafts
+-- pre-dating this schema change), we fetch fresh.
+ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS predicted_high_f INTEGER;
+ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS predicted_low_f INTEGER;
+ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS predicted_precip_in NUMERIC(5,2);
+ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS predicted_max_wind_mph INTEGER;
+
 -- Brief access tokens (May 17, 2026). Each sent Pro Brief gets a random
 -- unguessable token. The subscriber's web view URL embeds this token:
 --   https://weathervalet.ai/brief/<token>
@@ -17073,6 +17091,7 @@ def _process_pending_briefs_inner() -> None:
                     window_end_ms = int(time.time() * 1000) + 4 * 60 * 60 * 1000
 
                 now_ms = int(time.time() * 1000)
+                draft_preds = _extract_predicted_values_from_forecast(forecast)
                 try:
                     with db() as conn:
                         with conn.cursor() as cur:
@@ -17081,16 +17100,23 @@ def _process_pending_briefs_inner() -> None:
                                    (user_id, brief_type, created_at, window_end_at, status,
                                     user_tier, location_label, location_lat, location_lng,
                                     channels, ai_verdict, ai_snippet, ai_body,
-                                    met_verdict, met_snippet, met_body)
+                                    met_verdict, met_snippet, met_body,
+                                    predicted_high_f, predicted_low_f,
+                                    predicted_precip_in, predicted_max_wind_mph)
                                    VALUES (%s, 'morning', %s, %s, 'pending-review',
-                                           %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                           %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                           %s, %s, %s, %s)
                                    RETURNING id""",
                                 (c["user_id"], now_ms, window_end_ms,
                                  tier, location_label,
                                  float(c["loc_lat"]), float(c["loc_lng"]),
                                  c["channels"] or "",
                                  ai_verdict, ai_snippet, ai_body,
-                                 ai_verdict, ai_snippet, ai_body),
+                                 ai_verdict, ai_snippet, ai_body,
+                                 draft_preds.get("predicted_high_f"),
+                                 draft_preds.get("predicted_low_f"),
+                                 draft_preds.get("predicted_precip_in"),
+                                 draft_preds.get("predicted_max_wind_mph")),
                             )
                             new_id = cur.fetchone()["id"]
                     print(
@@ -17461,6 +17487,7 @@ def _pregenerate_pro_brief_drafts_inner() -> None:
 
             now_ms = int(time.time() * 1000)
             tier = c["subscription_tier"]
+            pregen_preds = _extract_predicted_values_from_forecast(forecast)
             try:
                 with db() as conn:
                     with conn.cursor() as cur:
@@ -17469,16 +17496,23 @@ def _pregenerate_pro_brief_drafts_inner() -> None:
                                (user_id, brief_type, created_at, window_end_at, status,
                                 user_tier, location_label, location_lat, location_lng,
                                 channels, ai_verdict, ai_snippet, ai_body,
-                                met_verdict, met_snippet, met_body)
+                                met_verdict, met_snippet, met_body,
+                                predicted_high_f, predicted_low_f,
+                                predicted_precip_in, predicted_max_wind_mph)
                                VALUES (%s, 'morning', %s, %s, 'pending-review',
-                                       %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                       %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                       %s, %s, %s, %s)
                                RETURNING id""",
                             (c["user_id"], now_ms, window_end_ms,
                              tier, location_label,
                              float(c["loc_lat"]), float(c["loc_lng"]),
                              c["channels"] or "",
                              ai_verdict, ai_snippet, ai_body,
-                             ai_verdict, ai_snippet, ai_body),
+                             ai_verdict, ai_snippet, ai_body,
+                             pregen_preds.get("predicted_high_f"),
+                             pregen_preds.get("predicted_low_f"),
+                             pregen_preds.get("predicted_precip_in"),
+                             pregen_preds.get("predicted_max_wind_mph")),
                         )
                         new_id = cur.fetchone()["id"]
                 print(
@@ -22545,6 +22579,7 @@ def met_pro_brief_create_for_subscriber():
         window_end_ms = int(time.time() * 1000) + 18 * 60 * 60 * 1000
 
     now_ms = int(time.time() * 1000)
+    admin_preds = _extract_predicted_values_from_forecast(forecast)
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -22552,9 +22587,12 @@ def met_pro_brief_create_for_subscriber():
                      (user_id, brief_type, created_at, window_end_at, status,
                       user_tier, location_label, location_lat, location_lng,
                       channels, ai_verdict, ai_snippet, ai_body,
-                      met_verdict, met_snippet, met_body)
+                      met_verdict, met_snippet, met_body,
+                      predicted_high_f, predicted_low_f,
+                      predicted_precip_in, predicted_max_wind_mph)
                    VALUES (%s, 'morning', %s, %s, 'pending-review',
-                           %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                           %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                           %s, %s, %s, %s)
                    RETURNING id""",
                 (target_user_id, now_ms, window_end_ms,
                  sub["subscription_tier"] or "pro_single",
@@ -22562,7 +22600,11 @@ def met_pro_brief_create_for_subscriber():
                  float(sub["lat"]), float(sub["lng"]),
                  sub.get("channels") or "sms,email",
                  ai_verdict, ai_snippet, ai_body,
-                 ai_verdict, ai_snippet, ai_body),
+                 ai_verdict, ai_snippet, ai_body,
+                 admin_preds.get("predicted_high_f"),
+                 admin_preds.get("predicted_low_f"),
+                 admin_preds.get("predicted_precip_in"),
+                 admin_preds.get("predicted_max_wind_mph")),
             )
             new_id = cur.fetchone()["id"]
 
@@ -22639,17 +22681,29 @@ def met_pro_brief_refresh_ai(draft_id):
         row.get("location_label") or "",
         forecast or {},
         address=row.get("loc_address") or "")
+    refreshed_preds = _extract_predicted_values_from_forecast(forecast)
 
-    # Update the AI fields only; Met's edits are preserved
+    # Update the AI fields + predictions snapshot. Met's edits are
+    # preserved. The predictions snapshot reflects whatever forecast
+    # the Met has now chosen to see — they explicitly clicked Refresh.
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """UPDATE pro_brief_drafts
                    SET ai_verdict = %s,
                        ai_snippet = %s,
-                       ai_body = %s
+                       ai_body = %s,
+                       predicted_high_f = %s,
+                       predicted_low_f = %s,
+                       predicted_precip_in = %s,
+                       predicted_max_wind_mph = %s
                    WHERE id = %s""",
-                (new_verdict, new_snippet, new_body, draft_id),
+                (new_verdict, new_snippet, new_body,
+                 refreshed_preds.get("predicted_high_f"),
+                 refreshed_preds.get("predicted_low_f"),
+                 refreshed_preds.get("predicted_precip_in"),
+                 refreshed_preds.get("predicted_max_wind_mph"),
+                 draft_id),
             )
 
     print(
@@ -22895,18 +22949,35 @@ def met_pro_brief_send(draft_id):
         full_body = legacy_body + f"\n\n- {met_name}, WeatherValet"
 
     # Write brief_history row first so we can attach the access token
-    # Capture forecast predictions for accuracy grading (May 26, 2026).
-    # Send-time snapshot — reflects what the Met saw when they sent,
-    # not the stale 8 PM draft snapshot.
-    pro_forecast = None
-    try:
-        if row.get("location_lat") is not None and row.get("location_lng") is not None:
-            pro_forecast = _fetch_forecast(
-                float(row["location_lat"]), float(row["location_lng"])
-            )
-    except Exception as e:
-        print(f"[pro-brief-send] forecast fetch failed (non-fatal): {e}", flush=True)
-    pro_preds = _extract_predicted_values_from_forecast(pro_forecast)
+    # Capture forecast predictions for accuracy grading.
+    #
+    # Phase 3 (May 26, 2026): Prefer the draft-time forecast snapshot
+    # (stored in pro_brief_drafts) over a fresh send-time fetch. The
+    # draft snapshot reflects what the Met actually saw when they
+    # edited the brief — that's what should be graded against.
+    #
+    # If the draft predictions are NULL (older drafts pre-dating this
+    # schema), fall back to send-time fetch (Phase 2 behavior).
+    pro_preds = {
+        "predicted_high_f": row.get("predicted_high_f"),
+        "predicted_low_f": row.get("predicted_low_f"),
+        "predicted_precip_in": (
+            float(row["predicted_precip_in"])
+            if row.get("predicted_precip_in") is not None else None
+        ),
+        "predicted_max_wind_mph": row.get("predicted_max_wind_mph"),
+    }
+    have_draft_preds = any(v is not None for v in pro_preds.values())
+    if not have_draft_preds:
+        # Fallback for older drafts: fetch forecast now.
+        try:
+            if row.get("location_lat") is not None and row.get("location_lng") is not None:
+                pro_forecast = _fetch_forecast(
+                    float(row["location_lat"]), float(row["location_lng"])
+                )
+                pro_preds = _extract_predicted_values_from_forecast(pro_forecast)
+        except Exception as e:
+            print(f"[pro-brief-send] fallback forecast fetch failed (non-fatal): {e}", flush=True)
 
     history_id = None
     try:
@@ -31471,7 +31542,9 @@ def _fire_pro_brief_draft(draft_id: int, final_body: str | None,
         with db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id, user_id, status, location_lat, location_lng FROM pro_brief_drafts WHERE id = %s",
+                    "SELECT id, user_id, status, location_lat, location_lng, "
+                    "predicted_high_f, predicted_low_f, predicted_precip_in, "
+                    "predicted_max_wind_mph FROM pro_brief_drafts WHERE id = %s",
                     (draft_id,),
                 )
                 draft = cur.fetchone()
@@ -31501,19 +31574,34 @@ def _fire_pro_brief_draft(draft_id: int, final_body: str | None,
                 if sub:
                     body_for_history = (final_body or "")[:140]
 
-                    # Capture forecast predictions for accuracy grading
-                    # (May 26, 2026). Best-effort, non-fatal.
-                    pfire_forecast = None
-                    try:
-                        if (draft.get("location_lat") is not None
-                                and draft.get("location_lng") is not None):
-                            pfire_forecast = _fetch_forecast(
-                                float(draft["location_lat"]),
-                                float(draft["location_lng"]),
-                            )
-                    except Exception as e:
-                        print(f"[scheduled-fire] forecast fetch failed (non-fatal): {e}", flush=True)
-                    pfire_preds = _extract_predicted_values_from_forecast(pfire_forecast)
+                    # Capture forecast predictions for accuracy grading.
+                    #
+                    # Phase 3 (May 26, 2026): prefer the draft's stored
+                    # snapshot (what was captured at 8 PM the night
+                    # before, or refreshed by the Met). Fall back to
+                    # send-time fetch only if the draft has no stored
+                    # predictions.
+                    pfire_preds = {
+                        "predicted_high_f": draft.get("predicted_high_f"),
+                        "predicted_low_f": draft.get("predicted_low_f"),
+                        "predicted_precip_in": (
+                            float(draft["predicted_precip_in"])
+                            if draft.get("predicted_precip_in") is not None else None
+                        ),
+                        "predicted_max_wind_mph": draft.get("predicted_max_wind_mph"),
+                    }
+                    if not any(v is not None for v in pfire_preds.values()):
+                        # Fallback fetch
+                        try:
+                            if (draft.get("location_lat") is not None
+                                    and draft.get("location_lng") is not None):
+                                pfire_forecast = _fetch_forecast(
+                                    float(draft["location_lat"]),
+                                    float(draft["location_lng"]),
+                                )
+                                pfire_preds = _extract_predicted_values_from_forecast(pfire_forecast)
+                        except Exception as e:
+                            print(f"[scheduled-fire] fallback forecast fetch failed (non-fatal): {e}", flush=True)
 
                     cur.execute(
                         """INSERT INTO brief_history
