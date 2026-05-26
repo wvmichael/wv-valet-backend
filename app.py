@@ -28276,7 +28276,13 @@ NWS_OBS_THRESHOLDS = {
     "precip_in":         0.10,   # >= 0.10" total during window
     "wind_sustained_mph": 20.0,  # >= 20 mph at any hourly obs
     "wind_gust_mph":     30.0,   # >= 30 mph at any hourly obs
-    "temp_swing_f":      25.0,   # >= 25°F max-to-min during window
+    # temp_swing_f removed May 26, 2026. A diurnal temperature swing
+    # (e.g. warm afternoon to cold overnight) is not a forecast accuracy
+    # metric — it's just weather. Kansas in spring routinely has 30°F+
+    # daily swings as a baseline. The previous 25°F threshold was
+    # flagging normal weather as "severe observation" and causing the
+    # Met's verdict to be scored as under-called. See Chris Sramek email
+    # 2026-05-26 for the case that exposed this.
     "temp_max_f":        95.0,   # max temp >= 95°F
     "temp_min_f":        20.0,   # min temp <= 20°F
 }
@@ -28522,7 +28528,6 @@ def _classify_observations(observations: list) -> tuple:
 
     temp_max = max(temps) if temps else None
     temp_min = min(temps) if temps else None
-    temp_swing = (temp_max - temp_min) if (temp_max is not None and temp_min is not None) else 0.0
 
     th = NWS_OBS_THRESHOLDS
     findings = []
@@ -28532,8 +28537,6 @@ def _classify_observations(observations: list) -> tuple:
         findings.append(f"sustained wind {max_sustained_wind:.0f} mph")
     if max_gust >= th["wind_gust_mph"]:
         findings.append(f"wind gust {max_gust:.0f} mph")
-    if temp_swing >= th["temp_swing_f"]:
-        findings.append(f"{temp_swing:.0f}\u00b0F temp swing")
     if temp_max is not None and temp_max >= th["temp_max_f"]:
         findings.append(f"max temp {temp_max:.0f}\u00b0F")
     if temp_min is not None and temp_min <= th["temp_min_f"]:
@@ -28664,6 +28667,7 @@ def _run_brief_grader_for_day(grade_date: str, force_regrade: bool = False) -> d
     graded = 0
     skipped_no_outcome = 0
     skipped_no_location = 0
+    skipped_quiet_day = 0  # No NWS alerts + no work-affecting observations
     already_present = 0
     errors = 0
     grade_counts = {"accurate": 0, "over_called": 0, "under_called": 0,
@@ -28732,6 +28736,21 @@ def _run_brief_grader_for_day(grade_date: str, force_regrade: bool = False) -> d
                     print(f"[grader] observations layer failed brief={b.get('id')}: "
                           f"{e!r}", flush=True)
 
+            # ── May 26, 2026: Pause grading on quiet days ──
+            # If neither NWS alerts nor observations caught anything
+            # work-affecting, there's nothing to grade the brief
+            # against. Skip rather than scoring as "accurate" (which
+            # inflates the numbers) or as "under-called" (which is
+            # wrong). The brief is excluded from today's counts.
+            # See Chris Sramek email 2026-05-26 for the case that
+            # exposed this. The right long-term fix is the work-impact
+            # rebuild — comparing the brief's actual forecast text to
+            # observed conditions. This is the holding pattern until
+            # that lands.
+            if highest == "none":
+                skipped_quiet_day += 1
+                continue
+
             grade, score = _grade_brief(b["verdict"], highest)
             grade_counts[grade] = grade_counts.get(grade, 0) + 1
 
@@ -28774,7 +28793,8 @@ def _run_brief_grader_for_day(grade_date: str, force_regrade: bool = False) -> d
             print(f"[grader] failed brief={b.get('id')}: {e!r}", flush=True)
 
     print(f"[grader] {grade_date}: graded={graded} already={already_present} "
-          f"no_loc={skipped_no_location} errors={errors} dist={grade_counts}", flush=True)
+          f"no_loc={skipped_no_location} quiet={skipped_quiet_day} "
+          f"errors={errors} dist={grade_counts}", flush=True)
 
     return {
         "ok": True,
