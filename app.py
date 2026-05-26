@@ -1405,6 +1405,31 @@ CREATE TABLE IF NOT EXISTS brief_history (
 );
 CREATE INDEX IF NOT EXISTS idx_brief_history_user ON brief_history(user_id, delivered_at DESC);
 
+-- ── Structured predictions (May 26, 2026) ──
+-- Added so the grader can compare what the Met (or AI) PREDICTED vs
+-- what actually happened, not just compare the verdict label against
+-- weather events. NULL for older briefs that pre-date this schema
+-- change — those get graded on verdict-vs-reality only.
+--
+-- predicted_precip_in: total precipitation expected over the brief's
+--   coverage window (typically the morning brief covers 24 hours from
+--   delivery). Stored as inches (NUMERIC for precision).
+-- predicted_max_wind_mph: highest sustained wind speed expected
+--   during the window.
+-- predicted_high_f / predicted_low_f: expected daily high and low
+--   temperatures in Fahrenheit.
+--
+-- Population path:
+--   - AI auto-generated briefs: scheduler extracts from the forecast
+--     snapshot used to draft the brief and writes these columns.
+--   - Met-touched Pro briefs: same forecast snapshot, captured at send.
+--   - Older briefs (pre-2026-05-26): NULL, grader falls back to
+--     parsing full_body via regex (Chunk 3).
+ALTER TABLE brief_history ADD COLUMN IF NOT EXISTS predicted_high_f INTEGER;
+ALTER TABLE brief_history ADD COLUMN IF NOT EXISTS predicted_low_f INTEGER;
+ALTER TABLE brief_history ADD COLUMN IF NOT EXISTS predicted_precip_in NUMERIC(5,2);
+ALTER TABLE brief_history ADD COLUMN IF NOT EXISTS predicted_max_wind_mph INTEGER;
+
 -- ── Brief outcomes / Met accuracy tracking (May 23, 2026) ──
 -- One row per graded brief. Created by the nightly grader job, which
 -- walks yesterday's brief_history entries and compares each Met's
@@ -1460,6 +1485,28 @@ CREATE INDEX IF NOT EXISTS idx_brief_outcomes_subscriber
     ON brief_outcomes(subscriber_user_id, delivered_at DESC);
 CREATE INDEX IF NOT EXISTS idx_brief_outcomes_delivered
     ON brief_outcomes(delivered_at DESC);
+
+-- ── Work-impact accuracy detail columns (May 26, 2026) ──
+-- Added so the Rosie email can show specific predicted-vs-observed
+-- numbers ("You called high 78°F, actual was 76°F") and so the grade
+-- is auditable. NULL when the source brief had no structured
+-- predictions and the regex parser also couldn't extract them.
+ALTER TABLE brief_outcomes ADD COLUMN IF NOT EXISTS predicted_high_f INTEGER;
+ALTER TABLE brief_outcomes ADD COLUMN IF NOT EXISTS predicted_low_f INTEGER;
+ALTER TABLE brief_outcomes ADD COLUMN IF NOT EXISTS predicted_precip_in NUMERIC(5,2);
+ALTER TABLE brief_outcomes ADD COLUMN IF NOT EXISTS predicted_max_wind_mph INTEGER;
+ALTER TABLE brief_outcomes ADD COLUMN IF NOT EXISTS observed_high_f INTEGER;
+ALTER TABLE brief_outcomes ADD COLUMN IF NOT EXISTS observed_low_f INTEGER;
+ALTER TABLE brief_outcomes ADD COLUMN IF NOT EXISTS observed_precip_in NUMERIC(5,2);
+ALTER TABLE brief_outcomes ADD COLUMN IF NOT EXISTS observed_max_wind_mph INTEGER;
+-- 'predicted-only' (verdict-vs-severity, no structured comparison),
+-- 'full' (structured predicted-vs-observed delta applied),
+-- 'work-impact' (work-affecting weather check + verdict appropriateness)
+ALTER TABLE brief_outcomes ADD COLUMN IF NOT EXISTS grading_method TEXT;
+-- Snapshot of whether this brief had Met touch (denormalized from
+-- brief_history.is_met_touched so the Rosie email can group without
+-- a join).
+ALTER TABLE brief_outcomes ADD COLUMN IF NOT EXISTS was_met_touched BOOLEAN;
 
 -- ── NWS station cache (May 23, 2026 — Tier 3) ──
 -- Maps a subscriber's user_id to the nearest NWS observation station.
@@ -15935,6 +15982,238 @@ def _generate_ai_brief(location_label: str, forecast: dict,
     return (verdict, snippet, full_body)
 
 
+def _extract_predicted_values_from_forecast(forecast: Optional[dict]) -> dict:
+    """Extract structured predictions from an Open-Meteo forecast dict.
+
+    Added May 26, 2026 to support work-impact accuracy grading. The
+    brief generator already has the forecast in hand when it writes
+    to brief_history — we just need to peel out the day's high, low,
+    expected precipitation, and max wind so the grader can compare
+    against observed values later.
+
+    Returns a dict with keys: predicted_high_f, predicted_low_f,
+    predicted_precip_in, predicted_max_wind_mph. Any field that the
+    forecast didn't include comes back as None — the grader handles
+    NULLs gracefully (it grades on what's available).
+
+    Open-Meteo response shape:
+        forecast = {
+            "daily": {
+                "temperature_2m_max": [78.4],
+                "temperature_2m_min": [52.1],
+                "precipitation_sum":  [0.0],
+                "windspeed_10m_max":  [11.8],
+                ...
+            },
+            ...
+        }
+    The brief covers today (forecast_days=1) so we always read index [0].
+    """
+    out = {
+        "predicted_high_f": None,
+        "predicted_low_f": None,
+        "predicted_precip_in": None,
+        "predicted_max_wind_mph": None,
+    }
+    if not forecast:
+        return out
+    daily = forecast.get("daily") or {}
+
+    def _first_value(key: str):
+        seq = daily.get(key)
+        if isinstance(seq, list) and seq:
+            v = seq[0]
+            return v if v is not None else None
+        return None
+
+    high = _first_value("temperature_2m_max")
+    low = _first_value("temperature_2m_min")
+    precip = _first_value("precipitation_sum")
+    wind = _first_value("windspeed_10m_max")
+
+    # Round temps/wind to integers (the columns are INTEGER); keep precip
+    # as float for the NUMERIC(5,2) column.
+    try:
+        out["predicted_high_f"] = int(round(float(high))) if high is not None else None
+    except Exception:
+        pass
+    try:
+        out["predicted_low_f"] = int(round(float(low))) if low is not None else None
+    except Exception:
+        pass
+    try:
+        out["predicted_precip_in"] = float(precip) if precip is not None else None
+    except Exception:
+        pass
+    try:
+        out["predicted_max_wind_mph"] = int(round(float(wind))) if wind is not None else None
+    except Exception:
+        pass
+    return out
+
+
+def _parse_predictions_from_brief_text(body: Optional[str]) -> dict:
+    """Best-effort extraction of predicted values from brief body text.
+
+    Added May 26, 2026 as a fallback for briefs that pre-date the
+    structured-predictions schema. Brief authors write in natural
+    language so this parser is intentionally conservative — it catches
+    common patterns and returns None for anything ambiguous. The grader
+    treats None as "couldn't extract this field, skip the comparison."
+
+    Patterns we try to catch:
+      - "high of 78°F" / "high near 78" / "highs in the upper 70s"
+      - "low of 52°F" / "overnight low 52" / "lows in the low 50s"
+      - "0.25 inches of rain" / "0.1\" precip" / "trace rain"
+      - "winds 10-15 mph" / "wind gusts to 25 mph" / "20 mph winds"
+
+    Returns dict with same shape as _extract_predicted_values_from_forecast.
+    """
+    out = {
+        "predicted_high_f": None,
+        "predicted_low_f": None,
+        "predicted_precip_in": None,
+        "predicted_max_wind_mph": None,
+    }
+    if not body:
+        return out
+    text = body.lower()
+
+    # ── High temperature ──
+    # Match: "high of 78", "high near 78", "high 78°F"
+    # Does NOT match "high 70s" (decade form) — handled below.
+    high_match = re.search(
+        r"high(?:s)?\s+(?:of|near|around)\s+(\d{2,3})(?:[\s°]*f)?",
+        text,
+    )
+    if not high_match:
+        # "high XX°F" / "high XX F" with no preposition
+        high_match = re.search(
+            r"\bhigh(?:s)?\s+(\d{2,3})\s*°?\s*f\b",
+            text,
+        )
+    if not high_match:
+        # "high XX." or "high XX," (sentence-final number)
+        high_match = re.search(
+            r"\bhigh(?:s)?\s+(\d{2,3})[\s\.,]",
+            text,
+        )
+    if high_match:
+        try:
+            v = int(high_match.group(1))
+            # Sanity: realistic high temps are 0-130°F
+            if 0 <= v <= 130:
+                out["predicted_high_f"] = v
+        except Exception:
+            pass
+
+    # "highs in the upper 70s" / "highs in the low 80s" — coarse but useful
+    if out["predicted_high_f"] is None:
+        decade_match = re.search(
+            r"high(?:s)?\s*(?:in the)?\s*(low|mid|upper)\s+(\d0)s",
+            text,
+        )
+        if decade_match:
+            try:
+                base = int(decade_match.group(2))
+                pos = decade_match.group(1)
+                offset = {"low": 2, "mid": 5, "upper": 8}.get(pos, 5)
+                out["predicted_high_f"] = base + offset
+            except Exception:
+                pass
+
+    # ── Low temperature ──
+    # Match: "low of 52", "low near 52", "overnight low 52°F"
+    # Intentionally requires either an explicit prefix (of/near/around)
+    # OR direct number after — does NOT match "low 50s" (decade form),
+    # which is handled by the decade fallback below.
+    low_match = re.search(
+        r"(?:overnight\s+)?low(?:s)?\s+(?:of|near|around)\s+(\d{1,3})(?:[\s°]*f)?",
+        text,
+    )
+    if not low_match:
+        # Also try "low XX°F" / "low XX F" with no preposition
+        low_match = re.search(
+            r"\blow(?:s)?\s+(\d{1,3})\s*°?\s*f\b",
+            text,
+        )
+    if not low_match:
+        # And "low XX." or "low XX," (sentence-final number)
+        low_match = re.search(
+            r"\blow(?:s)?\s+(\d{1,3})[\s\.,]",
+            text,
+        )
+    if low_match:
+        try:
+            v = int(low_match.group(1))
+            if -30 <= v <= 90:  # sanity
+                out["predicted_low_f"] = v
+        except Exception:
+            pass
+
+    if out["predicted_low_f"] is None:
+        decade_match = re.search(
+            r"low(?:s)?\s*(?:in the)?\s*(low|mid|upper)\s+(\d0)s",
+            text,
+        )
+        if decade_match:
+            try:
+                base = int(decade_match.group(2))
+                pos = decade_match.group(1)
+                offset = {"low": 2, "mid": 5, "upper": 8}.get(pos, 5)
+                out["predicted_low_f"] = base + offset
+            except Exception:
+                pass
+
+    # ── Precipitation ──
+    # Match: "0.25 inches", "0.1\"", "1.5 inches of rain"
+    precip_match = re.search(
+        r"(\d+\.\d+)\s*(?:inches?|\"|in\b)\s*(?:of\s+)?(?:rain|precip|precipitation)",
+        text,
+    )
+    if precip_match:
+        try:
+            v = float(precip_match.group(1))
+            if 0 <= v <= 20:  # sanity (20" is biblical)
+                out["predicted_precip_in"] = v
+        except Exception:
+            pass
+
+    # "trace" / "no rain" / "dry" / "no measurable precip"
+    if out["predicted_precip_in"] is None:
+        if re.search(r"\bno\s+(?:measurable\s+)?(?:rain|precip|precipitation)\b", text) or \
+           re.search(r"\b(?:dry|clear)\s+(?:day|conditions|throughout)", text):
+            out["predicted_precip_in"] = 0.0
+        elif re.search(r"\btrace\s+(?:of\s+)?(?:rain|precip|precipitation)\b", text):
+            out["predicted_precip_in"] = 0.01  # nominal trace
+
+    # ── Max wind ──
+    # Match: "winds 10-15 mph", "winds W 5-15 mph", "winds NW at 10-15 mph"
+    # Direction letters (N/S/E/W, NE/NW/SE/SW, NNE etc.) may appear
+    # between "winds" and the number — optionally followed by "at".
+    # Match: "gusts to 25 mph", "20 mph winds"
+    wind_range = re.search(
+        r"winds?\s+(?:[NSEWnsew]{1,3}\s+)?(?:at\s+)?\d{1,2}\s*[-\u2013]\s*(\d{1,3})\s*mph",
+        text,
+    )
+    wind_gust = re.search(r"gust(?:s|ing)?\s+to\s+(\d{1,3})\s*mph", text)
+    wind_solo = re.search(r"(\d{1,3})\s*mph\s+winds?", text)
+
+    best_wind = None
+    for m in (wind_gust, wind_range, wind_solo):
+        if m:
+            try:
+                v = int(m.group(1))
+                if 0 <= v <= 150 and (best_wind is None or v > best_wind):
+                    best_wind = v
+            except Exception:
+                pass
+    if best_wind is not None:
+        out["predicted_max_wind_mph"] = best_wind
+
+    return out
+
+
 def _generate_hobbyist_brief_llm(location_label: str, forecast: dict,
                                    address: str = "",
                                    subscriber_name: str = "") -> tuple[str, str, str]:
@@ -16507,19 +16786,33 @@ def _already_sent_today(user_id: int, brief_type: str, user_timezone: str = None
 def _record_brief_delivery(user_id: int, brief_type: str, verdict: str,
                             snippet: str, full_body: str, delivery_status: str,
                             channels_used: str, is_met_touched: bool = False,
-                            met_name: Optional[str] = None) -> None:
-    """Insert a brief_history row."""
+                            met_name: Optional[str] = None,
+                            predictions: Optional[dict] = None) -> None:
+    """Insert a brief_history row.
+
+    May 26, 2026: added predictions param. When supplied, the dict should
+    contain keys predicted_high_f, predicted_low_f, predicted_precip_in,
+    predicted_max_wind_mph (any may be None). When omitted, all
+    structured predictions are stored as NULL — that's fine, the grader
+    falls back to text-parsing the full_body or skips the comparison.
+    """
     now_ms = int(time.time() * 1000)
+    p = predictions or {}
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO brief_history
                    (user_id, brief_type, delivered_at, verdict, snippet,
                     full_body, delivery_status, channels_used,
-                    is_met_touched, met_name)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    is_met_touched, met_name,
+                    predicted_high_f, predicted_low_f,
+                    predicted_precip_in, predicted_max_wind_mph)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                           %s, %s, %s, %s)""",
                 (user_id, brief_type, now_ms, verdict, snippet, full_body,
-                 delivery_status, channels_used, is_met_touched, met_name),
+                 delivery_status, channels_used, is_met_touched, met_name,
+                 p.get("predicted_high_f"), p.get("predicted_low_f"),
+                 p.get("predicted_precip_in"), p.get("predicted_max_wind_mph")),
             )
 
 
@@ -16840,6 +17133,12 @@ def _process_pending_briefs_inner() -> None:
                 # Met already sent the override. Nothing to do.
                 continue
 
+            # Fetch forecast once at the top of both branches so we
+            # have predicted values available for brief_history even
+            # when the Met overrides the AI text (added May 26, 2026
+            # for work-impact accuracy grading).
+            forecast = _fetch_forecast(float(c["loc_lat"]), float(c["loc_lng"]))
+
             # ── Generate the brief content ──
             if existing_draft and existing_draft["status"] in ("pending-review", "claimed"):
                 # Use Met's edits if any, else fall back to AI content
@@ -16858,7 +17157,6 @@ def _process_pending_briefs_inner() -> None:
                 # the LLM is unavailable for any reason the template still
                 # works as before, no delivery is missed.
                 location_label = c["loc_label"] or c["loc_address"] or "your location"
-                forecast = _fetch_forecast(float(c["loc_lat"]), float(c["loc_lng"]))
                 verdict, snippet, full_body = _generate_hobbyist_brief_llm(
                     location_label, forecast or {},
                     address=c.get("loc_address") or "",
@@ -16922,6 +17220,7 @@ def _process_pending_briefs_inner() -> None:
                 channels_used=",".join(channels_used),
                 is_met_touched=is_met_touched,
                 met_name=met_name_for_record,
+                predictions=_extract_predicted_values_from_forecast(forecast),
             )
 
             # ── Payroll attribution for Hobbyists (May 23, 2026) ──
@@ -22596,6 +22895,19 @@ def met_pro_brief_send(draft_id):
         full_body = legacy_body + f"\n\n- {met_name}, WeatherValet"
 
     # Write brief_history row first so we can attach the access token
+    # Capture forecast predictions for accuracy grading (May 26, 2026).
+    # Send-time snapshot — reflects what the Met saw when they sent,
+    # not the stale 8 PM draft snapshot.
+    pro_forecast = None
+    try:
+        if row.get("location_lat") is not None and row.get("location_lng") is not None:
+            pro_forecast = _fetch_forecast(
+                float(row["location_lat"]), float(row["location_lng"])
+            )
+    except Exception as e:
+        print(f"[pro-brief-send] forecast fetch failed (non-fatal): {e}", flush=True)
+    pro_preds = _extract_predicted_values_from_forecast(pro_forecast)
+
     history_id = None
     try:
         with db() as conn:
@@ -22604,12 +22916,19 @@ def met_pro_brief_send(draft_id):
                     """INSERT INTO brief_history
                        (user_id, brief_type, delivered_at, verdict, snippet,
                         full_body, delivery_status, channels_used,
-                        is_met_touched, met_name)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s)
+                        is_met_touched, met_name,
+                        predicted_high_f, predicted_low_f,
+                        predicted_precip_in, predicted_max_wind_mph)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s,
+                               %s, %s, %s, %s)
                        RETURNING id""",
                     (row["user_id"], row["brief_type"], now_ms, final_verdict,
                      bottom_line[:200] if bottom_line else (final_snippet or legacy_body[:140]),
-                     full_body, "pending", "", met_name),
+                     full_body, "pending", "", met_name,
+                     pro_preds.get("predicted_high_f"),
+                     pro_preds.get("predicted_low_f"),
+                     pro_preds.get("predicted_precip_in"),
+                     pro_preds.get("predicted_max_wind_mph")),
                 )
                 history_id = cur.fetchone()["id"]
     except Exception as e:
@@ -22850,7 +23169,9 @@ def met_pro_brief_send(draft_id):
                                   bp.channels,
                                   sc.primary_met_id,
                                   loc.label AS loc_label,
-                                  loc.address_text AS loc_address
+                                  loc.address_text AS loc_address,
+                                  loc.lat AS loc_lat,
+                                  loc.lng AS loc_lng
                            FROM users u
                            LEFT JOIN brief_preferences bp ON bp.user_id = u.id
                            LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
@@ -22902,6 +23223,20 @@ def met_pro_brief_send(draft_id):
 
             # Insert brief_history for this recipient
             sub_loc_label = sub.get("loc_label") or "your location"
+
+            # Capture forecast predictions for this extra subscriber's
+            # location (each has their own — same brief body but
+            # different observation points). Best-effort, non-fatal.
+            extra_forecast = None
+            try:
+                if sub.get("loc_lat") is not None and sub.get("loc_lng") is not None:
+                    extra_forecast = _fetch_forecast(
+                        float(sub["loc_lat"]), float(sub["loc_lng"])
+                    )
+            except Exception as e:
+                print(f"[pro-brief-send] extra forecast fetch failed user={extra_user_id}: {e}", flush=True)
+            extra_preds = _extract_predicted_values_from_forecast(extra_forecast)
+
             extra_hist_id = None
             with db() as conn:
                 with conn.cursor() as cur:
@@ -22909,13 +23244,20 @@ def met_pro_brief_send(draft_id):
                         """INSERT INTO brief_history
                            (user_id, brief_type, delivered_at, verdict, snippet,
                             full_body, delivery_status, channels_used,
-                            is_met_touched, met_name)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s)
+                            is_met_touched, met_name,
+                            predicted_high_f, predicted_low_f,
+                            predicted_precip_in, predicted_max_wind_mph)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s,
+                                   %s, %s, %s, %s)
                            RETURNING id""",
                         (extra_user_id, row["brief_type"], int(time.time() * 1000),
                          final_verdict,
                          bottom_line[:200] if bottom_line else (final_snippet or legacy_body[:140]),
-                         full_body, "pending", "", met_name),
+                         full_body, "pending", "", met_name,
+                         extra_preds.get("predicted_high_f"),
+                         extra_preds.get("predicted_low_f"),
+                         extra_preds.get("predicted_precip_in"),
+                         extra_preds.get("predicted_max_wind_mph")),
                     )
                     extra_hist_id = cur.fetchone()["id"]
 
@@ -28164,17 +28506,16 @@ def _classify_nws_event(event_name: str) -> str:
 
 
 def _grade_brief(verdict: str, actual_severity: str) -> tuple:
-    """Pure grading function. Takes the Met's verdict and the highest
-    NWS severity that fired in the coverage window. Returns
-    (grade, score) per the safety-bias rubric, floored at 0.
+    """Legacy verdict-vs-severity grader, kept for fallback only.
+
+    Used when we have no structured predictions or observations to
+    compare. The new primary grader is _grade_brief_work_impact below.
 
     Grades:
       'accurate'       — called it right
       'over_called'    — predicted worse than actual (forgivable)
       'under_called'   — predicted better than actual (concerning)
       'critical_miss'  — said 'clear' when high-severity fired
-
-    Scores follow the table in brief_outcomes schema comment.
     """
     v = (verdict or "").lower().strip()
     s = (actual_severity or "none").lower().strip()
@@ -28199,9 +28540,191 @@ def _grade_brief(verdict: str, actual_severity: str) -> tuple:
         return ("accurate", 1.0)  # medium or high — risk was justified
 
     # Unknown verdict (null, empty, weird string) — can't grade.
-    # Return a neutral score so the brief shows up in queries with
-    # an explanation but doesn't move the Met's average.
     return ("ungradable", 1.0)
+
+
+# ── Work-impact grading thresholds (May 26, 2026) ──
+# Temperature tolerance: predicted vs observed within this many °F
+# is considered accurate (no penalty).
+GRADING_TEMP_TOLERANCE_F = 5
+# Wind tolerance: predicted vs observed within this many mph is fine.
+GRADING_WIND_TOLERANCE_MPH = 10
+# Precip tolerance: within this many inches is fine (rain forecasts
+# are notoriously bumpy in space and time).
+GRADING_PRECIP_TOLERANCE_IN = 0.20
+
+
+def _grade_brief_work_impact(verdict: str,
+                              actual_severity: str,
+                              predictions: dict,
+                              observations: dict) -> tuple:
+    """Work-impact accuracy grader.
+
+    Added May 26, 2026 in response to the Chris Sramek case where the
+    old grader flagged a CLEAR call as "under-called" because the day
+    had a normal 36°F overnight temperature swing. Grading should
+    reflect what the customer actually cares about: did the brief
+    correctly warn about weather that would affect work, and did it
+    avoid false alarms?
+
+    Two-step grade:
+      1. Verdict appropriateness vs work-affecting weather reality
+         (this is the safety-bias core grade)
+      2. Predicted-vs-observed deltas tweak the score within a grade
+         category (good predictions earn full score; poor predictions
+         within the same grade earn a lower score)
+
+    Returns (grade, score, details_dict) where details_dict has:
+      - grading_method: 'work-impact' if both predictions+observations
+        were available, 'predicted-only' otherwise
+      - temp_delta_high_f, temp_delta_low_f, etc.: the deltas computed
+      - explanation: short human-readable string for the email
+    """
+    v = (verdict or "").lower().strip()
+    s = (actual_severity or "none").lower().strip()
+    p = predictions or {}
+    o = observations or {}
+
+    # ── Step 1: Verdict-vs-reality (the legacy grade is still the
+    # safety-bias floor; predictions tweak the score but never change
+    # the core grade category)
+    base_grade, base_score = _grade_brief(v, s)
+
+    # If we don't have structured predictions OR observations,
+    # we can't do the delta comparison. Return the base grade and
+    # mark the method as 'predicted-only'.
+    have_predictions = any(p.get(k) is not None for k in
+                           ("predicted_high_f", "predicted_low_f",
+                            "predicted_precip_in", "predicted_max_wind_mph"))
+    have_observations = any(o.get(k) is not None for k in
+                            ("observed_high_f", "observed_low_f",
+                             "observed_precip_in", "observed_max_wind_mph"))
+    if not (have_predictions and have_observations):
+        return (base_grade, base_score, {
+            "grading_method": "predicted-only",
+            "explanation": "",
+        })
+
+    # ── Step 2: Compute deltas where both sides are present
+    deltas = {}
+    issues = []
+    if (p.get("predicted_high_f") is not None
+            and o.get("observed_high_f") is not None):
+        d = abs(int(o["observed_high_f"]) - int(p["predicted_high_f"]))
+        deltas["high_f"] = d
+        if d > GRADING_TEMP_TOLERANCE_F:
+            issues.append(
+                f"high off by {d}°F (called {p['predicted_high_f']}, "
+                f"actual {o['observed_high_f']})"
+            )
+
+    if (p.get("predicted_low_f") is not None
+            and o.get("observed_low_f") is not None):
+        d = abs(int(o["observed_low_f"]) - int(p["predicted_low_f"]))
+        deltas["low_f"] = d
+        if d > GRADING_TEMP_TOLERANCE_F:
+            issues.append(
+                f"low off by {d}°F (called {p['predicted_low_f']}, "
+                f"actual {o['observed_low_f']})"
+            )
+
+    if (p.get("predicted_precip_in") is not None
+            and o.get("observed_precip_in") is not None):
+        pp = float(p["predicted_precip_in"])
+        po = float(o["observed_precip_in"])
+        d = abs(po - pp)
+        deltas["precip_in"] = d
+        if d > GRADING_PRECIP_TOLERANCE_IN:
+            issues.append(
+                f"precip off by {d:.2f}\" (called {pp:.2f}\", actual {po:.2f}\")"
+            )
+
+    if (p.get("predicted_max_wind_mph") is not None
+            and o.get("observed_max_wind_mph") is not None):
+        d = abs(int(o["observed_max_wind_mph"]) - int(p["predicted_max_wind_mph"]))
+        deltas["wind_mph"] = d
+        if d > GRADING_WIND_TOLERANCE_MPH:
+            issues.append(
+                f"wind off by {d} mph (called {p['predicted_max_wind_mph']}, "
+                f"actual {o['observed_max_wind_mph']})"
+            )
+
+    # ── Step 3: Score tweaking within the grade
+    # If the base grade is 'accurate' but predictions had issues,
+    # demote the score slightly (still 'accurate' as a category since
+    # the verdict was right, but not perfect).
+    final_score = base_score
+    if base_grade == "accurate" and issues:
+        # 0.10 per issue, floored at 0.7 (never below the 'over_called'
+        # score of 0.8 — we don't want a predicted-vs-observed delta
+        # to look WORSE than an actual false alarm).
+        final_score = max(0.8, base_score - 0.05 * len(issues))
+
+    explanation = "; ".join(issues) if issues else ""
+    details = {
+        "grading_method": "work-impact",
+        "explanation": explanation,
+        **{f"delta_{k}": v for k, v in deltas.items()},
+    }
+    return (base_grade, final_score, details)
+
+
+def _extract_observations_for_grading(observations: list) -> dict:
+    """Compute observed max temp, min temp, total precip, max wind
+    from an NWS observation list. Returns dict with keys matching the
+    brief_outcomes column names (observed_high_f, observed_low_f, etc.).
+
+    Companion to _classify_observations — that function returns a
+    severity bucket, this one returns the raw numbers so the grader
+    can do predicted-vs-observed comparison.
+    """
+    out = {
+        "observed_high_f": None,
+        "observed_low_f": None,
+        "observed_precip_in": None,
+        "observed_max_wind_mph": None,
+    }
+    if not observations:
+        return out
+
+    temps = []
+    max_wind = 0.0
+    has_wind = False
+    total_precip = 0.0
+    has_precip = False
+    for o in observations:
+        if o.get("temp_f") is not None:
+            try:
+                temps.append(float(o["temp_f"]))
+            except Exception:
+                pass
+        # Use the higher of sustained or gust for "max wind"
+        ws = o.get("wind_speed_mph")
+        wg = o.get("wind_gust_mph")
+        try:
+            if ws is not None:
+                max_wind = max(max_wind, float(ws))
+                has_wind = True
+            if wg is not None:
+                max_wind = max(max_wind, float(wg))
+                has_wind = True
+        except Exception:
+            pass
+        if o.get("precip_in") is not None:
+            try:
+                total_precip += float(o["precip_in"])
+                has_precip = True
+            except Exception:
+                pass
+
+    if temps:
+        out["observed_high_f"] = int(round(max(temps)))
+        out["observed_low_f"] = int(round(min(temps)))
+    if has_precip:
+        out["observed_precip_in"] = round(total_precip, 2)
+    if has_wind:
+        out["observed_max_wind_mph"] = int(round(max_wind))
+    return out
 
 
 def _fetch_alerts_for_point(lat: float, lng: float, start_ms: int, end_ms: int) -> list:
@@ -28647,6 +29170,9 @@ def _run_brief_grader_for_day(grade_date: str, force_regrade: bool = False) -> d
                 cur.execute(
                     """SELECT bh.id, bh.user_id, bh.delivered_at, bh.verdict,
                               bh.is_met_touched, bh.met_name,
+                              bh.full_body,
+                              bh.predicted_high_f, bh.predicted_low_f,
+                              bh.predicted_precip_in, bh.predicted_max_wind_mph,
                               COALESCE(loc.lat, 0) AS lat,
                               COALESCE(loc.lng, 0) AS lng
                        FROM brief_history bh
@@ -28717,21 +29243,32 @@ def _run_brief_grader_for_day(grade_date: str, force_regrade: bool = False) -> d
             # exceeded thresholds, upgrade to 'medium'. Never upgrades
             # to 'high' and never downgrades — observations only catch
             # the gap between "perfectly clear" and "NWS-advisory level."
+            #
+            # May 26, 2026: also use the raw observations for predicted-
+            # vs-observed grading (the work-impact rebuild). Always
+            # fetch when we have any predictions to compare against.
             obs_summary = ""
-            if highest == "none":
+            observations_list = []
+            have_predictions_for_brief = any(
+                b.get(k) is not None
+                for k in ("predicted_high_f", "predicted_low_f",
+                          "predicted_precip_in", "predicted_max_wind_mph")
+            )
+            need_obs = (highest == "none") or have_predictions_for_brief
+            if need_obs:
                 try:
                     station = _get_or_cache_station_for_subscriber(
                         b["user_id"], b["lat"], b["lng"]
                     )
                     if station:
-                        observations = _fetch_observations_for_station(
+                        observations_list = _fetch_observations_for_station(
                             station["station_id"], cov_start, cov_end
                         )
-                        obs_severity, obs_summary = _classify_observations(observations)
-                        if obs_severity == "medium":
+                        obs_severity, obs_summary = _classify_observations(observations_list)
+                        if obs_severity == "medium" and highest == "none":
                             highest = "medium"
-                            # Be polite to NWS between two extra calls
-                            time.sleep(0.2)
+                        # Be polite to NWS between extra calls
+                        time.sleep(0.2)
                 except Exception as e:
                     print(f"[grader] observations layer failed brief={b.get('id')}: "
                           f"{e!r}", flush=True)
@@ -28743,15 +29280,35 @@ def _run_brief_grader_for_day(grade_date: str, force_regrade: bool = False) -> d
             # inflates the numbers) or as "under-called" (which is
             # wrong). The brief is excluded from today's counts.
             # See Chris Sramek email 2026-05-26 for the case that
-            # exposed this. The right long-term fix is the work-impact
-            # rebuild — comparing the brief's actual forecast text to
-            # observed conditions. This is the holding pattern until
-            # that lands.
+            # exposed this.
             if highest == "none":
                 skipped_quiet_day += 1
                 continue
 
-            grade, score = _grade_brief(b["verdict"], highest)
+            # ── May 26, 2026: Build predictions dict ──
+            # Use structured columns first; fall back to regex parser
+            # if all four columns are NULL (older briefs that pre-date
+            # the schema change).
+            if have_predictions_for_brief:
+                predictions = {
+                    "predicted_high_f": b.get("predicted_high_f"),
+                    "predicted_low_f": b.get("predicted_low_f"),
+                    "predicted_precip_in": (
+                        float(b["predicted_precip_in"])
+                        if b.get("predicted_precip_in") is not None else None
+                    ),
+                    "predicted_max_wind_mph": b.get("predicted_max_wind_mph"),
+                }
+            else:
+                predictions = _parse_predictions_from_brief_text(b.get("full_body"))
+
+            # ── Extract observed values (May 26, 2026) ──
+            observations = _extract_observations_for_grading(observations_list)
+
+            # ── Grade using work-impact rubric ──
+            grade, score, grade_details = _grade_brief_work_impact(
+                b["verdict"], highest, predictions, observations
+            )
             grade_counts[grade] = grade_counts.get(grade, 0) + 1
 
             attributed_met_id = _resolve_attributed_met_for_brief(
@@ -28777,13 +29334,32 @@ def _run_brief_grader_for_day(grade_date: str, force_regrade: bool = False) -> d
                              (brief_history_id, subscriber_user_id, attributed_met_id,
                               delivered_at, verdict_assigned, actual_severity,
                               grade, score, nws_alert_summary, nws_alert_ids,
-                              graded_at_ms)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                              graded_at_ms,
+                              predicted_high_f, predicted_low_f,
+                              predicted_precip_in, predicted_max_wind_mph,
+                              observed_high_f, observed_low_f,
+                              observed_precip_in, observed_max_wind_mph,
+                              grading_method, was_met_touched, notes)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                   %s, %s, %s, %s,
+                                   %s, %s, %s, %s,
+                                   %s, %s, %s)
                            ON CONFLICT (brief_history_id) DO NOTHING""",
                         (b["id"], b["user_id"], attributed_met_id,
                          b["delivered_at"], b["verdict"], highest,
                          grade, score, event_summary, ids_str,
-                         int(time.time() * 1000)),
+                         int(time.time() * 1000),
+                         predictions.get("predicted_high_f"),
+                         predictions.get("predicted_low_f"),
+                         predictions.get("predicted_precip_in"),
+                         predictions.get("predicted_max_wind_mph"),
+                         observations.get("observed_high_f"),
+                         observations.get("observed_low_f"),
+                         observations.get("observed_precip_in"),
+                         observations.get("observed_max_wind_mph"),
+                         grade_details.get("grading_method"),
+                         bool(b["is_met_touched"]),
+                         grade_details.get("explanation") or None),
                     )
             graded += 1
             # Be polite to NWS: small pause between requests
@@ -28803,6 +29379,7 @@ def _run_brief_grader_for_day(grade_date: str, force_regrade: bool = False) -> d
         "graded": graded,
         "already_present": already_present,
         "skipped_no_location": skipped_no_location,
+        "skipped_quiet_day": skipped_quiet_day,
         "errors": errors,
         "grade_distribution": grade_counts,
     }
@@ -28921,6 +29498,11 @@ def _compose_accuracy_email(met_user_id: int, met_name: str, grade_date: str) ->
                     """SELECT bo.id, bo.delivered_at, bo.verdict_assigned,
                               bo.actual_severity, bo.grade, bo.score,
                               bo.nws_alert_summary,
+                              bo.predicted_high_f, bo.predicted_low_f,
+                              bo.predicted_precip_in, bo.predicted_max_wind_mph,
+                              bo.observed_high_f, bo.observed_low_f,
+                              bo.observed_precip_in, bo.observed_max_wind_mph,
+                              bo.grading_method, bo.was_met_touched, bo.notes,
                               COALESCE(sub.name, sub.email, '(subscriber)') AS subscriber_name,
                               COALESCE(loc.address_text, loc.county, '') AS location_label
                        FROM brief_outcomes bo
@@ -29000,7 +29582,7 @@ def _compose_accuracy_email(met_user_id: int, met_name: str, grade_date: str) ->
         lines.append(f"You had 1 brief attributed to you on {pretty_date}.")
     else:
         lines.append(f"You had {total} briefs attributed to you on {pretty_date}.")
-    lines.append("Here's how each held up against NWS:")
+    lines.append("Here's how each played out — verdict vs. work-affecting weather:")
     lines.append("")
 
     # Per-brief walkthrough
@@ -29018,7 +29600,53 @@ def _compose_accuracy_email(met_user_id: int, met_name: str, grade_date: str) ->
         "critical_miss": "CRITICAL MISS.",
         "ungradable":    "Could not grade.",
     }
-    for r in rows:
+
+    def _format_prediction_vs_observed(r) -> str:
+        """Build a short 'You called X, actual was Y' string for the brief.
+
+        Returns "" if there's nothing useful to say (no predictions
+        OR no observations captured). Only shows fields where BOTH
+        sides are available — silence is honest when we don't have
+        the data.
+
+        Includes only the most informative deltas to keep the line
+        readable. If a field was within tolerance, we don't mention it
+        (the brief was right, no need to spotlight it).
+        """
+        parts = []
+        # Temps
+        ph = r.get("predicted_high_f"); oh = r.get("observed_high_f")
+        if ph is not None and oh is not None:
+            d = abs(int(oh) - int(ph))
+            if d > GRADING_TEMP_TOLERANCE_F:
+                parts.append(f"high called {ph}°F, actual {oh}°F")
+        pl = r.get("predicted_low_f"); ol = r.get("observed_low_f")
+        if pl is not None and ol is not None:
+            d = abs(int(ol) - int(pl))
+            if d > GRADING_TEMP_TOLERANCE_F:
+                parts.append(f"low called {pl}°F, actual {ol}°F")
+        # Precip
+        pp = r.get("predicted_precip_in"); op = r.get("observed_precip_in")
+        if pp is not None and op is not None:
+            try:
+                pp_f = float(pp); op_f = float(op)
+                if abs(op_f - pp_f) > GRADING_PRECIP_TOLERANCE_IN:
+                    parts.append(
+                        f'precip called {pp_f:.2f}", actual {op_f:.2f}"'
+                    )
+            except Exception:
+                pass
+        # Wind
+        pw = r.get("predicted_max_wind_mph"); ow = r.get("observed_max_wind_mph")
+        if pw is not None and ow is not None:
+            d = abs(int(ow) - int(pw))
+            if d > GRADING_WIND_TOLERANCE_MPH:
+                parts.append(f"wind called {pw} mph, actual {ow} mph")
+        return "; ".join(parts)
+
+    def _format_brief_entry(r) -> list:
+        """Return a list of 2-3 lines describing one brief outcome."""
+        out = []
         verdict = (r["verdict_assigned"] or "").upper()
         sub_label = r["subscriber_name"]
         loc = r["location_label"] or ""
@@ -29026,9 +29654,42 @@ def _compose_accuracy_email(met_user_id: int, met_name: str, grade_date: str) ->
         nws = r["nws_alert_summary"] or "no alerts"
         glyph = GLYPH.get(r["grade"], "[ ?]")
         gradel = GRADE_LABEL.get(r["grade"], "")
-        # Two-line entry for readability
-        lines.append(f"  {glyph} {sub_label}{loc_str}")
-        lines.append(f"        You called {verdict}. NWS: {nws}. {gradel}")
+        # Line 1: who + where
+        out.append(f"  {glyph} {sub_label}{loc_str}")
+        # Line 2: verdict + outcome
+        out.append(f"        You called {verdict}. NWS: {nws}. {gradel}")
+        # Line 3 (optional): predicted-vs-observed comparison
+        comparison = _format_prediction_vs_observed(r)
+        if comparison:
+            out.append(f"        Details: {comparison}.")
+        return out
+
+    # Split rows into Met-touched vs AI-sent for grouped reporting.
+    # was_met_touched is denormalized into brief_outcomes by the grader.
+    met_rows = [r for r in rows if r.get("was_met_touched")]
+    ai_rows = [r for r in rows if not r.get("was_met_touched")]
+
+    if met_rows and ai_rows:
+        # Both buckets present — show grouped
+        lines.append("Briefs you sent yourself:")
+        for r in met_rows:
+            lines.extend(_format_brief_entry(r))
+        lines.append("")
+        lines.append("Briefs sent by AI (you're the assigned Met):")
+        for r in ai_rows:
+            lines.extend(_format_brief_entry(r))
+    elif met_rows:
+        # All Met-touched — no need for sub-headers
+        for r in met_rows:
+            lines.extend(_format_brief_entry(r))
+    else:
+        # All AI-sent
+        if ai_rows:
+            lines.append("All briefs were sent by AI (you're the assigned Met):")
+            lines.append("")
+        for r in ai_rows:
+            lines.extend(_format_brief_entry(r))
+
     lines.append("")
 
     # Yesterday's score
@@ -30006,6 +30667,90 @@ def admin_grade_day(grade_date: str):
     return jsonify(result)
 
 
+@app.route("/api/v1/admin/grade-backfill", methods=["OPTIONS"])
+def _admin_grade_backfill_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/grade-backfill")
+def admin_grade_backfill():
+    """Re-grade the last N days under the current rubric.
+
+    Added May 26, 2026 to support the work-impact rebuild backfill.
+    Walks back from yesterday (ET) for N days, force-regrading each.
+    Returns per-day results.
+
+    Query params:
+      ?days=30  — how many days back to grade (default 30, max 60)
+      ?force=1  — required; backfill always force-regrades (deletes
+                  then re-inserts outcomes). Explicit confirmation that
+                  the caller knows historical grades will be overwritten.
+
+    NWS doesn't reliably keep historical alerts more than ~7 days, so
+    older dates may grade with sparse alert data. The work-impact
+    grader handles this gracefully — falls back to verdict-only when
+    observations and predictions aren't available.
+    """
+    actor, err = _require_admin()
+    if err:
+        return err
+    force = (request.args.get("force") or "").lower() in ("1", "true", "yes")
+    if not force:
+        return jsonify({
+            "ok": False,
+            "error": "force-required",
+            "hint": "Add ?force=1 to confirm backfill will overwrite existing outcomes.",
+        }), 400
+    try:
+        days = int(request.args.get("days") or 30)
+    except Exception:
+        return jsonify({"ok": False, "error": "bad-days-param"}), 400
+    if days < 1 or days > 60:
+        return jsonify({"ok": False, "error": "days-out-of-range",
+                        "hint": "Use 1 to 60."}), 400
+
+    ET = ZoneInfo("America/New_York")
+    today_et = datetime.now(ET).date()
+
+    per_day = []
+    total_graded = 0
+    total_skipped_quiet = 0
+    total_errors = 0
+    for offset in range(1, days + 1):
+        target = today_et - timedelta(days=offset)
+        target_str = target.strftime("%Y-%m-%d")
+        try:
+            result = _run_brief_grader_for_day(target_str, force_regrade=True)
+            graded = int(result.get("graded") or 0)
+            quiet = int(result.get("skipped_quiet_day") or 0)
+            errs = int(result.get("errors") or 0)
+            per_day.append({
+                "date": target_str,
+                "graded": graded,
+                "skipped_quiet_day": quiet,
+                "errors": errs,
+                "ok": bool(result.get("ok")),
+            })
+            total_graded += graded
+            total_skipped_quiet += quiet
+            total_errors += errs
+        except Exception as e:
+            print(f"[backfill] day {target_str} crashed: {e!r}", flush=True)
+            per_day.append({
+                "date": target_str, "ok": False, "error": str(e),
+            })
+            total_errors += 1
+
+    return jsonify({
+        "ok": True,
+        "days_processed": len(per_day),
+        "total_graded": total_graded,
+        "total_skipped_quiet_day": total_skipped_quiet,
+        "total_errors": total_errors,
+        "per_day": per_day,
+    })
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Met email preferences (May 23, 2026 — Tier 2)
 # ─────────────────────────────────────────────────────────────────────
@@ -30726,7 +31471,7 @@ def _fire_pro_brief_draft(draft_id: int, final_body: str | None,
         with db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id, user_id, status FROM pro_brief_drafts WHERE id = %s",
+                    "SELECT id, user_id, status, location_lat, location_lng FROM pro_brief_drafts WHERE id = %s",
                     (draft_id,),
                 )
                 draft = cur.fetchone()
@@ -30755,14 +31500,36 @@ def _fire_pro_brief_draft(draft_id: int, final_body: str | None,
                 sub = cur.fetchone()
                 if sub:
                     body_for_history = (final_body or "")[:140]
+
+                    # Capture forecast predictions for accuracy grading
+                    # (May 26, 2026). Best-effort, non-fatal.
+                    pfire_forecast = None
+                    try:
+                        if (draft.get("location_lat") is not None
+                                and draft.get("location_lng") is not None):
+                            pfire_forecast = _fetch_forecast(
+                                float(draft["location_lat"]),
+                                float(draft["location_lng"]),
+                            )
+                    except Exception as e:
+                        print(f"[scheduled-fire] forecast fetch failed (non-fatal): {e}", flush=True)
+                    pfire_preds = _extract_predicted_values_from_forecast(pfire_forecast)
+
                     cur.execute(
                         """INSERT INTO brief_history
                            (user_id, brief_type, delivered_at, snippet, full_body,
-                            delivery_status, channels_used, is_met_touched, met_name)
+                            delivery_status, channels_used, is_met_touched, met_name,
+                            predicted_high_f, predicted_low_f,
+                            predicted_precip_in, predicted_max_wind_mph)
                            VALUES (%s, 'morning', %s, %s, %s, 'sent',
-                                   'sms,email', TRUE, %s)""",
+                                   'sms,email', TRUE, %s,
+                                   %s, %s, %s, %s)""",
                         (draft["user_id"], now_ms, body_for_history,
-                         final_body or "", sent_by_name or ""),
+                         final_body or "", sent_by_name or "",
+                         pfire_preds.get("predicted_high_f"),
+                         pfire_preds.get("predicted_low_f"),
+                         pfire_preds.get("predicted_precip_in"),
+                         pfire_preds.get("predicted_max_wind_mph")),
                     )
         # SMS dispatch
         try:
