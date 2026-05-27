@@ -30938,6 +30938,75 @@ def preferences_unsubscribe():
 # Admin: manually fire accuracy emails for a given grade date
 # ─────────────────────────────────────────────────────────────────────
 
+@app.route("/api/v1/admin/preview-accuracy-email/<grade_date>", methods=["OPTIONS"])
+def _admin_preview_accuracy_email_preflight(grade_date):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/preview-accuracy-email/<grade_date>")
+@app.get("/api/v1/admin/preview-accuracy-email/<grade_date>")
+def admin_preview_accuracy_email(grade_date: str):
+    """Preview Rosie's accuracy email for a specific Met without sending.
+
+    Added May 27, 2026 for verifying the work-impact rebuild output
+    matches expectations. Returns the composed subject + body so you
+    can read exactly what a Met would see — no email delivered, no
+    last-sent guard updated.
+
+    Path param: YYYY-MM-DD (Eastern Time).
+    Query param: ?to=<email>  — Met whose email to preview (required).
+    """
+    actor, err = _require_admin()
+    if err:
+        return err
+
+    only_email = (request.args.get("to") or "").strip().lower()
+    if not only_email:
+        return jsonify({
+            "ok": False,
+            "error": "missing-to",
+            "hint": "Add ?to=<met-email> to preview that Met's email."
+        }), 400
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT u.id, u.email, u.name
+                       FROM users u
+                       JOIN user_roles ur ON ur.user_id = u.id
+                       WHERE LOWER(u.email) = %s AND ur.role = 'met'
+                         AND u.is_active = TRUE""",
+                    (only_email,),
+                )
+                m = cur.fetchone()
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"db: {e}"}), 500
+    if not m:
+        return jsonify({"ok": False, "error": "met-not-found",
+                        "hint": "Email must belong to an active Met user."}), 404
+
+    composed = _compose_accuracy_email(m["id"], m.get("name") or "", grade_date)
+    if not composed:
+        return jsonify({
+            "ok": True,
+            "would_send": False,
+            "reason": "no-attributed-briefs",
+            "met": {"id": m["id"], "email": m["email"], "name": m.get("name")},
+            "grade_date": grade_date,
+        })
+
+    return jsonify({
+        "ok": True,
+        "would_send": True,
+        "met": {"id": m["id"], "email": m["email"], "name": m.get("name")},
+        "grade_date": grade_date,
+        "subject": composed.get("subject"),
+        "body_text": composed.get("body_text"),
+        "body_html": composed.get("body_html"),
+    })
+
+
 @app.route("/api/v1/admin/send-accuracy-emails/<grade_date>", methods=["OPTIONS"])
 def _admin_send_accuracy_preflight(grade_date):
     return ("", 204)
