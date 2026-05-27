@@ -30938,6 +30938,116 @@ def preferences_unsubscribe():
 # Admin: manually fire accuracy emails for a given grade date
 # ─────────────────────────────────────────────────────────────────────
 
+@app.route("/api/v1/admin/inspect-briefs", methods=["OPTIONS"])
+def _admin_inspect_briefs_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/inspect-briefs")
+def admin_inspect_briefs():
+    """Return brief_history rows for a given date + optional location filter.
+
+    Added May 27, 2026 to investigate why multiple subscribers in the
+    same town received different verdicts on the same day. Lets us see
+    send timestamps, stored predictions, and verdicts side by side
+    without having to dump the whole table.
+
+    Query params:
+      ?date=YYYY-MM-DD     — date to inspect (required, Eastern Time)
+      ?location=<substring> — case-insensitive match on saved_locations
+                              address_text or label (optional)
+      ?limit=<n>           — max rows (default 50, max 200)
+    """
+    actor, err = _require_admin()
+    if err:
+        return err
+
+    date_str = (request.args.get("date") or "").strip()
+    if not date_str:
+        return jsonify({"ok": False, "error": "missing-date",
+                        "hint": "Add ?date=YYYY-MM-DD"}), 400
+    try:
+        ET = ZoneInfo("America/New_York")
+        d = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=ET)
+        day_start_ms = int(d.timestamp() * 1000)
+        day_end_ms = day_start_ms + (24 * 3600 * 1000)
+    except Exception:
+        return jsonify({"ok": False, "error": "bad-date"}), 400
+
+    location_filter = (request.args.get("location") or "").strip().lower()
+    try:
+        limit = min(200, max(1, int(request.args.get("limit") or 50)))
+    except Exception:
+        limit = 50
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                params = [day_start_ms, day_end_ms]
+                where_loc = ""
+                if location_filter:
+                    where_loc = (" AND (LOWER(COALESCE(loc.address_text, '')) LIKE %s "
+                                 "OR LOWER(COALESCE(loc.label, '')) LIKE %s)")
+                    pat = f"%{location_filter}%"
+                    params.extend([pat, pat])
+                params.append(limit)
+                cur.execute(
+                    f"""SELECT bh.id, bh.user_id, bh.delivered_at, bh.verdict,
+                               bh.is_met_touched, bh.met_name, bh.snippet,
+                               bh.predicted_high_f, bh.predicted_low_f,
+                               bh.predicted_precip_in, bh.predicted_max_wind_mph,
+                               COALESCE(u.name, u.email, '(user)') AS subscriber_name,
+                               COALESCE(loc.label, loc.address_text, '') AS location_label,
+                               loc.lat, loc.lng
+                        FROM brief_history bh
+                        LEFT JOIN users u ON u.id = bh.user_id
+                        LEFT JOIN saved_locations loc
+                          ON loc.user_id = bh.user_id AND loc.is_primary = TRUE
+                        WHERE bh.brief_type = 'morning'
+                          AND bh.delivery_status = 'sent'
+                          AND bh.delivered_at >= %s AND bh.delivered_at < %s
+                        {where_loc}
+                        ORDER BY bh.delivered_at ASC
+                        LIMIT %s""",
+                    params,
+                )
+                rows = cur.fetchall()
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"db: {e}"}), 500
+
+    # Format for readable output
+    out = []
+    for r in rows:
+        delivered_dt = datetime.fromtimestamp(
+            r["delivered_at"] / 1000, tz=timezone.utc
+        ).astimezone(ZoneInfo("America/New_York"))
+        out.append({
+            "id": r["id"],
+            "delivered_at_et": delivered_dt.strftime("%Y-%m-%d %H:%M:%S ET"),
+            "subscriber": r["subscriber_name"],
+            "location": r["location_label"],
+            "lat": float(r["lat"]) if r["lat"] is not None else None,
+            "lng": float(r["lng"]) if r["lng"] is not None else None,
+            "verdict": r["verdict"],
+            "is_met_touched": bool(r["is_met_touched"]),
+            "met_name": r.get("met_name"),
+            "predicted_high_f": r.get("predicted_high_f"),
+            "predicted_low_f": r.get("predicted_low_f"),
+            "predicted_precip_in": (float(r["predicted_precip_in"])
+                                    if r.get("predicted_precip_in") is not None else None),
+            "predicted_max_wind_mph": r.get("predicted_max_wind_mph"),
+            "snippet": (r.get("snippet") or "")[:200],
+        })
+
+    return jsonify({
+        "ok": True,
+        "date": date_str,
+        "location_filter": location_filter or None,
+        "row_count": len(out),
+        "rows": out,
+    })
+
+
 @app.route("/api/v1/admin/preview-accuracy-email/<grade_date>", methods=["OPTIONS"])
 def _admin_preview_accuracy_email_preflight(grade_date):
     return ("", 204)
