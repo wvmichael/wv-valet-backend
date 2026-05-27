@@ -568,6 +568,24 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS accuracy_email_last_sent_date TEXT;
 -- Only admins can set this; no portal UI exposes it.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS team_cap_override INTEGER;
 
+-- ── Operational SMS consent for Mets (May 27, 2026) ──
+-- Records when a Met explicitly consented to receive operational
+-- SMS from WeatherValet (work-related messages: brief assignments,
+-- on-call pings, severe-weather operational coordination, payroll
+-- notifications). Required by Twilio for toll-free verification
+-- of +18889191531 (Met-facing number), per rejection code 30513.
+--
+-- NULL = no consent recorded. Operational SMS to this Met is held.
+-- Timestamp (ms) = consent recorded at this moment.
+-- Source: "web" (Met clicked the consent box in their workspace) OR
+--         "verbal-admin" (Met verbally agreed; admin recorded on their
+--         behalf with timestamp). Twilio accepts both as long as
+--         each is documented.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS operational_sms_consent_at BIGINT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS operational_sms_consent_ip TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS operational_sms_consent_source TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS operational_sms_consent_recorded_by INTEGER;
+
 -- Phase 10 timezone support: every user has a timezone (IANA name like
 -- "America/Indiana/Indianapolis"). Used by the brief scheduler to deliver
 -- in the subscriber's local time, not UTC. Defaults to Indianapolis
@@ -15279,7 +15297,10 @@ def me_profile_get():
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, email, name, phone, met_onboarded_at FROM users WHERE id = %s",
+                """SELECT id, email, name, phone, met_onboarded_at,
+                          operational_sms_consent_at,
+                          operational_sms_consent_source
+                   FROM users WHERE id = %s""",
                 (user["id"],),
             )
             row = cur.fetchone()
@@ -15292,6 +15313,8 @@ def me_profile_get():
             "name": row.get("name") or "",
             "phone": row.get("phone") or "",
             "met_onboarded_at": row.get("met_onboarded_at"),
+            "operational_sms_consent_at": row.get("operational_sms_consent_at"),
+            "operational_sms_consent_source": row.get("operational_sms_consent_source"),
         },
     })
 
@@ -15372,6 +15395,183 @@ def me_profile_update():
             "phone": row.get("phone") or "",
         },
     })
+
+
+@app.route("/api/v1/me/operational-sms-consent", methods=["OPTIONS"])
+def _me_op_sms_consent_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/me/operational-sms-consent")
+def me_operational_sms_consent_record():
+    """Record the current user's consent to receive operational SMS.
+
+    Added May 27, 2026 for Twilio toll-free verification of the
+    Met-facing number (+18889191531). The Met checks a box in their
+    workspace and POSTs to this endpoint. We record:
+      - timestamp (ms since epoch)
+      - source ('web' for self-recorded via this endpoint)
+      - IP address at time of consent (for audit / Twilio review)
+
+    Idempotent: if already consented, returns the existing timestamp.
+    Refusing consent is handled by DELETE on this same URL.
+
+    Met must have a phone number on file first — refusing to record
+    consent for a phone that isn't there.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT phone, operational_sms_consent_at
+                   FROM users WHERE id = %s""",
+                (user["id"],),
+            )
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "user-not-found"}), 404
+    if not (row.get("phone") or "").strip():
+        return jsonify({
+            "ok": False,
+            "error": "phone-required",
+            "hint": "Add a phone number to your profile first, then consent.",
+        }), 400
+
+    # If already consented, return existing timestamp (idempotent)
+    if row.get("operational_sms_consent_at"):
+        return jsonify({
+            "ok": True,
+            "consented_at": row["operational_sms_consent_at"],
+            "already_consented": True,
+        })
+
+    # Record fresh consent
+    now_ms = int(time.time() * 1000)
+    # Capture IP — best effort, may be a proxy. Twilio accepts that.
+    consent_ip = (request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+                  or request.remote_addr
+                  or "")
+    consent_ip = consent_ip[:64]  # truncate paranoia
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE users
+                   SET operational_sms_consent_at = %s,
+                       operational_sms_consent_ip = %s,
+                       operational_sms_consent_source = 'web',
+                       operational_sms_consent_recorded_by = %s
+                   WHERE id = %s""",
+                (now_ms, consent_ip, user["id"], user["id"]),
+            )
+    print(f"[op-sms-consent] user={user['id']} recorded consent ip={consent_ip}",
+          flush=True)
+    return jsonify({"ok": True, "consented_at": now_ms})
+
+
+@app.delete("/api/v1/me/operational-sms-consent")
+def me_operational_sms_consent_revoke():
+    """Revoke the current user's operational SMS consent.
+
+    Sets all consent fields back to NULL. Future operational SMS
+    sends should check operational_sms_consent_at IS NOT NULL before
+    firing. (May 27, 2026)
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE users
+                   SET operational_sms_consent_at = NULL,
+                       operational_sms_consent_ip = NULL,
+                       operational_sms_consent_source = NULL,
+                       operational_sms_consent_recorded_by = NULL
+                   WHERE id = %s""",
+                (user["id"],),
+            )
+    print(f"[op-sms-consent] user={user['id']} REVOKED consent", flush=True)
+    return jsonify({"ok": True, "revoked": True})
+
+
+@app.route("/api/v1/admin/operational-sms-consent/<int:target_user_id>",
+           methods=["OPTIONS"])
+def _admin_op_sms_consent_preflight(target_user_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/operational-sms-consent/<int:target_user_id>")
+def admin_record_operational_sms_consent(target_user_id: int):
+    """Admin records a Met's operational SMS consent on their behalf.
+
+    Used for Mets who consented verbally (most current Mets at launch)
+    before the in-workspace consent flow existed. Records source as
+    'verbal-admin' so the audit trail is clear about who recorded it
+    and how.
+
+    Body (JSON):
+      { "consent_date": "2026-05-27" }  (optional; defaults to now)
+
+    Twilio accepts both web and verbal-admin consent records as long
+    as each is documented per recipient.
+    """
+    actor, err = _require_admin()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    consent_date = (data.get("consent_date") or "").strip()
+    if consent_date:
+        try:
+            dt = datetime.strptime(consent_date, "%Y-%m-%d")
+            consent_ms = int(dt.timestamp() * 1000)
+        except Exception:
+            return jsonify({"ok": False, "error": "bad-date",
+                            "hint": "Use YYYY-MM-DD."}), 400
+    else:
+        consent_ms = int(time.time() * 1000)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, phone FROM users WHERE id = %s""",
+                (target_user_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "user-not-found"}), 404
+    if not (row.get("phone") or "").strip():
+        return jsonify({
+            "ok": False,
+            "error": "phone-required",
+            "hint": "Set the user's phone first, then record consent.",
+        }), 400
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE users
+                   SET operational_sms_consent_at = %s,
+                       operational_sms_consent_source = 'verbal-admin',
+                       operational_sms_consent_recorded_by = %s,
+                       operational_sms_consent_ip = NULL
+                   WHERE id = %s""",
+                (consent_ms, actor["id"], target_user_id),
+            )
+    print(f"[op-sms-consent] admin={actor['id']} recorded VERBAL consent "
+          f"for user={target_user_id} dated={consent_ms}", flush=True)
+    return jsonify({"ok": True, "consented_at": consent_ms,
+                    "source": "verbal-admin"})
 
 
 @app.route("/api/v1/me/met-onboarding-dismiss", methods=["OPTIONS"])
