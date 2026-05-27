@@ -1788,6 +1788,14 @@ ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS predicted_low_f INTEGER;
 ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS predicted_precip_in NUMERIC(5,2);
 ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS predicted_max_wind_mph INTEGER;
 
+-- ── Cancel tracking (May 27, 2026) ──
+-- Added when the Pro Brief editor's Cancel button was wired up to
+-- actually dismiss drafts. Before this, the Cancel button only
+-- closed the modal and drafts stayed in pending-review forever.
+-- See Chris Sramek report for the bug that prompted this.
+ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS cancelled_at BIGINT;
+ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS cancelled_by_user_id INTEGER;
+
 -- Brief access tokens (May 17, 2026). Each sent Pro Brief gets a random
 -- unguessable token. The subscriber's web view URL embeds this token:
 --   https://weathervalet.ai/brief/<token>
@@ -22763,6 +22771,67 @@ def met_pro_brief_claim(draft_id):
     return jsonify({"ok": True})
 
 
+@app.route("/api/v1/met/pro-briefs/<int:draft_id>/cancel", methods=["OPTIONS"])
+def _met_pro_brief_cancel_preflight(draft_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/met/pro-briefs/<int:draft_id>/cancel")
+def met_pro_brief_cancel(draft_id):
+    """Cancel a pro brief draft. Sets status='cancelled' so it disappears
+    from the Met's review queue.
+
+    Added May 27, 2026 from Chris Sramek's report: the Cancel button in
+    the Pro Brief editor previously just closed the modal without
+    telling the backend, leaving stale drafts visible day after day.
+
+    Idempotent: if already cancelled, returns ok. If already sent,
+    returns 409 (can't cancel a sent brief — that's an
+    undo-after-send, which is a different operation).
+
+    Visibility-gated (May 22, 2026): same as claim — Mets can only
+    cancel drafts they can see.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    is_admin = "admin" in roles
+    if not _can_met_see_pro_brief(user["id"], draft_id, is_admin):
+        return jsonify({"ok": False, "error": "not-found"}), 404
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, status FROM pro_brief_drafts WHERE id = %s",
+                (draft_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    if row["status"] == "cancelled":
+        return jsonify({"ok": True, "status": "cancelled"})  # idempotent
+    if row["status"] == "sent":
+        return jsonify({"ok": False, "error": "already-sent",
+                        "hint": "Can't cancel a brief that's already been sent."}), 409
+
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE pro_brief_drafts
+                   SET status = 'cancelled',
+                       cancelled_at = %s,
+                       cancelled_by_user_id = %s
+                   WHERE id = %s""",
+                (now_ms, user["id"], draft_id),
+            )
+    return jsonify({"ok": True, "status": "cancelled"})
+
+
 @app.patch("/api/v1/met/pro-briefs/<int:draft_id>")
 def met_pro_brief_update(draft_id):
     """Edit met_verdict / met_snippet / met_body / met_notes. Does NOT send.
@@ -27996,6 +28065,109 @@ def met_my_subscribers():
             "thresholds": thresholds_by_user.get(r["id"], []),
         })
     return jsonify({"ok": True, "subscribers": subscribers})
+
+
+@app.route("/api/v1/met/subscriber/<int:subscriber_id>/recent-sends", methods=["OPTIONS"])
+def _met_subscriber_recent_sends_preflight(subscriber_id):
+    return ("", 204)
+
+
+@app.get("/api/v1/met/subscriber/<int:subscriber_id>/recent-sends")
+def met_subscriber_recent_sends(subscriber_id: int):
+    """Return the last N brief deliveries for a specific subscriber.
+
+    Added May 27, 2026 from Chris Sramek's question "Where can we see
+    what went out?" — gives Mets per-subscriber visibility into what
+    was actually delivered, when, and by whom.
+
+    For each delivery:
+      - delivered_at_et: human-readable timestamp in Eastern Time
+      - brief_type: 'morning' / 'broadcast' / 'update' etc.
+      - verdict: 'clear' / 'caution' / 'risk'
+      - snippet: first ~150 chars of body so the Met can recall content
+      - sent_by: Met name if Met-touched, "AI auto-send" otherwise
+      - channels_used: 'sms,email' / 'email' / etc.
+      - delivery_status: 'sent' / 'failed' / 'pending'
+
+    Query params:
+      ?days=7  — how many days back (default 7, max 30)
+
+    Access: Met or admin. Mets see any subscriber for now (v1 — same
+    as my-subscribers behavior). Region-scoping comes later when we
+    have Met-to-region assignments.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "met" not in (user.get("roles") or []) and "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    try:
+        days = min(30, max(1, int(request.args.get("days") or 7)))
+    except Exception:
+        days = 7
+
+    now_ms = int(time.time() * 1000)
+    cutoff_ms = now_ms - (days * 24 * 3600 * 1000)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            # Confirm the subscriber exists
+            cur.execute(
+                "SELECT id, name, email, subscription_tier FROM users WHERE id = %s",
+                (subscriber_id,),
+            )
+            sub = cur.fetchone()
+            if not sub:
+                return jsonify({"ok": False, "error": "subscriber-not-found"}), 404
+
+            cur.execute(
+                """SELECT bh.id, bh.delivered_at, bh.brief_type, bh.verdict,
+                          bh.snippet, bh.delivery_status, bh.channels_used,
+                          bh.is_met_touched, bh.met_name
+                   FROM brief_history bh
+                   WHERE bh.user_id = %s
+                     AND bh.delivered_at >= %s
+                   ORDER BY bh.delivered_at DESC
+                   LIMIT 100""",
+                (subscriber_id, cutoff_ms),
+            )
+            rows = cur.fetchall()
+
+    ET = ZoneInfo("America/New_York")
+    out = []
+    for r in rows:
+        delivered_dt = datetime.fromtimestamp(
+            r["delivered_at"] / 1000, tz=timezone.utc
+        ).astimezone(ET)
+        sent_by = (r.get("met_name") or "").strip() if r.get("is_met_touched") else ""
+        if not sent_by:
+            sent_by = "AI auto-send" if not r.get("is_met_touched") else "(Met)"
+        out.append({
+            "id": r["id"],
+            "delivered_at_ms": r["delivered_at"],
+            "delivered_at_et": delivered_dt.strftime("%a %b %-d, %Y · %-I:%M %p ET"),
+            "brief_type": r.get("brief_type") or "morning",
+            "verdict": r.get("verdict") or "",
+            "snippet": (r.get("snippet") or "")[:200],
+            "sent_by": sent_by,
+            "is_met_touched": bool(r.get("is_met_touched")),
+            "delivery_status": r.get("delivery_status") or "sent",
+            "channels_used": r.get("channels_used") or "",
+        })
+
+    return jsonify({
+        "ok": True,
+        "subscriber": {
+            "id": sub["id"],
+            "name": sub.get("name") or "",
+            "email": sub.get("email") or "",
+            "tier": sub.get("subscription_tier") or "",
+        },
+        "days": days,
+        "send_count": len(out),
+        "sends": out,
+    })
 
 
 @app.route("/api/v1/met/threads/new", methods=["OPTIONS"])
