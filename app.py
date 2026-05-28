@@ -28323,8 +28323,8 @@ def met_subscriber_recent_sends(subscriber_id: int):
 
             cur.execute(
                 """SELECT bh.id, bh.delivered_at, bh.brief_type, bh.verdict,
-                          bh.snippet, bh.delivery_status, bh.channels_used,
-                          bh.is_met_touched, bh.met_name
+                          bh.snippet, bh.full_body, bh.delivery_status,
+                          bh.channels_used, bh.is_met_touched, bh.met_name
                    FROM brief_history bh
                    WHERE bh.user_id = %s
                      AND bh.delivered_at >= %s
@@ -28349,7 +28349,7 @@ def met_subscriber_recent_sends(subscriber_id: int):
             "delivered_at_et": delivered_dt.strftime("%a %b %-d, %Y · %-I:%M %p ET"),
             "brief_type": r.get("brief_type") or "morning",
             "verdict": r.get("verdict") or "",
-            "snippet": (r.get("snippet") or "")[:200],
+            "snippet": (r.get("full_body") or r.get("snippet") or ""),
             "sent_by": sent_by,
             "is_met_touched": bool(r.get("is_met_touched")),
             "delivery_status": r.get("delivery_status") or "sent",
