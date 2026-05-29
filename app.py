@@ -31425,6 +31425,125 @@ def _admin_preview_accuracy_email_preflight(grade_date):
     return ("", 204)
 
 
+@app.route("/api/v1/admin/inspect-scheduled-messages", methods=["OPTIONS"])
+def _admin_inspect_scheduled_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/inspect-scheduled-messages")
+def admin_inspect_scheduled_messages():
+    """Return recent scheduled_messages rows so we can debug stuck schedules.
+
+    Added May 28, 2026 from Chris & Timmy report: Schedule button leaves
+    briefs sitting in queue forever. Lets us see exact state — status,
+    scheduled_for_ms (vs now), fire_error, fired_at — without guessing.
+
+    Query params:
+      ?hours=48                  — how far back to look (default 48, max 168)
+      ?status=pending|sent|failed — filter by status (optional)
+      ?type=pro_brief            — filter by type (optional)
+    """
+    actor, err = _require_admin()
+    if err:
+        return err
+    try:
+        hours = min(168, max(1, int(request.args.get("hours") or 48)))
+    except Exception:
+        hours = 48
+    status_filter = (request.args.get("status") or "").strip()
+    type_filter = (request.args.get("type") or "").strip()
+
+    now_ms = int(time.time() * 1000)
+    cutoff_ms = now_ms - (hours * 3600 * 1000)
+
+    where_parts = ["created_at >= %s"]
+    params = [cutoff_ms]
+    if status_filter:
+        where_parts.append("status = %s")
+        params.append(status_filter)
+    if type_filter:
+        where_parts.append("type = %s")
+        params.append(type_filter)
+    where_sql = " AND ".join(where_parts)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""SELECT id, type, status, scheduled_for_ms, scheduled_tz,
+                           scheduled_by_user_id, scheduled_by_name,
+                           created_at, fired_at, fire_error,
+                           content_payload, target_audience
+                    FROM scheduled_messages
+                    WHERE {where_sql}
+                    ORDER BY created_at DESC
+                    LIMIT 100""",
+                params,
+            )
+            rows = cur.fetchall()
+
+    ET = ZoneInfo("America/New_York")
+    out = []
+    for r in rows:
+        scheduled_dt = datetime.fromtimestamp(
+            r["scheduled_for_ms"] / 1000, tz=timezone.utc
+        ).astimezone(ET)
+        created_dt = datetime.fromtimestamp(
+            r["created_at"] / 1000, tz=timezone.utc
+        ).astimezone(ET)
+        fired_dt = None
+        if r.get("fired_at"):
+            fired_dt = datetime.fromtimestamp(
+                r["fired_at"] / 1000, tz=timezone.utc
+            ).astimezone(ET).strftime("%a %b %-d %-I:%M:%S %p ET")
+
+        # Quick parse of draft_id from content_payload for pro_brief
+        draft_id = None
+        if r.get("type") == "pro_brief" and r.get("content_payload"):
+            try:
+                cp = _json_sched.loads(r["content_payload"])
+                draft_id = cp.get("draft_id")
+            except Exception:
+                pass
+
+        is_overdue = (r["status"] == "pending"
+                      and r["scheduled_for_ms"] < now_ms - 60_000)
+
+        out.append({
+            "id": r["id"],
+            "type": r["type"],
+            "status": r["status"],
+            "scheduled_for_et": scheduled_dt.strftime("%a %b %-d %-I:%M:%S %p ET"),
+            "scheduled_for_ms": r["scheduled_for_ms"],
+            "scheduled_tz": r.get("scheduled_tz"),
+            "created_et": created_dt.strftime("%a %b %-d %-I:%M:%S %p ET"),
+            "scheduled_by": r.get("scheduled_by_name") or f"#{r['scheduled_by_user_id']}",
+            "fired_et": fired_dt,
+            "fire_error": r.get("fire_error"),
+            "draft_id": draft_id,
+            "is_overdue_pending": is_overdue,
+            "minutes_overdue": (
+                int((now_ms - r["scheduled_for_ms"]) / 60_000)
+                if is_overdue else None
+            ),
+        })
+
+    summary = {
+        "total": len(out),
+        "pending": sum(1 for r in out if r["status"] == "pending"),
+        "sent": sum(1 for r in out if r["status"] == "sent"),
+        "failed": sum(1 for r in out if r["status"] == "failed"),
+        "overdue_pending": sum(1 for r in out if r["is_overdue_pending"]),
+    }
+    return jsonify({
+        "ok": True,
+        "now_ms": now_ms,
+        "now_et": datetime.fromtimestamp(now_ms/1000, tz=timezone.utc).astimezone(ET).strftime("%a %b %-d %-I:%M:%S %p ET"),
+        "hours_window": hours,
+        "summary": summary,
+        "rows": out,
+    })
+
+
 @app.post("/api/v1/admin/preview-accuracy-email/<grade_date>")
 @app.get("/api/v1/admin/preview-accuracy-email/<grade_date>")
 def admin_preview_accuracy_email(grade_date: str):
