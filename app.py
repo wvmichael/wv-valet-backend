@@ -2345,8 +2345,6 @@ ALTER TABLE shift_assignments ADD COLUMN IF NOT EXISTS is_drop BOOLEAN NOT NULL 
 -- Each row is a publishable forecast location for an embeddable widget.
 -- Stations like nwksradio.net embed an iframe pointing at one of these
 -- locations and listeners see WV-branded weather for their area.
--- Phase 1 is read-only (AI-generated, no Met override). Phase 2 adds
--- widget_narratives table for Met-edited copy.
 CREATE TABLE IF NOT EXISTS widget_locations (
     id              SERIAL PRIMARY KEY,
     slug            TEXT NOT NULL UNIQUE,        -- URL-safe: 'colby-ks', 'goodland-ks'
@@ -2365,6 +2363,49 @@ CREATE TABLE IF NOT EXISTS widget_locations (
 CREATE INDEX IF NOT EXISTS idx_widget_locations_region
     ON widget_locations(region, sort_order)
     WHERE is_active = TRUE;
+
+-- ── Widget Narratives (May 28, 2026) — Phase 2 of radio-partner widget ──
+-- Stores AI-drafted and optionally Met-edited prose ("meteorologist
+-- notes") that appear on the widget detail page. One narrative per
+-- location per generation cycle. Mets can edit ai_body to create
+-- a Met-edited version (met_body) and publish. The most recent
+-- published narrative whose expires_at is in the future is what the
+-- public widget serves.
+--
+-- Workflow (mirrors Pro brief pattern):
+--   1. Pregen job creates row with status='pending-review', ai_body filled
+--   2. Met opens Widgets tab, sees pending narrative for each location
+--   3. Met either:
+--      a. Clicks "Publish AI version" → met_touched=false, status='published'
+--      b. Edits ai_body, clicks "Save & Publish" → met_body filled,
+--         met_touched=true, status='published'
+--   4. Public widget shows met_body if met_touched=true, else ai_body
+--   5. Next pregen cycle: previous narrative auto-expires; new draft created
+CREATE TABLE IF NOT EXISTS widget_narratives (
+    id              SERIAL PRIMARY KEY,
+    location_id     INTEGER NOT NULL REFERENCES widget_locations(id) ON DELETE CASCADE,
+    -- Generation cycle: 'morning' (5 AM CT) or 'afternoon' (12 PM CT).
+    -- Used for "is this morning's narrative still relevant?" checks.
+    cycle           TEXT NOT NULL DEFAULT 'morning',
+    -- Status: pending-review | published | expired | cancelled
+    status          TEXT NOT NULL DEFAULT 'pending-review',
+    -- AI's draft and any Met-edited version
+    ai_body         TEXT NOT NULL DEFAULT '',
+    met_body        TEXT,
+    met_touched     BOOLEAN NOT NULL DEFAULT FALSE,
+    met_user_id     INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    met_name        TEXT,
+    -- Lifecycle timestamps
+    created_at      BIGINT NOT NULL,
+    published_at    BIGINT,
+    expires_at      BIGINT NOT NULL,
+    cancelled_at    BIGINT
+);
+CREATE INDEX IF NOT EXISTS idx_widget_narratives_location_published
+    ON widget_narratives(location_id, published_at DESC)
+    WHERE status = 'published';
+CREATE INDEX IF NOT EXISTS idx_widget_narratives_status
+    ON widget_narratives(status, created_at DESC);
 """
 
 
@@ -5697,11 +5738,71 @@ def widget_get_forecast(slug: str):
             "observed_at_iso": current.get("time"),
         },
         "days": days,
-        # Phase 2 will populate this with Met-edited copy. Phase 1 returns null.
-        "met_narrative": None,
+        # Phase 2 (May 28, 2026): if a published narrative exists for
+        # this location and hasn't expired, include it in the response.
+        # met_touched indicates whether a Met actually edited the AI
+        # draft (vs. just publishing the AI version as-is).
+        "met_narrative": _widget_active_narrative(loc["id"]),
         "data_source": "open-meteo",
         "generated_at_ms": int(time.time() * 1000),
     })
+
+
+def _widget_active_narrative(location_id: int) -> Optional[dict]:
+    """Fetch the active published narrative for a widget location.
+
+    Returns a dict suitable for inclusion in the public widget JSON,
+    or None if no narrative is currently published OR all available
+    narratives have expired.
+
+    Phase 2 (May 28, 2026): supports the "Met can override" workflow.
+    """
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT n.id, n.cycle, n.ai_body, n.met_body, n.met_touched,
+                          n.met_name, n.published_at, n.expires_at
+                   FROM widget_narratives n
+                   WHERE n.location_id = %s
+                     AND n.status = 'published'
+                     AND n.expires_at > %s
+                   ORDER BY n.published_at DESC
+                   LIMIT 1""",
+                (location_id, now_ms),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    body = (row.get("met_body") if row.get("met_touched") else row.get("ai_body")) or ""
+    if not body.strip():
+        return None
+    return {
+        "body_text": body,
+        "met_touched": bool(row.get("met_touched")),
+        "met_name": row.get("met_name") or "WeatherValet Meteorologist",
+        "cycle": row.get("cycle"),
+        "published_at_ms": row.get("published_at"),
+        "relative_time": _format_relative_time(row.get("published_at"), now_ms),
+    }
+
+
+def _format_relative_time(then_ms: Optional[int], now_ms: int) -> str:
+    """Format a timestamp as a relative-time string like '2h ago'.
+
+    Used in narratives so radio-station listeners know how fresh the
+    Met's commentary is.
+    """
+    if not then_ms:
+        return ""
+    diff_ms = now_ms - then_ms
+    if diff_ms < 60_000:
+        return "just now"
+    if diff_ms < 3600_000:
+        return f"{int(diff_ms / 60_000)}m ago"
+    if diff_ms < 86_400_000:
+        return f"{int(diff_ms / 3_600_000)}h ago"
+    return f"{int(diff_ms / 86_400_000)}d ago"
 
 
 @app.route("/api/v1/widget/region/<region_slug>/locations", methods=["OPTIONS"])
@@ -5738,6 +5839,209 @@ def widget_region_locations(region_slug: str):
             for r in rows
         ],
     })
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Widget Met-edit endpoints (May 28, 2026) — Phase 2 of radio-partner widget
+# ════════════════════════════════════════════════════════════════════════════
+# Workflow: AI pregen creates pending-review rows. Mets see them in the
+# "Widgets" tab of their workspace and either click "Publish AI version"
+# (no edit, met_touched stays False) or edit then publish (met_touched
+# becomes True, met_body stored). The public widget reads whichever the
+# Met chose.
+
+@app.route("/api/v1/met/widget-narratives", methods=["OPTIONS"])
+def _met_widget_narratives_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/widget-narratives")
+def met_widget_narratives_list():
+    """List widget narratives for the Met's workspace.
+
+    Returns pending-review (needs action) AND recently published
+    (last 24 hours). Mets see one row per location with status,
+    so they can quickly review/publish/edit. Visible to all Mets;
+    no per-Met territory gate for Phase 2 (Phase 3 may add one).
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    now_ms = int(time.time() * 1000)
+    cutoff_ms = now_ms - 24 * 3600 * 1000
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT n.id, n.location_id, n.cycle, n.status,
+                          n.ai_body, n.met_body, n.met_touched,
+                          n.met_user_id, n.met_name,
+                          n.created_at, n.published_at, n.expires_at,
+                          l.slug, l.name AS location_name,
+                          l.short_name, l.region, l.region_label
+                   FROM widget_narratives n
+                   JOIN widget_locations l ON l.id = n.location_id
+                   WHERE n.status IN ('pending-review', 'published')
+                     AND (n.status = 'pending-review'
+                          OR n.published_at >= %s)
+                     AND n.expires_at > %s
+                   ORDER BY n.created_at DESC""",
+                (cutoff_ms, now_ms),
+            )
+            rows = cur.fetchall()
+
+    out = []
+    for r in rows:
+        out.append({
+            "id": r["id"],
+            "location": {
+                "slug": r["slug"],
+                "name": r["location_name"],
+                "short_name": r.get("short_name"),
+                "region": r.get("region"),
+                "region_label": r.get("region_label"),
+            },
+            "cycle": r["cycle"],
+            "status": r["status"],
+            "ai_body": r.get("ai_body") or "",
+            "met_body": r.get("met_body") or "",
+            "met_touched": bool(r.get("met_touched")),
+            "met_name": r.get("met_name"),
+            "created_at_ms": r.get("created_at"),
+            "published_at_ms": r.get("published_at"),
+            "expires_at_ms": r.get("expires_at"),
+        })
+
+    return jsonify({"ok": True, "narratives": out})
+
+
+@app.route("/api/v1/met/widget-narratives/<int:narrative_id>",
+           methods=["OPTIONS"])
+def _met_widget_narrative_one_preflight(narrative_id):
+    return ("", 204)
+
+
+@app.patch("/api/v1/met/widget-narratives/<int:narrative_id>")
+def met_widget_narrative_edit(narrative_id: int):
+    """Met edits the narrative text. Sets met_body and met_touched=True
+    but does NOT publish — Met still needs to click Publish separately."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    body = (data.get("body_text") or "").strip()
+    if not body:
+        return jsonify({"ok": False, "error": "body-required"}), 400
+    if len(body) > 2000:
+        return jsonify({"ok": False, "error": "body-too-long",
+                        "hint": "Keep narratives under 2000 characters."}), 400
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE widget_narratives
+                   SET met_body = %s,
+                       met_touched = TRUE,
+                       met_user_id = %s,
+                       met_name = %s
+                   WHERE id = %s
+                     AND status IN ('pending-review', 'published')
+                   RETURNING id""",
+                (body, user["id"], user.get("name") or "", narrative_id),
+            )
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "narrative-not-found"}), 404
+    print(f"[widget-narratives] met={user['id']} edited #{narrative_id}",
+          flush=True)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/v1/met/widget-narratives/<int:narrative_id>/publish")
+def met_widget_narrative_publish(narrative_id: int):
+    """Met publishes a narrative — marks it active so the public widget
+    shows it. Publishing the AI-only version is fine; publishing a
+    Met-edited version uses the met_body.
+
+    Body (optional JSON):
+      { "body_text": "..." }  — if present, edits before publish in one shot
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    body_override = (data.get("body_text") or "").strip()
+    now_ms = int(time.time() * 1000)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            # If body_override provided, treat this as edit+publish in one call
+            if body_override:
+                if len(body_override) > 2000:
+                    return jsonify({
+                        "ok": False, "error": "body-too-long",
+                        "hint": "Keep narratives under 2000 characters."
+                    }), 400
+                cur.execute(
+                    """UPDATE widget_narratives
+                       SET met_body = %s,
+                           met_touched = TRUE,
+                           met_user_id = %s,
+                           met_name = %s,
+                           status = 'published',
+                           published_at = %s
+                       WHERE id = %s
+                         AND status IN ('pending-review', 'published')
+                       RETURNING id""",
+                    (body_override, user["id"], user.get("name") or "",
+                     now_ms, narrative_id),
+                )
+            else:
+                # Just publishing the existing draft (AI or previously edited)
+                cur.execute(
+                    """UPDATE widget_narratives
+                       SET status = 'published',
+                           published_at = %s,
+                           met_user_id = COALESCE(met_user_id, %s),
+                           met_name = COALESCE(met_name, %s)
+                       WHERE id = %s
+                         AND status IN ('pending-review', 'published')
+                       RETURNING id, location_id""",
+                    (now_ms, user["id"], user.get("name") or "", narrative_id),
+                )
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"ok": False, "error": "narrative-not-found"}), 404
+
+            # Expire any OLDER published narratives for this location
+            # (otherwise multiple "published" rows could exist; the
+            # public widget query handles this via LIMIT 1, but cleaning
+            # up keeps the data tidy.)
+            cur.execute(
+                """UPDATE widget_narratives
+                   SET status = 'expired'
+                   WHERE location_id = (
+                     SELECT location_id FROM widget_narratives WHERE id = %s
+                   )
+                     AND id != %s
+                     AND status = 'published'""",
+                (narrative_id, narrative_id),
+            )
+    print(f"[widget-narratives] met={user['id']} published #{narrative_id}",
+          flush=True)
+    return jsonify({"ok": True, "published_at_ms": now_ms})
 
 
 @app.route("/api/v1/met/polish-text", methods=["OPTIONS"])
@@ -16195,6 +16499,138 @@ def _fetch_forecast_7day(lat: float, lng: float) -> Optional[dict]:
         return None
 
 
+def _generate_widget_narrative(location_name: str, forecast: dict) -> str:
+    """Generate a 3-4 sentence weather narrative for the widget detail page.
+
+    Phase 2 of the radio-partner widget (May 28, 2026). Produces prose
+    suitable for a "meteorologist note" — the kind of analytical
+    commentary you'd hear on local radio. Examples of the style:
+      "An active weather pattern moves through the region this week..."
+      "High pressure builds in by mid-week, locking in pleasant
+       conditions through the weekend..."
+
+    Deterministic templating against the 7-day forecast — no LLM call.
+    Looks at temperature trend (warming/cooling/steady), precipitation
+    chances (active vs. dry), and notable wind to construct prose.
+    Returns empty string if forecast data is unusable; caller should
+    not publish in that case.
+
+    Mets can edit this output in their workspace if they want to add
+    local context (e.g., "this is the front that the Climate Prediction
+    Center flagged in their 6-10 day outlook"). Editing flips
+    met_touched=True on the widget_narratives row.
+    """
+    if not forecast or "daily" not in forecast:
+        return ""
+    daily = forecast.get("daily") or {}
+    times = daily.get("time") or []
+    if len(times) < 3:
+        return ""
+    highs = daily.get("temperature_2m_max") or []
+    lows = daily.get("temperature_2m_min") or []
+    precip_in = daily.get("precipitation_sum") or []
+    precip_prob = daily.get("precipitation_probability_max") or []
+    winds = daily.get("windspeed_10m_max") or []
+    codes = daily.get("weathercode") or []
+
+    # Defensive: pad arrays to same length
+    n = min(len(times), len(highs), len(lows), len(codes))
+    if n < 3:
+        return ""
+
+    # ── Sentence 1: Today's setup ──
+    today_code = codes[0] if n > 0 else 0
+    today_label = _weather_code_label(today_code).lower()
+    today_high = highs[0]
+    today_low = lows[0]
+    today_precip_prob = precip_prob[0] if len(precip_prob) > 0 else None
+    today_wind = winds[0] if len(winds) > 0 else None
+
+    s1_parts = []
+    # Opening framing depends on conditions
+    if today_label in ("clear", "mostly clear"):
+        s1_parts.append("Quiet weather to start the day across the area")
+    elif today_label == "overcast":
+        s1_parts.append("Cloudy skies hold across the area today")
+    elif "rain" in today_label or "showers" in today_label or "drizzle" in today_label:
+        s1_parts.append("Wet weather is the headline today")
+    elif "snow" in today_label:
+        s1_parts.append("Snow is the story across the region today")
+    elif "thunder" in today_label:
+        s1_parts.append("Thunderstorm chances stand out today")
+    elif "fog" in today_label:
+        s1_parts.append("Fog will be the morning concern")
+    else:
+        s1_parts.append(f"A mix of conditions sets the stage today")
+
+    if today_high is not None:
+        s1_parts.append(f"with highs reaching {round(today_high)}°")
+    sentence_1 = ", ".join(s1_parts) + "."
+
+    # ── Sentence 2: Precipitation outlook ──
+    sentence_2 = ""
+    # Look at next 3 days for precip chances
+    wet_days = []
+    for i in range(min(4, n)):
+        p = precip_prob[i] if i < len(precip_prob) else 0
+        if p is not None and p >= 40:
+            day_name = "today" if i == 0 else ("tomorrow" if i == 1 else _day_word(times[i]))
+            wet_days.append((day_name, int(p)))
+    if wet_days:
+        if len(wet_days) == 1:
+            sentence_2 = f"The best chance for precipitation comes {wet_days[0][0]} at {wet_days[0][1]}%."
+        else:
+            day_names = ", ".join(d[0] for d in wet_days[:-1]) + f" and {wet_days[-1][0]}"
+            sentence_2 = f"Precipitation chances run highest {day_names}."
+    else:
+        # No notable precip in the window
+        sentence_2 = "No widespread precipitation looks likely through the next several days."
+
+    # ── Sentence 3: Temperature trend ──
+    sentence_3 = ""
+    # Compare today's high to days 2-4
+    later_highs = [h for h in highs[1:4] if h is not None]
+    if today_high is not None and later_highs:
+        avg_later = sum(later_highs) / len(later_highs)
+        diff = avg_later - today_high
+        if diff >= 8:
+            sentence_3 = f"Temperatures climb through midweek, peaking near {round(max(later_highs))}°."
+        elif diff <= -8:
+            sentence_3 = f"Cooler air settles in over the next few days, with highs dropping to the {_temp_bucket(min(later_highs))}s."
+        else:
+            sentence_3 = f"Temperatures hold fairly steady, generally in the {_temp_bucket(today_high)}s through the period."
+
+    # ── Sentence 4: Wind callout if significant ──
+    sentence_4 = ""
+    max_wind = max([w for w in winds[:4] if w is not None] or [0])
+    if max_wind >= 25:
+        wind_day_idx = next((i for i, w in enumerate(winds[:4]) if w == max_wind), 0)
+        wind_day = "today" if wind_day_idx == 0 else ("tomorrow" if wind_day_idx == 1 else _day_word(times[wind_day_idx]))
+        sentence_4 = f"Wind picks up {wind_day}, gusting to {round(max_wind)} mph at times."
+
+    parts = [s for s in (sentence_1, sentence_2, sentence_3, sentence_4) if s]
+    return " ".join(parts)
+
+
+def _day_word(date_iso: str) -> str:
+    """Convert ISO date to a day-of-week word for narrative use.
+    'Wednesday', 'Thursday', etc. Returns 'later this week' if parse fails."""
+    try:
+        d = datetime.strptime(date_iso, "%Y-%m-%d")
+        return d.strftime("%A")
+    except Exception:
+        return "later this week"
+
+
+def _temp_bucket(temp_f: float) -> str:
+    """Bucket a temperature into a decade label ('70', '80', etc.)
+    Used in narratives like 'in the 70s'."""
+    try:
+        return str(int(temp_f) // 10 * 10)
+    except Exception:
+        return "comfortable"
+
+
 def _weather_code_label(code: int) -> str:
     """Open-Meteo WMO weather code → short human label."""
     if code == 0: return "Clear"
@@ -17966,6 +18402,133 @@ def _pregenerate_pro_brief_drafts() -> None:
         _release_scheduler_lock(_lock_conn, _LOCK_KEY)
 
 
+def _generate_widget_narratives() -> None:
+    """Pre-generate widget narratives twice daily.
+
+    Phase 2 of the radio-partner widget (May 28, 2026). Runs at 5 AM CT
+    (morning narrative — covers AM drive + workday) and 12 PM CT
+    (afternoon narrative — covers PM drive + evening) for each active
+    widget location.
+
+    Each generation cycle creates a new widget_narratives row with
+    status='pending-review' so a Met can claim it and edit before
+    publish. If no Met touches it within the freshness window, the
+    public widget falls back to showing the AI version.
+
+    Concurrency: wrapped in a Postgres advisory lock (key 91234569,
+    distinct from Pro brief pregen's 91234568) so multi-worker
+    deployments don't generate twice.
+
+    Idempotency: each (location, cycle, date) tuple is generated at
+    most once via a duplicate check before INSERT.
+    """
+    _LOCK_KEY = 91234569
+    _lock_conn = _try_acquire_scheduler_lock(_LOCK_KEY)
+    if _lock_conn is None:
+        return
+    try:
+        _generate_widget_narratives_inner()
+    finally:
+        _release_scheduler_lock(_lock_conn, _LOCK_KEY)
+
+
+def _generate_widget_narratives_inner() -> None:
+    """Body of _generate_widget_narratives. See outer function docstring.
+
+    For each active widget_location:
+      1. Check if it's currently 5 AM or 12 PM in the location's local tz
+      2. If so, determine cycle ('morning' or 'afternoon')
+      3. Skip if a narrative for this (location, cycle, today) already exists
+      4. Fetch a 7-day forecast
+      5. Generate the AI narrative
+      6. INSERT with status='pending-review' and a Met-edit window
+
+    Expires_at is set to:
+      - Morning cycle: noon local time (when afternoon cycle takes over)
+      - Afternoon cycle: 5 AM tomorrow local (when next morning cycle takes over)
+    """
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, slug, name, lat, lng, timezone
+                   FROM widget_locations
+                   WHERE is_active = TRUE
+                   ORDER BY sort_order, id"""
+            )
+            locations = cur.fetchall()
+
+    for loc in locations:
+        try:
+            tz = ZoneInfo(loc.get("timezone") or "America/Chicago")
+            local_now = datetime.now(tz)
+            hour = local_now.hour
+            today_str = local_now.strftime("%Y-%m-%d")
+
+            # Decide cycle. Generate at 5 AM and 12 PM (noon) local.
+            # We give a 1-hour window for each so the scheduler tick can
+            # land any time within. Duplicate check prevents re-generation.
+            if hour == 5:
+                cycle = "morning"
+                # Expires when afternoon cycle starts (noon today local)
+                expires_local = local_now.replace(hour=12, minute=0, second=0, microsecond=0)
+            elif hour == 12:
+                cycle = "afternoon"
+                # Expires when next morning cycle starts (5 AM tomorrow local)
+                from datetime import timedelta
+                expires_local = (local_now + timedelta(days=1)).replace(
+                    hour=5, minute=0, second=0, microsecond=0
+                )
+            else:
+                continue  # not a generation hour for this location
+
+            expires_ms = int(expires_local.timestamp() * 1000)
+
+            # Duplicate check: has a narrative for this (location, cycle,
+            # today's local date) already been generated?
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT id FROM widget_narratives
+                           WHERE location_id = %s
+                             AND cycle = %s
+                             AND created_at >= %s
+                           LIMIT 1""",
+                        (loc["id"], cycle, now_ms - 18 * 3600 * 1000),
+                    )
+                    if cur.fetchone():
+                        continue  # already created in this 18-hour window
+
+            # Fetch forecast and generate narrative
+            forecast = _fetch_forecast_7day(loc["lat"], loc["lng"])
+            if not forecast:
+                print(f"[widget-narratives] forecast fetch failed for {loc['slug']}",
+                      flush=True)
+                continue
+            narrative = _generate_widget_narrative(loc["name"], forecast)
+            if not narrative:
+                print(f"[widget-narratives] narrative empty for {loc['slug']}, skipping",
+                      flush=True)
+                continue
+
+            # Insert as pending-review
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO widget_narratives
+                             (location_id, cycle, status, ai_body,
+                              created_at, expires_at)
+                           VALUES (%s, %s, 'pending-review', %s, %s, %s)""",
+                        (loc["id"], cycle, narrative, now_ms, expires_ms),
+                    )
+            print(f"[widget-narratives] generated {cycle} narrative for {loc['slug']}",
+                  flush=True)
+        except Exception as e:
+            print(f"[widget-narratives] failed for loc {loc.get('slug')}: {e!r}",
+                  flush=True)
+            continue
+
+
 def _pregenerate_pro_brief_drafts_inner() -> None:
     """Original body of _pregenerate_pro_brief_drafts. Extracted May 22,
     2026 so the outer function can wrap it in an advisory lock without
@@ -18126,6 +18689,10 @@ def _brief_scheduler_loop() -> None:
             _pregenerate_pro_brief_drafts()
         except Exception as e:
             print(f"[pregen-pro] tick failed: {e!r}", flush=True)
+        try:
+            _generate_widget_narratives()
+        except Exception as e:
+            print(f"[widget-narratives] tick failed: {e!r}", flush=True)
         try:
             _process_severe_alerts()
         except Exception as e:
