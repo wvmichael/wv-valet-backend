@@ -31647,6 +31647,128 @@ def admin_inspect_scheduled_messages():
     })
 
 
+@app.route("/api/v1/admin/inspect-drafts", methods=["OPTIONS"])
+def _admin_inspect_drafts_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/inspect-drafts")
+def admin_inspect_drafts():
+    """Inspect pro_brief_drafts rows directly to diagnose stuck drafts.
+
+    Added May 28, 2026 to investigate why some Hobbyist drafts sit in
+    the Met's Pro Briefs queue past their window without auto-sending.
+    Distinct from inspect-briefs (which shows brief_history = sent) and
+    inspect-scheduled-messages (which shows the scheduled_messages
+    queue). This shows pro_brief_drafts which is the work-in-progress
+    table — pending review, claimed by Met, sent, or cancelled.
+
+    Query params:
+      ?hours=48           — how far back (default 48, max 168)
+      ?status=pending-review|claimed|sent|cancelled  — filter
+      ?user_id=N          — filter to one subscriber
+    """
+    actor, err = _require_admin()
+    if err:
+        return err
+    try:
+        hours = min(168, max(1, int(request.args.get("hours") or 48)))
+    except Exception:
+        hours = 48
+    status_filter = (request.args.get("status") or "").strip()
+    try:
+        user_filter = int(request.args.get("user_id") or 0) or None
+    except Exception:
+        user_filter = None
+
+    now_ms = int(time.time() * 1000)
+    cutoff_ms = now_ms - (hours * 3600 * 1000)
+
+    where = ["d.created_at >= %s"]
+    params = [cutoff_ms]
+    if status_filter:
+        where.append("d.status = %s")
+        params.append(status_filter)
+    if user_filter:
+        where.append("d.user_id = %s")
+        params.append(user_filter)
+    where_sql = " AND ".join(where)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""SELECT d.id, d.user_id, d.brief_type, d.status,
+                           d.user_tier, d.location_label,
+                           d.created_at, d.window_end_at, d.sent_at,
+                           d.sent_by_name, d.cancelled_at,
+                           d.ai_verdict, d.met_verdict,
+                           d.ai_snippet, d.met_snippet,
+                           u.name AS subscriber_name, u.email AS subscriber_email,
+                           u.subscription_tier AS current_tier
+                    FROM pro_brief_drafts d
+                    JOIN users u ON u.id = d.user_id
+                    WHERE {where_sql}
+                    ORDER BY d.created_at DESC
+                    LIMIT 200""",
+                params,
+            )
+            rows = cur.fetchall()
+
+    ET = ZoneInfo("America/New_York")
+    def _fmt(ms):
+        if not ms:
+            return None
+        return datetime.fromtimestamp(
+            ms / 1000, tz=timezone.utc
+        ).astimezone(ET).strftime("%a %b %-d %-I:%M %p ET")
+
+    out = []
+    for r in rows:
+        is_past_window = (r["status"] in ("pending-review", "claimed")
+                          and r.get("window_end_at")
+                          and r["window_end_at"] < now_ms)
+        out.append({
+            "id": r["id"],
+            "user_id": r["user_id"],
+            "subscriber": r.get("subscriber_name") or r.get("subscriber_email"),
+            "current_tier": r.get("current_tier"),
+            "draft_tier": r.get("user_tier"),
+            "status": r["status"],
+            "verdict": r.get("met_verdict") or r.get("ai_verdict"),
+            "is_met_touched": bool(r.get("met_verdict") or r.get("met_snippet")),
+            "brief_type": r.get("brief_type"),
+            "location_label": r.get("location_label"),
+            "snippet_preview": (r.get("met_snippet") or r.get("ai_snippet") or "")[:120],
+            "created_et": _fmt(r["created_at"]),
+            "window_end_et": _fmt(r.get("window_end_at")),
+            "sent_et": _fmt(r.get("sent_at")),
+            "cancelled_et": _fmt(r.get("cancelled_at")),
+            "sent_by": r.get("sent_by_name"),
+            "is_past_window_pending": bool(is_past_window),
+        })
+
+    summary = {
+        "total": len(out),
+        "by_status": {},
+        "by_tier": {},
+        "past_window_pending": sum(1 for r in out if r["is_past_window_pending"]),
+        "suppress_verdict": sum(1 for r in out if r["verdict"] == "suppress"),
+    }
+    for r in out:
+        s = r["status"]
+        summary["by_status"][s] = summary["by_status"].get(s, 0) + 1
+        t = r.get("current_tier") or "unknown"
+        summary["by_tier"][t] = summary["by_tier"].get(t, 0) + 1
+
+    return jsonify({
+        "ok": True,
+        "now_et": datetime.fromtimestamp(now_ms/1000, tz=timezone.utc).astimezone(ET).strftime("%a %b %-d %-I:%M %p ET"),
+        "hours_window": hours,
+        "summary": summary,
+        "rows": out,
+    })
+
+
 @app.post("/api/v1/admin/preview-accuracy-email/<grade_date>")
 @app.get("/api/v1/admin/preview-accuracy-email/<grade_date>")
 def admin_preview_accuracy_email(grade_date: str):
