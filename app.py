@@ -32602,6 +32602,108 @@ def admin_inspect_drafts():
     })
 
 
+@app.route("/api/v1/admin/widget-narrative/generate/<slug>", methods=["OPTIONS"])
+def _admin_widget_narr_generate_preflight(slug):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/widget-narrative/generate/<slug>")
+def admin_generate_widget_narrative(slug: str):
+    """Admin: manually generate a widget narrative for a location, NOW.
+
+    Bypasses the 5 AM / noon CT scheduler gate so we can test the
+    full Phase 2 workflow end-to-end without waiting for the cron.
+    Creates a pending-review row using the current cycle (morning if
+    before noon local; afternoon if noon or later).
+
+    Idempotent at the cycle level — uses the same 18-hour duplicate
+    check as the scheduler, so calling twice in the same cycle is a
+    no-op (returns existing).
+    """
+    actor, err = _require_admin()
+    if err:
+        return err
+
+    slug = (slug or "").strip().lower()
+    if not slug:
+        return jsonify({"ok": False, "error": "slug-required"}), 400
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, slug, name, lat, lng, timezone
+                   FROM widget_locations
+                   WHERE slug = %s AND is_active = TRUE""",
+                (slug,),
+            )
+            loc = cur.fetchone()
+    if not loc:
+        return jsonify({"ok": False, "error": "location-not-found"}), 404
+
+    tz = ZoneInfo(loc.get("timezone") or "America/Chicago")
+    local_now = datetime.now(tz)
+    # Choose cycle based on time-of-day in the location's timezone
+    cycle = "morning" if local_now.hour < 12 else "afternoon"
+    # Expires when the OTHER cycle takes over
+    from datetime import timedelta
+    if cycle == "morning":
+        expires_local = local_now.replace(hour=12, minute=0, second=0, microsecond=0)
+        if expires_local <= local_now:
+            expires_local = expires_local + timedelta(days=1)
+    else:
+        next_day = local_now + timedelta(days=1)
+        expires_local = next_day.replace(hour=5, minute=0, second=0, microsecond=0)
+    expires_ms = int(expires_local.timestamp() * 1000)
+    now_ms = int(time.time() * 1000)
+
+    # Duplicate check
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, status FROM widget_narratives
+                   WHERE location_id = %s
+                     AND cycle = %s
+                     AND created_at >= %s
+                   ORDER BY created_at DESC
+                   LIMIT 1""",
+                (loc["id"], cycle, now_ms - 18 * 3600 * 1000),
+            )
+            existing = cur.fetchone()
+    if existing:
+        return jsonify({
+            "ok": True,
+            "narrative_id": existing["id"],
+            "status": existing["status"],
+            "note": "Existing narrative for this cycle returned (idempotent).",
+        })
+
+    forecast = _fetch_forecast_7day(loc["lat"], loc["lng"])
+    if not forecast:
+        return jsonify({"ok": False, "error": "forecast-fetch-failed"}), 503
+    narrative = _generate_widget_narrative(loc["name"], forecast)
+    if not narrative:
+        return jsonify({"ok": False, "error": "narrative-generation-failed"}), 500
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO widget_narratives
+                     (location_id, cycle, status, ai_body, created_at, expires_at)
+                   VALUES (%s, %s, 'pending-review', %s, %s, %s)
+                   RETURNING id""",
+                (loc["id"], cycle, narrative, now_ms, expires_ms),
+            )
+            row = cur.fetchone()
+    print(f"[widget-narratives] admin={actor['id']} force-generated for {slug}",
+          flush=True)
+    return jsonify({
+        "ok": True,
+        "narrative_id": row["id"],
+        "cycle": cycle,
+        "ai_body_preview": narrative[:200],
+    })
+
+
 @app.post("/api/v1/admin/preview-accuracy-email/<grade_date>")
 @app.get("/api/v1/admin/preview-accuracy-email/<grade_date>")
 def admin_preview_accuracy_email(grade_date: str):
