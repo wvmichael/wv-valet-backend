@@ -2340,6 +2340,31 @@ CREATE INDEX IF NOT EXISTS idx_shift_met
 -- (met_user_id IS NOT NULL AND is_drop = FALSE).
 ALTER TABLE shift_assignments ALTER COLUMN met_user_id DROP NOT NULL;
 ALTER TABLE shift_assignments ADD COLUMN IF NOT EXISTS is_drop BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- ── Widget Locations (May 28, 2026) — Phase 1 of radio-partner widget ──
+-- Each row is a publishable forecast location for an embeddable widget.
+-- Stations like nwksradio.net embed an iframe pointing at one of these
+-- locations and listeners see WV-branded weather for their area.
+-- Phase 1 is read-only (AI-generated, no Met override). Phase 2 adds
+-- widget_narratives table for Met-edited copy.
+CREATE TABLE IF NOT EXISTS widget_locations (
+    id              SERIAL PRIMARY KEY,
+    slug            TEXT NOT NULL UNIQUE,        -- URL-safe: 'colby-ks', 'goodland-ks'
+    name            TEXT NOT NULL,               -- Display: 'Colby, Kansas'
+    short_name      TEXT,                        -- Compact: 'Colby' (used in pickers)
+    region          TEXT,                        -- Group slug: 'nw-kansas'
+    region_label    TEXT,                        -- Display: 'NW Kansas'
+    lat             DOUBLE PRECISION NOT NULL,
+    lng             DOUBLE PRECISION NOT NULL,
+    timezone        TEXT NOT NULL DEFAULT 'America/Chicago',
+    sort_order      INTEGER NOT NULL DEFAULT 0,  -- Within region, lowest first
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at      BIGINT NOT NULL,
+    updated_at      BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_widget_locations_region
+    ON widget_locations(region, sort_order)
+    WHERE is_active = TRUE;
 """
 
 
@@ -2410,6 +2435,12 @@ def init_db() -> None:
         _seed_met_territories()
     except Exception as e:
         print(f"[met-territories] seed at init failed: {e}", flush=True)
+    # Seed widget_locations for the radio-partner widget (May 28, 2026).
+    # Phase 1: Colby + Goodland for NW Kansas (nwksradio.net). Idempotent.
+    try:
+        _seed_widget_locations()
+    except Exception as e:
+        print(f"[widget-locations] seed at init failed: {e}", flush=True)
     # Backfill brief_preferences for migrated subscribers who don't have
     # them yet (May 22, 2026). The original migration tool didn't create
     # this row, so the scheduler never picked up migrated Pro/Hobbyist
@@ -2620,6 +2651,45 @@ def _seed_met_territories() -> None:
                     (user_id, name, region_label, sort_order, now_ms),
                 )
                 print(f"[met-territories] seeded {name} for user_id={user_id}", flush=True)
+
+
+def _seed_widget_locations() -> None:
+    """Seed widget_locations for the first radio partner (NW Kansas).
+
+    Phase 1 of the radio-partner widget feature (May 28, 2026). Each row
+    is a publishable forecast location that a partner station's website
+    can embed via iframe. NW Kansas is the first region; Colby and
+    Goodland are the first two locations Chris requested.
+
+    Idempotent: ON CONFLICT (slug) DO NOTHING, so repeated startups are
+    safe and only the first run inserts these rows. To add new locations
+    later, just add them to seed_specs and redeploy.
+    """
+    now_ms = int(time.time() * 1000)
+    # (slug, name, short_name, region, region_label, lat, lng, tz, sort_order)
+    seed_specs = [
+        ("colby-ks",    "Colby, Kansas",    "Colby",    "nw-kansas", "NW Kansas",
+         39.3956, -101.0524, "America/Chicago", 10),
+        ("goodland-ks", "Goodland, Kansas", "Goodland", "nw-kansas", "NW Kansas",
+         39.3505, -101.7104, "America/Denver",  20),
+    ]
+    with db() as conn:
+        with conn.cursor() as cur:
+            for slug, name, short_name, region, region_label, lat, lng, tz, sort_order in seed_specs:
+                cur.execute(
+                    """INSERT INTO widget_locations
+                         (slug, name, short_name, region, region_label,
+                          lat, lng, timezone, sort_order,
+                          is_active, created_at, updated_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s, %s)
+                       ON CONFLICT (slug) DO NOTHING""",
+                    (slug, name, short_name, region, region_label,
+                     lat, lng, tz, sort_order, now_ms, now_ms),
+                )
+            cur.execute("SELECT COUNT(*) AS c FROM widget_locations")
+            count = cur.fetchone()["c"]
+            print(f"[widget-locations] seed complete; {count} locations active",
+                  flush=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -5528,6 +5598,146 @@ def _call_gemini_polish(body_text: str) -> list:
             "reason": reason[:60] or "polish"
         })
     return out
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Widget endpoints (May 28, 2026) — Phase 1 of radio-partner widget
+# ════════════════════════════════════════════════════════════════════════════
+# Public read-only endpoints. No auth — these are designed to be called
+# from arbitrary partner-station websites via the embedded widget.
+# Phase 1 returns raw AI forecast data only. Phase 2 will layer a
+# Met-edited narrative on top of this same response shape.
+
+@app.route("/api/v1/widget/<slug>", methods=["OPTIONS"])
+def _widget_get_preflight(slug):
+    return ("", 204)
+
+
+@app.get("/api/v1/widget/<slug>")
+def widget_get_forecast(slug: str):
+    """Public widget endpoint: returns forecast JSON for a location.
+
+    Looks up widget_locations by slug, fetches a 7-day cached forecast
+    from Open-Meteo, and returns a clean response shape. CORS open so
+    partner sites can fetch directly if they prefer JS over iframe.
+    """
+    slug = (slug or "").strip().lower()
+    if not slug:
+        return jsonify({"ok": False, "error": "slug-required"}), 400
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, slug, name, short_name, region, region_label,
+                          lat, lng, timezone
+                   FROM widget_locations
+                   WHERE slug = %s AND is_active = TRUE""",
+                (slug,),
+            )
+            loc = cur.fetchone()
+
+    if not loc:
+        return jsonify({"ok": False, "error": "location-not-found"}), 404
+
+    forecast = _fetch_forecast_7day(loc["lat"], loc["lng"])
+    if not forecast:
+        return jsonify({
+            "ok": False,
+            "error": "forecast-unavailable",
+            "location": {
+                "slug": loc["slug"], "name": loc["name"],
+                "short_name": loc.get("short_name"),
+                "region": loc.get("region"), "region_label": loc.get("region_label"),
+            },
+        }), 503
+
+    # Build response: location meta + current + 7-day daily forecast
+    current = forecast.get("current_weather") or {}
+    daily = forecast.get("daily") or {}
+
+    days = []
+    times = daily.get("time") or []
+    for i, day_iso in enumerate(times):
+        try:
+            code = (daily.get("weathercode") or [0])[i]
+            days.append({
+                "date": day_iso,
+                "high_f": (daily.get("temperature_2m_max") or [None])[i],
+                "low_f":  (daily.get("temperature_2m_min") or [None])[i],
+                "precip_in": (daily.get("precipitation_sum") or [None])[i],
+                "precip_prob_pct": (daily.get("precipitation_probability_max") or [None])[i],
+                "wind_max_mph": (daily.get("windspeed_10m_max") or [None])[i],
+                "weather_code": code,
+                "conditions": _weather_code_label(code) if code is not None else "",
+                "sunrise": (daily.get("sunrise") or [None])[i],
+                "sunset":  (daily.get("sunset")  or [None])[i],
+            })
+        except Exception:
+            # Defensive — if Open-Meteo returns ragged arrays, skip that day
+            continue
+
+    return jsonify({
+        "ok": True,
+        "location": {
+            "slug": loc["slug"],
+            "name": loc["name"],
+            "short_name": loc.get("short_name") or loc["name"].split(",")[0].strip(),
+            "region": loc.get("region"),
+            "region_label": loc.get("region_label"),
+            "timezone": loc.get("timezone"),
+            "lat": loc["lat"], "lng": loc["lng"],
+        },
+        "current": {
+            "temp_f": current.get("temperature"),
+            "wind_mph": current.get("windspeed"),
+            "wind_dir_deg": current.get("winddirection"),
+            "weather_code": current.get("weathercode"),
+            "conditions": (_weather_code_label(current.get("weathercode"))
+                           if current.get("weathercode") is not None else ""),
+            "observed_at_iso": current.get("time"),
+        },
+        "days": days,
+        # Phase 2 will populate this with Met-edited copy. Phase 1 returns null.
+        "met_narrative": None,
+        "data_source": "open-meteo",
+        "generated_at_ms": int(time.time() * 1000),
+    })
+
+
+@app.route("/api/v1/widget/region/<region_slug>/locations", methods=["OPTIONS"])
+def _widget_region_preflight(region_slug):
+    return ("", 204)
+
+
+@app.get("/api/v1/widget/region/<region_slug>/locations")
+def widget_region_locations(region_slug: str):
+    """Public: list all active locations in a region. Used by the
+    location picker in the widget (Phase 3 wires this up to the UI;
+    Phase 1 ships it so frontend can already use it)."""
+    region_slug = (region_slug or "").strip().lower()
+    if not region_slug:
+        return jsonify({"ok": False, "error": "region-required"}), 400
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT slug, name, short_name, region, region_label, timezone
+                   FROM widget_locations
+                   WHERE region = %s AND is_active = TRUE
+                   ORDER BY sort_order, name""",
+                (region_slug,),
+            )
+            rows = cur.fetchall()
+    return jsonify({
+        "ok": True,
+        "region": region_slug,
+        "region_label": rows[0].get("region_label") if rows else None,
+        "locations": [
+            {"slug": r["slug"], "name": r["name"],
+             "short_name": r.get("short_name") or r["name"].split(",")[0].strip(),
+             "timezone": r.get("timezone")}
+            for r in rows
+        ],
+    })
 
 
 @app.route("/api/v1/met/polish-text", methods=["OPTIONS"])
@@ -15926,6 +16136,62 @@ def _fetch_forecast(lat: float, lng: float) -> Optional[dict]:
             return json.loads(resp.read().decode("utf-8"))
     except Exception as e:
         print(f"[brief-forecast] fetch failed for ({lat},{lng}): {e}", flush=True)
+        return None
+
+
+# ── Widget forecast cache (May 28, 2026) ──
+# In-memory TTL cache for the radio-partner widget endpoint. Keys are
+# (lat, lng) tuples rounded to 4 decimal places (~10m precision); values
+# are (timestamp_ms, payload) tuples. Widget pages embed on partner
+# sites and may be loaded by every visitor on every page view, so we
+# cache the upstream Open-Meteo response for WIDGET_CACHE_TTL_SECONDS
+# to keep traffic to api.open-meteo.com sane. The cache lives in the
+# gunicorn worker process; with multiple workers, each maintains its
+# own. That's fine — Open-Meteo handles modest traffic and the cache
+# only needs to prevent runaway request rates, not be globally unique.
+_WIDGET_FORECAST_CACHE: dict[tuple[float, float], tuple[int, dict]] = {}
+WIDGET_CACHE_TTL_SECONDS = 600  # 10 minutes
+
+
+def _fetch_forecast_7day(lat: float, lng: float) -> Optional[dict]:
+    """Fetch a 7-day forecast with current conditions for the widget.
+
+    Returns a raw Open-Meteo response with daily highs/lows/conditions
+    for 7 days plus current_weather. Cached for 10 minutes per
+    (lat,lng) so embeds don't hammer the upstream API.
+
+    Phase 1 of the widget: this is the only data source. Phase 2 adds
+    a Met-edited narrative on top of this AI-generated forecast.
+    """
+    cache_key = (round(lat, 4), round(lng, 4))
+    now_ms = int(time.time() * 1000)
+    cached = _WIDGET_FORECAST_CACHE.get(cache_key)
+    if cached and (now_ms - cached[0]) < (WIDGET_CACHE_TTL_SECONDS * 1000):
+        return cached[1]
+    try:
+        url = (
+            "https://api.open-meteo.com/v1/forecast"
+            f"?latitude={lat}&longitude={lng}"
+            "&current_weather=true"
+            "&hourly=temperature_2m,relativehumidity_2m,precipitation_probability,"
+            "windspeed_10m,winddirection_10m,weathercode"
+            "&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,"
+            "precipitation_probability_max,windspeed_10m_max,weathercode,sunrise,sunset"
+            "&temperature_unit=fahrenheit&windspeed_unit=mph"
+            "&precipitation_unit=inch&timezone=auto&forecast_days=7"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "weathervalet/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        _WIDGET_FORECAST_CACHE[cache_key] = (now_ms, data)
+        return data
+    except Exception as e:
+        print(f"[widget-forecast] fetch failed for ({lat},{lng}): {e}", flush=True)
+        # On failure, fall back to whatever's in the cache even if stale.
+        # Better to show 11-min-old data than nothing.
+        if cached:
+            print(f"[widget-forecast] serving stale cache for ({lat},{lng})", flush=True)
+            return cached[1]
         return None
 
 
