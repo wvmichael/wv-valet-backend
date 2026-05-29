@@ -18344,6 +18344,30 @@ def _process_pending_briefs_inner() -> None:
             # subscriber; instead alert the assigned primary Met (or admin
             # if none) so a human can investigate.
             if verdict == "suppress":
+                # Record the suppression in brief_history so the Met
+                # workspace can surface it for recovery (May 29, 2026).
+                # Idempotent: skip if a suppressed row already exists
+                # today for this subscriber + brief_type.
+                try:
+                    sup_now_ms = int(time.time() * 1000)
+                    user_tz = c.get("timezone") or "America/Indiana/Indianapolis"
+                    if not _already_sent_today(c["user_id"], "morning", user_tz):
+                        with db() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    """INSERT INTO brief_history
+                                       (user_id, brief_type, delivered_at, verdict,
+                                        snippet, full_body, delivery_status, channels_used,
+                                        is_met_touched, met_name)
+                                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                                    (c["user_id"], "morning", sup_now_ms, "suppress",
+                                     (snippet or "")[:140],
+                                     full_body, "suppressed", "",
+                                     False, None),
+                                )
+                except Exception as hist_e:
+                    print(f"[brief-scheduler] suppressed history insert failed user_id={c['user_id']}: {hist_e}", flush=True)
+
                 try:
                     _alert_met_on_suppressed_brief(
                         subscriber_user_id=c["user_id"],
@@ -24630,6 +24654,343 @@ def _autosend_pro_brief_draft(draft_id: int) -> tuple[bool, str]:
         flush=True,
     )
     return (True, "")
+
+
+@app.get("/api/v1/met/suppressed-briefs")
+def met_list_suppressed_briefs():
+    """List today's suppressed Hobbyist briefs for the Met workspace.
+
+    Added May 29, 2026 as the Suppressed-Hobbyist recovery surface.
+
+    Scope: Pro covering Mets see ONLY their assigned subscribers'
+    suppressions; admins see all. "Today" = subscriber's local day.
+
+    Returns rows with enough context for the Met to act:
+      - history_id (for retry/manual-send endpoints)
+      - subscriber name/email/phone/location
+      - the original suppression reason (the AI's full_body output)
+      - timestamp when suppression occurred
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    is_admin = "admin" in roles
+    met_id = user["id"]
+
+    # Window: last 24 hours, captures today + any late-night suppressions
+    cutoff_ms = int(time.time() * 1000) - (24 * 3600 * 1000)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            if is_admin:
+                cur.execute(
+                    """SELECT bh.id AS history_id, bh.user_id, bh.delivered_at AS suppressed_at,
+                              bh.snippet, bh.full_body AS reason,
+                              u.name AS subscriber_name, u.email AS subscriber_email,
+                              u.phone AS subscriber_phone,
+                              loc.label AS location_label, loc.address_text AS location_address
+                       FROM brief_history bh
+                       JOIN users u ON u.id = bh.user_id
+                       LEFT JOIN saved_locations loc
+                            ON loc.user_id = u.id AND loc.is_primary = TRUE
+                       WHERE bh.delivery_status = 'suppressed'
+                         AND bh.delivered_at >= %s
+                       ORDER BY bh.delivered_at DESC""",
+                    (cutoff_ms,),
+                )
+            else:
+                # Met sees only assigned subscribers (primary_met or backup_met).
+                # Hobbyists don't have subscriber_coverage rows, so we also
+                # surface unassigned suppressions (any Met can recover them).
+                cur.execute(
+                    """SELECT bh.id AS history_id, bh.user_id, bh.delivered_at AS suppressed_at,
+                              bh.snippet, bh.full_body AS reason,
+                              u.name AS subscriber_name, u.email AS subscriber_email,
+                              u.phone AS subscriber_phone,
+                              loc.label AS location_label, loc.address_text AS location_address
+                       FROM brief_history bh
+                       JOIN users u ON u.id = bh.user_id
+                       LEFT JOIN saved_locations loc
+                            ON loc.user_id = u.id AND loc.is_primary = TRUE
+                       LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
+                       WHERE bh.delivery_status = 'suppressed'
+                         AND bh.delivered_at >= %s
+                         AND (sc.primary_met_id = %s
+                              OR sc.backup_met_id = %s
+                              OR sc.user_id IS NULL)
+                       ORDER BY bh.delivered_at DESC""",
+                    (cutoff_ms, met_id, met_id),
+                )
+            rows = cur.fetchall()
+
+    out = []
+    for r in rows:
+        out.append({
+            "history_id": r["history_id"],
+            "user_id": r["user_id"],
+            "suppressed_at": r["suppressed_at"],
+            "subscriber_name": r.get("subscriber_name") or "",
+            "subscriber_email": r["subscriber_email"],
+            "subscriber_phone": r.get("subscriber_phone") or "",
+            "location_label": r.get("location_label") or "",
+            "location_address": r.get("location_address") or "",
+            "snippet": r.get("snippet") or "",
+            "reason": r.get("reason") or "",
+        })
+    return jsonify({"ok": True, "count": len(out), "rows": out})
+
+
+@app.post("/api/v1/met/suppressed-briefs/<int:history_id>/retry")
+def met_retry_suppressed_brief(history_id):
+    """Regenerate the AI brief for a previously-suppressed subscriber.
+
+    If the new generation returns verdict != 'suppress', the brief is
+    sent to the subscriber and a new brief_history row is written
+    (delivery_status='sent', is_met_touched=FALSE, met_name=NULL —
+    because the Met didn't write content, just clicked Retry).
+
+    If the new generation ALSO returns verdict='suppress', we return
+    an error and DO NOT send. Met can then fall back to manual-send.
+
+    The original suppressed history row is left in place for audit.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    # Look up the original suppression row + subscriber context
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT bh.id, bh.user_id, bh.delivery_status,
+                          u.name, u.email, u.phone, u.timezone,
+                          bp.channels,
+                          loc.label AS loc_label, loc.address_text AS loc_address,
+                          loc.lat AS loc_lat, loc.lng AS loc_lng,
+                          loc.county AS loc_county
+                   FROM brief_history bh
+                   JOIN users u ON u.id = bh.user_id
+                   LEFT JOIN brief_preferences bp ON bp.user_id = u.id
+                   LEFT JOIN saved_locations loc
+                        ON loc.user_id = u.id AND loc.is_primary = TRUE
+                   WHERE bh.id = %s""",
+                (history_id,),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    if row["delivery_status"] != "suppressed":
+        return jsonify({"ok": False, "error": "not-suppressed",
+                        "current_status": row["delivery_status"]}), 409
+
+    if not row.get("loc_lat") or not row.get("loc_lng"):
+        return jsonify({"ok": False, "error": "no-location",
+                        "message": "Subscriber has no primary location set"}), 422
+
+    # Regenerate forecast + brief
+    try:
+        forecast = _fetch_forecast(row["loc_lat"], row["loc_lng"])
+    except Exception as e:
+        print(f"[suppressed-retry] forecast fetch failed: {e}", flush=True)
+        return jsonify({"ok": False, "error": "forecast-failed",
+                        "message": "Could not fetch forecast data"}), 502
+
+    location_label = _smart_location_label(
+        row.get("loc_label") or "",
+        row.get("loc_address") or "")
+    try:
+        verdict, snippet, full_body = _generate_hobbyist_brief_llm(
+            location_label, forecast,
+            county=row.get("loc_county") or "",
+        )
+    except Exception as e:
+        print(f"[suppressed-retry] brief gen failed: {e}", flush=True)
+        return jsonify({"ok": False, "error": "generation-failed",
+                        "message": "AI brief generation failed"}), 500
+
+    if verdict == "suppress":
+        # Still bad data. Don't send. Met should use manual-send instead.
+        return jsonify({
+            "ok": False,
+            "error": "still-suppressed",
+            "message": "AI re-generation still returned suppress verdict. Data may still be bad. Use Manual-send to write a brief manually.",
+            "reason": full_body,
+        }), 409
+
+    # Good brief — send via subscriber's preferred channels
+    channels = [ch for ch in (row.get("channels") or "").split(",") if ch]
+    channels_used = []
+    any_success = False
+    smart_subject = f"Your WeatherValet brief, {location_label}"
+    reply_to = _get_subscriber_reply_to_email(row["user_id"])
+
+    for ch in channels:
+        if ch == "sms" and row.get("phone"):
+            ok = send_sms(row["phone"], snippet + "\n\nFull brief: " + full_body[:1200])
+            if ok:
+                channels_used.append("sms")
+                any_success = True
+        elif ch == "email" and row.get("email"):
+            try:
+                _send_brief_email(row["email"], smart_subject, full_body, reply_to=reply_to)
+                channels_used.append("email")
+                any_success = True
+            except Exception as e:
+                print(f"[suppressed-retry] email send failed: {e}", flush=True)
+
+    if not any_success:
+        return jsonify({"ok": False, "error": "no-channels-succeeded",
+                        "message": "No delivery channel succeeded. Check subscriber phone/email."}), 502
+
+    # Record new brief_history row marking the successful recovery delivery
+    try:
+        now_ms = int(time.time() * 1000)
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO brief_history
+                       (user_id, brief_type, delivered_at, verdict,
+                        snippet, full_body, delivery_status, channels_used,
+                        is_met_touched, met_name)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (row["user_id"], "morning", now_ms, verdict,
+                     (snippet or "")[:140], full_body,
+                     "sent", ",".join(channels_used),
+                     False, None),
+                )
+    except Exception as e:
+        print(f"[suppressed-retry] history insert failed: {e}", flush=True)
+        # Don't fail the request — brief WAS sent, just recording failed
+
+    return jsonify({
+        "ok": True,
+        "verdict": verdict,
+        "channels_used": channels_used,
+        "snippet": snippet,
+    })
+
+
+@app.post("/api/v1/met/suppressed-briefs/<int:history_id>/manual-send")
+def met_manual_send_suppressed_brief(history_id):
+    """Send a Met-authored brief to a previously-suppressed subscriber.
+
+    Body: {"snippet": "...", "full_body": "...", "verdict": "clear|caution|risk"}
+
+    snippet is what goes in the SMS preview (140 chars max).
+    full_body is the full brief shown in email and the long-form SMS append.
+    verdict is the Met's call after looking at the data. Defaults to 'clear'
+    if not provided.
+
+    Writes a new brief_history row marking is_met_touched=TRUE so payroll/
+    audit can credit the Met. Original suppressed row stays for audit.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    snippet = (data.get("snippet") or "").strip()
+    full_body = (data.get("full_body") or "").strip()
+    verdict = (data.get("verdict") or "clear").strip().lower()
+
+    if not snippet:
+        return jsonify({"ok": False, "error": "missing-snippet",
+                        "message": "snippet field is required"}), 422
+    if not full_body:
+        return jsonify({"ok": False, "error": "missing-body",
+                        "message": "full_body field is required"}), 422
+    if verdict not in ("clear", "caution", "risk"):
+        return jsonify({"ok": False, "error": "invalid-verdict",
+                        "message": "verdict must be clear, caution, or risk"}), 422
+
+    # Look up subscriber + channels
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT bh.id, bh.user_id, bh.delivery_status,
+                          u.name, u.email, u.phone,
+                          bp.channels,
+                          loc.label AS loc_label, loc.address_text AS loc_address
+                   FROM brief_history bh
+                   JOIN users u ON u.id = bh.user_id
+                   LEFT JOIN brief_preferences bp ON bp.user_id = u.id
+                   LEFT JOIN saved_locations loc
+                        ON loc.user_id = u.id AND loc.is_primary = TRUE
+                   WHERE bh.id = %s""",
+                (history_id,),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    if row["delivery_status"] != "suppressed":
+        return jsonify({"ok": False, "error": "not-suppressed",
+                        "current_status": row["delivery_status"]}), 409
+
+    location_label = _smart_location_label(
+        row.get("loc_label") or "",
+        row.get("loc_address") or "")
+
+    # Send via channels
+    channels = [ch for ch in (row.get("channels") or "").split(",") if ch]
+    channels_used = []
+    any_success = False
+    met_name = user.get("name") or user.get("email") or "Met"
+    smart_subject = f"Your WeatherValet brief, {location_label}"
+    reply_to = _get_subscriber_reply_to_email(row["user_id"])
+
+    for ch in channels:
+        if ch == "sms" and row.get("phone"):
+            ok = send_sms(row["phone"], snippet + "\n\nFull brief: " + full_body[:1200])
+            if ok:
+                channels_used.append("sms")
+                any_success = True
+        elif ch == "email" and row.get("email"):
+            try:
+                _send_brief_email(row["email"], smart_subject, full_body, reply_to=reply_to)
+                channels_used.append("email")
+                any_success = True
+            except Exception as e:
+                print(f"[suppressed-manual-send] email failed: {e}", flush=True)
+
+    if not any_success:
+        return jsonify({"ok": False, "error": "no-channels-succeeded",
+                        "message": "No delivery channel succeeded. Check subscriber phone/email."}), 502
+
+    # Record new history row, attributed to the Met
+    try:
+        now_ms = int(time.time() * 1000)
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO brief_history
+                       (user_id, brief_type, delivered_at, verdict,
+                        snippet, full_body, delivery_status, channels_used,
+                        is_met_touched, met_name)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (row["user_id"], "morning", now_ms, verdict,
+                     snippet[:140], full_body,
+                     "sent", ",".join(channels_used),
+                     True, met_name),
+                )
+    except Exception as e:
+        print(f"[suppressed-manual-send] history insert failed: {e}", flush=True)
+
+    return jsonify({
+        "ok": True,
+        "channels_used": channels_used,
+        "met_name": met_name,
+    })
 
 
 @app.post("/api/v1/met/pro-briefs/<int:draft_id>/send")
