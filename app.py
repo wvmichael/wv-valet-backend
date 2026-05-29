@@ -18816,10 +18816,14 @@ def _brief_scheduler_loop() -> None:
             _pregenerate_pro_brief_drafts()
         except Exception as e:
             print(f"[pregen-pro] tick failed: {e!r}", flush=True)
-        try:
-            _generate_widget_narratives()
-        except Exception as e:
-            print(f"[widget-narratives] tick failed: {e!r}", flush=True)
+        # Widget narrative pregen disabled May 29 2026 — Met-edited
+        # narratives removed from public widget (competed with paid
+        # subs) and from Met workspace. Pregen would just write to
+        # a table no one reads. Uncomment to re-enable.
+        # try:
+        #     _generate_widget_narratives()
+        # except Exception as e:
+        #     print(f"[widget-narratives] tick failed: {e!r}", flush=True)
         try:
             _process_severe_alerts()
         except Exception as e:
