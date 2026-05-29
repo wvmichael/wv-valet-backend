@@ -1814,6 +1814,15 @@ ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS predicted_max_wind_mph INT
 ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS cancelled_at BIGINT;
 ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS cancelled_by_user_id INTEGER;
 
+-- Auto-send safety net (May 29, 2026) — when a Met fails to send a Pro
+-- brief by the end of the morning window, the system auto-sends the AI
+-- version (unless verdict=suppress) so paying subscribers always get
+-- their daily brief. auto_sent_at = when the safety net fired;
+-- auto_send_skipped_reason = audit text when we DIDN'T auto-send
+-- ('suppress_verdict', 'no_channels', etc).
+ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS auto_sent_at BIGINT;
+ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS auto_send_skipped_reason TEXT;
+
 -- Brief access tokens (May 17, 2026). Each sent Pro Brief gets a random
 -- unguessable token. The subscriber's web view URL embeds this token:
 --   https://weathervalet.ai/brief/<token>
@@ -18833,6 +18842,10 @@ def _brief_scheduler_loop() -> None:
         except Exception as e:
             print(f"[missed-brief-check] tick failed: {e!r}", flush=True)
         try:
+            _autosend_missed_pro_briefs()
+        except Exception as e:
+            print(f"[autosend-scheduler] tick failed: {e!r}", flush=True)
+        try:
             _process_scheduled_messages()
         except Exception as e:
             print(f"[scheduled-msg-tick] tick failed: {e!r}", flush=True)
@@ -19320,9 +19333,130 @@ def _check_missed_pro_briefs() -> None:
             print(f"[missed-brief-check] per-sub error user_id={c.get('user_id')}: {e!r}", flush=True)
 
 
-# ════════════════════════════════════════════════════════════════════
-# NWS severe alert detection + Met paging (Phase 10 Item #7)
-# ════════════════════════════════════════════════════════════════════
+def _autosend_missed_pro_briefs() -> None:
+    """Auto-send Pro briefs when the Met failed to send by window+15min.
+
+    Phase: safety net (May 29, 2026). Pro subscribers pay for daily
+    Met-touched briefs. The existing _check_missed_pro_briefs fires
+    at +5 min with an SMS to admin+Met. This function fires at +15
+    min — giving the Met a 10-minute window to react to the alert
+    before the system auto-sends the AI version (unless verdict=suppress,
+    in which case we hold and rely on the human alert path).
+
+    Runs every 60s. Dedupes via the auto_sent_at column on
+    pro_brief_drafts (set by _autosend_pro_brief_draft on success),
+    so a draft is auto-sent at most once.
+    """
+    _LOCK_KEY = 91234571  # distinct from other scheduler locks
+    _lock_conn = _try_acquire_scheduler_lock(_LOCK_KEY)
+    if _lock_conn is None:
+        return  # another worker is on it
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT
+                          u.id AS user_id, u.email, u.name, u.timezone,
+                          u.subscription_tier,
+                          bp.morning_window_start, bp.morning_window_end
+                       FROM users u
+                       JOIN brief_preferences bp ON bp.user_id = u.id
+                       WHERE u.is_active = TRUE
+                         AND bp.morning_enabled = TRUE
+                         AND u.subscription_tier IN
+                             ('pro_single','pro_multi','pro_enterprise')
+                         AND EXISTS (
+                           SELECT 1 FROM user_roles ur
+                           WHERE ur.user_id = u.id AND ur.role = 'subscriber'
+                         )"""
+                )
+                pro_subs = cur.fetchall()
+
+        for c in pro_subs:
+            try:
+                user_tz = c.get("timezone") or "America/Indiana/Indianapolis"
+                try:
+                    tz = ZoneInfo(user_tz)
+                except Exception:
+                    tz = ZoneInfo("America/Indiana/Indianapolis")
+                local_now = datetime.now(tz)
+
+                try:
+                    end_h = int(c["morning_window_end"][:2])
+                    end_m = int(c["morning_window_end"][3:])
+                except (ValueError, TypeError, IndexError):
+                    continue
+
+                window_end_today = local_now.replace(
+                    hour=end_h, minute=end_m, second=0, microsecond=0
+                )
+                # Auto-send threshold: 15 minutes past window end.
+                # This gives the Met 10 minutes after the +5min admin
+                # alert to react before the system takes over.
+                check_after = window_end_today + timedelta(minutes=15)
+                if local_now < check_after:
+                    continue
+                # Don't auto-send for windows that closed too long ago —
+                # the subscriber's context has moved on; sending now
+                # would be more confusing than helpful.
+                if (local_now - check_after).total_seconds() > 7200:
+                    continue
+
+                # Already sent (manually or auto)?
+                if _already_sent_today(c["user_id"], "morning", user_tz):
+                    continue
+
+                # Find the most recent pending draft for this subscriber today
+                today_start_ms = int(local_now.replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                ).timestamp() * 1000)
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """SELECT id FROM pro_brief_drafts
+                               WHERE user_id = %s
+                                 AND status IN ('pending-review', 'claimed')
+                                 AND brief_type = 'morning'
+                                 AND auto_sent_at IS NULL
+                                 AND cancelled_at IS NULL
+                                 AND created_at >= %s
+                               ORDER BY created_at DESC
+                               LIMIT 1""",
+                            (c["user_id"], today_start_ms),
+                        )
+                        draft_row = cur.fetchone()
+
+                if not draft_row:
+                    # No eligible draft — could be that pregen failed last
+                    # night, or the draft was cancelled. The +5min admin
+                    # alert already fired for this case; nothing more
+                    # we can do here.
+                    continue
+
+                ok, reason = _autosend_pro_brief_draft(draft_row["id"])
+                sub_name = (c.get("name") or "").strip() or c["email"]
+                if ok:
+                    print(
+                        f"[autosend-scheduler] auto-sent draft={draft_row['id']} "
+                        f"for {sub_name} (user_id={c['user_id']})",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[autosend-scheduler] held draft={draft_row['id']} "
+                        f"for {sub_name}: {reason}",
+                        flush=True,
+                    )
+            except Exception as e:
+                print(
+                    f"[autosend-scheduler] per-sub error user_id={c.get('user_id')}: {e!r}",
+                    flush=True,
+                )
+    finally:
+        _release_scheduler_lock(_lock_conn, _LOCK_KEY)
+
+
+
 #
 # Each scheduler tick:
 #   1. Fetch active NWS alerts (events we care about)
@@ -22844,6 +22978,8 @@ def met_pro_subscribers_queue():
                 "sent_by_name": draft.get("sent_by_name") or "",
                 "final_verdict": draft.get("final_verdict") or "",
                 "delivery_time_local": draft.get("delivery_time_local") or "",
+                "auto_sent_at": draft.get("auto_sent_at"),
+                "auto_send_skipped_reason": draft.get("auto_send_skipped_reason") or "",
             } if draft else None),
         })
 
@@ -23719,6 +23855,8 @@ def met_pro_briefs_list():
             "sent_at": r["sent_at"],
             "sent_by_name": r["sent_by_name"],
             "final_verdict": r["final_verdict"],
+            "auto_sent_at": r.get("auto_sent_at"),
+            "auto_send_skipped_reason": r.get("auto_send_skipped_reason") or "",
             # Territory-coverage context (May 22, 2026):
             # primary_met_name lets the UI show "Covering for Chris Sramek".
             # is_covering is true if THIS Met is seeing the draft via
@@ -24192,6 +24330,308 @@ def met_pro_brief_update(draft_id):
     return jsonify({"ok": True})
 
 
+def _autosend_pro_brief_draft(draft_id: int) -> tuple[bool, str]:
+    """Auto-send a Pro brief draft when the Met failed to send in time.
+
+    Phase: safety net (May 29, 2026). Mirrors met_pro_brief_send's
+    delivery primitives but uses 'WeatherValet' as the sender (no Met
+    name) and adds a transparency line so subscribers know it was
+    automatically delivered rather than human-reviewed.
+
+    Returns (True, "") on successful delivery (at least one channel).
+    Returns (False, reason) when we refused to send. Reason values:
+      'draft-not-found' | 'wrong-status' | 'suppress-verdict' |
+      'no-channels' | 'empty-brief' | 'all-channels-failed'
+
+    Side effects on success:
+      - Marks pro_brief_drafts.auto_sent_at, status='sent'
+      - Creates brief_history row (is_met_touched=FALSE, met_name='WeatherValet')
+      - Creates brief_access_tokens row for the web view link
+    Side effects on refusal:
+      - Marks pro_brief_drafts.auto_send_skipped_reason (audit trail)
+      - Does NOT change status — Met can still send manually
+    """
+    now_ms = int(time.time() * 1000)
+
+    # ── Fetch draft + subscriber ──
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT d.*, u.email AS sub_email, u.phone AS sub_phone,
+                          u.name AS sub_name,
+                          loc.address_text AS location_address
+                   FROM pro_brief_drafts d
+                   JOIN users u ON u.id = d.user_id
+                   LEFT JOIN saved_locations loc
+                        ON loc.user_id = u.id AND loc.is_primary = TRUE
+                   WHERE d.id = %s""",
+                (draft_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return (False, "draft-not-found")
+    if row["status"] not in ("pending-review", "claimed"):
+        return (False, "wrong-status")
+    if row.get("auto_sent_at"):
+        return (False, "already-auto-sent")
+
+    # ── Resolve content ──
+    final_verdict = (row.get("met_verdict") or row.get("ai_verdict") or "caution").strip()
+    final_snippet = (row.get("met_snippet") or row.get("ai_snippet") or "").strip()
+    legacy_body = (row.get("met_body") or row.get("ai_body") or "").strip()
+    bottom_line = (row.get("bottom_line") or "").strip()
+    weather_details = (row.get("weather_details") or "").strip()
+    whats_ahead = (row.get("whats_ahead") or "").strip()
+    is_structured = bool(bottom_line or weather_details or whats_ahead)
+
+    # ── Refuse on suppress verdict ──
+    # The AI flagged this brief's underlying forecast as unusable.
+    # Better to send nothing than to send a flawed forecast. The
+    # missed-brief admin alert (separate scheduler) will still fire.
+    if final_verdict.lower() == "suppress":
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """UPDATE pro_brief_drafts
+                           SET auto_send_skipped_reason = 'suppress-verdict'
+                           WHERE id = %s""",
+                        (draft_id,),
+                    )
+        except Exception:
+            pass
+        return (False, "suppress-verdict")
+
+    if not is_structured and not legacy_body:
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """UPDATE pro_brief_drafts
+                           SET auto_send_skipped_reason = 'empty-brief'
+                           WHERE id = %s""",
+                        (draft_id,),
+                    )
+        except Exception:
+            pass
+        return (False, "empty-brief")
+
+    # ── Verdict label (mirror met_pro_brief_send) ──
+    verdict_label = {
+        "clear":   "✓ CLEAR",
+        "caution": "⚠ CAUTION",
+        "risk":    "⚠ RISK",
+    }.get(final_verdict.lower(), final_verdict.upper())
+
+    location_label = row.get("location_label") or "your location"
+    sender_name = "WeatherValet"  # No Met name for auto-send
+
+    # ── Compose full_body (for brief_history) ──
+    if is_structured:
+        parts = [f"TODAY'S CALL: {verdict_label}"]
+        if bottom_line:
+            parts.append("")
+            parts.append(bottom_line)
+        if weather_details:
+            parts.append("")
+            parts.append("WEATHER DETAILS")
+            parts.append(weather_details)
+        if whats_ahead:
+            parts.append("")
+            parts.append("WHAT'S AHEAD")
+            parts.append(whats_ahead)
+        full_body = "\n".join(parts)
+    else:
+        full_body = legacy_body
+
+    # ── Insert brief_history ──
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO brief_history
+                       (user_id, brief_type, delivered_at, verdict,
+                        snippet, full_body, delivery_status, channels_used,
+                        is_met_touched, met_name,
+                        predicted_high_f, predicted_low_f,
+                        predicted_precip_in, predicted_max_wind_mph)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                       RETURNING id""",
+                    (row["user_id"], row["brief_type"], now_ms, final_verdict,
+                     (bottom_line[:200] if bottom_line
+                      else (final_snippet or legacy_body[:140])),
+                     full_body, "pending", "", False, sender_name,
+                     row.get("predicted_high_f"),
+                     row.get("predicted_low_f"),
+                     row.get("predicted_precip_in"),
+                     row.get("predicted_max_wind_mph")),
+                )
+                history_id = cur.fetchone()["id"]
+    except Exception as e:
+        print(f"[autosend] history insert failed for draft={draft_id}: {e}", flush=True)
+        return (False, "history-insert-failed")
+
+    # ── Create access token for the web view ──
+    access_token = secrets.token_urlsafe(24)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO brief_access_tokens
+                       (token, history_id, subscriber_user_id, created_at_ms)
+                       VALUES (%s, %s, %s, %s)""",
+                    (access_token, history_id, row["user_id"], now_ms),
+                )
+    except Exception as e:
+        print(f"[autosend] token insert failed for draft={draft_id}: {e}", flush=True)
+        # Continue — SMS/email still ship, just no web view link
+
+    frontend_base = (os.environ.get("FRONTEND_BASE_URL")
+                     or os.environ.get("PUBLIC_BASE_URL")
+                     or "https://weathervalet.ai")
+    if frontend_base.endswith("/"):
+        frontend_base = frontend_base[:-1]
+    web_url = f"{frontend_base}/brief/{access_token}"
+
+    # ── Dispatch through configured channels ──
+    channels = [ch for ch in (row.get("channels") or "").split(",") if ch]
+    if not channels:
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """UPDATE pro_brief_drafts
+                           SET auto_send_skipped_reason = 'no-channels'
+                           WHERE id = %s""",
+                        (draft_id,),
+                    )
+        except Exception:
+            pass
+        return (False, "no-channels")
+
+    channels_used = []
+    any_success = False
+    transparency_line = "Auto-sent while your meteorologist is unavailable."
+
+    for ch in channels:
+        if ch == "sms" and row.get("sub_phone"):
+            if is_structured and bottom_line:
+                sms_intro = bottom_line[:140].rstrip()
+                if len(bottom_line) > 140:
+                    sms_intro = sms_intro.rsplit(" ", 1)[0] + "…"
+                sms_text = (
+                    f"{verdict_label} · WeatherValet\n\n"
+                    f"{sms_intro}\n\n"
+                    f"Full brief: {web_url}\n"
+                    f"— From WeatherValet ({transparency_line.lower()})"
+                )
+            else:
+                sms_text = (
+                    (final_snippet or legacy_body[:140])
+                    + f"\n\nFull: {web_url}\n— From WeatherValet ({transparency_line.lower()})"
+                )
+            try:
+                if send_sms(row["sub_phone"], sms_text):
+                    channels_used.append("sms")
+                    any_success = True
+            except Exception as e:
+                print(f"[autosend] SMS failed user={row['user_id']}: {e}", flush=True)
+
+        elif ch == "email" and row.get("sub_email"):
+            smart_label = _smart_location_label(
+                row.get("location_label") or "",
+                row.get("location_address") or "")
+            subject = f"Your WeatherValet brief, {smart_label}"
+            reply_to = _get_subscriber_reply_to_email(row["user_id"])
+            # Plain-text body with the transparency banner at the top.
+            # Email is the canonical record so we keep the full structured
+            # content; the transparency line tells the reader why no Met
+            # name appears at the bottom.
+            body_lines = [
+                f"[{transparency_line}]",
+                "",
+                f"TODAY'S CALL: {verdict_label}",
+            ]
+            if bottom_line:
+                body_lines += ["", bottom_line]
+            if weather_details:
+                body_lines += ["", "WEATHER DETAILS", weather_details]
+            if whats_ahead:
+                body_lines += ["", "WHAT'S AHEAD", whats_ahead]
+            if not is_structured and legacy_body:
+                body_lines += ["", legacy_body]
+            body_lines += [
+                "",
+                f"Full brief online: {web_url}",
+                "",
+                "— WeatherValet",
+            ]
+            email_body = "\n".join(body_lines)
+            try:
+                if _send_brief_email(row["sub_email"], subject, email_body,
+                                     html=False, reply_to=reply_to):
+                    channels_used.append("email")
+                    any_success = True
+            except Exception as e:
+                print(f"[autosend] email failed user={row['user_id']}: {e}", flush=True)
+
+    if not any_success:
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """UPDATE pro_brief_drafts
+                           SET auto_send_skipped_reason = 'all-channels-failed'
+                           WHERE id = %s""",
+                        (draft_id,),
+                    )
+                    cur.execute(
+                        """UPDATE brief_history
+                           SET delivery_status = 'failed'
+                           WHERE id = %s""",
+                        (history_id,),
+                    )
+        except Exception:
+            pass
+        return (False, "all-channels-failed")
+
+    # ── Mark success on draft + history ──
+    delivery_status = "sent"
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE pro_brief_drafts
+                       SET status = 'sent',
+                           sent_at = %s,
+                           auto_sent_at = %s,
+                           final_verdict = %s,
+                           final_body = %s,
+                           history_id = %s,
+                           sent_by_name = %s
+                       WHERE id = %s""",
+                    (now_ms, now_ms, final_verdict, full_body,
+                     history_id, sender_name, draft_id),
+                )
+                cur.execute(
+                    """UPDATE brief_history
+                       SET delivery_status = %s,
+                           channels_used = %s
+                       WHERE id = %s""",
+                    (delivery_status, ",".join(channels_used), history_id),
+                )
+    except Exception as e:
+        print(f"[autosend] final update failed for draft={draft_id}: {e}", flush=True)
+        # Don't return failure — the SMS/email already went out
+
+    print(
+        f"[autosend] draft={draft_id} sent for user={row['user_id']} "
+        f"channels={channels_used} verdict={final_verdict}",
+        flush=True,
+    )
+    return (True, "")
+
+
 @app.post("/api/v1/met/pro-briefs/<int:draft_id>/send")
 def met_pro_brief_send(draft_id):
     """Send the Met's edited brief to the subscriber. Marks status='sent',
@@ -24233,6 +24673,16 @@ def met_pro_brief_send(draft_id):
 
     if not row:
         return jsonify({"ok": False, "error": "not-found"}), 404
+    # Auto-send safety net guard (May 29, 2026): if the system already
+    # auto-sent this brief to protect the subscriber from a missed
+    # window, the Met cannot send it again. Block with 409 + the
+    # auto_sent_at timestamp so the UI can show "Auto-sent at X:XX AM".
+    if row.get("auto_sent_at"):
+        return jsonify({
+            "ok": False,
+            "error": "already-auto-sent",
+            "auto_sent_at": row["auto_sent_at"],
+        }), 409
     if row["status"] not in ("pending-review", "claimed"):
         return jsonify({"ok": False, "error": "already-sent-or-expired", "status": row["status"]}), 409
 
