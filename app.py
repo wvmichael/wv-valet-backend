@@ -33192,8 +33192,10 @@ def admin_audit_subscriber_timezones():
     Three timezone fields could disagree for the same subscriber:
       1. users.timezone — used by the brief scheduler and missed-brief
          alerts (where briefs actually fire from)
-      2. brief_preferences.daily_brief_timezone — used by the coverage
-         task generator that creates daily_brief_tasks for payroll
+      2. subscriber_coverage.daily_brief_timezone — Pro-tier only,
+         used by the coverage task generator that creates
+         daily_brief_tasks rows for payroll. Hobbyists have no row
+         here so pref_tz will be empty for them.
       3. The 'correct' timezone for their saved address (inferred from
          state code in address_text — best-effort, not authoritative)
 
@@ -33237,7 +33239,7 @@ def admin_audit_subscriber_timezones():
                           loc.address_text AS loc_address
                    FROM users u
                    LEFT JOIN brief_preferences bp ON bp.user_id = u.id
-                   LEFT JOIN subscriber_brief_schedule sc ON sc.user_id = u.id
+                   LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
                    LEFT JOIN saved_locations loc
                           ON loc.user_id = u.id AND loc.is_primary = TRUE
                    WHERE u.is_active = TRUE
@@ -33254,6 +33256,8 @@ def admin_audit_subscriber_timezones():
         user_tz = r.get("user_tz") or ""
         pref_tz = r.get("daily_brief_timezone") or ""
         addr = r.get("loc_address") or ""
+        tier = r.get("subscription_tier") or ""
+        is_pro = tier.startswith("pro_")
 
         # Extract state code from address — last token like ", IN 46052"
         state_code = ""
@@ -33266,16 +33270,19 @@ def admin_audit_subscriber_timezones():
         # Flag 1: u.timezone missing
         if not user_tz:
             flags.append("user_tz_empty")
-        # Flag 2: pref tz set AND differs from user_tz
-        if pref_tz and user_tz and pref_tz != user_tz:
+        # Flag 2: pref tz set AND differs from user_tz (Pro only — Hobbyists
+        # don't have a subscriber_coverage row by design)
+        if is_pro and pref_tz and user_tz and pref_tz != user_tz:
             flags.append("user_tz_vs_pref_tz_mismatch")
-        # Flag 3: pref tz set but user_tz missing (unusual)
-        if pref_tz and not user_tz:
-            flags.append("only_pref_tz_set")
+        # Flag 3: Pro subscriber with NO pref_tz at all — coverage row
+        # might be missing entirely
+        if is_pro and not pref_tz:
+            flags.append("pro_missing_coverage_row")
         # Flag 4: implied tz from address differs from user_tz
         if implied_tz and user_tz and implied_tz != user_tz:
-            # Detroit / Indianapolis are not strict mismatches with each other,
-            # but flagging anyway — admin should review.
+            # Indiana has tz splits, Kentucky too — flag for review,
+            # admin decides whether the address actually implies a
+            # different tz for this person.
             flags.append("user_tz_vs_address_mismatch")
         # Flag 5: tz string fails to parse (invalid IANA name)
         for label, tz_val in (("user_tz", user_tz), ("pref_tz", pref_tz)):
@@ -33289,7 +33296,7 @@ def admin_audit_subscriber_timezones():
             "user_id": r["id"],
             "name": r.get("name") or "",
             "email": r["email"],
-            "tier": r.get("subscription_tier") or "",
+            "tier": tier,
             "user_tz": user_tz,
             "pref_tz": pref_tz,
             "address": addr,
