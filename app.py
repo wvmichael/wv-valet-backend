@@ -32831,6 +32831,182 @@ def admin_generate_widget_narrative(slug: str):
     })
 
 
+@app.route("/api/v1/admin/widget-locations", methods=["OPTIONS"])
+def _admin_widget_locations_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/widget-locations")
+def admin_list_widget_locations():
+    """List all widget locations (active and inactive) for admin tooling.
+
+    Phase 5 of widget rollout (May 28, 2026). Used to verify what's
+    seeded and to feed the embed snippet generator with the canonical
+    list. Listing requires admin role since locations are partner-
+    operational data.
+    """
+    actor, err = _require_admin()
+    if err:
+        return err
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, slug, name, short_name, region, region_label,
+                          lat, lng, timezone, sort_order, is_active,
+                          created_at, updated_at
+                   FROM widget_locations
+                   ORDER BY region, sort_order, name"""
+            )
+            rows = cur.fetchall()
+    return jsonify({
+        "ok": True,
+        "locations": [dict(r) for r in rows],
+    })
+
+
+@app.post("/api/v1/admin/widget-locations")
+def admin_upsert_widget_location():
+    """Create or update a widget location.
+
+    Phase 5 (May 28, 2026). Admin-only. Idempotent on slug — if a row
+    with the same slug exists, this UPDATES it instead of creating a
+    duplicate. Lets us onboard new partner stations' towns without
+    editing seed code or redeploying.
+
+    Required body fields:
+      slug         (string, lowercase URL-safe — "colby-ks")
+      name         ("Colby, Kansas")
+      lat          (number)
+      lng          (number)
+
+    Optional:
+      short_name   (default: derived from name)
+      region       (group slug — "nw-kansas")
+      region_label ("NW Kansas")
+      timezone     (IANA tz — default America/Chicago)
+      sort_order   (int, default 100; lower = earlier in picker)
+      is_active    (bool, default true)
+    """
+    actor, err = _require_admin()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    slug = (data.get("slug") or "").strip().lower()
+    name = (data.get("name") or "").strip()
+    try:
+        lat = float(data.get("lat"))
+        lng = float(data.get("lng"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "lat-lng-required"}), 400
+
+    if not slug or not name:
+        return jsonify({"ok": False, "error": "slug-and-name-required"}), 400
+    # Slug validation: lowercase letters, digits, hyphens only
+    if not re.match(r'^[a-z0-9][a-z0-9\-]*[a-z0-9]$', slug):
+        return jsonify({
+            "ok": False,
+            "error": "slug-invalid",
+            "hint": "Slug must be lowercase letters/digits/hyphens only (e.g., 'colby-ks').",
+        }), 400
+
+    short_name = (data.get("short_name") or "").strip() or name.split(",")[0].strip()
+    region = (data.get("region") or "").strip().lower() or None
+    region_label = (data.get("region_label") or "").strip() or None
+    timezone_str = (data.get("timezone") or "America/Chicago").strip()
+    try:
+        sort_order = int(data.get("sort_order") or 100)
+    except Exception:
+        sort_order = 100
+    is_active = bool(data.get("is_active", True))
+
+    # Validate timezone string
+    try:
+        ZoneInfo(timezone_str)
+    except Exception:
+        return jsonify({"ok": False, "error": "timezone-invalid",
+                        "hint": "Use IANA tz like 'America/Chicago'."}), 400
+
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO widget_locations
+                     (slug, name, short_name, region, region_label,
+                      lat, lng, timezone, sort_order, is_active,
+                      created_at, updated_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (slug) DO UPDATE SET
+                     name = EXCLUDED.name,
+                     short_name = EXCLUDED.short_name,
+                     region = EXCLUDED.region,
+                     region_label = EXCLUDED.region_label,
+                     lat = EXCLUDED.lat,
+                     lng = EXCLUDED.lng,
+                     timezone = EXCLUDED.timezone,
+                     sort_order = EXCLUDED.sort_order,
+                     is_active = EXCLUDED.is_active,
+                     updated_at = EXCLUDED.updated_at
+                   RETURNING id, (xmax = 0) AS was_created""",
+                (slug, name, short_name, region, region_label,
+                 lat, lng, timezone_str, sort_order, is_active,
+                 now_ms, now_ms),
+            )
+            row = cur.fetchone()
+    print(f"[widget-admin] {'created' if row['was_created'] else 'updated'} "
+          f"location {slug} (by admin={actor['id']})", flush=True)
+    return jsonify({
+        "ok": True,
+        "id": row["id"],
+        "slug": slug,
+        "was_created": bool(row["was_created"]),
+    })
+
+
+@app.route("/api/v1/widget/locations-public", methods=["OPTIONS"])
+def _widget_locations_public_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/widget/locations-public")
+def widget_locations_public():
+    """List all active widget locations grouped by region.
+
+    PUBLIC endpoint (no auth) — used by the /embed page snippet
+    generator to populate the location/region dropdowns. Returns
+    only active locations and only fields needed for picking +
+    display. Sensitive internal fields (created_at, etc.) excluded.
+    """
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT slug, name, short_name, region, region_label
+                   FROM widget_locations
+                   WHERE is_active = TRUE
+                   ORDER BY region, sort_order, name"""
+            )
+            rows = cur.fetchall()
+    # Group by region for easier UI rendering
+    by_region: dict = {}
+    for r in rows:
+        region = r.get("region") or "other"
+        if region not in by_region:
+            by_region[region] = {
+                "region": region,
+                "region_label": r.get("region_label") or region.replace("-", " ").title(),
+                "locations": [],
+            }
+        by_region[region]["locations"].append({
+            "slug": r["slug"],
+            "name": r["name"],
+            "short_name": r.get("short_name") or r["name"].split(",")[0].strip(),
+        })
+    return jsonify({
+        "ok": True,
+        "regions": list(by_region.values()),
+    })
+
+
 @app.post("/api/v1/admin/preview-accuracy-email/<grade_date>")
 @app.get("/api/v1/admin/preview-accuracy-email/<grade_date>")
 def admin_preview_accuracy_email(grade_date: str):
