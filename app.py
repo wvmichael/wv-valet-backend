@@ -33183,6 +33183,133 @@ def admin_inspect_drafts():
     })
 
 
+@app.get("/api/v1/admin/audit-subscriber-timezones")
+def admin_audit_subscriber_timezones():
+    """Audit subscriber timezone settings to spot inconsistencies.
+
+    Added May 29, 2026 as part of the timezone correctness sweep.
+
+    Three timezone fields could disagree for the same subscriber:
+      1. users.timezone — used by the brief scheduler and missed-brief
+         alerts (where briefs actually fire from)
+      2. brief_preferences.daily_brief_timezone — used by the coverage
+         task generator that creates daily_brief_tasks for payroll
+      3. The 'correct' timezone for their saved address (inferred from
+         state code in address_text — best-effort, not authoritative)
+
+    Returns per-subscriber rows showing all three plus a 'flags' array
+    listing any divergence. Empty flags = clean. Read-only.
+    """
+    actor, err = _require_admin()
+    if err:
+        return err
+
+    # Rough state-to-default-tz mapping. NOT comprehensive (Indiana has
+    # tz splits, Kentucky too, etc.) but catches obvious mismatches.
+    STATE_DEFAULT_TZ = {
+        "AL": "America/Chicago", "AK": "America/Anchorage", "AZ": "America/Phoenix",
+        "AR": "America/Chicago", "CA": "America/Los_Angeles", "CO": "America/Denver",
+        "CT": "America/New_York", "DE": "America/New_York", "FL": "America/New_York",
+        "GA": "America/New_York", "HI": "Pacific/Honolulu", "ID": "America/Boise",
+        "IL": "America/Chicago", "IN": "America/Indiana/Indianapolis",
+        "IA": "America/Chicago", "KS": "America/Chicago", "KY": "America/New_York",
+        "LA": "America/Chicago", "ME": "America/New_York", "MD": "America/New_York",
+        "MA": "America/New_York", "MI": "America/Detroit", "MN": "America/Chicago",
+        "MS": "America/Chicago", "MO": "America/Chicago", "MT": "America/Denver",
+        "NE": "America/Chicago", "NV": "America/Los_Angeles", "NH": "America/New_York",
+        "NJ": "America/New_York", "NM": "America/Denver", "NY": "America/New_York",
+        "NC": "America/New_York", "ND": "America/Chicago", "OH": "America/New_York",
+        "OK": "America/Chicago", "OR": "America/Los_Angeles", "PA": "America/New_York",
+        "RI": "America/New_York", "SC": "America/New_York", "SD": "America/Chicago",
+        "TN": "America/Chicago", "TX": "America/Chicago", "UT": "America/Denver",
+        "VT": "America/New_York", "VA": "America/New_York", "WA": "America/Los_Angeles",
+        "WV": "America/New_York", "WI": "America/Chicago", "WY": "America/Denver",
+        "DC": "America/New_York",
+    }
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.name, u.email, u.timezone AS user_tz,
+                          u.subscription_tier,
+                          bp.morning_window_start, bp.morning_window_end,
+                          sc.daily_brief_time, sc.daily_brief_timezone,
+                          loc.address_text AS loc_address
+                   FROM users u
+                   LEFT JOIN brief_preferences bp ON bp.user_id = u.id
+                   LEFT JOIN subscriber_brief_schedule sc ON sc.user_id = u.id
+                   LEFT JOIN saved_locations loc
+                          ON loc.user_id = u.id AND loc.is_primary = TRUE
+                   WHERE u.is_active = TRUE
+                     AND EXISTS (
+                       SELECT 1 FROM user_roles ur
+                       WHERE ur.user_id = u.id AND ur.role = 'subscriber'
+                     )
+                   ORDER BY u.id"""
+            )
+            rows = cur.fetchall()
+
+    out = []
+    for r in rows:
+        user_tz = r.get("user_tz") or ""
+        pref_tz = r.get("daily_brief_timezone") or ""
+        addr = r.get("loc_address") or ""
+
+        # Extract state code from address — last token like ", IN 46052"
+        state_code = ""
+        m = re.search(r',\s*([A-Z]{2})\s+\d{5}', addr or "")
+        if m:
+            state_code = m.group(1)
+        implied_tz = STATE_DEFAULT_TZ.get(state_code, "")
+
+        flags = []
+        # Flag 1: u.timezone missing
+        if not user_tz:
+            flags.append("user_tz_empty")
+        # Flag 2: pref tz set AND differs from user_tz
+        if pref_tz and user_tz and pref_tz != user_tz:
+            flags.append("user_tz_vs_pref_tz_mismatch")
+        # Flag 3: pref tz set but user_tz missing (unusual)
+        if pref_tz and not user_tz:
+            flags.append("only_pref_tz_set")
+        # Flag 4: implied tz from address differs from user_tz
+        if implied_tz and user_tz and implied_tz != user_tz:
+            # Detroit / Indianapolis are not strict mismatches with each other,
+            # but flagging anyway — admin should review.
+            flags.append("user_tz_vs_address_mismatch")
+        # Flag 5: tz string fails to parse (invalid IANA name)
+        for label, tz_val in (("user_tz", user_tz), ("pref_tz", pref_tz)):
+            if tz_val:
+                try:
+                    ZoneInfo(tz_val)
+                except Exception:
+                    flags.append(f"{label}_invalid")
+
+        out.append({
+            "user_id": r["id"],
+            "name": r.get("name") or "",
+            "email": r["email"],
+            "tier": r.get("subscription_tier") or "",
+            "user_tz": user_tz,
+            "pref_tz": pref_tz,
+            "address": addr,
+            "state_code": state_code,
+            "implied_tz_from_state": implied_tz,
+            "morning_window_start": r.get("morning_window_start") or "",
+            "morning_window_end": r.get("morning_window_end") or "",
+            "daily_brief_time": r.get("daily_brief_time") or "",
+            "flags": flags,
+        })
+
+    flagged = [s for s in out if s["flags"]]
+    return jsonify({
+        "ok": True,
+        "total_subscribers": len(out),
+        "flagged_count": len(flagged),
+        "rows": out,
+    })
+
+
 @app.route("/api/v1/admin/widget-narrative/generate/<slug>", methods=["OPTIONS"])
 def _admin_widget_narr_generate_preflight(slug):
     return ("", 204)
