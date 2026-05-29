@@ -5743,6 +5743,10 @@ def widget_get_forecast(slug: str):
         # met_touched indicates whether a Met actually edited the AI
         # draft (vs. just publishing the AI version as-is).
         "met_narrative": _widget_active_narrative(loc["id"]),
+        # Phase 4 (May 28, 2026): active NWS alerts for this location.
+        # Ordered by severity, filtered to outdoor-safety-relevant events.
+        # Empty list when nothing is active. 2-minute cache TTL.
+        "alerts": _fetch_widget_alerts(loc["lat"], loc["lng"]),
         "data_source": "open-meteo",
         "generated_at_ms": int(time.time() * 1000),
     })
@@ -16497,6 +16501,129 @@ def _fetch_forecast_7day(lat: float, lng: float) -> Optional[dict]:
             print(f"[widget-forecast] serving stale cache for ({lat},{lng})", flush=True)
             return cached[1]
         return None
+
+
+# ── Widget alert cache (May 28, 2026, Phase 4) ──
+# Active NWS alerts cache. Separate from the forecast cache (10 min)
+# because severe weather requires FRESH data — a Tornado Warning issued
+# at 2:31 PM cannot wait until 2:41 PM to appear on the widget.
+# 2-minute TTL is the compromise: NWS pushes new alert states every ~1
+# minute, so 2 minutes is "close enough to real-time" without hammering
+# api.weather.gov when an embed gets high traffic during a storm.
+_WIDGET_ALERTS_CACHE: dict[tuple[float, float], tuple[int, list]] = {}
+WIDGET_ALERTS_TTL_SECONDS = 120  # 2 minutes
+
+# Curated list of NWS alert event types the widget surfaces.
+# These are the ones that matter for outdoor safety in the Plains/
+# Midwest market we're starting with. Marine/coastal/tsunami events
+# are intentionally excluded (irrelevant to landlocked stations).
+# Add more types here as we expand to other regions.
+WIDGET_SURFACED_EVENTS = frozenset({
+    # Severe convective
+    "Tornado Warning", "Tornado Watch",
+    "Severe Thunderstorm Warning", "Severe Thunderstorm Watch",
+    # Flooding
+    "Flash Flood Warning", "Flash Flood Watch",
+    "Flood Warning", "Flood Watch", "Flood Advisory",
+    # Winter
+    "Winter Storm Warning", "Winter Storm Watch",
+    "Blizzard Warning", "Blizzard Watch",
+    "Ice Storm Warning",
+    "Winter Weather Advisory",
+    # Wind / heat / fire / fog / cold
+    "High Wind Warning", "High Wind Watch",
+    "Wind Advisory",
+    "Extreme Heat Warning", "Extreme Heat Watch",
+    "Heat Advisory",
+    "Red Flag Warning", "Fire Weather Watch",
+    "Dense Fog Advisory",
+    "Freeze Warning", "Freeze Watch", "Frost Advisory",
+    # Special
+    "Special Weather Statement",
+})
+
+
+def _fetch_widget_alerts(lat: float, lng: float) -> list:
+    """Fetch currently-active NWS alerts for a widget location.
+
+    Returns a list of alert dicts ordered by severity (Extreme/Severe
+    first), filtered to the curated WIDGET_SURFACED_EVENTS set.
+    Cached for 2 minutes per (lat,lng).
+
+    Each alert dict shape:
+      {
+        id, event, severity, urgency, certainty,
+        headline, description,
+        effective_iso, expires_iso, ends_iso,
+        sender_name
+      }
+
+    Returns [] on any failure — the widget will show a forecast with
+    no alert banner, which is the safe default. We don't surface
+    fetch errors to the public widget.
+    """
+    cache_key = (round(lat, 4), round(lng, 4))
+    now_ms = int(time.time() * 1000)
+    cached = _WIDGET_ALERTS_CACHE.get(cache_key)
+    if cached and (now_ms - cached[0]) < (WIDGET_ALERTS_TTL_SECONDS * 1000):
+        return cached[1]
+    try:
+        lat_s = f"{float(lat):.4f}"
+        lng_s = f"{float(lng):.4f}"
+        url = (
+            "https://api.weather.gov/alerts/active"
+            f"?point={lat_s},{lng_s}"
+        )
+        headers = {
+            "User-Agent": "WeatherValet (michael@weathervalet.com)",
+            "Accept": "application/geo+json",
+        }
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        features = data.get("features") or []
+        out = []
+        for f in features:
+            props = f.get("properties") or {}
+            event = (props.get("event") or "").strip()
+            if event not in WIDGET_SURFACED_EVENTS:
+                continue
+            out.append({
+                "id": props.get("id") or "",
+                "event": event,
+                "severity": props.get("severity") or "",
+                "urgency": props.get("urgency") or "",
+                "certainty": props.get("certainty") or "",
+                "headline": (props.get("headline") or "").strip(),
+                "description": (props.get("description") or "").strip(),
+                "effective_iso": props.get("effective") or "",
+                "expires_iso": props.get("expires") or "",
+                "ends_iso": props.get("ends") or "",
+                "sender_name": props.get("senderName") or "",
+            })
+        # Sort by severity rank — Extreme > Severe > Moderate > Minor > Unknown.
+        # Then by event-name severity (Warnings outrank Watches, etc.) as
+        # a secondary sort. Most urgent alert appears first in the banner.
+        sev_rank = {"Extreme": 0, "Severe": 1, "Moderate": 2, "Minor": 3, "Unknown": 4}
+        def _event_rank(ev: str) -> int:
+            ev_lower = ev.lower()
+            if "warning" in ev_lower: return 0
+            if "watch" in ev_lower: return 1
+            if "advisory" in ev_lower: return 2
+            if "statement" in ev_lower: return 3
+            return 4
+        out.sort(key=lambda a: (sev_rank.get(a["severity"], 5),
+                                _event_rank(a["event"]),
+                                a["effective_iso"]))
+        _WIDGET_ALERTS_CACHE[cache_key] = (now_ms, out)
+        return out
+    except Exception as e:
+        print(f"[widget-alerts] fetch failed for ({lat},{lng}): {e!r}", flush=True)
+        # On failure, fall back to whatever's in the cache even if stale.
+        # Better to show 3-min-old alert data than no alerts during a storm.
+        if cached:
+            return cached[1]
+        return []
 
 
 def _generate_widget_narrative(location_name: str, forecast: dict) -> str:
