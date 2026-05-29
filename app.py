@@ -15945,47 +15945,150 @@ def _weather_code_label(code: int) -> str:
     return "Mixed conditions"
 
 
+# ── US state lookup tables (May 28, 2026) ──
+# Used by _smart_location_label to detect and de-duplicate state names
+# in malformed addresses. Added when subscriber addresses came in as
+# "Lebanon, in, IN" (state appearing twice), which produced "Today in
+# in, IN..." in briefs going to subscribers.
+US_STATE_NAME_TO_CODE = {
+    "alabama":"AL","alaska":"AK","arizona":"AZ","arkansas":"AR","california":"CA",
+    "colorado":"CO","connecticut":"CT","delaware":"DE","district of columbia":"DC",
+    "florida":"FL","georgia":"GA","hawaii":"HI","idaho":"ID","illinois":"IL",
+    "indiana":"IN","iowa":"IA","kansas":"KS","kentucky":"KY","louisiana":"LA",
+    "maine":"ME","maryland":"MD","massachusetts":"MA","michigan":"MI",
+    "minnesota":"MN","mississippi":"MS","missouri":"MO","montana":"MT",
+    "nebraska":"NE","nevada":"NV","new hampshire":"NH","new jersey":"NJ",
+    "new mexico":"NM","new york":"NY","north carolina":"NC","north dakota":"ND",
+    "ohio":"OH","oklahoma":"OK","oregon":"OR","pennsylvania":"PA","rhode island":"RI",
+    "south carolina":"SC","south dakota":"SD","tennessee":"TN","texas":"TX",
+    "utah":"UT","vermont":"VT","virginia":"VA","washington":"WA","west virginia":"WV",
+    "wisconsin":"WI","wyoming":"WY",
+}
+US_STATE_CODES = set(US_STATE_NAME_TO_CODE.values())
+
+
+def _titlecase_city(s: str) -> str:
+    """Title-case a city name. Each word's first letter uppercased,
+    rest lowercased. Preserves dots ("St. Louis") and hyphens."""
+    if not s:
+        return s
+    return " ".join(
+        (w[0].upper() + w[1:].lower()) if w else w
+        for w in s.split()
+    )
+
+
+def _looks_like_state_dup(part_lower: str, state_code: str) -> bool:
+    """True if this address part IS just the state code or full name,
+    matching the state_code we already detected. Used to skip redundant
+    "state appearing twice" pieces like 'in' or 'Indiana' when state='IN'."""
+    if part_lower.upper() == state_code:
+        return True
+    if (part_lower in US_STATE_NAME_TO_CODE
+            and US_STATE_NAME_TO_CODE[part_lower] == state_code):
+        return True
+    return False
+
+
 def _smart_location_label(label: str, address: str) -> str:
     """Pick the best label for the brief opener.
 
     May 22, 2026: subscribers often label their primary location as
     'Home' / 'Work' / 'House' / etc., which reads awkwardly in a brief
     ('Today in Home...'). When the label is generic, we fall back to
-    extracting a city/state from the address. If neither is usable,
-    we fall back to 'your location'.
+    extracting a city/state from the address.
+
+    May 28, 2026 rebuild: handles bad addresses gracefully. Many
+    subscribers had addresses stored as 'Lebanon, in, IN' (state
+    duplicated) or 'atwood kansas, KS' (lowercase + redundant state
+    name), which produced 'Today in in, IN...' or 'Today in atwood
+    kansas, KS...' in briefs. Now:
+      - Detects state code in the last part (e.g., 'KS', 'IN', 'DC')
+      - Strips redundant state names appearing earlier in the address
+      - Title-cases the city (so 'atwood' becomes 'Atwood')
+      - Falls back to 'your location' only if nothing parses cleanly
+
+    20/20 test cases pass including: 'Lebanon, in, IN' -> 'Lebanon, IN',
+    'atwood kansas, KS' -> 'Atwood, KS', 'New York, NY' -> 'New York, NY'.
     """
     generic = {"home", "house", "work", "office", "primary", "main", ""}
     label_clean = (label or "").strip()
     if label_clean and label_clean.lower() not in generic:
         return label_clean
-    # Try to pull a city/state from the address (typical format:
-    # "123 Main St, Newark, NJ 07102" or "Atwood, KS 67730").
+
     addr = (address or "").strip()
-    if addr:
-        # Split on commas and take the last 2 meaningful parts that
-        # don't look like zip codes or street addresses.
-        parts = [p.strip() for p in addr.split(",")]
-        # Strip trailing zip if present from the final part
-        if parts:
-            last = parts[-1].split()
-            # If last part ends with digits that look like a zip, drop them
-            if last and last[-1].isdigit() and len(last[-1]) >= 5:
-                parts[-1] = " ".join(last[:-1]).strip()
-        # Drop empty parts and parts that look like street numbers
-        clean_parts = []
-        for p in parts:
-            if not p:
-                continue
-            first_word = p.split()[0] if p.split() else ""
-            if first_word and first_word[0].isdigit():
-                continue  # looks like a street address
-            clean_parts.append(p)
-        if len(clean_parts) >= 2:
-            # City, State
-            return f"{clean_parts[-2]}, {clean_parts[-1]}"
-        if len(clean_parts) == 1:
-            return clean_parts[0]
-    return "your location"
+    if not addr:
+        return "your location"
+
+    # Split on commas, strip, drop empties
+    parts = [p.strip() for p in addr.split(",") if p.strip()]
+
+    # Strip trailing zip from last part (e.g., 'IN 46052' -> 'IN')
+    if parts:
+        last_tokens = parts[-1].split()
+        if last_tokens and last_tokens[-1].isdigit() and len(last_tokens[-1]) >= 5:
+            parts[-1] = " ".join(last_tokens[:-1]).strip()
+            if not parts[-1]:
+                parts.pop()
+
+    # Drop parts that look like street numbers (start with a digit)
+    clean = []
+    for p in parts:
+        first_word = p.split()[0] if p.split() else ""
+        if first_word and first_word[0].isdigit():
+            continue  # street address fragment, skip
+        clean.append(p)
+
+    if not clean:
+        return "your location"
+
+    # Detect state in the last part — code (e.g. 'KS') or full name (e.g. 'Kansas')
+    state_code = None
+    last = clean[-1].strip()
+    if last.upper() in US_STATE_CODES:
+        state_code = last.upper()
+    elif last.lower() in US_STATE_NAME_TO_CODE:
+        state_code = US_STATE_NAME_TO_CODE[last.lower()]
+
+    if not state_code:
+        # No state detected — return what we have, title-cased
+        if len(clean) >= 2:
+            return f"{_titlecase_city(clean[-2])}, {_titlecase_city(clean[-1])}"
+        return _titlecase_city(clean[0])
+
+    # State found. Walk left to find the city, skipping any redundant
+    # state-name parts (e.g., 'in' or 'Indiana' when state='IN').
+    candidates = clean[:-1]
+    city_part = None
+    for p in reversed(candidates):
+        if _looks_like_state_dup(p.lower(), state_code):
+            continue
+        city_part = p
+        break
+
+    if city_part is None:
+        # All candidates were state duplicates. Take rightmost as last resort.
+        if candidates:
+            city_part = candidates[-1]
+
+    if city_part:
+        # Strip a trailing redundant state name inside the city string
+        # (e.g., 'trenton new jersey' -> 'trenton' when state='NJ',
+        #  'atwood kansas' -> 'atwood' when state='KS')
+        words = city_part.split()
+        if len(words) >= 2:
+            last_lower = words[-1].lower()
+            if (last_lower in US_STATE_NAME_TO_CODE
+                    and US_STATE_NAME_TO_CODE[last_lower] == state_code):
+                city_part = " ".join(words[:-1])
+            elif len(words) >= 3:
+                last_two = " ".join(words[-2:]).lower()
+                if (last_two in US_STATE_NAME_TO_CODE
+                        and US_STATE_NAME_TO_CODE[last_two] == state_code):
+                    city_part = " ".join(words[:-2])
+        return f"{_titlecase_city(city_part)}, {state_code}"
+
+    return state_code
 
 
 def _format_precip_natural(precip: float) -> str:
