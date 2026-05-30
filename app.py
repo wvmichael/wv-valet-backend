@@ -7357,6 +7357,83 @@ def meteorologist_view(claim_token: str):
                                   sla_minutes=SLA_MINUTES, now=now_ts())
 
 
+# Map the workspace verdict KEY to a human word for the customer SMS.
+# The Met workspace composer submits one of these three keys via the
+# active [data-verdict] button; the legacy HTML claim form submits a
+# free-text sentence instead (handled separately below).
+_VERDICT_WORD = {"clear": "Clear", "caution": "Caution", "risk": "Risk"}
+
+
+def _extract_brief_section(notes: str, label: str) -> str:
+    """Pull one labeled section out of the workspace notes block.
+
+    The workspace composer builds `notes` as labeled chunks joined by
+    blank lines, e.g.:
+
+        REASON
+        <text>
+
+        WATCH FOR
+        <text>
+
+        BOTTOM LINE
+        <text>
+
+    Returns the body text under `label` (without the label line), or ""
+    if that section isn't present. Matching is case-insensitive and the
+    label must be on its own line.
+    """
+    if not notes:
+        return ""
+    blocks = re.split(r"\n\s*\n", notes.strip())
+    target = label.strip().upper()
+    for block in blocks:
+        lines = block.split("\n", 1)
+        head = lines[0].strip().upper()
+        if head == target:
+            return lines[1].strip() if len(lines) > 1 else ""
+    return ""
+
+
+def _compose_review_sms_lead(verdict: str, notes: str, limit: int = 140) -> str:
+    """Build the lead sentence of the customer 'verdict ready' SMS.
+
+    Two completion paths feed this:
+      1. Met workspace — `verdict` is a key ('clear'|'caution'|'risk')
+         and the customer-facing prose lives in `notes` under labeled
+         sections. We lead with the verdict WORD + the BOTTOM LINE, e.g.
+         "Caution — Hold the 2pm pour; window reopens after 4." If the
+         Met left BOTTOM LINE blank we fall back to REASON, then to the
+         verdict word alone.
+      2. Legacy HTML claim form — `verdict` is already a free-text
+         sentence (no notes structure). We use it as-is, since it's
+         prose, not a key.
+
+    The result is truncated to `limit` chars so the whole SMS stays
+    compact (the link + thank-you tail is appended by the caller).
+    """
+    v = (verdict or "").strip()
+    word = _VERDICT_WORD.get(v.lower())
+
+    if word:
+        # Workspace path — v is a known key; build word + bottom line.
+        body = (_extract_brief_section(notes, "BOTTOM LINE")
+                or _extract_brief_section(notes, "REASON"))
+        if body:
+            # Collapse internal newlines so the SMS reads as one line.
+            body = " ".join(body.split())
+            lead = f"{word} — {body}"
+        else:
+            lead = word
+    else:
+        # Legacy path — v is already a sentence (or empty). Use as-is.
+        lead = " ".join(v.split()) if v else "Your brief is ready."
+
+    if len(lead) > limit:
+        lead = lead[: limit - 1].rstrip() + "…"
+    return lead
+
+
 @app.post("/meteorologist/<claim_token>/complete")
 def meteorologist_complete(claim_token: str):
     """Meteorologist submits their verdict. We mark completed and SMS customer.
@@ -7433,9 +7510,12 @@ def meteorologist_complete(claim_token: str):
 
     # Customer SMS — verdict ready. We link to the customer review page
     # which shows the verdict + a "thank your meteorologist" tip button.
+    # Lead with a readable line (verdict word + bottom line) instead of
+    # the raw verdict key the workspace submits. See _compose_review_sms_lead.
+    sms_lead = _compose_review_sms_lead(verdict, notes)
     customer_msg = (
         f"WeatherValet: Your meteorologist's call is ready. "
-        f"{verdict[:120]}{'…' if len(verdict) > 120 else ''} "
+        f"{sms_lead} "
         f"View full brief + thank {completed_by_name}: "
         f"{FRONTEND_BASE_URL}/?review={customer_review_token}"
     )
