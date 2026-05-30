@@ -5389,6 +5389,47 @@ def auth_session():
     }), 200
 
 
+# ── /api/v1/me — current-user shim ──
+# The crew workspace's state detection (and the crew invitation gate)
+# call /api/v1/me to learn who's logged in and their roles. There was no
+# such route, so every load 404'd and the map fell back to a default
+# center. This returns the same user shape as /auth/session, but with
+# `roles` INSIDE the user object (the callers read me.user.roles), and a
+# clean 200 {"ok": false} when signed out so the console isn't noisy.
+@app.route("/api/v1/me", methods=["OPTIONS"])
+def _me_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me")
+def api_me():
+    """Who am I? Used by the crew workspace + invitation gate.
+
+    Returns:
+        200 {"ok": true, "user": {id, email, name, roles, ...}, "workspaces": [...]}
+        200 {"ok": false}  when not signed in (intentionally not 401 — the
+                            callers branch on me.ok and a 401 spams the
+                            console with a failed-resource error)
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False}), 200
+
+    workspaces = _roles_to_workspaces(user["roles"])
+    return jsonify({
+        "ok": True,
+        "user": {
+            "id": user["id"],
+            "email": user["email"],
+            "name": user["name"],
+            "roles": user.get("roles", []),
+            "subscription_tier": user.get("subscription_tier"),
+        },
+        "workspaces": workspaces,
+        "must_set_password": user.get("must_set_password", False),
+    }), 200
+
+
 # ── Logout — destroys the current session ──
 @app.post("/api/v1/auth/logout")
 def auth_logout():
