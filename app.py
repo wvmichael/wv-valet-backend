@@ -14978,6 +14978,77 @@ def me_threshold_alerts_delete(alert_id):
 # frontend's "Look up" button can show the resolved location before the
 # user commits to saving it.
 
+# US state names -> 2-letter abbreviation, used by the geocode confidence
+# check below.
+_US_STATES = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+    "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID",
+    "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS",
+    "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN",
+    "mississippi": "MS", "missouri": "MO", "montana": "MT", "nebraska": "NE",
+    "nevada": "NV", "new hampshire": "NH", "new jersey": "NJ",
+    "new mexico": "NM", "new york": "NY", "north carolina": "NC",
+    "north dakota": "ND", "ohio": "OH", "oklahoma": "OK", "oregon": "OR",
+    "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+    "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT",
+    "vermont": "VT", "virginia": "VA", "washington": "WA",
+    "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
+}
+_US_ABBREV_TO_STATE = {v: k for k, v in _US_STATES.items()}
+
+
+def _geocode_looks_confident(query, geo):
+    """Heuristic: does a geocode result plausibly match what the user typed?
+
+    Built to catch the failure where a bare, ambiguous word matches a tiny
+    same-named town in the wrong state (the classic case: "Nebraska"
+    geocoding to Nebraska, Indiana instead of the state).
+
+    Returns (ok, reason). ok=False means do not trust the result enough to
+    auto-write coordinates; leave the member un-located so an admin can
+    confirm, which is safer than placing them in the wrong state.
+    """
+    if not geo:
+        return False, "no-result"
+    q = (query or "").strip().lower()
+    if not q:
+        return False, "empty-query"
+    result_state = (geo.get("admin1") or "").strip().lower()  # admin1 = state
+
+    tokens = [t for t in q.replace(",", " ").split() if t]
+
+    # Case 1: the input is nothing but a bare US state name (e.g.
+    # "nebraska"). They mean the state. If the result's state is a
+    # different state, we matched a town, not the state.
+    if q in _US_STATES:
+        if result_state == q:
+            return True, "ok-state"
+        return False, "bare-state-name-matched-town"
+
+    # Case 2: the input names a state somewhere (whole-word full name, or
+    # a trailing 2-letter code like "Thomas County KS"). That state must
+    # match the result's state.
+    typed_states = set()
+    padded_q = " " + q + " "
+    for name in _US_STATES:
+        if (" " + name + " ") in padded_q:
+            typed_states.add(name)
+    if tokens:
+        last = tokens[-1]
+        if len(last) == 2 and last.upper() in _US_ABBREV_TO_STATE:
+            typed_states.add(_US_ABBREV_TO_STATE[last.upper()])
+    if typed_states:
+        if result_state in typed_states:
+            return True, "ok-state-match"
+        return False, "state-mismatch"
+
+    # Case 3: no state signal and not a bare state name. We cannot verify
+    # the state, so accept but flag it for the logs.
+    return True, "unverified-no-state-signal"
+
+
 def _geocode_address(query: str) -> Optional[dict]:
     """Look up a free-form address string. Two-stage:
 
@@ -20705,25 +20776,36 @@ def crew_apply_submit():
                     try:
                         geo = _geocode_address(county)
                         if geo and geo.get("lat") is not None and geo.get("lng") is not None:
-                            geo_label = geo.get("name") or county
-                            if geo.get("admin1") and ", " not in geo_label:
-                                geo_label += ", " + geo["admin1"]
-                            with conn.cursor() as cur:
-                                cur.execute(
-                                    """UPDATE users
-                                       SET crew_home_lat = %s,
-                                           crew_home_lng = %s,
-                                           crew_home_label = COALESCE(NULLIF(crew_home_label, ''), %s)
-                                       WHERE id = %s
-                                         AND (crew_home_lat IS NULL OR crew_home_lng IS NULL)""",
-                                    (float(geo["lat"]), float(geo["lng"]),
-                                     geo_label, applicant_user_id),
-                                )
+                            conf_ok, conf_reason = _geocode_looks_confident(county, geo)
+                            if not conf_ok:
                                 print(
-                                    f"[crew-apply] geocoded county={county!r} → "
-                                    f"({geo['lat']}, {geo['lng']}) for user_id={applicant_user_id}",
+                                    f"[crew-apply] LOW-CONFIDENCE geocode for county={county!r} "
+                                    f"-> name={geo.get('name')!r} state={geo.get('admin1')!r} "
+                                    f"(reason={conf_reason}); skipping auto-write so user_id="
+                                    f"{applicant_user_id} is not placed in the wrong spot. An admin "
+                                    f"can set it via /api/v1/admin/crew/<id>/geocode-home.",
                                     flush=True,
                                 )
+                            else:
+                                geo_label = geo.get("name") or county
+                                if geo.get("admin1") and ", " not in geo_label:
+                                    geo_label += ", " + geo["admin1"]
+                                with conn.cursor() as cur:
+                                    cur.execute(
+                                        """UPDATE users
+                                           SET crew_home_lat = %s,
+                                               crew_home_lng = %s,
+                                               crew_home_label = COALESCE(NULLIF(crew_home_label, ''), %s)
+                                           WHERE id = %s
+                                             AND (crew_home_lat IS NULL OR crew_home_lng IS NULL)""",
+                                        (float(geo["lat"]), float(geo["lng"]),
+                                         geo_label, applicant_user_id),
+                                    )
+                                    print(
+                                        f"[crew-apply] geocoded county={county!r} → "
+                                        f"({geo['lat']}, {geo['lng']}) for user_id={applicant_user_id}",
+                                        flush=True,
+                                    )
                         else:
                             print(
                                 f"[crew-apply] geocode returned nothing for county={county!r} "
@@ -21228,8 +21310,12 @@ def _local_date_key(user_tz: str = "America/Indianapolis") -> str:
 
 
 def _compute_streak(user_id: int) -> int:
-    """How many consecutive days has the user checked in (inclusive of today)?
-    Looks back 90 days max for sanity. Stops counting on first missed day.
+    """How many consecutive days has the user checked in, counting today
+    (or yesterday if they have not checked in yet today)? Looks back 90
+    days max. A missed day ends the streak.
+
+    Uses the same local date basis as _local_date_key() so the count does
+    not drift against the server's UTC clock near midnight.
     """
     with db() as conn:
         with conn.cursor() as cur:
@@ -21242,21 +21328,40 @@ def _compute_streak(user_id: int) -> int:
             rows = cur.fetchall()
     if not rows:
         return 0
-    # Compute consecutive day count
-    streak = 0
-    today = datetime.utcnow().date()
-    # Try today first, then walk backward
-    for i, r in enumerate(rows):
+
+    # Parse stored YYYY-MM-DD keys into a set of dates.
+    days = set()
+    for r in rows:
         try:
-            d = datetime.strptime(r["date_key"], "%Y-%m-%d").date()
+            days.add(datetime.strptime(r["date_key"], "%Y-%m-%d").date())
         except Exception:
             continue
-        expected = today - timedelta(days=i)
-        # Allow up to 1 day skew for timezone differences
-        if abs((d - expected).days) <= 1:
-            streak += 1
-        else:
-            break
+    if not days:
+        return 0
+
+    # "Today" on the same local clock the check-in writer uses, so the
+    # count does not drift against the server's UTC clock near midnight.
+    try:
+        today = datetime.strptime(_local_date_key(), "%Y-%m-%d").date()
+    except Exception:
+        today = datetime.utcnow().date()
+
+    # The streak is alive if they checked in today, or if their last
+    # check-in was yesterday and they simply have not checked in yet
+    # today. Anchor on whichever applies.
+    if today in days:
+        cursor_day = today
+    elif (today - timedelta(days=1)) in days:
+        cursor_day = today - timedelta(days=1)
+    else:
+        return 0
+
+    # Walk backward one day at a time while each day is present. A gap
+    # ends the streak.
+    streak = 0
+    while cursor_day in days:
+        streak += 1
+        cursor_day = cursor_day - timedelta(days=1)
     return streak
 
 
