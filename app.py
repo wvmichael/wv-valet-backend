@@ -16421,6 +16421,24 @@ def _me_profile_preflight():
     return ("", 204)
 
 
+@app.route("/api/v1/me", methods=["OPTIONS"])
+def _me_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me")
+def me_get():
+    """Return the current signed-in user with their roles, or a 401 when
+    there is no valid session. The frontend calls this to decide whether
+    to show a signed-in experience (for example the Crew workspace) or the
+    signed-out invitation. Response shape matches what the frontend reads:
+    { ok: true, user: { id, email, name, roles, ... } }."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    return jsonify({"ok": True, "user": user})
+
+
 @app.get("/api/v1/me/profile")
 def me_profile_get():
     """Return the current user's basic profile (name, email, phone).
