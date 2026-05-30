@@ -24911,6 +24911,88 @@ def met_vitals():
     })
 
 
+@app.get("/api/v1/admin/audit-crew-targetability")
+def admin_audit_crew_targetability():
+    """Audit every Crew member's setup state for mission targeting.
+
+    Added May 29, 2026 to debug Chris's complaint that his 4 NW Kansas
+    Crew don't show up on the mission deploy map / audience count.
+
+    For each Crew member, shows whether they meet each requirement:
+      - role = 'crew' (always true for rows returned here)
+      - is_active = TRUE
+      - crew_active = TRUE
+      - phone is non-empty (required for SMS dispatch)
+      - crew_home_lat / crew_home_lng both set (required for polygon targeting)
+
+    Crew members missing ANY of these won't show as map pins or count
+    in polygon audience. Admin can use this to spot misconfigured Crew.
+    """
+    actor, err = _require_admin()
+    if err:
+        return err
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.name, u.email,
+                          u.is_active, u.crew_active,
+                          u.phone,
+                          u.crew_home_lat, u.crew_home_lng, u.crew_home_label
+                   FROM users u
+                   JOIN user_roles ur ON ur.user_id = u.id
+                   WHERE ur.role = 'crew'
+                   ORDER BY u.is_active DESC, u.crew_active DESC, u.name"""
+            )
+            rows = cur.fetchall()
+
+    out = []
+    for r in rows:
+        flags = []
+        if not r.get("is_active"):
+            flags.append("user_not_active")
+        if not r.get("crew_active"):
+            flags.append("crew_not_active")
+        phone = (r.get("phone") or "").strip()
+        if not phone:
+            flags.append("no_phone")
+        if r.get("crew_home_lat") is None:
+            flags.append("no_home_lat")
+        if r.get("crew_home_lng") is None:
+            flags.append("no_home_lng")
+
+        # Targetable = will receive missions
+        targetable = (
+            r.get("is_active")
+            and r.get("crew_active")
+            and phone
+            and r.get("crew_home_lat") is not None
+            and r.get("crew_home_lng") is not None
+        )
+
+        out.append({
+            "user_id": r["id"],
+            "name": r.get("name") or "",
+            "email": r["email"],
+            "is_active": bool(r.get("is_active")),
+            "crew_active": bool(r.get("crew_active")),
+            "phone_set": bool(phone),
+            "home_label": r.get("crew_home_label") or "",
+            "home_lat": float(r["crew_home_lat"]) if r.get("crew_home_lat") is not None else None,
+            "home_lng": float(r["crew_home_lng"]) if r.get("crew_home_lng") is not None else None,
+            "targetable": bool(targetable),
+            "flags": flags,
+        })
+
+    targetable_count = sum(1 for s in out if s["targetable"])
+    return jsonify({
+        "ok": True,
+        "total_crew": len(out),
+        "targetable_count": targetable_count,
+        "rows": out,
+    })
+
+
 @app.route("/api/v1/met/mission-audience-count", methods=["OPTIONS"])
 def _met_mission_audience_count_preflight():
     return ("", 204)
