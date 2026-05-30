@@ -24773,6 +24773,144 @@ def storm_shelter_on_shift_met():
     })
 
 
+@app.get("/api/v1/met/vitals")
+def met_vitals():
+    """Return today + week stats for the current Met's workspace.
+
+    Added May 29, 2026 to back the vital tiles whose fake hardcoded
+    values were removed earlier today. Each number returned is computed
+    from existing tables — no schema changes.
+
+    Time windows are in Eastern Time:
+      today  = midnight ET today → now
+      week   = midnight ET Monday → now (calendar week)
+
+    Returns:
+      vitals.reviews_today / .earned_today_cents
+      vitals.reviews_week / .earned_week_cents
+      vitals.avg_response_seconds — avg(completed_at - claimed_at) for
+        reviews completed today by this Met
+      vitals.streak_days — currently null (consecutive-shifts logic
+        is fiddly; defer until requested)
+      missions.templates_authored — count of mission_templates_user rows
+        this Met created
+      missions.deployments_week — mission_deployments fired by this Met
+        this week
+      missions.completion_rate_pct — of those deployments, % where
+        crew_responded > 0
+      missions.citations_sent — sum of crew_cited from missions THIS Met
+        fired (proxy for "citations earned through your work")
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    met_id = user["id"]
+
+    # Time boundaries in ET. We store everything as ms-since-epoch BIGINTs
+    # so DB queries use the ms values, not datetimes.
+    ET = ZoneInfo("America/New_York")
+    now_et = datetime.now(ET)
+    midnight_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+    # Monday of the current week
+    days_since_monday = now_et.weekday()  # 0=Monday
+    week_start_et = midnight_et - timedelta(days=days_since_monday)
+
+    today_start_ms = int(midnight_et.timestamp() * 1000)
+    week_start_ms = int(week_start_et.timestamp() * 1000)
+    now_ms = int(now_et.timestamp() * 1000)
+
+    # MET_REVIEW_SHARE_PCT (65%) is used everywhere else for payroll math.
+    # Match that here so vital tile earnings match the monthly payroll line.
+    try:
+        share_pct = float(MET_REVIEW_SHARE_PCT)
+    except Exception:
+        share_pct = 0.65
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            # Reviews — today
+            cur.execute(
+                """SELECT COUNT(*) AS n,
+                          COALESCE(SUM(price_cents), 0) AS total_cents,
+                          AVG(GREATEST(completed_at - claimed_at, 0)) AS avg_ms
+                   FROM verification_requests
+                   WHERE status = 'completed'
+                     AND completed_by_user_id = %s
+                     AND completed_at >= %s AND completed_at < %s
+                     AND claimed_at IS NOT NULL""",
+                (met_id, today_start_ms, now_ms),
+            )
+            today_row = cur.fetchone() or {}
+            reviews_today = today_row.get("n") or 0
+            today_total = today_row.get("total_cents") or 0
+            today_avg_ms = today_row.get("avg_ms")
+            earned_today_cents = int(today_total * share_pct)
+            avg_response_seconds = int(today_avg_ms / 1000) if today_avg_ms else None
+
+            # Reviews — week
+            cur.execute(
+                """SELECT COUNT(*) AS n,
+                          COALESCE(SUM(price_cents), 0) AS total_cents
+                   FROM verification_requests
+                   WHERE status = 'completed'
+                     AND completed_by_user_id = %s
+                     AND completed_at >= %s AND completed_at < %s""",
+                (met_id, week_start_ms, now_ms),
+            )
+            week_row = cur.fetchone() or {}
+            reviews_week = week_row.get("n") or 0
+            week_total = week_row.get("total_cents") or 0
+            earned_week_cents = int(week_total * share_pct)
+
+            # Missions — templates authored (lifetime, not time-bound)
+            cur.execute(
+                """SELECT COUNT(*) AS n FROM mission_templates_user
+                   WHERE created_by_user_id = %s""",
+                (met_id,),
+            )
+            templates_authored = (cur.fetchone() or {}).get("n") or 0
+
+            # Missions — this week deployments + completion + citations
+            cur.execute(
+                """SELECT COUNT(*) AS total,
+                          SUM(CASE WHEN crew_responded > 0 THEN 1 ELSE 0 END) AS with_response,
+                          COALESCE(SUM(crew_cited), 0) AS citations
+                   FROM mission_deployments
+                   WHERE fired_by_user_id = %s
+                     AND fired_at >= %s AND fired_at < %s""",
+                (met_id, week_start_ms, now_ms),
+            )
+            m_row = cur.fetchone() or {}
+            deployments_week = m_row.get("total") or 0
+            with_response = m_row.get("with_response") or 0
+            citations_sent = m_row.get("citations") or 0
+            if deployments_week > 0:
+                completion_rate_pct = round(100.0 * with_response / deployments_week)
+            else:
+                completion_rate_pct = None
+
+    return jsonify({
+        "ok": True,
+        "vitals": {
+            "reviews_today": reviews_today,
+            "earned_today_cents": earned_today_cents,
+            "reviews_week": reviews_week,
+            "earned_week_cents": earned_week_cents,
+            "avg_response_seconds": avg_response_seconds,
+            "streak_days": None,  # v1: not implemented
+        },
+        "missions": {
+            "templates_authored": templates_authored,
+            "deployments_week": deployments_week,
+            "completion_rate_pct": completion_rate_pct,
+            "citations_sent": citations_sent,
+        },
+    })
+
+
 @app.get("/api/v1/met/map-default-center")
 def met_map_default_center():
     """Return the best default center+zoom for this Met's map view.
