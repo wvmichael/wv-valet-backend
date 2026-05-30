@@ -2187,6 +2187,17 @@ CREATE TABLE IF NOT EXISTS crew_notification_prefs (
 -- cited by a Meteorologist is a rare, welcome moment.
 ALTER TABLE crew_notification_prefs ADD COLUMN IF NOT EXISTS notify_on_cited BOOLEAN NOT NULL DEFAULT TRUE;
 
+-- Severe-alert notification dedupe (May 30, 2026). The scheduler matches
+-- active NWS severe alerts against Crew home locations every tick (~60s).
+-- This table guarantees each Crew member is notified at most once per
+-- NWS alert, no matter how many ticks the alert stays active.
+CREATE TABLE IF NOT EXISTS crew_severe_alert_notifications (
+    nws_alert_id   TEXT    NOT NULL,
+    crew_user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    notified_at    BIGINT  NOT NULL,
+    UNIQUE (nws_alert_id, crew_user_id)
+);
+
 -- ── Pro Threads (Phase 10 — Met<>Subscriber DMs) ──
 -- One thread per subscriber, holding their conversation with the Met
 -- team. Simpler than per-topic threading: subscribers see one continuous
@@ -19730,6 +19741,90 @@ def _page_met_for_alert(alert: dict, affected: list, page_token: str) -> bool:
         return False
 
 
+def _notify_crew_in_severe_alert(alert: dict) -> None:
+    """Notify opted-in Crew whose home base falls inside a severe alert
+    polygon.
+
+    Safe to call every scheduler tick: each (alert, Crew member) pair is
+    notified at most once, enforced by crew_severe_alert_notifications.
+
+    Deliberately independent of the Met-paging path below. Crew are
+    notified whether or not a Pro subscriber is in the polygon, and
+    whether or not the Met was already paged for this alert. The per-member
+    severe-alert preference is enforced inside _notify_crew_member (it
+    defaults to ON), so we pull every located Crew member here.
+    """
+    geom = alert.get("geometry")
+    nws_id = alert.get("nws_id")
+    if not geom or not nws_id:
+        return
+    geom_str = json.dumps(geom)
+    event = alert.get("event") or "Severe weather alert"
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT u.id, u.crew_home_lat AS lat, u.crew_home_lng AS lng
+                       FROM users u
+                       WHERE u.is_active = TRUE
+                         AND u.crew_home_lat IS NOT NULL
+                         AND u.crew_home_lng IS NOT NULL
+                         AND EXISTS (
+                           SELECT 1 FROM user_roles ur
+                            WHERE ur.user_id = u.id AND ur.role = 'crew'
+                         )"""
+                )
+                rows = cur.fetchall()
+    except Exception as e:
+        print(f"[crew-severe] candidate lookup failed: {e}", flush=True)
+        return
+
+    now_ms = int(time.time() * 1000)
+    for r in rows:
+        if r["lat"] is None or r["lng"] is None:
+            continue
+        try:
+            inside = _point_in_polygon_geojson(
+                float(r["lat"]), float(r["lng"]), geom_str
+            )
+        except Exception:
+            inside = False
+        if not inside:
+            continue
+
+        # Dedupe per (alert, Crew member). ON CONFLICT DO NOTHING means a
+        # repeat tick inserts nothing, so rowcount is 0 and we skip.
+        notified_now = False
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO crew_severe_alert_notifications
+                           (nws_alert_id, crew_user_id, notified_at)
+                           VALUES (%s, %s, %s)
+                           ON CONFLICT (nws_alert_id, crew_user_id) DO NOTHING""",
+                        (nws_id, r["id"], now_ms),
+                    )
+                    notified_now = (cur.rowcount == 1)
+        except Exception as e:
+            print(f"[crew-severe] dedupe insert failed: {e}", flush=True)
+            continue
+        if not notified_now:
+            continue
+
+        subject = f"{event} in your area"
+        body = (
+            f"The National Weather Service has issued a {event} for your area. "
+            f"Please take it seriously, get to a safe place, and follow "
+            f"official guidance."
+        )
+        try:
+            _notify_crew_member(r["id"], "notify_on_severe_alert", subject, body)
+        except Exception as e:
+            print(f"[crew-severe] notify failed for user {r['id']}: {e}", flush=True)
+
+
 def _process_severe_alerts() -> None:
     """One scheduler tick: fetch alerts, match against subscribers, page Met."""
     alerts = _fetch_active_nws_alerts()
@@ -19738,6 +19833,14 @@ def _process_severe_alerts() -> None:
 
     for alert in alerts:
         nws_id = alert["nws_id"]
+
+        # Notify opted-in Crew in this alert's area. Runs independently of
+        # the Met-paging logic below (which dedupes and may skip), so Crew
+        # coverage does not depend on a Pro subscriber being in the polygon.
+        try:
+            _notify_crew_in_severe_alert(alert)
+        except Exception as e:
+            print(f"[nws-process] crew notify pass failed: {e}", flush=True)
 
         # Dedupe — have we already paged for this alert?
         try:
@@ -20705,7 +20808,8 @@ def crew_apply_submit():
         "handle": "@sarah_indy",
         "email": "sarah@example.com",
         "phone": "317-555-0123",
-        "county": "Marion County, IN",
+        "county": "Marion County",
+        "state": "Indiana",
         "mission_interests": ["storms","hail","wind"],
         "hours": "all",
         "notify": "sms"
@@ -20729,6 +20833,7 @@ def crew_apply_submit():
     phone_raw = (data.get("phone") or "").strip()
     phone = normalize_phone(phone_raw) if phone_raw else None
     county = (data.get("county") or "").strip() or None
+    state = (data.get("state") or "").strip() or None
 
     interests_list = data.get("mission_interests") or []
     if isinstance(interests_list, str):
@@ -20785,9 +20890,17 @@ def crew_apply_submit():
                 # location later via /api/v1/me/crew-location.
                 if county:
                     try:
-                        geo = _geocode_address(county)
+                        # Combine the county with the explicitly chosen state so
+                        # the geocoder cannot drift to a same-named place in
+                        # another state (e.g. "Nebraska" the small Indiana town
+                        # vs. the state of Nebraska). The confidence gate below
+                        # then checks the result against this fuller query.
+                        geo_query = county
+                        if state and state.lower() not in county.lower():
+                            geo_query = county + ", " + state
+                        geo = _geocode_address(geo_query)
                         if geo and geo.get("lat") is not None and geo.get("lng") is not None:
-                            conf_ok, conf_reason = _geocode_looks_confident(county, geo)
+                            conf_ok, conf_reason = _geocode_looks_confident(geo_query, geo)
                             if not conf_ok:
                                 print(
                                     f"[crew-apply] LOW-CONFIDENCE geocode for county={county!r} "
