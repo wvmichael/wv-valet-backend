@@ -35723,6 +35723,32 @@ def admin_grade_day(grade_date: str):
     return jsonify(result)
 
 
+@app.route("/api/v1/admin/grade-reviews-day/<grade_date>", methods=["OPTIONS"])
+def _admin_grade_reviews_day_preflight(grade_date):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/grade-reviews-day/<grade_date>")
+def admin_grade_reviews_day(grade_date: str):
+    """Manual one-shot grading for on-demand REVIEWS on a specific date
+    (Task #5). Parallel to /api/v1/admin/grade-day, which grades briefs.
+
+    Path param: YYYY-MM-DD (Eastern Time).
+    Query param: ?force=1 to delete existing review outcomes and regrade.
+
+    Same NWS-history caveat as the brief grader: alerts aren't reliably
+    available beyond a few days, so this is mostly for the last day or two.
+    """
+    actor, err = _require_admin()
+    if err:
+        return err
+    force = (request.args.get("force") or "").lower() in ("1", "true", "yes")
+    result = _run_review_grader_for_day(grade_date, force_regrade=force)
+    if not result.get("ok"):
+        return jsonify(result), 400
+    return jsonify(result)
+
+
 @app.route("/api/v1/admin/grade-backfill", methods=["OPTIONS"])
 def _admin_grade_backfill_preflight():
     return ("", 204)
