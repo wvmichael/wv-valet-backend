@@ -24911,6 +24911,96 @@ def met_vitals():
     })
 
 
+@app.route("/api/v1/met/mission-audience-count", methods=["OPTIONS"])
+def _met_mission_audience_count_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/met/mission-audience-count")
+def met_mission_audience_count():
+    """Return the live Crew count for a mission's target area.
+
+    Added May 29, 2026 to replace the static "All Crew in coverage
+    area" placeholder text on the mission deploy modal. Reuses the
+    SAME _find_crew_for_mission helper that fires use at dispatch
+    time — so the displayed count is guaranteed to match what the
+    Met will actually reach.
+
+    Body: { polygon_geojson: string|null }
+      - null / empty → counts all active Crew with valid home location
+      - GeoJSON Feature → counts Crew whose home is inside the polygon
+
+    POST not GET because polygon GeoJSON can exceed URL length limits.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    polygon = data.get("polygon_geojson")
+    if isinstance(polygon, str) and not polygon.strip():
+        polygon = None
+
+    try:
+        crew = _find_crew_for_mission(polygon)
+    except Exception as e:
+        print(f"[mission-audience-count] error: {e}", flush=True)
+        return jsonify({"ok": False, "error": "lookup-failed"}), 500
+
+    return jsonify({"ok": True, "count": len(crew)})
+
+
+@app.get("/api/v1/met/crew-locations")
+def met_crew_locations():
+    """Return active Crew home locations for the mission deploy map.
+
+    Added May 29, 2026 to fix the bug where Mets couldn't see Crew on
+    the map and were drawing polygons blind.
+
+    Returns active Crew members who have BOTH crew_home_lat AND
+    crew_home_lng set. Members without coordinates are silently skipped
+    since they can't be targeted by polygon anyway (the dispatcher
+    filters them out at fire time too).
+
+    Met/admin only — exposes home locations which shouldn't be public.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.name, u.email,
+                          u.crew_home_lat, u.crew_home_lng, u.crew_home_label
+                   FROM users u
+                   JOIN user_roles ur ON ur.user_id = u.id
+                   WHERE ur.role = 'crew'
+                     AND u.is_active = TRUE
+                     AND u.crew_active = TRUE
+                     AND u.crew_home_lat IS NOT NULL
+                     AND u.crew_home_lng IS NOT NULL"""
+            )
+            rows = cur.fetchall()
+
+    out = []
+    for r in rows:
+        out.append({
+            "user_id": r["id"],
+            "name": r.get("name") or "",
+            "lat": float(r["crew_home_lat"]),
+            "lng": float(r["crew_home_lng"]),
+            "label": r.get("crew_home_label") or "",
+        })
+    return jsonify({"ok": True, "count": len(out), "crew": out})
+
+
 @app.get("/api/v1/met/map-default-center")
 def met_map_default_center():
     """Return the best default center+zoom for this Met's map view.
