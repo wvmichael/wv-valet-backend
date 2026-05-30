@@ -2197,6 +2197,10 @@ CREATE TABLE IF NOT EXISTS crew_severe_alert_notifications (
     notified_at    BIGINT  NOT NULL,
     UNIQUE (nws_alert_id, crew_user_id)
 );
+-- All-clear (#C14): store the alert's effective expiry so we can tell the
+-- same members when it has passed, and stamp the all-clear once it is sent.
+ALTER TABLE crew_severe_alert_notifications ADD COLUMN IF NOT EXISTS alert_expires_at BIGINT;
+ALTER TABLE crew_severe_alert_notifications ADD COLUMN IF NOT EXISTS all_clear_sent_at BIGINT;
 
 -- ── Pro Threads (Phase 10 — Met<>Subscriber DMs) ──
 -- One thread per subscriber, holding their conversation with the Met
@@ -19801,10 +19805,10 @@ def _notify_crew_in_severe_alert(alert: dict) -> None:
                 with conn.cursor() as cur:
                     cur.execute(
                         """INSERT INTO crew_severe_alert_notifications
-                           (nws_alert_id, crew_user_id, notified_at)
-                           VALUES (%s, %s, %s)
+                           (nws_alert_id, crew_user_id, notified_at, alert_expires_at)
+                           VALUES (%s, %s, %s, %s)
                            ON CONFLICT (nws_alert_id, crew_user_id) DO NOTHING""",
-                        (nws_id, r["id"], now_ms),
+                        (nws_id, r["id"], now_ms, alert.get("expires_at")),
                     )
                     notified_now = (cur.rowcount == 1)
         except Exception as e:
@@ -19825,8 +19829,75 @@ def _notify_crew_in_severe_alert(alert: dict) -> None:
             print(f"[crew-severe] notify failed for user {r['id']}: {e}", flush=True)
 
 
+def _send_crew_all_clears() -> None:
+    """Relief half of severe weather (#C14): when an alert we notified Crew
+    about has passed its effective time, tell those same members the storm
+    has cleared.
+
+    Runs every tick, independent of whether anything is currently active
+    (an alert clearing is exactly when nothing is active). Each notification
+    row gets at most one all-clear, claimed atomically via all_clear_sent_at
+    so concurrent ticks cannot double-send.
+    """
+    now_ms = int(time.time() * 1000)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT nws_alert_id, crew_user_id
+                       FROM crew_severe_alert_notifications
+                       WHERE all_clear_sent_at IS NULL
+                         AND alert_expires_at IS NOT NULL
+                         AND alert_expires_at <= %s
+                       LIMIT 500""",
+                    (now_ms,),
+                )
+                rows = cur.fetchall()
+    except Exception as e:
+        print(f"[crew-allclear] lookup failed: {e!r}", flush=True)
+        return
+
+    for r in (rows or []):
+        # Claim the row first so a concurrent worker won't also send.
+        claimed = False
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """UPDATE crew_severe_alert_notifications
+                           SET all_clear_sent_at = %s
+                           WHERE nws_alert_id = %s AND crew_user_id = %s
+                             AND all_clear_sent_at IS NULL""",
+                        (now_ms, r["nws_alert_id"], r["crew_user_id"]),
+                    )
+                    claimed = (cur.rowcount == 1)
+        except Exception as e:
+            print(f"[crew-allclear] claim failed: {e!r}", flush=True)
+            continue
+        if not claimed:
+            continue
+        try:
+            _notify_crew_member(
+                r["crew_user_id"],
+                "notify_on_severe_alert",
+                "All clear in your area",
+                "The severe weather alert for your area has passed. The "
+                "National Weather Service is no longer showing it active. "
+                "Take care as conditions settle.",
+            )
+        except Exception as e:
+            print(f"[crew-allclear] notify failed for user {r['crew_user_id']}: {e!r}", flush=True)
+
+
 def _process_severe_alerts() -> None:
     """One scheduler tick: fetch alerts, match against subscribers, page Met."""
+    # Relief half (#C14): send all-clears for alerts that have passed their
+    # effective time. Runs first, so it fires even when nothing is active.
+    try:
+        _send_crew_all_clears()
+    except Exception as e:
+        print(f"[nws-process] all-clear pass failed: {e}", flush=True)
+
     alerts = _fetch_active_nws_alerts()
     if not alerts:
         return
@@ -21862,6 +21933,89 @@ def me_crew_hyperlocal():
     })
 
 
+def _crew_centerpoint(user_id):
+    """Best available home coordinates for a Crew member: their Crew home
+    base if set, otherwise their primary saved location. Returns
+    (lat, lng) as floats, or (None, None) if neither is known."""
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT crew_home_lat, crew_home_lng FROM users WHERE id = %s",
+                    (user_id,),
+                )
+                row = cur.fetchone()
+                if row and row.get("crew_home_lat") is not None \
+                        and row.get("crew_home_lng") is not None:
+                    return float(row["crew_home_lat"]), float(row["crew_home_lng"])
+                cur.execute(
+                    """SELECT latitude, longitude FROM saved_locations
+                       WHERE user_id = %s AND is_primary = TRUE LIMIT 1""",
+                    (user_id,),
+                )
+                row = cur.fetchone()
+                if row and row.get("latitude") is not None \
+                        and row.get("longitude") is not None:
+                    return float(row["latitude"]), float(row["longitude"])
+    except Exception as e:
+        print(f"[crew-centerpoint] failed: {e!r}", flush=True)
+    return None, None
+
+
+@app.route("/api/v1/me/crew/neighbors", methods=["OPTIONS"])
+def _me_crew_neighbors_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/crew/neighbors")
+def me_crew_neighbors():
+    """How many OTHER Crew members checked in today within X miles of me.
+
+    Powers the neighbor-presence signal (#C12): community without invented
+    activity. Counts only real check-ins from today's local date, using
+    each member's home base as their location (check-ins carry no
+    coordinates of their own).
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": True, "count": 0, "radius_mi": 10, "no_location": True})
+
+    try:
+        radius_mi = float(request.args.get("radius_mi", 10))
+    except (TypeError, ValueError):
+        radius_mi = 10.0
+
+    lat, lng = _crew_centerpoint(user["id"])
+    if lat is None or lng is None:
+        return jsonify({"ok": True, "count": 0, "radius_mi": radius_mi,
+                        "no_location": True})
+
+    today_key = _local_date_key()
+    lat_delta = radius_mi / 69.0
+    lng_delta = radius_mi / (69.0 * max(0.01, abs(_cos_approx(lat))))
+    count = 0
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT COUNT(DISTINCT c.user_id) AS n
+                       FROM crew_checkins c
+                       JOIN users u ON u.id = c.user_id
+                       WHERE c.date_key = %s
+                         AND c.user_id != %s
+                         AND u.crew_home_lat BETWEEN %s AND %s
+                         AND u.crew_home_lng BETWEEN %s AND %s""",
+                    (today_key, user["id"],
+                     lat - lat_delta, lat + lat_delta,
+                     lng - lng_delta, lng + lng_delta),
+                )
+                count = (cur.fetchone() or {}).get("n", 0) or 0
+    except Exception as e:
+        print(f"[crew-neighbors] failed: {e!r}", flush=True)
+
+    return jsonify({"ok": True, "count": count, "radius_mi": radius_mi})
+
+
 def _cos_approx(lat_deg: float) -> float:
     """Quick cosine approximation for distance bounding box math."""
     import math
@@ -22190,7 +22344,39 @@ def crew_reports_submit():
     except Exception as e:
         print(f"[crew-report-submit] nearby notify failed: {e!r}", flush=True)
 
-    return jsonify({"ok": True, "report_id": new_id})
+    # Honest recognition (#C11): were they the first Crew member to flag
+    # weather near here in the last hour? Truthful, computed live from real
+    # reports. No invented numbers: if others already reported nearby, we
+    # simply say nothing.
+    recognition = None
+    try:
+        window_ms = now_ms - (60 * 60 * 1000)
+        rec_radius_mi = 10.0
+        rlat_delta = rec_radius_mi / 69.0
+        rlng_delta = rec_radius_mi / (69.0 * max(0.01, abs(_cos_approx(lat))))
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT COUNT(*) AS n FROM crew_reports
+                       WHERE created_at >= %s
+                         AND user_id != %s
+                         AND is_hidden = FALSE
+                         AND latitude BETWEEN %s AND %s
+                         AND longitude BETWEEN %s AND %s""",
+                    (window_ms, user["id"],
+                     lat - rlat_delta, lat + rlat_delta,
+                     lng - rlng_delta, lng + rlng_delta),
+                )
+                others = (cur.fetchone() or {}).get("n", 0) or 0
+        if others == 0:
+            recognition = (
+                "You are the first Crew member to flag weather near you in "
+                "the last hour. Thank you for the early eyes."
+            )
+    except Exception as e:
+        print(f"[crew-report-submit] recognition calc failed: {e!r}", flush=True)
+
+    return jsonify({"ok": True, "report_id": new_id, "recognition": recognition})
 
 
 @app.route("/api/v1/crew/reports/<int:report_id>/verify", methods=["OPTIONS"])
