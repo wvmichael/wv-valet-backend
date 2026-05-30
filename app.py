@@ -445,6 +445,21 @@ ALTER TABLE verification_requests
 ALTER TABLE verification_requests
     ADD COLUMN IF NOT EXISTS met_overrode_ai BOOLEAN;
 
+-- Per-review forecast data (May 30, 2026 — Task C1). At creation the
+-- customer-side reading already computed the structured weather + the
+-- rule-engine reasons + a real confidence number, but all of it was
+-- thrown away (only ai_status_key survived). We now persist it so the
+-- Met composer can show the actual data the AI saw (C2) instead of
+-- mock values, and so the nightly grader can score reviews (Task #5).
+--   forecast_snapshot — JSON blob of the reading: temp/wind/precip/sky,
+--                       raw numerics, stats, reasons[], sources, alerts.
+--   ai_confidence     — the engine's real 0-100 confidence (replaces the
+--                       hardcoded 70 the queue used to send).
+ALTER TABLE verification_requests
+    ADD COLUMN IF NOT EXISTS forecast_snapshot TEXT;
+ALTER TABLE verification_requests
+    ADD COLUMN IF NOT EXISTS ai_confidence INTEGER;
+
 -- ── Brief submission audit log ──
 -- Every POST to /admin/brief writes a row here. Lets the Meteorologist Portal
 -- show a real submission history (not just the current state of the brief
@@ -6169,6 +6184,60 @@ def met_polish_text():
 # Customer flow: create checkout
 # ────────────────────────────────────────────────────────────────────────────
 
+# Cap on the stored forecast snapshot. The reading blob is small (a few
+# hundred bytes), but bound it so a malformed/oversized client payload
+# can't bloat the row. ~20 KB is generous headroom.
+_FORECAST_SNAPSHOT_MAX_BYTES = 20_000
+
+
+def _coerce_forecast_snapshot(raw) -> Optional[str]:
+    """Normalize an incoming forecast snapshot to bounded JSON text.
+
+    Accepts a dict (serialize it) or a JSON string (validate it parses).
+    Returns JSON text, or None if absent/invalid/too large. Never raises —
+    a bad snapshot must not block checkout (the payment is what matters).
+    """
+    if raw is None:
+        return None
+    try:
+        if isinstance(raw, (dict, list)):
+            text = json.dumps(raw, separators=(",", ":"))
+        elif isinstance(raw, str):
+            stripped = raw.strip()
+            if not stripped:
+                return None
+            json.loads(stripped)  # validate it's real JSON
+            text = stripped
+        else:
+            return None
+    except Exception:
+        return None
+    if len(text.encode("utf-8")) > _FORECAST_SNAPSHOT_MAX_BYTES:
+        return None
+    return text
+
+
+def _coerce_confidence(raw) -> Optional[int]:
+    """Clamp an incoming confidence value to an int in [0, 100], or None."""
+    if raw is None:
+        return None
+    try:
+        n = int(round(float(raw)))
+    except (ValueError, TypeError):
+        return None
+    return max(0, min(100, n))
+
+
+def _safe_json_loads(raw):
+    """Parse JSON text to an object for API responses; None on empty/invalid.
+    Used to return stored snapshots as real objects rather than raw strings."""
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
 
 @app.post("/api/v1/verification/checkout")
 def create_checkout_session():
@@ -6227,6 +6296,22 @@ def create_checkout_session():
     else:
         ai_brief = "(Decision Engine not installed in this deployment.)"
 
+    # Task C1: persist the structured reading the customer side already
+    # computed (temp/wind/precip/sky, rule reasons, real confidence) so the
+    # Met composer can show real data instead of mocks, and the grader can
+    # later score the review. All optional + best-effort — a missing or
+    # malformed snapshot never blocks checkout.
+    forecast_snapshot = _coerce_forecast_snapshot(body.get("forecast_snapshot"))
+    ai_confidence = _coerce_confidence(body.get("ai_confidence"))
+    # If confidence wasn't sent as a top-level field but is inside the
+    # snapshot, lift it out so the queue has a clean column to read.
+    if ai_confidence is None and forecast_snapshot:
+        try:
+            snap = json.loads(forecast_snapshot)
+            ai_confidence = _coerce_confidence(snap.get("confidence"))
+        except Exception:
+            pass
+
     with db() as conn:
         with conn.cursor() as cur:
             # Use RETURNING id to get the auto-generated primary key. This
@@ -6238,14 +6323,16 @@ def create_checkout_session():
                    (created_at, updated_at, status, tier, price_cents,
                     customer_email, customer_phone,
                     plan_text, plan_industry, plan_location, plan_window,
-                    ai_brief_markdown, ai_status_key, claim_token)
-                   VALUES (%s, %s, 'pending', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ai_brief_markdown, ai_status_key, claim_token,
+                    forecast_snapshot, ai_confidence)
+                   VALUES (%s, %s, 'pending', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                    RETURNING id""",
                 (now_ts(), now_ts(), tier_key, tier["price_cents"],
                  customer_email, customer_phone,
                  plan_text, body.get("plan_industry"), body.get("plan_location"),
                  body.get("plan_window"),
-                 ai_brief, body.get("ai_status_key"), claim_token),
+                 ai_brief, body.get("ai_status_key"), claim_token,
+                 forecast_snapshot, ai_confidence),
             )
             request_id = cur.fetchone()['id']
 
@@ -16029,7 +16116,8 @@ def met_queue_list():
                 f"""SELECT id, created_at, updated_at, status, tier, price_cents,
                           customer_email, customer_phone, plan_text, plan_industry,
                           plan_location, plan_window, ai_brief_markdown, ai_status_key,
-                          claim_token, claimed_at, claimed_by_user_id
+                          claim_token, claimed_at, claimed_by_user_id,
+                          forecast_snapshot, ai_confidence
                    FROM verification_requests
                    WHERE status = 'paid' {claimed_clause}
                    ORDER BY
@@ -16055,6 +16143,8 @@ def met_queue_list():
             "plan_window": r["plan_window"],
             "ai_brief_markdown": r["ai_brief_markdown"],
             "ai_status_key": r["ai_status_key"],
+            "ai_confidence": r["ai_confidence"],
+            "forecast_snapshot": _safe_json_loads(r["forecast_snapshot"]),
             "claim_token": r["claim_token"],
             "claimed_at": r["claimed_at"],
             "claimed_by_user_id": r["claimed_by_user_id"],
