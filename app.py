@@ -20696,6 +20696,42 @@ def crew_apply_submit():
                                WHERE id = %s AND (phone IS NULL OR phone = '')""",
                             (phone, applicant_user_id),
                         )
+                # Geocode the applicant's county (May 29, 2026) so they
+                # become targetable on the mission deploy map immediately.
+                # Non-blocking: if geocoding fails we still create the
+                # applicant + send the verify link; they can set a precise
+                # location later via /api/v1/me/crew-location.
+                if county:
+                    try:
+                        geo = _geocode_address(county)
+                        if geo and geo.get("lat") is not None and geo.get("lng") is not None:
+                            geo_label = geo.get("name") or county
+                            if geo.get("admin1") and ", " not in geo_label:
+                                geo_label += ", " + geo["admin1"]
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    """UPDATE users
+                                       SET crew_home_lat = %s,
+                                           crew_home_lng = %s,
+                                           crew_home_label = COALESCE(NULLIF(crew_home_label, ''), %s)
+                                       WHERE id = %s
+                                         AND (crew_home_lat IS NULL OR crew_home_lng IS NULL)""",
+                                    (float(geo["lat"]), float(geo["lng"]),
+                                     geo_label, applicant_user_id),
+                                )
+                                print(
+                                    f"[crew-apply] geocoded county={county!r} → "
+                                    f"({geo['lat']}, {geo['lng']}) for user_id={applicant_user_id}",
+                                    flush=True,
+                                )
+                        else:
+                            print(
+                                f"[crew-apply] geocode returned nothing for county={county!r} "
+                                f"(user_id={applicant_user_id}) — crew won't be on map until they set location",
+                                flush=True,
+                            )
+                    except Exception as geo_e:
+                        print(f"[crew-apply] geocode error: {geo_e!r}", flush=True)
                 raw_token = new_secure_token()
                 token_hash = hash_token(raw_token)
                 now_seconds = int(time.time())
@@ -24908,6 +24944,112 @@ def met_vitals():
             "completion_rate_pct": completion_rate_pct,
             "citations_sent": citations_sent,
         },
+    })
+
+
+@app.route("/api/v1/admin/crew/<int:user_id>/geocode-home", methods=["OPTIONS"])
+def _admin_crew_geocode_home_preflight(user_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/crew/<int:user_id>/geocode-home")
+def admin_crew_geocode_home(user_id):
+    """Geocode a Crew member's home location from a free-form address.
+
+    Added May 29, 2026 to retroactively fix Crew members who signed up
+    before geocoding was added to the application flow (John A. Rundel,
+    Laura Clapp, etc.) — they had county text but no lat/lng, so they
+    couldn't be targeted on the mission deploy map.
+
+    Body:
+        { "address": "Thomas County, KS" }   — explicit override
+      OR (if no body)
+        Falls back to: crew_applications.county for this user's email
+        Then:          users.crew_home_label
+
+    On success, sets users.crew_home_lat/lng/label.
+    Returns the geocode result so admin can verify it landed in the
+    expected county.
+    """
+    actor, err = _require_admin()
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    address = (data.get("address") or "").strip()
+
+    # If no explicit address, look up from crew_applications + users
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT email, name, crew_home_label
+                   FROM users WHERE id = %s""",
+                (user_id,),
+            )
+            urow = cur.fetchone()
+            if not urow:
+                return jsonify({"ok": False, "error": "user-not-found"}), 404
+
+            if not address:
+                # Try the application county first
+                cur.execute(
+                    """SELECT county FROM crew_applications
+                       WHERE email = %s
+                       ORDER BY created_at DESC
+                       LIMIT 1""",
+                    (urow["email"],),
+                )
+                arow = cur.fetchone()
+                if arow and (arow.get("county") or "").strip():
+                    address = arow["county"].strip()
+                elif (urow.get("crew_home_label") or "").strip():
+                    address = urow["crew_home_label"].strip()
+
+    if not address:
+        return jsonify({
+            "ok": False,
+            "error": "no-address",
+            "message": "Could not find an address. Send {address: '...'} in body.",
+        }), 400
+
+    geo = _geocode_address(address)
+    if not geo:
+        return jsonify({
+            "ok": False,
+            "error": "geocode-failed",
+            "message": f"No coordinates found for: {address}",
+            "address_tried": address,
+        }), 422
+
+    lat = float(geo["lat"])
+    lng = float(geo["lng"])
+    # Build a clean label from geocoder result if user has none
+    label_from_geo = ""
+    if geo.get("name"):
+        label_from_geo = geo["name"]
+        if geo.get("admin1"):
+            label_from_geo += ", " + geo["admin1"]
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE users
+                   SET crew_home_lat = %s,
+                       crew_home_lng = %s,
+                       crew_home_label = COALESCE(NULLIF(crew_home_label, ''), %s)
+                   WHERE id = %s""",
+                (lat, lng, label_from_geo, user_id),
+            )
+
+    return jsonify({
+        "ok": True,
+        "user_id": user_id,
+        "address_used": address,
+        "lat": lat,
+        "lng": lng,
+        "geocoded_name": geo.get("name") or "",
+        "geocoded_admin1": geo.get("admin1") or "",
+        "geocoded_admin2": geo.get("admin2") or "",
     })
 
 
