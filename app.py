@@ -22229,6 +22229,79 @@ def met_cite_crew_report(report_id: int):
     return jsonify({"ok": True, "cited_by": met_name, "already_cited": already})
 
 
+# ─── Met reads responses to their missions ───────────────────────────
+# Unified feed: in-app responses (crew_mission_responses, which can carry
+# a photo) to missions this Met created, plus text responses
+# (mission_notifications) to deployments this Met fired. Newest first.
+
+@app.route("/api/v1/met/mission-responses", methods=["OPTIONS"])
+def _met_mission_responses_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/mission-responses")
+def met_mission_responses():
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    items = []
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                # In-app responses to missions this Met created (may have a photo)
+                cur.execute(
+                    """SELECT cmr.response_text, cmr.image_url, cmr.submitted_at AS ts,
+                              COALESCE(u.name, 'Crew member') AS crew_name,
+                              cm.title AS mission_title
+                       FROM crew_mission_responses cmr
+                       JOIN crew_missions cm ON cm.id = cmr.mission_id
+                       LEFT JOIN users u ON u.id = cmr.user_id
+                       WHERE cm.created_by_user_id = %s
+                       ORDER BY cmr.submitted_at DESC LIMIT 50""",
+                    (user["id"],),
+                )
+                for r in cur.fetchall():
+                    items.append({
+                        "crew_name": r.get("crew_name") or "Crew member",
+                        "mission_title": r.get("mission_title") or "Mission",
+                        "response_text": r.get("response_text") or "",
+                        "image_url": r.get("image_url") or "",
+                        "submitted_at": r.get("ts"),
+                        "kind": "inbox",
+                    })
+                # Text responses to deployments this Met fired (SMS / bridge)
+                cur.execute(
+                    """SELECT mn.response_text, mn.responded_at AS ts,
+                              COALESCE(u.name, 'Crew member') AS crew_name,
+                              md.template_name, md.prompt
+                       FROM mission_notifications mn
+                       JOIN mission_deployments md ON md.id = mn.mission_id
+                       LEFT JOIN users u ON u.id = mn.crew_user_id
+                       WHERE md.fired_by_user_id = %s AND mn.responded_at IS NOT NULL
+                       ORDER BY mn.responded_at DESC LIMIT 50""",
+                    (user["id"],),
+                )
+                for r in cur.fetchall():
+                    items.append({
+                        "crew_name": r.get("crew_name") or "Crew member",
+                        "mission_title": r.get("template_name") or r.get("prompt") or "Field mission",
+                        "response_text": r.get("response_text") or "",
+                        "image_url": "",
+                        "submitted_at": r.get("ts"),
+                        "kind": "deployment",
+                    })
+    except Exception as e:
+        print(f"[met-mission-responses] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+
+    items.sort(key=lambda x: x.get("submitted_at") or 0, reverse=True)
+    return jsonify({"ok": True, "responses": items[:50]})
+
+
 # ─── Hide a report (Crew toggle-off) ─────────────────────────────────
 #
 # When a Crew member toggles a condition off (e.g. "it stopped raining"),
