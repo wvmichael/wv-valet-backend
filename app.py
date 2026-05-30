@@ -1571,6 +1571,41 @@ ALTER TABLE brief_outcomes ADD COLUMN IF NOT EXISTS grading_method TEXT;
 -- a join).
 ALTER TABLE brief_outcomes ADD COLUMN IF NOT EXISTS was_met_touched BOOLEAN;
 
+-- ── Review outcomes / Met review accuracy (May 30, 2026 — Task #5) ──
+-- One row per graded on-demand verification review, created by the
+-- nightly grader. Parallels brief_outcomes but for verification_requests
+-- (paid go/no-go calls) instead of broadcast briefs. Closes the loop on
+-- the human verdict: "your reviews were right X% of the time."
+--
+-- We grade the MET's final verdict (met_verdict_key) against reality, and
+-- also store the AI's suggested verdict + whether the Met overrode it, so
+-- the calibration scorecard (Task #14) can later answer "when a Met
+-- overrides the AI, are they usually right?"
+--
+-- Idempotent: UNIQUE (verification_request_id) + ON CONFLICT DO NOTHING,
+-- so re-running a day is a no-op (admin force-regrade deletes first).
+CREATE TABLE IF NOT EXISTS review_outcomes (
+    id                      SERIAL PRIMARY KEY,
+    verification_request_id INTEGER NOT NULL UNIQUE
+                              REFERENCES verification_requests(id) ON DELETE CASCADE,
+    attributed_met_id       INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    completed_at            BIGINT NOT NULL,        -- seconds (matches verification_requests)
+    met_verdict             TEXT,                   -- 'clear'|'caution'|'risk' (normalized)
+    ai_verdict              TEXT,                   -- ai_status_key snapshot
+    met_overrode_ai         BOOLEAN,                -- snapshot of the override signal
+    actual_severity         TEXT NOT NULL,          -- 'none'|'medium'|'high'
+    grade                   TEXT NOT NULL,          -- accurate|over_called|under_called|critical_miss|ungradable
+    score                   NUMERIC(4,2) NOT NULL,
+    nws_alert_summary       TEXT,
+    observed_summary        TEXT,
+    graded_at_ms            BIGINT NOT NULL,
+    notes                   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_review_outcomes_met
+    ON review_outcomes(attributed_met_id, completed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_review_outcomes_completed
+    ON review_outcomes(completed_at DESC);
+
 -- ── NWS station cache (May 23, 2026 — Tier 3) ──
 -- Maps a subscriber's user_id to the nearest NWS observation station.
 -- Populated lazily by the grader: first time we need observations for
@@ -34202,6 +34237,202 @@ def _run_brief_grader_for_day(grade_date: str, force_regrade: bool = False) -> d
     }
 
 
+def _review_grading_latlng(req: dict) -> Optional[tuple]:
+    """Resolve a (lat, lng) for a review to grade against observations.
+
+    Prefers coordinates embedded in the stored forecast_snapshot (cheapest,
+    and exactly the point the customer-side reading used). Falls back to
+    geocoding the free-text plan_location. Returns None if neither yields
+    a usable point — the review is then graded on NWS alerts only, or
+    skipped as a quiet day like briefs.
+    """
+    # 1) Snapshot may carry coordinates (added when C2 sends the reading).
+    snap_raw = req.get("forecast_snapshot")
+    if snap_raw:
+        try:
+            snap = json.loads(snap_raw) if isinstance(snap_raw, str) else snap_raw
+            for lat_key, lng_key in (("lat", "lng"), ("latitude", "longitude")):
+                lat = snap.get(lat_key)
+                lng = snap.get(lng_key)
+                if lat is not None and lng is not None:
+                    return (float(lat), float(lng))
+        except Exception:
+            pass
+    # 2) Geocode the plan location text.
+    loc = (req.get("plan_location") or "").strip()
+    if loc:
+        try:
+            geo = _geocode_address(loc)
+            if geo and geo.get("lat") is not None and geo.get("lng") is not None:
+                return (float(geo["lat"]), float(geo["lng"]))
+        except Exception:
+            pass
+    return None
+
+
+def _run_review_grader_for_day(grade_date: str, force_regrade: bool = False) -> dict:
+    """Grade every on-demand verification review COMPLETED on the given
+    local-Eastern date, scoring the Met's verdict against what actually
+    happened (NWS alerts + nearest-station observations).
+
+    Mirrors _run_brief_grader_for_day but for verification_requests:
+      - location comes from the snapshot or geocoded plan_location
+        (reviews have no subscriber saved_location),
+      - the graded verdict is the Met's call (met_verdict_key),
+      - attribution is direct (completed_by_user_id),
+      - quiet days (no alerts, no work-affecting obs) are skipped, same
+        as briefs, to avoid inflating "accurate".
+
+    grade_date: 'YYYY-MM-DD' ET. completed_at is stored in SECONDS.
+    """
+    ET = ZoneInfo("America/New_York")
+    try:
+        y, m, d = [int(x) for x in grade_date.split("-")]
+        day_start = datetime(y, m, d, 0, 0, 0, tzinfo=ET)
+    except Exception:
+        return {"ok": False, "error": "invalid-date"}
+    day_end = day_start + timedelta(days=1)
+    # verification_requests timestamps are SECONDS.
+    day_start_s = int(day_start.timestamp())
+    day_end_s = int(day_end.timestamp())
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                if force_regrade:
+                    cur.execute(
+                        """DELETE FROM review_outcomes
+                           WHERE completed_at >= %s AND completed_at < %s""",
+                        (day_start_s, day_end_s),
+                    )
+                cur.execute(
+                    """SELECT id, completed_by_user_id, completed_at,
+                              met_verdict_key, ai_status_key, met_overrode_ai,
+                              plan_location, forecast_snapshot
+                       FROM verification_requests
+                       WHERE status = 'completed'
+                         AND completed_at >= %s AND completed_at < %s
+                         AND met_verdict_key IN ('clear', 'caution', 'risk')
+                       ORDER BY completed_at ASC""",
+                    (day_start_s, day_end_s),
+                )
+                reviews = cur.fetchall()
+    except Exception as e:
+        return {"ok": False, "error": f"db-fetch-failed: {e}"}
+
+    graded = 0
+    already_present = 0
+    skipped_no_location = 0
+    skipped_quiet_day = 0
+    errors = 0
+    grade_counts = {"accurate": 0, "over_called": 0, "under_called": 0,
+                    "critical_miss": 0, "ungradable": 0}
+
+    for r in reviews:
+        try:
+            if not force_regrade:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT 1 FROM review_outcomes WHERE verification_request_id = %s",
+                            (r["id"],),
+                        )
+                        if cur.fetchone():
+                            already_present += 1
+                            continue
+
+            latlng = _review_grading_latlng(r)
+            if latlng is None:
+                skipped_no_location += 1
+                continue
+            lat, lng = latlng
+
+            # Coverage window: completion → 24h later. completed_at is in
+            # seconds; the alert/obs helpers expect ms.
+            cov_start_ms = int(r["completed_at"]) * 1000
+            cov_end_ms = cov_start_ms + (24 * 3600 * 1000)
+
+            alerts = _fetch_alerts_for_point(lat, lng, cov_start_ms, cov_end_ms)
+            highest = "none"
+            event_names = []
+            for a in alerts:
+                sev = _classify_nws_event(a.get("event", ""))
+                if sev == "high":
+                    highest = "high"
+                elif sev == "medium" and highest != "high":
+                    highest = "medium"
+                if sev != "none":
+                    event_names.append(a.get("event") or "")
+
+            # Observation layer — catches the gap between "clear" and
+            # "NWS-advisory level." Point-based station lookup (reviews
+            # have no subscriber to key the cache on).
+            obs_summary = ""
+            if highest == "none":
+                try:
+                    station = _find_nearest_nws_station(lat, lng)
+                    if station and station.get("station_id"):
+                        observations_list = _fetch_observations_for_station(
+                            station["station_id"], cov_start_ms, cov_end_ms
+                        )
+                        obs_severity, obs_summary = _classify_observations(observations_list)
+                        if obs_severity == "medium":
+                            highest = "medium"
+                        time.sleep(0.2)
+                except Exception as e:
+                    print(f"[review-grader] obs layer failed review={r.get('id')}: {e!r}",
+                          flush=True)
+
+            # Quiet day — nothing work-affecting to grade against. Skip
+            # rather than inflate "accurate" (same policy as briefs).
+            if highest == "none":
+                skipped_quiet_day += 1
+                continue
+
+            grade, score = _grade_brief(r["met_verdict_key"], highest)
+            grade_counts[grade] = grade_counts.get(grade, 0) + 1
+
+            event_summary = ", ".join(sorted(set(e for e in event_names if e)))[:500] or None
+
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO review_outcomes
+                             (verification_request_id, attributed_met_id, completed_at,
+                              met_verdict, ai_verdict, met_overrode_ai,
+                              actual_severity, grade, score,
+                              nws_alert_summary, observed_summary, graded_at_ms, notes)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                           ON CONFLICT (verification_request_id) DO NOTHING""",
+                        (r["id"], r["completed_by_user_id"], r["completed_at"],
+                         r["met_verdict_key"], r["ai_status_key"], r["met_overrode_ai"],
+                         highest, grade, score,
+                         event_summary, (obs_summary or None),
+                         int(time.time() * 1000), None),
+                    )
+            graded += 1
+            time.sleep(0.4)  # be polite to NWS between reviews
+        except Exception as e:
+            errors += 1
+            print(f"[review-grader] failed review={r.get('id')}: {e!r}", flush=True)
+
+    print(f"[review-grader] {grade_date}: graded={graded} already={already_present} "
+          f"no_loc={skipped_no_location} quiet={skipped_quiet_day} "
+          f"errors={errors} dist={grade_counts}", flush=True)
+
+    return {
+        "ok": True,
+        "date": grade_date,
+        "reviews_scanned": len(reviews),
+        "graded": graded,
+        "already_present": already_present,
+        "skipped_no_location": skipped_no_location,
+        "skipped_quiet_day": skipped_quiet_day,
+        "errors": errors,
+        "grade_distribution": grade_counts,
+    }
+
+
 # In-memory tracker: last date we ran the grader. Persists for the
 # lifetime of the process. A server restart can cause a re-run on the
 # same day, but the ON CONFLICT DO NOTHING in _run_brief_grader_for_day
@@ -34233,6 +34464,14 @@ def _maybe_run_nightly_brief_grader() -> None:
         print(f"[brief-grader] nightly run firing — grading {yesterday}", flush=True)
         result = _run_brief_grader_for_day(yesterday, force_regrade=False)
         print(f"[brief-grader] nightly result: {result}", flush=True)
+        # Task #5: grade yesterday's on-demand reviews in the same window.
+        # Isolated in its own try so a review-grader failure can't block
+        # the brief grader's run-date bookkeeping below.
+        try:
+            review_result = _run_review_grader_for_day(yesterday, force_regrade=False)
+            print(f"[review-grader] nightly result: {review_result}", flush=True)
+        except Exception as e:
+            print(f"[review-grader] nightly run failed: {e!r}", flush=True)
         _LAST_GRADER_RUN_DATE = today_str
     except Exception as e:
         print(f"[brief-grader] _maybe_run_nightly failed: {e!r}", flush=True)
