@@ -26804,6 +26804,133 @@ def met_vitals():
     })
 
 
+@app.route("/api/v1/met/calibration", methods=["OPTIONS"])
+def _met_calibration_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/calibration")
+def met_calibration():
+    """The Met's forecast-accuracy scorecard (Task #14).
+
+    Surfaces the graded outcomes that the nightly graders already produce,
+    so a Met can see how their calls held up — including the key question:
+    when they OVERRODE the AI, were they usually right?
+
+    Window: trailing 90 days. Two sections:
+
+      reviews — from review_outcomes (on-demand go/no-go calls):
+        graded, accurate, over_called, under_called, critical_miss,
+        accuracy_pct, plus an `override` block (calls where the Met
+        overruled the AI: count + how many were accurate) and an `agree`
+        block (calls where the Met agreed with the AI).
+
+      briefs — from brief_outcomes (broadcast Daily Briefs), same grade
+        buckets + accuracy_pct, for a fuller picture.
+
+    accuracy_pct counts 'accurate' + 'over_called' as "safe" is tempting,
+    but we keep it strict: accuracy_pct = accurate / graded. Over-calling
+    is surfaced separately so the Met can see their own bias.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    met_id = user["id"]
+
+    window_days = 90
+    now_s = now_ts()
+    reviews_since_s = now_s - (window_days * 86400)
+    briefs_since_ms = int(time.time() * 1000) - (window_days * 86400 * 1000)
+
+    def _pct(num, den):
+        return round(100.0 * num / den) if den else None
+
+    reviews = {
+        "graded": 0, "accurate": 0, "over_called": 0, "under_called": 0,
+        "critical_miss": 0, "accuracy_pct": None,
+        "override": {"count": 0, "accurate": 0, "accuracy_pct": None},
+        "agree": {"count": 0, "accurate": 0, "accuracy_pct": None},
+    }
+    briefs = {
+        "graded": 0, "accurate": 0, "over_called": 0, "under_called": 0,
+        "critical_miss": 0, "accuracy_pct": None,
+    }
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            # ── Reviews (review_outcomes) ──
+            cur.execute(
+                """SELECT
+                       COUNT(*) AS graded,
+                       COUNT(*) FILTER (WHERE grade = 'accurate') AS accurate,
+                       COUNT(*) FILTER (WHERE grade = 'over_called') AS over_called,
+                       COUNT(*) FILTER (WHERE grade = 'under_called') AS under_called,
+                       COUNT(*) FILTER (WHERE grade = 'critical_miss') AS critical_miss,
+                       COUNT(*) FILTER (WHERE met_overrode_ai IS TRUE) AS ov_count,
+                       COUNT(*) FILTER (WHERE met_overrode_ai IS TRUE
+                                          AND grade = 'accurate') AS ov_accurate,
+                       COUNT(*) FILTER (WHERE met_overrode_ai IS FALSE) AS ag_count,
+                       COUNT(*) FILTER (WHERE met_overrode_ai IS FALSE
+                                          AND grade = 'accurate') AS ag_accurate
+                   FROM review_outcomes
+                   WHERE attributed_met_id = %s
+                     AND completed_at >= %s
+                     AND grade <> 'ungradable'""",
+                (met_id, reviews_since_s),
+            )
+            r = cur.fetchone() or {}
+            reviews["graded"] = r.get("graded") or 0
+            reviews["accurate"] = r.get("accurate") or 0
+            reviews["over_called"] = r.get("over_called") or 0
+            reviews["under_called"] = r.get("under_called") or 0
+            reviews["critical_miss"] = r.get("critical_miss") or 0
+            reviews["accuracy_pct"] = _pct(reviews["accurate"], reviews["graded"])
+            ov_count = r.get("ov_count") or 0
+            ag_count = r.get("ag_count") or 0
+            reviews["override"] = {
+                "count": ov_count,
+                "accurate": r.get("ov_accurate") or 0,
+                "accuracy_pct": _pct(r.get("ov_accurate") or 0, ov_count),
+            }
+            reviews["agree"] = {
+                "count": ag_count,
+                "accurate": r.get("ag_accurate") or 0,
+                "accuracy_pct": _pct(r.get("ag_accurate") or 0, ag_count),
+            }
+
+            # ── Briefs (brief_outcomes) ──
+            cur.execute(
+                """SELECT
+                       COUNT(*) AS graded,
+                       COUNT(*) FILTER (WHERE grade = 'accurate') AS accurate,
+                       COUNT(*) FILTER (WHERE grade = 'over_called') AS over_called,
+                       COUNT(*) FILTER (WHERE grade = 'under_called') AS under_called,
+                       COUNT(*) FILTER (WHERE grade = 'critical_miss') AS critical_miss
+                   FROM brief_outcomes
+                   WHERE attributed_met_id = %s
+                     AND delivered_at >= %s
+                     AND grade <> 'ungradable'""",
+                (met_id, briefs_since_ms),
+            )
+            b = cur.fetchone() or {}
+            briefs["graded"] = b.get("graded") or 0
+            briefs["accurate"] = b.get("accurate") or 0
+            briefs["over_called"] = b.get("over_called") or 0
+            briefs["under_called"] = b.get("under_called") or 0
+            briefs["critical_miss"] = b.get("critical_miss") or 0
+            briefs["accuracy_pct"] = _pct(briefs["accurate"], briefs["graded"])
+
+    return jsonify({
+        "ok": True,
+        "window_days": window_days,
+        "reviews": reviews,
+        "briefs": briefs,
+    })
+
+
 @app.route("/api/v1/admin/crew/<int:user_id>/geocode-home", methods=["OPTIONS"])
 def _admin_crew_geocode_home_preflight(user_id):
     return ("", 204)
