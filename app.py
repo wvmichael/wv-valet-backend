@@ -21267,6 +21267,80 @@ def _is_crew_member(user: dict) -> bool:
     return "crew" in (user.get("roles") or [])
 
 
+# Schema defaults for crew_notification_prefs, used when a member has no
+# prefs row yet so brand-new Crew still get the high-value notifications.
+_CREW_NOTIFY_DEFAULTS = {
+    "notify_on_verify": True,
+    "notify_on_mission": True,
+    "notify_on_nearby_report": False,
+    "notify_on_severe_alert": True,
+    "notify_on_mission_response": True,
+    "notify_via_email": True,
+    "notify_via_text": False,
+}
+
+
+def _notify_crew_member(user_id, pref_key, subject, body, actor_user_id=None):
+    """Send a notification to a Crew member, honoring their preferences.
+
+    Reads crew_notification_prefs for this user. Respects the event toggle
+    (pref_key, e.g. 'notify_on_verify') and the channel toggles
+    (notify_via_email / notify_via_text). Email is reliable today; text
+    rides on the Twilio number (best-effort, may not deliver until the
+    toll-free verification clears).
+
+    Best-effort and never raises, so it can be called inline from a
+    request handler without risking the response. Always call it AFTER
+    the handler's own `with db()` block has closed — this opens its own
+    connection.
+
+    actor_user_id: if set and equal to user_id, the call is skipped so we
+    never notify someone about their own action.
+    """
+    try:
+        if actor_user_id is not None and actor_user_id == user_id:
+            return
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM crew_notification_prefs WHERE user_id = %s",
+                    (user_id,),
+                )
+                prefs = cur.fetchone()
+                cur.execute(
+                    "SELECT name, email, phone FROM users WHERE id = %s",
+                    (user_id,),
+                )
+                u = cur.fetchone()
+        if not u:
+            return
+
+        def _p(key):
+            if prefs is not None and prefs.get(key) is not None:
+                return bool(prefs.get(key))
+            return _CREW_NOTIFY_DEFAULTS.get(key, False)
+
+        if not _p(pref_key):
+            return
+
+        sent_any = False
+        if _p("notify_via_email") and u.get("email"):
+            try:
+                _send_brief_email(u["email"], subject, body, html=False)
+                sent_any = True
+            except Exception as e:
+                print(f"[crew-notify] email failed user={user_id}: {e!r}", flush=True)
+        if _p("notify_via_text") and u.get("phone"):
+            try:
+                send_sms(u["phone"], body)
+                sent_any = True
+            except Exception as e:
+                print(f"[crew-notify] sms failed user={user_id}: {e!r}", flush=True)
+        print(f"[crew-notify] user={user_id} pref={pref_key} sent={sent_any}", flush=True)
+    except Exception as e:
+        print(f"[crew-notify] unexpected error user={user_id}: {e!r}", flush=True)
+
+
 # ─── Crew personal stats ────────────────────────────────────────────
 
 @app.route("/api/v1/me/crew/stats", methods=["OPTIONS"])
@@ -21843,6 +21917,45 @@ def crew_reports_submit():
         print(f"[crew-report-submit] failed: {e!r}", flush=True)
         return jsonify({"ok": False, "error": "db-error"}), 500
 
+    # Notify nearby Crew who have opted in. notify_on_nearby_report is
+    # FALSE by default, so this stays silent unless someone turns it on.
+    # Rough 5-mile bounding box on Crew home location, capped so an active
+    # storm can't fan a report out to everyone at once.
+    try:
+        radius_mi = 5.0
+        lat_delta = radius_mi / 69.0
+        lng_delta = radius_mi / (69.0 * max(0.01, abs(_cos_approx(lat))))
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT DISTINCT u.id
+                       FROM users u
+                       JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'crew'
+                       JOIN crew_notification_prefs p ON p.user_id = u.id
+                            AND p.notify_on_nearby_report = TRUE
+                       WHERE u.is_active = TRUE
+                         AND u.id != %s
+                         AND u.crew_home_lat BETWEEN %s AND %s
+                         AND u.crew_home_lng BETWEEN %s AND %s
+                       LIMIT 50""",
+                    (user["id"],
+                     lat - lat_delta, lat + lat_delta,
+                     lng - lng_delta, lng + lng_delta),
+                )
+                nearby_rows = cur.fetchall()
+        for nr in (nearby_rows or []):
+            _notify_crew_member(
+                nr["id"],
+                "notify_on_nearby_report",
+                "A nearby Valet Crew report",
+                "A fellow Valet Crew member just reported " + report_type
+                + " within about 5 miles of you. Open WeatherValet to "
+                "see the map.",
+                actor_user_id=user["id"],
+            )
+    except Exception as e:
+        print(f"[crew-report-submit] nearby notify failed: {e!r}", flush=True)
+
     return jsonify({"ok": True, "report_id": new_id})
 
 
@@ -21910,6 +22023,19 @@ def crew_report_verify(report_id: int):
     except Exception as e:
         print(f"[crew-verify] failed: {e!r}", flush=True)
         return jsonify({"ok": False, "error": "db-error"}), 500
+
+    # Notify the report owner the first time a neighbor confirms it.
+    # Only on the first confirmation (new_count == 1) so a busy report
+    # doesn't ping the owner once per verifier. Best-effort.
+    if inserted and new_count == 1 and row and row.get("user_id"):
+        _notify_crew_member(
+            row["user_id"],
+            "notify_on_verify",
+            "A neighbor confirmed your WeatherValet report",
+            "A fellow Valet Crew member just confirmed the report you "
+            "submitted. Thanks for helping keep the map honest.",
+            actor_user_id=user["id"],
+        )
 
     return jsonify({
         "ok": True,
@@ -22189,6 +22315,36 @@ def crew_missions_create():
         flush=True,
     )
 
+    # Notify Crew in the target area that a new mission is live. Mirrors
+    # the region matching the Crew inbox uses (primary saved location
+    # state/county; NULL target = everyone). Honors notify_on_mission.
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT DISTINCT u.id
+                       FROM users u
+                       JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'crew'
+                       JOIN saved_locations sl ON sl.user_id = u.id AND sl.is_primary = TRUE
+                       WHERE u.is_active = TRUE
+                         AND (%s IS NULL OR sl.region_state = %s)
+                         AND (%s IS NULL OR sl.region_county = %s)
+                       LIMIT 500""",
+                    (target_state, target_state, target_county, target_county),
+                )
+                recipient_rows = cur.fetchall()
+        for rr in (recipient_rows or []):
+            _notify_crew_member(
+                rr["id"],
+                "notify_on_mission",
+                "New WeatherValet mission in your area",
+                f"A Meteorologist just posted a mission: {title}. "
+                "Open WeatherValet to respond.",
+                actor_user_id=user["id"],
+            )
+    except Exception as e:
+        print(f"[mission-create] crew notify failed: {e!r}", flush=True)
+
     return jsonify({"ok": True, "mission_id": new_id})
 
 
@@ -22233,7 +22389,8 @@ def me_crew_mission_respond(mission_id: int):
         with db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """SELECT id, expires_at, is_active FROM crew_missions
+                    """SELECT id, expires_at, is_active,
+                              created_by_user_id, title FROM crew_missions
                        WHERE id = %s""",
                     (mission_id,),
                 )
@@ -22260,6 +22417,20 @@ def me_crew_mission_respond(mission_id: int):
     except Exception as e:
         print(f"[mission-respond] failed: {e!r}", flush=True)
         return jsonify({"ok": False, "error": "db-error"}), 500
+
+    # Notify the Meteorologist (or admin) who created this mission that a
+    # response just came in. Honors notify_on_mission_response. Skipped if
+    # the creator is the same person responding.
+    if row and row.get("created_by_user_id"):
+        _notify_crew_member(
+            row["created_by_user_id"],
+            "notify_on_mission_response",
+            "New response to your WeatherValet mission",
+            "A Valet Crew member just responded to your mission"
+            + (f": {row.get('title')}." if row.get("title") else ".")
+            + " Open WeatherValet to read it.",
+            actor_user_id=user["id"],
+        )
 
     return jsonify({"ok": True, "response_id": resp_id})
 
