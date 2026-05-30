@@ -903,6 +903,30 @@ CREATE INDEX IF NOT EXISTS idx_mso_date ON met_shift_overrides(shift_date);
 CREATE INDEX IF NOT EXISTS idx_mso_met ON met_shift_overrides(met_user_id);
 CREATE INDEX IF NOT EXISTS idx_mso_subscriber ON met_shift_overrides(subscriber_user_id);
 
+-- ── Shift handoff notes (May 30, 2026 — Task #13) ──
+-- A Met writes a short end-of-shift handoff so the next Met doesn't drop a
+-- ball during active weather. Three lightweight fields plus an optional
+-- note. The incoming Met sees recent handoffs on entry and can acknowledge
+-- one so the outgoing Met knows it was read.
+--   live_now  — situations active right now
+--   watching  — developing concerns to keep an eye on
+--   promised  — commitments made to a subscriber/customer
+CREATE TABLE IF NOT EXISTS met_handoffs (
+    id                  SERIAL PRIMARY KEY,
+    author_user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    author_name         TEXT,
+    live_now            TEXT,
+    watching            TEXT,
+    promised            TEXT,
+    note                TEXT,
+    created_at          BIGINT NOT NULL,
+    acknowledged_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    acknowledged_by_name    TEXT,
+    acknowledged_at     BIGINT
+);
+CREATE INDEX IF NOT EXISTS idx_met_handoffs_recent
+    ON met_handoffs(created_at DESC);
+
 
 -- Met "available right now" heartbeat.
 -- The frontend pings this every 60 seconds while a Met has the workspace open.
@@ -23616,6 +23640,145 @@ def met_snippets_use(snippet_id: int):
     if not row:
         return jsonify({"ok": False, "error": "not-found"}), 404
     return jsonify({"ok": True, "use_count": row["use_count"]})
+
+
+# ─── Shift handoff notes (Task #13) ───────────────────────────────────
+# End-of-shift "what's live / watching / promised" notes passed to the
+# next Met on duty.
+
+@app.route("/api/v1/met/handoffs", methods=["OPTIONS"])
+def _met_handoffs_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/handoffs")
+def met_handoffs_list():
+    """Recent shift handoffs (default last 48h, newest first) for the
+    incoming Met to read. ?hours= overrides the window (max 168)."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    met_id = user["id"]
+
+    try:
+        hours = float(request.args.get("hours", 48))
+    except (ValueError, TypeError):
+        hours = 48.0
+    hours = max(1.0, min(168.0, hours))
+    cutoff = now_ts() - int(hours * 3600)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, author_user_id, author_name, live_now, watching,
+                          promised, note, created_at,
+                          acknowledged_by_user_id, acknowledged_by_name, acknowledged_at
+                   FROM met_handoffs
+                   WHERE created_at >= %s
+                   ORDER BY created_at DESC
+                   LIMIT 50""",
+                (cutoff,),
+            )
+            rows = cur.fetchall()
+
+    out = []
+    for r in rows:
+        out.append({
+            "id": r["id"],
+            "author_name": r["author_name"] or "A meteorologist",
+            "mine": (r["author_user_id"] == met_id),
+            "live_now": r["live_now"] or "",
+            "watching": r["watching"] or "",
+            "promised": r["promised"] or "",
+            "note": r["note"] or "",
+            "created_at": r["created_at"],
+            "minutes_ago": max(0, (now_ts() - r["created_at"]) // 60),
+            "acknowledged": r["acknowledged_at"] is not None,
+            "acknowledged_by_name": r["acknowledged_by_name"],
+            "acknowledged_by_me": (r["acknowledged_by_user_id"] == met_id),
+        })
+    return jsonify({"ok": True, "hours": hours, "handoffs": out})
+
+
+@app.post("/api/v1/met/handoffs")
+def met_handoffs_create():
+    """Create a shift handoff. Body: {live_now, watching, promised, note}.
+    At least one field must be non-empty."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    live_now = (data.get("live_now") or "").strip()[:1000]
+    watching = (data.get("watching") or "").strip()[:1000]
+    promised = (data.get("promised") or "").strip()[:1000]
+    note = (data.get("note") or "").strip()[:1000]
+
+    if not (live_now or watching or promised or note):
+        return jsonify({"ok": False, "error": "empty-handoff"}), 400
+
+    now = now_ts()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO met_handoffs
+                     (author_user_id, author_name, live_now, watching,
+                      promised, note, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)
+                   RETURNING id""",
+                (user["id"], user.get("name"), live_now, watching,
+                 promised, note, now),
+            )
+            new_id = cur.fetchone()["id"]
+
+    return jsonify({"ok": True, "id": new_id})
+
+
+@app.route("/api/v1/met/handoffs/<int:handoff_id>/ack", methods=["OPTIONS"])
+def _met_handoff_ack_preflight(handoff_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/met/handoffs/<int:handoff_id>/ack")
+def met_handoffs_ack(handoff_id: int):
+    """Acknowledge a handoff so the outgoing Met knows it was read. Idempotent;
+    a Met can't meaningfully acknowledge their own but it's harmless."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    now = now_ts()
+    with db() as conn:
+        with conn.cursor() as cur:
+            # Only set ack the first time (don't overwrite who acknowledged first).
+            cur.execute(
+                """UPDATE met_handoffs
+                   SET acknowledged_by_user_id = %s,
+                       acknowledged_by_name = %s,
+                       acknowledged_at = %s
+                   WHERE id = %s AND acknowledged_at IS NULL
+                   RETURNING id""",
+                (user["id"], user.get("name"), now, handoff_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                # Either it doesn't exist, or it's already acknowledged.
+                cur.execute("SELECT acknowledged_at FROM met_handoffs WHERE id = %s",
+                            (handoff_id,))
+                exists = cur.fetchone()
+                if not exists:
+                    return jsonify({"ok": False, "error": "not-found"}), 404
+
+    return jsonify({"ok": True})
 
 
 # ─── Met reads responses to their missions ───────────────────────────
