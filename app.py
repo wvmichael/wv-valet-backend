@@ -19905,26 +19905,42 @@ def _parse_crew_condition(body):
     return None
 
 
+def _approx_us_tz_from_lng(lng):
+    """Rough US timezone from longitude, used only as a fallback when a
+    Crew member has no explicit timezone on file. Approximate band edges;
+    the point is simply to keep the morning nudge in the morning and never
+    send a pre-dawn text (a West Coast member must not be pinged at 5 AM)."""
+    try:
+        x = float(lng)
+    except (TypeError, ValueError):
+        return "America/Indiana/Indianapolis"
+    if x >= -87.5:
+        return "America/New_York"
+    if x >= -101.0:
+        return "America/Chicago"
+    if x >= -114.5:
+        return "America/Denver"
+    return "America/Los_Angeles"
+
+
 def _crew_daily_checkin_nudge() -> None:
-    """Once each morning, text opted-in Crew who have not checked in yet.
+    """Each tick, text opted-in Crew for whom it is now the 8 AM hour in
+    THEIR local timezone and who have not checked in yet.
 
-    Self-gating on a narrow Eastern-time window so it fires once per day.
-    Strictly opt-in (notify_on_daily_checkin). Skips members who already
-    checked in today and dedupes via crew_daily_nudges so a re-run in the
-    window cannot double-send. The message rotates by day and member id so
-    the same person does not see the same words two mornings running.
+    Per-member local time is the whole point here: an 8 AM Eastern blast
+    would hit a West Coast member at 5 AM. We use the member's stored
+    timezone when present, otherwise derive one from their home longitude.
+    Strictly opt-in (notify_on_daily_checkin). Deduped once per day via
+    crew_daily_nudges, and the message rotates by day and member id so the
+    same person does not see the same words two mornings running.
     """
-    now_et = datetime.now(ZoneInfo("America/New_York"))
-    if not (now_et.hour == 8 and now_et.minute < 9):
-        return
-
     today_key = _local_date_key()
     now_ms = int(time.time() * 1000)
     try:
         with db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """SELECT u.id, u.phone
+                    """SELECT u.id, u.phone, u.timezone, u.crew_home_lng
                        FROM users u
                        JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'crew'
                        JOIN crew_notification_prefs p ON p.user_id = u.id
@@ -19939,7 +19955,7 @@ def _crew_daily_checkin_nudge() -> None:
                            SELECT 1 FROM crew_daily_nudges n
                             WHERE n.user_id = u.id AND n.date_key = %s
                          )
-                       LIMIT 1000""",
+                       LIMIT 2000""",
                     (today_key, today_key),
                 )
                 rows = cur.fetchall()
@@ -19954,6 +19970,14 @@ def _crew_daily_checkin_nudge() -> None:
         return
     day_number = now_ms // (24 * 60 * 60 * 1000)
     for r in rows:
+        # Only send during the 8 AM hour in this member's own timezone.
+        tz = (r.get("timezone") or "").strip()
+        if not tz:
+            tz = _approx_us_tz_from_lng(r.get("crew_home_lng"))
+        local_now = _local_now_for_user(tz)
+        if local_now.hour != 8:
+            continue
+
         # Claim the per-day slot first so a re-run cannot double-send.
         claimed = False
         try:
