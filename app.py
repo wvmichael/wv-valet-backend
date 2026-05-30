@@ -432,6 +432,19 @@ ALTER TABLE verification_requests
 CREATE INDEX IF NOT EXISTS idx_vr_claimed_by
     ON verification_requests(claimed_by_user_id, status);
 
+-- AI-override tracking (May 30, 2026 — Task #7). Captured at completion,
+-- not recomputed later: when a Met submits, we freeze their verdict as a
+-- normalized key and record whether it differed from the AI's suggestion
+-- (ai_status_key). Lets each Met see how often they overrule the AI, and
+-- gives us clean training/quality data instead of re-classifying prose.
+--   met_verdict_key  — 'clear'|'caution'|'risk' (normalized) or NULL
+--   met_overrode_ai  — TRUE/FALSE, or NULL when undeterminable (no AI
+--                      verdict on the row, or prose we couldn't classify)
+ALTER TABLE verification_requests
+    ADD COLUMN IF NOT EXISTS met_verdict_key TEXT;
+ALTER TABLE verification_requests
+    ADD COLUMN IF NOT EXISTS met_overrode_ai BOOLEAN;
+
 -- ── Brief submission audit log ──
 -- Every POST to /admin/brief writes a row here. Lets the Meteorologist Portal
 -- show a real submission history (not just the current state of the brief
@@ -7532,6 +7545,12 @@ def meteorologist_complete(claim_token: str):
     # this is what we share with the customer in the delivered-review SMS).
     customer_review_token = new_secure_token()
 
+    # AI-override tracking (Task #7). Freeze the Met's verdict as a key and
+    # record whether it differed from the AI's suggestion (row.ai_status_key,
+    # set at creation). Computed now, at decision time — not re-derived later.
+    met_verdict_key = _normalize_met_verdict_key(verdict)
+    met_overrode_ai = _compute_ai_override(row.get("ai_status_key"), met_verdict_key)
+
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -7539,12 +7558,27 @@ def meteorologist_complete(claim_token: str):
                    SET status='completed', completed_at=%s, updated_at=%s,
                        meteorologist_verdict=%s, meteorologist_notes=%s,
                        completed_by_user_id=%s, completed_by_name=%s,
-                       customer_review_token=%s
+                       customer_review_token=%s,
+                       met_verdict_key=%s, met_overrode_ai=%s
                    WHERE id=%s""",
                 (now_ts(), now_ts(), verdict, notes,
                  completed_by_user_id, completed_by_name,
-                 customer_review_token, row["id"]),
+                 customer_review_token, met_verdict_key, met_overrode_ai,
+                 row["id"]),
             )
+
+    # Audit trail for the override decision (best-effort; never blocks).
+    if met_overrode_ai is not None:
+        _audit_log(
+            completed_by_user_id, completed_by_name,
+            "review_completed", target_type="verification_request",
+            target_id=row["id"],
+            details={
+                "ai_verdict": row.get("ai_status_key"),
+                "met_verdict": met_verdict_key,
+                "overrode_ai": met_overrode_ai,
+            },
+        )
 
     # Customer SMS — verdict ready. We link to the customer review page
     # which shows the verdict + a "thank your meteorologist" tip button.
@@ -7650,6 +7684,43 @@ def _classify_meteorologist_verdict(verdict_text: str) -> str:
     # than risk (avoids over-counting disagreements with AI=clear) or clear
     # (avoids under-counting disagreements with AI=risk).
     return "caution"
+
+
+def _normalize_met_verdict_key(verdict: str) -> Optional[str]:
+    """Normalize a submitted Met verdict to 'clear'|'caution'|'risk'.
+
+    Two completion paths feed this:
+      - Met workspace — `verdict` is already one of the three keys, so we
+        trust it directly (this is the exact call the Met made; no guessing).
+      - Legacy HTML claim form — `verdict` is free-text prose, so we fall
+        back to the keyword classifier.
+
+    Returns the key, or None if even the classifier can't decide (it won't
+    normally return None today, but we keep the contract honest).
+    """
+    v = (verdict or "").strip().lower()
+    if v in ("clear", "caution", "risk"):
+        return v
+    classified = _classify_meteorologist_verdict(verdict)
+    return classified if classified in ("clear", "caution", "risk") else None
+
+
+def _compute_ai_override(ai_status_key: Optional[str],
+                         met_verdict_key: Optional[str]) -> Optional[bool]:
+    """Did the Met overrule the AI's suggested verdict?
+
+    True  — Met's verdict differs from the AI's.
+    False — Met agreed with the AI.
+    None  — undeterminable (no AI verdict stored, or Met verdict
+            couldn't be normalized). We store NULL rather than guess so
+            the override rate is computed only over comparable reviews.
+    """
+    ai = (ai_status_key or "").strip().lower()
+    if ai not in ("clear", "caution", "risk"):
+        return None
+    if met_verdict_key not in ("clear", "caution", "risk"):
+        return None
+    return met_verdict_key != ai
 
 
 @app.get("/admin/queue")
@@ -26446,6 +26517,17 @@ def met_vitals():
     week_start_ms = int(week_start_et.timestamp() * 1000)
     now_ms = int(now_et.timestamp() * 1000)
 
+    # IMPORTANT: the *_ms bounds above are correct for tables that store
+    # ms-since-epoch (mission_deployments.fired_at, etc.), but
+    # verification_requests stores completed_at / claimed_at in SECONDS
+    # (now_ts()). Comparing seconds-valued columns against ms thresholds
+    # made every review query match nothing — so reviews_today/week (and
+    # their earnings) silently read 0. Use seconds bounds for those.
+    # (Fixed May 30, 2026 alongside override tracking.)
+    today_start_s = today_start_ms // 1000
+    week_start_s = week_start_ms // 1000
+    now_s = now_ms // 1000
+
     # MET_REVIEW_SHARE_PCT (65%) is used everywhere else for payroll math.
     # Match that here so vital tile earnings match the monthly payroll line.
     try:
@@ -26455,26 +26537,27 @@ def met_vitals():
 
     with db() as conn:
         with conn.cursor() as cur:
-            # Reviews — today
+            # Reviews — today. completed_at/claimed_at are SECONDS, so use
+            # seconds bounds and treat the AVG result as seconds directly.
             cur.execute(
                 """SELECT COUNT(*) AS n,
                           COALESCE(SUM(price_cents), 0) AS total_cents,
-                          AVG(GREATEST(completed_at - claimed_at, 0)) AS avg_ms
+                          AVG(GREATEST(completed_at - claimed_at, 0)) AS avg_s
                    FROM verification_requests
                    WHERE status = 'completed'
                      AND completed_by_user_id = %s
                      AND completed_at >= %s AND completed_at < %s
                      AND claimed_at IS NOT NULL""",
-                (met_id, today_start_ms, now_ms),
+                (met_id, today_start_s, now_s),
             )
             today_row = cur.fetchone() or {}
             reviews_today = today_row.get("n") or 0
             today_total = today_row.get("total_cents") or 0
-            today_avg_ms = today_row.get("avg_ms")
+            today_avg_s = today_row.get("avg_s")
             earned_today_cents = int(today_total * share_pct)
-            avg_response_seconds = int(today_avg_ms / 1000) if today_avg_ms else None
+            avg_response_seconds = int(today_avg_s) if today_avg_s else None
 
-            # Reviews — week
+            # Reviews — week (seconds bounds; see note above)
             cur.execute(
                 """SELECT COUNT(*) AS n,
                           COALESCE(SUM(price_cents), 0) AS total_cents
@@ -26482,12 +26565,34 @@ def met_vitals():
                    WHERE status = 'completed'
                      AND completed_by_user_id = %s
                      AND completed_at >= %s AND completed_at < %s""",
-                (met_id, week_start_ms, now_ms),
+                (met_id, week_start_s, now_s),
             )
             week_row = cur.fetchone() or {}
             reviews_week = week_row.get("n") or 0
             week_total = week_row.get("total_cents") or 0
             earned_week_cents = int(week_total * share_pct)
+
+            # AI overrides — week (Task #7). Of this Met's completed reviews
+            # this week where the override signal is determinable, how many
+            # did they overrule the AI? met_overrode_ai is NULL when not
+            # comparable, so we only count rows where it's TRUE/FALSE.
+            cur.execute(
+                """SELECT
+                       COUNT(*) FILTER (WHERE met_overrode_ai IS NOT NULL) AS comparable,
+                       COUNT(*) FILTER (WHERE met_overrode_ai IS TRUE) AS overrode
+                   FROM verification_requests
+                   WHERE status = 'completed'
+                     AND completed_by_user_id = %s
+                     AND completed_at >= %s AND completed_at < %s""",
+                (met_id, week_start_s, now_s),
+            )
+            ov_row = cur.fetchone() or {}
+            overrides_comparable_week = ov_row.get("comparable") or 0
+            overrides_week = ov_row.get("overrode") or 0
+            if overrides_comparable_week > 0:
+                override_rate_pct = round(100.0 * overrides_week / overrides_comparable_week)
+            else:
+                override_rate_pct = None
 
             # Missions — templates authored (lifetime, not time-bound)
             cur.execute(
@@ -26525,6 +26630,9 @@ def met_vitals():
             "earned_week_cents": earned_week_cents,
             "avg_response_seconds": avg_response_seconds,
             "streak_days": None,  # v1: not implemented
+            "overrides_week": overrides_week,
+            "overrides_comparable_week": overrides_comparable_week,
+            "override_rate_pct": override_rate_pct,
         },
         "missions": {
             "templates_authored": templates_authored,
