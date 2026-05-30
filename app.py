@@ -16421,24 +16421,6 @@ def _me_profile_preflight():
     return ("", 204)
 
 
-@app.route("/api/v1/me", methods=["OPTIONS"])
-def _me_preflight():
-    return ("", 204)
-
-
-@app.get("/api/v1/me")
-def me_get():
-    """Return the current signed-in user with their roles, or a 401 when
-    there is no valid session. The frontend calls this to decide whether
-    to show a signed-in experience (for example the Crew workspace) or the
-    signed-out invitation. Response shape matches what the frontend reads:
-    { ok: true, user: { id, email, name, roles, ... } }."""
-    user = _get_current_user()
-    if user is None:
-        return jsonify({"ok": False, "error": "not-authenticated"}), 401
-    return jsonify({"ok": True, "user": user})
-
-
 @app.get("/api/v1/me/profile")
 def me_profile_get():
     """Return the current user's basic profile (name, email, phone).
@@ -23304,6 +23286,145 @@ def met_cite_crew_report(report_id: int):
         )
 
     return jsonify({"ok": True, "cited_by": met_name, "already_cited": already})
+
+
+def _compass_bearing(lat1: float, lng1: float, lat2: float, lng2: float) -> str:
+    """Rough 8-point compass direction FROM point 1 TO point 2.
+    Used to tell a Met a Crew report is e.g. '12 mi NW' of the job site."""
+    import math as _m
+    dlng = _m.radians(lng2 - lng1)
+    y = _m.sin(dlng) * _m.cos(_m.radians(lat2))
+    x = (_m.cos(_m.radians(lat1)) * _m.sin(_m.radians(lat2))
+         - _m.sin(_m.radians(lat1)) * _m.cos(_m.radians(lat2)) * _m.cos(dlng))
+    brng = (_m.degrees(_m.atan2(y, x)) + 360) % 360
+    dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    return dirs[int((brng + 22.5) // 45) % 8]
+
+
+@app.route("/api/v1/met/queue/<int:request_id>/nearby-crew-reports", methods=["OPTIONS"])
+def _met_nearby_crew_reports_preflight(request_id):
+    return ("", 204)
+
+
+@app.get("/api/v1/met/queue/<int:request_id>/nearby-crew-reports")
+def met_nearby_crew_reports(request_id: int):
+    """Ground-truth panel for the review composer (Task #11A, May 30 2026).
+
+    Given a review, return recent Crew field reports near the customer's
+    location — the real observations the AI's models never see (actual hail
+    size, when the storm really arrived). Lets the Met factor in ground
+    truth and one-click cite the reports they used.
+
+    Query params:
+      radius_miles — search radius (default 75, max 250)
+      hours        — recency window (default 12, max 72)
+
+    Each report includes distance_miles, bearing (8-point compass),
+    minutes_ago, verified_count, citation state, and cited_by_me so the
+    composer can show a Cite/Cited toggle.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    try:
+        radius_miles = float(request.args.get("radius_miles", 75))
+    except (ValueError, TypeError):
+        radius_miles = 75.0
+    radius_miles = max(1.0, min(250.0, radius_miles))
+    try:
+        hours = float(request.args.get("hours", 12))
+    except (ValueError, TypeError):
+        hours = 12.0
+    hours = max(1.0, min(72.0, hours))
+
+    radius_m = radius_miles * 1609.344
+    now_ms = int(time.time() * 1000)
+    cutoff_ms = now_ms - int(hours * 3600 * 1000)
+    met_id = user["id"]
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            # Resolve the review + its location. Reuse the same snapshot-or-
+            # geocode resolver the review grader uses, so location handling
+            # is consistent across the two features.
+            cur.execute(
+                """SELECT id, plan_location, forecast_snapshot
+                   FROM verification_requests WHERE id = %s""",
+                (request_id,),
+            )
+            req = cur.fetchone()
+            if not req:
+                return jsonify({"ok": False, "error": "review-not-found"}), 404
+
+            latlng = _review_grading_latlng(req)
+            if latlng is None:
+                # No usable location — return an empty-but-OK result with a
+                # reason, so the composer can show "location unknown" rather
+                # than an error.
+                return jsonify({
+                    "ok": True, "located": False, "reason": "no-location",
+                    "center": None, "radius_miles": radius_miles,
+                    "hours": hours, "reports": [],
+                })
+            lat, lng = latlng
+
+            # Bounding-box prefilter (cheap, index-friendly), then exact
+            # haversine. ~1 deg lat ≈ 69 mi; lng scaled by cos(lat).
+            lat_pad = radius_miles / 69.0
+            cos_lat = max(0.01, math.cos(math.radians(lat)))
+            lng_pad = radius_miles / (69.0 * cos_lat)
+            cur.execute(
+                """SELECT id, user_id, user_name, report_type, latitude, longitude,
+                          notes, image_url, verified_count, created_at,
+                          cited_at, cited_by_user_id, cited_by_name
+                   FROM crew_reports
+                   WHERE is_hidden = FALSE
+                     AND created_at >= %s
+                     AND latitude BETWEEN %s AND %s
+                     AND longitude BETWEEN %s AND %s
+                   ORDER BY created_at DESC
+                   LIMIT 200""",
+                (cutoff_ms, lat - lat_pad, lat + lat_pad,
+                 lng - lng_pad, lng + lng_pad),
+            )
+            candidates = cur.fetchall()
+
+    reports = []
+    for r in candidates:
+        dist_m = _haversine_meters(lat, lng, r["latitude"], r["longitude"])
+        if dist_m > radius_m:
+            continue
+        reports.append({
+            "id": r["id"],
+            "report_type": r["report_type"],
+            "notes": r["notes"] or "",
+            "image_url": r["image_url"],
+            "reporter_name": r["user_name"] or "A Crew member",
+            "distance_miles": round(dist_m / 1609.344, 1),
+            "bearing": _compass_bearing(lat, lng, r["latitude"], r["longitude"]),
+            "minutes_ago": max(0, (now_ms - r["created_at"]) // 60000),
+            "verified_count": r["verified_count"] or 0,
+            "cited": r["cited_at"] is not None,
+            "cited_by_name": r["cited_by_name"],
+            "cited_by_me": (r["cited_by_user_id"] == met_id),
+        })
+
+    # Closest first — the most operationally relevant ground truth.
+    reports.sort(key=lambda x: x["distance_miles"])
+
+    return jsonify({
+        "ok": True,
+        "located": True,
+        "center": {"lat": lat, "lng": lng},
+        "radius_miles": radius_miles,
+        "hours": hours,
+        "count": len(reports),
+        "reports": reports,
+    })
 
 
 # ─── Met reads responses to their missions ───────────────────────────
