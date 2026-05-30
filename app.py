@@ -2202,6 +2202,18 @@ CREATE TABLE IF NOT EXISTS crew_severe_alert_notifications (
 ALTER TABLE crew_severe_alert_notifications ADD COLUMN IF NOT EXISTS alert_expires_at BIGINT;
 ALTER TABLE crew_severe_alert_notifications ADD COLUMN IF NOT EXISTS all_clear_sent_at BIGINT;
 
+-- Daily check-in nudge (#C9). Opt-in only (default FALSE): a member must
+-- choose to receive the morning message. crew_daily_nudges dedupes so a
+-- member gets at most one nudge per local day, and only if they have not
+-- already checked in.
+ALTER TABLE crew_notification_prefs ADD COLUMN IF NOT EXISTS notify_on_daily_checkin BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE TABLE IF NOT EXISTS crew_daily_nudges (
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    date_key    TEXT NOT NULL,
+    sent_at     BIGINT NOT NULL,
+    UNIQUE (user_id, date_key)
+);
+
 -- ── Pro Threads (Phase 10 — Met<>Subscriber DMs) ──
 -- One thread per subscriber, holding their conversation with the Met
 -- team. Simpler than per-topic threading: subscribers see one continuous
@@ -18970,6 +18982,10 @@ def _brief_scheduler_loop() -> None:
             _process_scheduled_messages()
         except Exception as e:
             print(f"[scheduled-msg-tick] tick failed: {e!r}", flush=True)
+        try:
+            _crew_daily_checkin_nudge()
+        except Exception as e:
+            print(f"[crew-nudge] tick failed: {e!r}", flush=True)
         # Phase 11 (May 17): Coverage scheduler jobs
         # Generate today/tomorrow tasks for Pro subscribers, then check
         # for escalations. Both run on the same 60s tick so deadlines
@@ -19827,6 +19843,139 @@ def _notify_crew_in_severe_alert(alert: dict) -> None:
             _notify_crew_member(r["id"], "notify_on_severe_alert", subject, body)
         except Exception as e:
             print(f"[crew-severe] notify failed for user {r['id']}: {e}", flush=True)
+
+
+# ─── Crew daily check-in nudge (#C9) ────────────────────────────────
+# Opt-in morning message that rotates through a pool so a member does not
+# see the same words every day, and skips anyone who already checked in.
+# Sent from the toll-free number, so a reply lands in the inbound webhook
+# (rosie_sms_inbound) and checks them in.
+_CREW_DAILY_NUDGE_MESSAGES = [
+    "Good morning! What does it look like outside right now? Reply clear, cloudy, rain, or storm to check-in.",
+    "This is a friendly reminder to check-in with us today.",
+    "Our Mets needs your help. What does it look like at your location?",
+    "Take a look outside. Is it clear, cloudy, raining, or storming?",
+    "Daily update: What does it look like outside at your location?",
+    "Weather check! What are conditions like at your location right now?",
+    "Help us monitor conditions in your area. What does the weather look like outside?",
+    "Take a quick glance outside and let us know what you see: clear, cloudy, rain, or storm.",
+    "We'd love an update from your location. What are current conditions outside?",
+    "Ground truth matters. What does the sky look like where you are right now?",
+    "Can you help us out with a quick weather observation? Reply clear, cloudy, rain, or storm.",
+    "What's happening outside your window? Let us know with a quick weather check-in.",
+    "Conditions can change quickly. What does the weather look like at your location right now?",
+    "Weather observation request: Is it clear, cloudy, raining, or storming where you are?",
+    "Today's weather check-in: What are you seeing outside at your location?",
+    "Help improve our weather awareness. What does it look like outside right now?",
+    "Quick weather survey: Are conditions clear, cloudy, rainy, or stormy in your area?",
+    "Your observation helps us stay informed. What are conditions like outside?",
+    "What does the sky have in store today? Reply clear, cloudy, rain, or storm.",
+    "We're checking conditions across the region. What does it look like where you are?",
+    "Step outside or look out a window. What weather conditions are you seeing right now?",
+    "A quick update from you goes a long way. What's the weather doing at your location?",
+    "Current conditions check: Clear, cloudy, rain, or storm?",
+    "Take 5 seconds to help us out. What does the weather look like where you are?",
+    "Valet Crew, we need your eyes on the sky. What's it looking like at your location?",
+    "Valet Crew! Crew check-in: What are current conditions where you are?",
+    "Help us build a real-time weather picture. What does it look like outside right now?",
+    "Your local observation helps everyone. What conditions are you seeing at your location?",
+    "Be our weather spotter for the day. Is it clear, cloudy, raining, or storming where you are?",
+]
+
+_CREW_CONDITION_WORDS = {
+    "clear": "clear", "sunny": "clear", "sun": "clear",
+    "cloud": "cloudy", "cloudy": "cloudy", "clouds": "cloudy", "overcast": "cloudy",
+    "rain": "rain", "raining": "rain", "rainy": "rain", "wet": "rain", "drizzle": "rain",
+    "storm": "storm", "storming": "storm", "stormy": "storm", "thunder": "storm",
+    "snow": "snow", "snowing": "snow", "snowy": "snow",
+    "fog": "fog", "foggy": "fog",
+    "wind": "wind", "windy": "wind",
+    "hail": "hail",
+}
+
+
+def _parse_crew_condition(body):
+    """Map the first recognizable word of an inbound reply to a condition,
+    or None if nothing matches. Forgiving: scans the whole message, not
+    just the first word, so 'it is raining' still resolves to rain."""
+    for raw in (body or "").lower().replace(",", " ").split():
+        w = raw.strip(".!?;:'\"")
+        if w in _CREW_CONDITION_WORDS:
+            return _CREW_CONDITION_WORDS[w]
+    return None
+
+
+def _crew_daily_checkin_nudge() -> None:
+    """Once each morning, text opted-in Crew who have not checked in yet.
+
+    Self-gating on a narrow Eastern-time window so it fires once per day.
+    Strictly opt-in (notify_on_daily_checkin). Skips members who already
+    checked in today and dedupes via crew_daily_nudges so a re-run in the
+    window cannot double-send. The message rotates by day and member id so
+    the same person does not see the same words two mornings running.
+    """
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    if not (now_et.hour == 8 and now_et.minute < 9):
+        return
+
+    today_key = _local_date_key()
+    now_ms = int(time.time() * 1000)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT u.id, u.phone
+                       FROM users u
+                       JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'crew'
+                       JOIN crew_notification_prefs p ON p.user_id = u.id
+                            AND p.notify_on_daily_checkin = TRUE
+                       WHERE u.is_active = TRUE
+                         AND u.phone IS NOT NULL AND u.phone != ''
+                         AND NOT EXISTS (
+                           SELECT 1 FROM crew_checkins c
+                            WHERE c.user_id = u.id AND c.date_key = %s
+                         )
+                         AND NOT EXISTS (
+                           SELECT 1 FROM crew_daily_nudges n
+                            WHERE n.user_id = u.id AND n.date_key = %s
+                         )
+                       LIMIT 1000""",
+                    (today_key, today_key),
+                )
+                rows = cur.fetchall()
+    except Exception as e:
+        print(f"[crew-nudge] lookup failed: {e!r}", flush=True)
+        return
+
+    if not rows:
+        return
+    pool = _CREW_DAILY_NUDGE_MESSAGES
+    if not pool:
+        return
+    day_number = now_ms // (24 * 60 * 60 * 1000)
+    for r in rows:
+        # Claim the per-day slot first so a re-run cannot double-send.
+        claimed = False
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO crew_daily_nudges (user_id, date_key, sent_at)
+                           VALUES (%s, %s, %s)
+                           ON CONFLICT (user_id, date_key) DO NOTHING""",
+                        (r["id"], today_key, now_ms),
+                    )
+                    claimed = (cur.rowcount == 1)
+        except Exception as e:
+            print(f"[crew-nudge] claim failed: {e!r}", flush=True)
+            continue
+        if not claimed:
+            continue
+        msg = pool[(day_number + r["id"]) % len(pool)]
+        try:
+            send_sms(r["phone"], msg)
+        except Exception as e:
+            print(f"[crew-nudge] send failed for user {r['id']}: {e!r}", flush=True)
 
 
 def _send_crew_all_clears() -> None:
@@ -21576,6 +21725,7 @@ _CREW_NOTIFY_DEFAULTS = {
     "notify_on_severe_alert": True,
     "notify_on_mission_response": True,
     "notify_on_cited": True,
+    "notify_on_daily_checkin": False,
     "notify_via_email": True,
     "notify_via_text": False,
 }
@@ -23328,6 +23478,7 @@ def me_crew_notif_get():
             "notify_on_severe_alert": row.get("notify_on_severe_alert", True),
             "notify_on_mission_response": row.get("notify_on_mission_response", True),
             "notify_on_cited": row.get("notify_on_cited", True),
+            "notify_on_daily_checkin": row.get("notify_on_daily_checkin", False),
             "notify_via_email": row.get("notify_via_email", True),
             "notify_via_text": row.get("notify_via_text", False),
         }
@@ -23345,6 +23496,7 @@ def me_crew_notif_update():
     allowed_keys = (
         "notify_on_verify", "notify_on_mission", "notify_on_nearby_report",
         "notify_on_severe_alert", "notify_on_mission_response", "notify_on_cited",
+        "notify_on_daily_checkin",
         "notify_via_email", "notify_via_text",
     )
     updates = {k: bool(v) for k, v in data.items() if k in allowed_keys}
@@ -30122,8 +30274,73 @@ def rosie_sms_inbound():
                 met = cur.fetchone()
 
     if not met:
-        # Unknown number. Reply politely so a misdirected text doesn't get
-        # lost in silence, but don't process the message.
+        # Not a Meteorologist. Is this a Crew member replying to a daily
+        # nudge? If so, treat the reply as a check-in (#C9).
+        crew = None
+        if from_phone:
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """SELECT u.id, u.name FROM users u
+                               JOIN user_roles ur ON ur.user_id = u.id
+                               WHERE u.phone = %s AND ur.role = 'crew'
+                                 AND u.is_active = TRUE LIMIT 1""",
+                            (from_phone,),
+                        )
+                        crew = cur.fetchone()
+            except Exception as e:
+                print(f"[crew-sms] lookup failed: {e}", flush=True)
+
+        if crew:
+            # Carrier opt-out / help keywords are handled by Twilio for
+            # toll-free numbers; if one still reaches us, do not check in.
+            if body.strip().upper() in ("STOP", "STOPALL", "UNSUBSCRIBE",
+                                        "CANCEL", "END", "QUIT", "HELP", "START"):
+                return ("<?xml version='1.0' encoding='UTF-8'?><Response/>",
+                        200, {"Content-Type": "text/xml"})
+            condition = _parse_crew_condition(body)
+            now_ms = int(time.time() * 1000)
+            today_key = _local_date_key()
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """INSERT INTO crew_checkins
+                                 (user_id, date_key, conditions, notes, checked_in_at)
+                               VALUES (%s, %s, %s, %s, %s)
+                               ON CONFLICT (user_id, date_key) DO UPDATE
+                                 SET conditions = EXCLUDED.conditions,
+                                     notes = EXCLUDED.notes,
+                                     checked_in_at = EXCLUDED.checked_in_at""",
+                            (crew["id"], today_key, condition or "",
+                             body[:500], now_ms),
+                        )
+            except Exception as e:
+                print(f"[crew-sms] checkin failed: {e}", flush=True)
+                reply = ("Sorry, something went wrong logging that. Please "
+                         "try again in a moment.")
+                twiml = f"<?xml version='1.0' encoding='UTF-8'?><Response><Message>{escape_xml(reply)}</Message></Response>"
+                return (twiml, 200, {"Content-Type": "text/xml"})
+
+            try:
+                streak = _compute_streak(crew["id"])
+            except Exception:
+                streak = 0
+            day_word = "day" if streak == 1 else "days"
+            if condition:
+                reply = (f"Got it, you are checked in. Logged: {condition}. "
+                         f"Streak: {streak} {day_word}. Thank you for the "
+                         f"eyes on the sky.")
+            else:
+                reply = (f"Got it, you are checked in. Streak: {streak} "
+                         f"{day_word}. Tip: reply clear, cloudy, rain, or "
+                         f"storm to log conditions.")
+            twiml = f"<?xml version='1.0' encoding='UTF-8'?><Response><Message>{escape_xml(reply)}</Message></Response>"
+            return (twiml, 200, {"Content-Type": "text/xml"})
+
+        # Truly unknown number. Reply politely so a misdirected text doesn't
+        # get lost in silence, but don't process the message.
         reply = ("This number is for the WeatherValet meteorologist team. "
                  "If you're a customer, please reply to your usual WV number "
                  "or email hello@weathervalet.ai.")
