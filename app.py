@@ -26719,6 +26719,29 @@ def met_vitals():
             else:
                 override_rate_pct = None
 
+            # Streak — consecutive ET days (ending today, or yesterday if
+            # nothing completed today yet) on which this Met completed at
+            # least one review. Implemented May 30, 2026 (was deferred).
+            # We pull the last 60 days of completion timestamps and count
+            # the consecutive run in Python (cleaner than date-bucket SQL
+            # across the ET boundary, and 60 rows is trivial).
+            streak_lookback_s = now_s - (60 * 86400)
+            cur.execute(
+                """SELECT completed_at
+                   FROM verification_requests
+                   WHERE status = 'completed'
+                     AND completed_by_user_id = %s
+                     AND completed_at >= %s""",
+                (met_id, streak_lookback_s),
+            )
+            completed_days = set()
+            for cr in cur.fetchall():
+                ts = cr.get("completed_at")
+                if ts is None:
+                    continue
+                d = datetime.fromtimestamp(ts, ET).date()
+                completed_days.add(d)
+
             # Missions — templates authored (lifetime, not time-bound)
             cur.execute(
                 """SELECT COUNT(*) AS n FROM mission_templates_user
@@ -26746,6 +26769,19 @@ def met_vitals():
             else:
                 completion_rate_pct = None
 
+    # Count the consecutive-day streak run ending today (or yesterday).
+    # Done outside the DB block — pure date arithmetic over completed_days.
+    streak_days = 0
+    if completed_days:
+        cursor_day = now_et.date()
+        if cursor_day not in completed_days:
+            # No review today yet — a streak can still be "alive" if they
+            # worked yesterday; start counting from yesterday.
+            cursor_day = cursor_day - timedelta(days=1)
+        while cursor_day in completed_days:
+            streak_days += 1
+            cursor_day = cursor_day - timedelta(days=1)
+
     return jsonify({
         "ok": True,
         "vitals": {
@@ -26754,7 +26790,7 @@ def met_vitals():
             "reviews_week": reviews_week,
             "earned_week_cents": earned_week_cents,
             "avg_response_seconds": avg_response_seconds,
-            "streak_days": None,  # v1: not implemented
+            "streak_days": streak_days,
             "overrides_week": overrides_week,
             "overrides_comparable_week": overrides_comparable_week,
             "override_rate_pct": override_rate_pct,
