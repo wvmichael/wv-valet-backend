@@ -775,6 +775,32 @@ CREATE TABLE IF NOT EXISTS mission_templates_user (
 CREATE INDEX IF NOT EXISTS idx_mtu_status
     ON mission_templates_user(status);
 
+-- ── Met brief snippets (May 30, 2026 — Task #12) ──
+-- Reusable phrasings a Met inserts into the review composer instead of
+-- retyping ("frontal timing 11-13z, went with HRRR over RAP", etc.).
+-- Modeled on mission_templates_user: a slug, an owner, a use_count to
+-- surface the most-used. Two scopes:
+--   scope='personal' — only the owner sees it
+--   scope='team'     — all Mets see it (shared library)
+-- category maps a snippet to a composer field so each field's menu shows
+-- only relevant snippets: 'reason'|'watch'|'bottom_line'|'alternate'|'general'.
+CREATE TABLE IF NOT EXISTS met_snippets (
+    id              SERIAL PRIMARY KEY,
+    owner_user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    owner_name      TEXT,
+    label           TEXT NOT NULL,                 -- short menu label
+    body            TEXT NOT NULL,                 -- the text inserted
+    category        TEXT NOT NULL DEFAULT 'general',
+    scope           TEXT NOT NULL DEFAULT 'personal',  -- 'personal' | 'team'
+    use_count       INTEGER NOT NULL DEFAULT 0,
+    created_at      BIGINT NOT NULL,
+    updated_at      BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_met_snippets_owner
+    ON met_snippets(owner_user_id, category);
+CREATE INDEX IF NOT EXISTS idx_met_snippets_scope
+    ON met_snippets(scope, category);
+
 
 -- ──────────────────────────────────────────────────────────────────────
 -- Coverage scheduler (Phase 11, May 17)
@@ -23425,6 +23451,171 @@ def met_nearby_crew_reports(request_id: int):
         "count": len(reports),
         "reports": reports,
     })
+
+
+# ─── Met brief snippets (Task #12) ────────────────────────────────────
+# Reusable phrasings the Met inserts into the composer. Personal +
+# team-shared, categorized by composer field.
+
+_SNIPPET_CATEGORIES = {"reason", "watch", "bottom_line", "alternate", "general"}
+
+
+def _snippet_out(r: dict, met_id: int) -> dict:
+    return {
+        "id": r["id"],
+        "label": r["label"],
+        "body": r["body"],
+        "category": r["category"],
+        "scope": r["scope"],
+        "use_count": r["use_count"] or 0,
+        "owner_name": r["owner_name"],
+        "mine": (r["owner_user_id"] == met_id),
+    }
+
+
+@app.route("/api/v1/met/snippets", methods=["OPTIONS"])
+def _met_snippets_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/snippets")
+def met_snippets_list():
+    """List snippets available to this Met: their own (any scope) plus all
+    team-shared snippets. Sorted most-used first within each category."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    met_id = user["id"]
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, owner_user_id, owner_name, label, body,
+                          category, scope, use_count
+                   FROM met_snippets
+                   WHERE owner_user_id = %s OR scope = 'team'
+                   ORDER BY use_count DESC, updated_at DESC""",
+                (met_id,),
+            )
+            rows = cur.fetchall()
+
+    return jsonify({
+        "ok": True,
+        "snippets": [_snippet_out(r, met_id) for r in rows],
+    })
+
+
+@app.post("/api/v1/met/snippets")
+def met_snippets_create():
+    """Create a snippet. Body: {label, body, category, scope}."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    label = (data.get("label") or "").strip()
+    body = (data.get("body") or "").strip()
+    category = (data.get("category") or "general").strip()
+    scope = (data.get("scope") or "personal").strip()
+
+    if not label or not body:
+        return jsonify({"ok": False, "error": "label-and-body-required"}), 400
+    if category not in _SNIPPET_CATEGORIES:
+        category = "general"
+    if scope not in ("personal", "team"):
+        scope = "personal"
+    # Keep things bounded.
+    label = label[:80]
+    body = body[:1000]
+
+    now = now_ts()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO met_snippets
+                     (owner_user_id, owner_name, label, body, category,
+                      scope, use_count, created_at, updated_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, 0, %s, %s)
+                   RETURNING id""",
+                (user["id"], user.get("name"), label, body, category,
+                 scope, now, now),
+            )
+            new_id = cur.fetchone()["id"]
+
+    return jsonify({"ok": True, "id": new_id})
+
+
+@app.route("/api/v1/met/snippets/<int:snippet_id>", methods=["OPTIONS"])
+def _met_snippet_item_preflight(snippet_id):
+    return ("", 204)
+
+
+@app.delete("/api/v1/met/snippets/<int:snippet_id>")
+def met_snippets_delete(snippet_id: int):
+    """Delete a snippet. Owner-only (admins may delete any)."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    is_admin = "admin" in roles
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            if is_admin:
+                cur.execute(
+                    "DELETE FROM met_snippets WHERE id = %s RETURNING id",
+                    (snippet_id,),
+                )
+            else:
+                cur.execute(
+                    "DELETE FROM met_snippets WHERE id = %s AND owner_user_id = %s RETURNING id",
+                    (snippet_id, user["id"]),
+                )
+            deleted = cur.fetchone()
+
+    if not deleted:
+        return jsonify({"ok": False, "error": "not-found-or-not-yours"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/v1/met/snippets/<int:snippet_id>/use", methods=["OPTIONS"])
+def _met_snippet_use_preflight(snippet_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/met/snippets/<int:snippet_id>/use")
+def met_snippets_use(snippet_id: int):
+    """Increment a snippet's use_count (best-effort; drives most-used
+    sorting). Available for any snippet the Met can see."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    met_id = user["id"]
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE met_snippets SET use_count = use_count + 1
+                   WHERE id = %s AND (owner_user_id = %s OR scope = 'team')
+                   RETURNING use_count""",
+                (snippet_id, met_id),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    return jsonify({"ok": True, "use_count": row["use_count"]})
 
 
 # ─── Met reads responses to their missions ───────────────────────────
