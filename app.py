@@ -2201,6 +2201,10 @@ CREATE TABLE IF NOT EXISTS crew_severe_alert_notifications (
 -- same members when it has passed, and stamp the all-clear once it is sent.
 ALTER TABLE crew_severe_alert_notifications ADD COLUMN IF NOT EXISTS alert_expires_at BIGINT;
 ALTER TABLE crew_severe_alert_notifications ADD COLUMN IF NOT EXISTS all_clear_sent_at BIGINT;
+-- Ride-it-out mode (#C13): keep the event name and NWS safety instruction
+-- so the in-app companion panel can show what is active and how to stay safe.
+ALTER TABLE crew_severe_alert_notifications ADD COLUMN IF NOT EXISTS event TEXT;
+ALTER TABLE crew_severe_alert_notifications ADD COLUMN IF NOT EXISTS instruction TEXT;
 
 -- Daily check-in nudge (#C9). Opt-in only (default FALSE): a member must
 -- choose to receive the morning message. crew_daily_nudges dedupes so a
@@ -19821,10 +19825,12 @@ def _notify_crew_in_severe_alert(alert: dict) -> None:
                 with conn.cursor() as cur:
                     cur.execute(
                         """INSERT INTO crew_severe_alert_notifications
-                           (nws_alert_id, crew_user_id, notified_at, alert_expires_at)
-                           VALUES (%s, %s, %s, %s)
+                           (nws_alert_id, crew_user_id, notified_at, alert_expires_at,
+                            event, instruction)
+                           VALUES (%s, %s, %s, %s, %s, %s)
                            ON CONFLICT (nws_alert_id, crew_user_id) DO NOTHING""",
-                        (nws_id, r["id"], now_ms, alert.get("expires_at")),
+                        (nws_id, r["id"], now_ms, alert.get("expires_at"),
+                         alert.get("event") or "", alert.get("instruction") or ""),
                     )
                     notified_now = (cur.rowcount == 1)
         except Exception as e:
@@ -22190,6 +22196,51 @@ def me_crew_neighbors():
     return jsonify({"ok": True, "count": count, "radius_mi": radius_mi})
 
 
+@app.route("/api/v1/me/crew/active-alert", methods=["OPTIONS"])
+def _me_crew_active_alert_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/crew/active-alert")
+def me_crew_active_alert():
+    """Whether the calling Crew member is currently inside an active severe
+    alert we notified them about (ride-it-out mode, #C13). Reads the stored
+    notification row, so no live NWS call is needed. Returns the event name
+    and safety instruction when active."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": True, "active": False})
+    now_ms = int(time.time() * 1000)
+    row = None
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT event, instruction, alert_expires_at
+                       FROM crew_severe_alert_notifications
+                       WHERE crew_user_id = %s
+                         AND all_clear_sent_at IS NULL
+                         AND (alert_expires_at IS NULL OR alert_expires_at > %s)
+                       ORDER BY notified_at DESC
+                       LIMIT 1""",
+                    (user["id"], now_ms),
+                )
+                row = cur.fetchone()
+    except Exception as e:
+        print(f"[crew-active-alert] failed: {e!r}", flush=True)
+        return jsonify({"ok": True, "active": False})
+
+    if not row:
+        return jsonify({"ok": True, "active": False})
+    return jsonify({
+        "ok": True,
+        "active": True,
+        "event": row.get("event") or "Severe weather alert",
+        "instruction": row.get("instruction") or "",
+        "expires_at": row.get("alert_expires_at"),
+    })
+
+
 def _cos_approx(lat_deg: float) -> float:
     """Quick cosine approximation for distance bounding box math."""
     import math
@@ -23436,6 +23487,51 @@ def me_crew_i_was_there():
         print(f"[i-was-there] failed: {e!r}", flush=True)
         return jsonify({"ok": False, "error": "db-error"}), 500
 
+    # #C10: attach the official NWS event that was in effect at each report's
+    # place and time, where we have one on record. Present-when-real only:
+    # our alert store covers events we detected, so the absence of a tag
+    # never means "all clear." Matched in Python from one bounded query.
+    official_by_report = {}
+    try:
+        times = [r["created_at"] for r in rows if r.get("created_at")]
+        if times:
+            tmin, tmax = min(times), max(times)
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT event, polygon_geojson, created_at, expires_at
+                           FROM nws_alert_pages
+                           WHERE polygon_geojson IS NOT NULL
+                             AND created_at <= %s
+                             AND (expires_at IS NULL OR expires_at >= %s)
+                           ORDER BY created_at DESC
+                           LIMIT 300""",
+                        (tmax, tmin),
+                    )
+                    alerts = cur.fetchall()
+            for r in rows:
+                rt = r.get("created_at") or 0
+                rlat = r.get("latitude")
+                rlng = r.get("longitude")
+                if rlat is None or rlng is None:
+                    continue
+                for a in (alerts or []):
+                    a_start = a.get("created_at") or 0
+                    a_end = a.get("expires_at") or (a_start + 6 * 60 * 60 * 1000)
+                    if not (a_start <= rt <= a_end):
+                        continue
+                    geo = a.get("polygon_geojson")
+                    if not geo:
+                        continue
+                    try:
+                        if _point_in_polygon_geojson(float(rlat), float(rlng), geo):
+                            official_by_report[r["id"]] = a.get("event") or ""
+                            break
+                    except Exception:
+                        continue
+    except Exception as e:
+        print(f"[i-was-there] official-event match failed: {e!r}", flush=True)
+
     return jsonify({
         "ok": True,
         "reports": [{
@@ -23450,6 +23546,7 @@ def me_crew_i_was_there():
             "is_hidden": r.get("is_hidden", False),
             "cited": bool(r.get("cited_at")),
             "cited_by_name": r.get("cited_by_name") or "",
+            "official_event": official_by_report.get(r["id"], ""),
         } for r in rows],
         "total": stats.get("total", 0),
         "verified_total": stats.get("verified_total", 0),
@@ -23457,6 +23554,123 @@ def me_crew_i_was_there():
         "limit": limit,
         "offset": offset,
     })
+
+
+def _longest_checkin_run(date_keys):
+    """Longest run of consecutive calendar days from 'YYYY-MM-DD' keys."""
+    from datetime import date as _date
+    days = []
+    for k in (date_keys or []):
+        try:
+            y, m, d = k.split("-")
+            days.append(_date(int(y), int(m), int(d)))
+        except Exception:
+            continue
+    if not days:
+        return 0
+    days = sorted(set(days))
+    best = run = 1
+    for i in range(1, len(days)):
+        if (days[i] - days[i - 1]).days == 1:
+            run += 1
+            best = max(best, run)
+        else:
+            run = 1
+    return best
+
+
+@app.route("/api/v1/me/crew/year-in-review", methods=["OPTIONS"])
+def _me_crew_year_review_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/crew/year-in-review")
+def me_crew_year_in_review():
+    """A truthful 'your year in weather' recap built only from the member's
+    own data over the last 365 days. No invented numbers."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if not _is_crew_member(user):
+        return jsonify({"ok": False, "error": "not-crew"}), 403
+
+    now_ms = int(time.time() * 1000)
+    year_ago_ms = now_ms - 365 * 24 * 60 * 60 * 1000
+    out = {
+        "reports_total": 0, "verified_total": 0, "cited_total": 0,
+        "checkins_total": 0, "active_days": 0,
+        "current_streak": 0, "longest_streak": 0,
+        "top_condition": "", "busiest_month": "", "member_since": None,
+    }
+    keys = []
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT COUNT(*) AS total,
+                              COUNT(*) FILTER (WHERE verified_count >= 1) AS verified,
+                              COUNT(*) FILTER (WHERE cited_at IS NOT NULL) AS cited
+                       FROM crew_reports
+                       WHERE user_id = %s AND created_at >= %s
+                         AND is_hidden = FALSE""",
+                    (user["id"], year_ago_ms),
+                )
+                row = cur.fetchone() or {}
+                out["reports_total"] = row.get("total", 0) or 0
+                out["verified_total"] = row.get("verified", 0) or 0
+                out["cited_total"] = row.get("cited", 0) or 0
+
+                cur.execute(
+                    """SELECT report_type, COUNT(*) AS n
+                       FROM crew_reports
+                       WHERE user_id = %s AND created_at >= %s
+                         AND is_hidden = FALSE
+                       GROUP BY report_type ORDER BY n DESC LIMIT 1""",
+                    (user["id"], year_ago_ms),
+                )
+                row = cur.fetchone()
+                if row and row.get("report_type"):
+                    out["top_condition"] = row["report_type"]
+
+                cur.execute(
+                    """SELECT to_char(to_timestamp(created_at / 1000),
+                                      'FMMonth YYYY') AS m, COUNT(*) AS n
+                       FROM crew_reports
+                       WHERE user_id = %s AND created_at >= %s
+                         AND is_hidden = FALSE
+                       GROUP BY m ORDER BY n DESC LIMIT 1""",
+                    (user["id"], year_ago_ms),
+                )
+                row = cur.fetchone()
+                if row and row.get("m"):
+                    out["busiest_month"] = (row["m"] or "").strip()
+
+                cur.execute(
+                    """SELECT date_key FROM crew_checkins
+                       WHERE user_id = %s AND checked_in_at >= %s
+                       ORDER BY date_key ASC""",
+                    (user["id"], year_ago_ms),
+                )
+                keys = [r["date_key"] for r in cur.fetchall() if r.get("date_key")]
+                out["checkins_total"] = len(keys)
+                out["active_days"] = len(set(keys))
+
+                cur.execute("SELECT created_at FROM users WHERE id = %s",
+                            (user["id"],))
+                row = cur.fetchone()
+                if row and row.get("created_at"):
+                    out["member_since"] = row["created_at"]
+    except Exception as e:
+        print(f"[year-review] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+
+    out["longest_streak"] = _longest_checkin_run(keys)
+    try:
+        out["current_streak"] = _compute_streak(user["id"])
+    except Exception:
+        out["current_streak"] = 0
+
+    return jsonify({"ok": True, "review": out})
 
 
 # ─── Notification preferences ───────────────────────────────────────
