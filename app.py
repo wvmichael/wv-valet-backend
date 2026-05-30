@@ -22317,9 +22317,38 @@ def me_crew_missions():
         print(f"[crew-missions] failed: {e!r}", flush=True)
         return jsonify({"ok": False, "error": "db-error"}), 500
 
-    return jsonify({
-        "ok": True,
-        "missions": [{
+    # Bridge (May 30, 2026): also surface SMS-deployed missions this user
+    # was targeted in, so a mission that arrived by text is not invisible
+    # in the app. Chris's deploy flow is unchanged; this is read-only.
+    # Responses to these route to the same store (mission_notifications)
+    # via /api/v1/me/crew/deployments/<id>/respond, so responses stay in
+    # one place.
+    deployments = []
+    seven_days_ago = now_ms - (7 * 24 * 60 * 60 * 1000)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT md.id, md.template_name, md.prompt,
+                              md.fired_by_name, md.fired_at,
+                              mn.responded_at
+                       FROM mission_deployments md
+                       JOIN mission_notifications mn
+                            ON mn.mission_id = md.id AND mn.crew_user_id = %s
+                       WHERE md.completed_at IS NULL
+                         AND md.status <> 'cancelled'
+                         AND md.fired_at >= %s
+                       ORDER BY md.fired_at DESC LIMIT 20""",
+                    (user["id"], seven_days_ago),
+                )
+                deployments = cur.fetchall()
+    except Exception as e:
+        print(f"[crew-missions] deployment bridge failed: {e!r}", flush=True)
+
+    unified = []
+    for m in missions:
+        unified.append({
+            "kind": "inbox",
             "id": m["id"],
             "title": m["title"],
             "description": m["description"],
@@ -22328,8 +22357,21 @@ def me_crew_missions():
             "starts_at": m["starts_at"],
             "expires_at": m["expires_at"],
             "responded": m.get("responded", False),
-        } for m in missions]
-    })
+        })
+    for d in deployments:
+        unified.append({
+            "kind": "deployment",
+            "id": d["id"],
+            "title": d.get("template_name") or "Field mission",
+            "description": d.get("prompt") or "",
+            "creator_name": d.get("fired_by_name") or "WeatherValet",
+            "creator_role": "met",
+            "starts_at": d.get("fired_at"),
+            "expires_at": None,
+            "responded": d.get("responded_at") is not None,
+        })
+
+    return jsonify({"ok": True, "missions": unified})
 
 
 # ─── Mission creation (admin + Met) ─────────────────────────────────
@@ -22538,6 +22580,90 @@ def me_crew_mission_respond(mission_id: int):
         )
 
     return jsonify({"ok": True, "response_id": resp_id})
+
+
+# ─── Crew responds to an SMS-deployed mission from inside the app ─────
+# (the bridge, May 30, 2026). Writes to the same mission_notifications
+# row the SMS link uses, so responses live in one place.
+
+@app.route("/api/v1/me/crew/deployments/<int:dep_id>/respond", methods=["OPTIONS"])
+def _me_crew_deployment_respond_preflight(dep_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/me/crew/deployments/<int:dep_id>/respond")
+def me_crew_deployment_respond(dep_id: int):
+    """Logged-in Crew member responds to an SMS-deployed mission in-app.
+    Updates that member's mission_notifications row (the same store the
+    public token page uses) and notifies the deploying Meteorologist.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if not _is_crew_member(user):
+        return jsonify({"ok": False, "error": "not-crew"}), 403
+
+    data = request.get_json(silent=True) or {}
+    response_text = (data.get("response_text") or "").strip()
+    if not response_text:
+        return jsonify({"ok": False, "error": "empty-response"}), 400
+    if len(response_text) > 4000:
+        return jsonify({"ok": False, "error": "response-too-long",
+                        "message": "Max 4000 characters."}), 400
+
+    now_ms = int(time.time() * 1000)
+    is_first = False
+    fired_by = None
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, responded_at FROM mission_notifications
+                       WHERE mission_id = %s AND crew_user_id = %s""",
+                    (dep_id, user["id"]),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"ok": False, "error": "not-targeted",
+                                    "message": "You were not part of this mission."}), 404
+                is_first = (row["responded_at"] is None)
+                cur.execute(
+                    """UPDATE mission_notifications
+                       SET response_text = %s, responded_at = %s
+                       WHERE id = %s""",
+                    (response_text, now_ms, row["id"]),
+                )
+                if is_first:
+                    cur.execute(
+                        """UPDATE mission_deployments
+                           SET crew_responded = crew_responded + 1
+                           WHERE id = %s""",
+                        (dep_id,),
+                    )
+                cur.execute(
+                    "SELECT fired_by_user_id FROM mission_deployments WHERE id = %s",
+                    (dep_id,),
+                )
+                dep = cur.fetchone()
+                if dep:
+                    fired_by = dep.get("fired_by_user_id")
+    except Exception as e:
+        print(f"[crew-deploy-respond] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+
+    # Loop parity: tell the Meteorologist who fired this that a response
+    # came in (matches the in-app mission path).
+    if fired_by:
+        _notify_crew_member(
+            fired_by,
+            "notify_on_mission_response",
+            "New response to your WeatherValet mission",
+            "A Valet Crew member just responded to your field mission. "
+            "Open WeatherValet to read it.",
+            actor_user_id=user["id"],
+        )
+
+    return jsonify({"ok": True, "first_response": is_first})
 
 
 # ─── Admin: list + cancel missions ──────────────────────────────────
