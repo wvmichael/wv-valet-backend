@@ -24656,6 +24656,199 @@ def _autosend_pro_brief_draft(draft_id: int) -> tuple[bool, str]:
     return (True, "")
 
 
+@app.get("/api/v1/storm-shelter/on-shift-met")
+def storm_shelter_on_shift_met():
+    """Return the Met to attribute Storm Shelter content to, for the
+    currently-authenticated subscriber.
+
+    Added May 29, 2026 to fix the hardcoded "M. Reynolds, Lead Meteorologist"
+    that previously appeared to every subscriber regardless of who was
+    actually on shift.
+
+    Layered logic:
+      1. Subscriber's territory → today's shift assignment for that
+         territory + current shift_type. Returns the on-shift Met with
+         status "On shift, tracking this storm".
+      2. Subscriber's primary_met_id (from subscriber_coverage). Returns
+         the assigned Met with status "Your meteorologist, tracking this
+         storm" (no "on shift" claim since they may be off-duty).
+      3. Fallback. Returns generic "WeatherValet Meteorologist" with
+         "Tracking this storm via our team" status.
+
+    All branches return the same JSON shape so frontend always has the
+    fields it needs:
+      { ok, name, initials, status, source, met_user_id (or null) }
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    user_id = user["id"]
+
+    # Determine current shift_type based on Eastern Time hour.
+    # Matches the shift_assignments CHECK constraint values:
+    #   morning   = 5am-12pm ET
+    #   afternoon = 12pm-6pm ET
+    #   evening   = 6pm-12am ET
+    #   (overnight 12am-5am has no shift; falls through to primary)
+    ET = ZoneInfo("America/New_York")
+    now_et = datetime.now(ET)
+    hr = now_et.hour
+    if 5 <= hr < 12:
+        current_shift = "morning"
+    elif 12 <= hr < 18:
+        current_shift = "afternoon"
+    elif 18 <= hr < 24:
+        current_shift = "evening"
+    else:
+        current_shift = None
+    today_et = now_et.date().isoformat()
+
+    def _initials(name: str) -> str:
+        if not name:
+            return "WV"
+        parts = name.strip().split()
+        if len(parts) >= 2:
+            return (parts[0][0] + parts[-1][0]).upper()
+        if parts:
+            return parts[0][:2].upper()
+        return "WV"
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            # Step 1: territory + on-shift Met
+            if current_shift:
+                cur.execute(
+                    """SELECT m.id AS met_id, m.name AS met_name
+                       FROM users u
+                       JOIN shift_assignments sa ON sa.territory_id = u.territory_id
+                       JOIN users m ON m.id = sa.met_user_id
+                       WHERE u.id = %s
+                         AND sa.shift_date = %s
+                         AND sa.shift_type = %s
+                         AND sa.is_drop = FALSE
+                         AND sa.met_user_id IS NOT NULL
+                       LIMIT 1""",
+                    (user_id, today_et, current_shift),
+                )
+                row = cur.fetchone()
+                if row:
+                    return jsonify({
+                        "ok": True,
+                        "name": row["met_name"],
+                        "initials": _initials(row["met_name"]),
+                        "status": "On shift \u00b7 tracking this storm",
+                        "source": "on_shift",
+                        "met_user_id": row["met_id"],
+                    })
+
+            # Step 2: primary Met (subscriber_coverage)
+            cur.execute(
+                """SELECT m.id AS met_id, m.name AS met_name
+                   FROM subscriber_coverage sc
+                   JOIN users m ON m.id = sc.primary_met_id
+                   WHERE sc.user_id = %s
+                   LIMIT 1""",
+                (user_id,),
+            )
+            row = cur.fetchone()
+            if row:
+                return jsonify({
+                    "ok": True,
+                    "name": row["met_name"],
+                    "initials": _initials(row["met_name"]),
+                    "status": "Your meteorologist \u00b7 tracking this storm",
+                    "source": "primary_met",
+                    "met_user_id": row["met_id"],
+                })
+
+    # Step 3: fallback (no shift, no primary)
+    return jsonify({
+        "ok": True,
+        "name": "WeatherValet Meteorologist",
+        "initials": "WV",
+        "status": "Tracking this storm via our team",
+        "source": "fallback",
+        "met_user_id": None,
+    })
+
+
+@app.get("/api/v1/met/map-default-center")
+def met_map_default_center():
+    """Return the best default center+zoom for this Met's map view.
+
+    Added May 29, 2026 to fix the Indianapolis-defaults-for-everyone bug.
+
+    Priority order:
+      1. Centroid of subscribers this Met is primary_met for. Most accurate
+         since it reflects who the Met actually serves.
+      2. Met's own primary saved location, if set. Useful for new Mets
+         who don't yet have assigned subscribers.
+      3. Continental US fallback (geographic center of the lower 48,
+         ~39.5, -98.4). Last resort — better than hardcoded Indianapolis.
+
+    Returns {ok, lat, lng, zoom, source}. source = subscribers|self|fallback.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    met_id = user["id"]
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            # Try 1: subscriber centroid
+            cur.execute(
+                """SELECT AVG(loc.lat) AS clat, AVG(loc.lng) AS clng,
+                          COUNT(*) AS n
+                   FROM subscriber_coverage sc
+                   JOIN saved_locations loc ON loc.user_id = sc.user_id
+                   WHERE sc.primary_met_id = %s
+                     AND loc.is_primary = TRUE
+                     AND loc.lat IS NOT NULL AND loc.lng IS NOT NULL""",
+                (met_id,),
+            )
+            row = cur.fetchone()
+            if row and row.get("n") and row["n"] > 0:
+                return jsonify({
+                    "ok": True,
+                    "lat": float(row["clat"]),
+                    "lng": float(row["clng"]),
+                    "zoom": 7,
+                    "source": "subscribers",
+                    "subscriber_count": row["n"],
+                })
+
+            # Try 2: Met's own primary saved location
+            cur.execute(
+                """SELECT lat, lng FROM saved_locations
+                   WHERE user_id = %s AND is_primary = TRUE
+                     AND lat IS NOT NULL AND lng IS NOT NULL
+                   LIMIT 1""",
+                (met_id,),
+            )
+            row = cur.fetchone()
+            if row:
+                return jsonify({
+                    "ok": True,
+                    "lat": float(row["lat"]),
+                    "lng": float(row["lng"]),
+                    "zoom": 7,
+                    "source": "self",
+                })
+
+    # Try 3: continental US fallback (geographic center of the lower 48)
+    return jsonify({
+        "ok": True,
+        "lat": 39.5,
+        "lng": -98.4,
+        "zoom": 4,
+        "source": "fallback",
+    })
+
+
 @app.get("/api/v1/met/suppressed-briefs")
 def met_list_suppressed_briefs():
     """List today's suppressed Hobbyist briefs for the Met workspace.
