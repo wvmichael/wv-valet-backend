@@ -23518,6 +23518,187 @@ def met_nearby_crew_reports(request_id: int):
     })
 
 
+# ─── Model side-by-side comparison for the composer (Task #11C) ───────
+# Pulls a multi-model point forecast from Open-Meteo's NOAA GFS API for a
+# review's location over the next N hours and aligns the models so the Met
+# can see where they AGREE (high confidence) vs DIVERGE (judgment call).
+# Models are real NOAA NCEP outputs exposed by Open-Meteo:
+#   ncep_hrrr_conus  — HRRR, 3km, rapid-refresh (best for convection)
+#   ncep_nam_conus   — NAM, 3km, 60h
+#   ncep_nbm_conus   — NBM, 2.5km, blended (carries native precip prob)
+#   gfs_seamless     — GFS, global fallback / longer range
+# Open-Meteo suffixes each variable with the model id, e.g.
+# temperature_2m_ncep_hrrr_conus. US-only models return null outside CONUS,
+# which we drop. No API key required. Verified against the GFS-API docs.
+
+_OPENMETEO_GFS_URL = "https://api.open-meteo.com/v1/gfs"
+# (label, model_id). Order = display order. HRRR first — it's the one a
+# US forecaster leans on for the short-range convective picture.
+_MODEL_COMPARE_SET = [
+    ("HRRR", "ncep_hrrr_conus"),
+    ("NAM", "ncep_nam_conus"),
+    ("NBM", "ncep_nbm_conus"),
+    ("GFS", "gfs_seamless"),
+]
+_MODEL_COMPARE_VARS = [
+    "temperature_2m", "precipitation_probability",
+    "precipitation", "wind_speed_10m", "wind_gusts_10m",
+]
+
+
+def _safe_idx(seq, i):
+    try:
+        return seq[i]
+    except (IndexError, TypeError):
+        return None
+
+
+def _fetch_model_comparison(lat: float, lng: float, hours: int) -> dict:
+    """Fetch a multi-model hourly forecast for a point and align it.
+
+    Returns a dict with per-hour rows, each row carrying each model's
+    values, plus a per-variable spread summary. Network/parse failures
+    return {"ok": False, "error": ...} — the caller surfaces a soft
+    'comparison unavailable' state rather than blocking the composer.
+    """
+    models_param = ",".join(m_id for _, m_id in _MODEL_COMPARE_SET)
+    vars_param = ",".join(_MODEL_COMPARE_VARS)
+    params = {
+        "latitude": f"{lat:.4f}",
+        "longitude": f"{lng:.4f}",
+        "hourly": vars_param,
+        "models": models_param,
+        "forecast_hours": str(hours),
+        "temperature_unit": "fahrenheit",
+        "wind_speed_unit": "mph",
+        "precipitation_unit": "inch",
+        "timezone": "auto",
+    }
+    try:
+        import urllib.parse
+        import urllib.request
+        url = _OPENMETEO_GFS_URL + "?" + urllib.parse.urlencode(params)
+        http_req = urllib.request.Request(url, headers={"User-Agent": "WeatherValet/1.0"})
+        with urllib.request.urlopen(http_req, timeout=12) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[model-compare] fetch failed: {e!r}", flush=True)
+        return {"ok": False, "error": "fetch-failed"}
+
+    hourly = payload.get("hourly") or {}
+    times = hourly.get("time") or []
+    if not times:
+        return {"ok": False, "error": "no-data"}
+
+    # Which models actually returned data (US-only models are null/absent
+    # outside CONUS). Present = temperature series exists with a real value.
+    present = []
+    for label, m_id in _MODEL_COMPARE_SET:
+        series = hourly.get("temperature_2m_" + m_id)
+        if series and any(v is not None for v in series):
+            present.append((label, m_id))
+    if not present:
+        return {"ok": False, "error": "no-models"}
+
+    def _series(varname, m_id):
+        return hourly.get(varname + "_" + m_id) or []
+
+    n = min(len(times), hours)
+    rows = []
+    for i in range(n):
+        row = {"time": times[i], "models": {}}
+        for label, m_id in present:
+            row["models"][label] = {
+                "temp_f": _safe_idx(_series("temperature_2m", m_id), i),
+                "precip_prob": _safe_idx(_series("precipitation_probability", m_id), i),
+                "precip_in": _safe_idx(_series("precipitation", m_id), i),
+                "wind_mph": _safe_idx(_series("wind_speed_10m", m_id), i),
+                "gust_mph": _safe_idx(_series("wind_gusts_10m", m_id), i),
+            }
+        rows.append(row)
+
+    # Per-variable spread across models over the window — the headline
+    # forecaster signal (where models diverge is where judgment matters).
+    def _spread(varname, agg):
+        per_model = []
+        for label, m_id in present:
+            vals = [v for v in _series(varname, m_id)[:n] if isinstance(v, (int, float))]
+            if not vals:
+                continue
+            per_model.append(max(vals) if agg == "max" else sum(vals) / len(vals))
+        if len(per_model) < 2:
+            return None
+        return round(max(per_model) - min(per_model), 1)
+
+    spread = {
+        "temp_f": _spread("temperature_2m", "mean"),
+        "precip_prob": _spread("precipitation_probability", "max"),
+        "gust_mph": _spread("wind_gusts_10m", "max"),
+    }
+
+    return {
+        "ok": True,
+        "models_present": [label for label, _ in present],
+        "hours": n,
+        "rows": rows,
+        "spread": spread,
+    }
+
+
+@app.route("/api/v1/met/queue/<int:request_id>/model-comparison", methods=["OPTIONS"])
+def _met_model_comparison_preflight(request_id):
+    return ("", 204)
+
+
+@app.get("/api/v1/met/queue/<int:request_id>/model-comparison")
+def met_model_comparison(request_id: int):
+    """Multi-model side-by-side for the review composer (Task #11C).
+
+    Resolves the review's location (snapshot coords or geocoded plan
+    location), then returns HRRR/NAM/NBM/GFS aligned hour-by-hour for the
+    next `hours` (default 12, max 24), plus a per-variable spread so the
+    Met can see model agreement at a glance.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    try:
+        hours = int(request.args.get("hours", 12))
+    except (ValueError, TypeError):
+        hours = 12
+    hours = max(3, min(24, hours))
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, plan_location, forecast_snapshot
+                   FROM verification_requests WHERE id = %s""",
+                (request_id,),
+            )
+            req = cur.fetchone()
+    if not req:
+        return jsonify({"ok": False, "error": "review-not-found"}), 404
+
+    latlng = _review_grading_latlng(req)
+    if latlng is None:
+        return jsonify({"ok": True, "located": False, "reason": "no-location"})
+    lat, lng = latlng
+
+    result = _fetch_model_comparison(lat, lng, hours)
+    if not result.get("ok"):
+        return jsonify({"ok": True, "located": True, "available": False,
+                        "reason": result.get("error"),
+                        "center": {"lat": lat, "lng": lng}})
+    result["located"] = True
+    result["available"] = True
+    result["center"] = {"lat": lat, "lng": lng}
+    return jsonify(result)
+
+
 # ─── Met brief snippets (Task #12) ────────────────────────────────────
 # Reusable phrasings the Met inserts into the composer. Personal +
 # team-shared, categorized by composer field.
