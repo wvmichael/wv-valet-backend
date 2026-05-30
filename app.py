@@ -19911,6 +19911,20 @@ def _parse_crew_condition(body):
     return None
 
 
+# Optional precise timezone lookup. If the `timezonefinder` package is
+# installed, we resolve a member's IANA timezone from their exact home
+# coordinates, which handles zone boundaries and split states (Indiana,
+# Tennessee, and so on) correctly. If it is not installed, everything still
+# works through the longitude-band fallback below, so the app never depends
+# on the package being present. To enable the precise path in production,
+# add `timezonefinder` to requirements.
+try:
+    from timezonefinder import TimezoneFinder as _TimezoneFinder
+    _TF = _TimezoneFinder()
+except Exception:
+    _TF = None
+
+
 def _approx_us_tz_from_lng(lng):
     """Rough US timezone from longitude, used only as a fallback when a
     Crew member has no explicit timezone on file. Approximate band edges;
@@ -19927,6 +19941,20 @@ def _approx_us_tz_from_lng(lng):
     if x >= -114.5:
         return "America/Denver"
     return "America/Los_Angeles"
+
+
+def _tz_from_latlng(lat, lng):
+    """Best available IANA timezone for a coordinate. Uses timezonefinder
+    when it is installed (precise polygons), otherwise the longitude band.
+    Always returns a valid IANA name, never None or empty."""
+    if _TF is not None:
+        try:
+            name = _TF.timezone_at(lat=float(lat), lng=float(lng))
+            if name:
+                return name
+        except Exception:
+            pass
+    return _approx_us_tz_from_lng(lng)
 
 
 def _crew_daily_checkin_nudge() -> None:
@@ -19946,7 +19974,7 @@ def _crew_daily_checkin_nudge() -> None:
         with db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """SELECT u.id, u.phone, u.timezone, u.crew_home_lng
+                    """SELECT u.id, u.phone, u.timezone, u.crew_home_lat, u.crew_home_lng
                        FROM users u
                        JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'crew'
                        JOIN crew_notification_prefs p ON p.user_id = u.id
@@ -19977,9 +20005,17 @@ def _crew_daily_checkin_nudge() -> None:
     day_number = now_ms // (24 * 60 * 60 * 1000)
     for r in rows:
         # Only send during the 8 AM hour in this member's own timezone.
-        tz = (r.get("timezone") or "").strip()
-        if not tz:
-            tz = _approx_us_tz_from_lng(r.get("crew_home_lng"))
+        # A Crew member's home coordinates are the truth of where they wake
+        # up, so we resolve from those first. The stored `timezone` column
+        # carries a default for everyone, so trusting it blindly would treat
+        # a West Coast member as Eastern and ping them pre-dawn. Coordinates
+        # avoid that; the stored value and the longitude band are fallbacks.
+        lat = r.get("crew_home_lat")
+        lng = r.get("crew_home_lng")
+        if lat is not None and lng is not None:
+            tz = _tz_from_latlng(lat, lng)
+        else:
+            tz = (r.get("timezone") or "").strip() or _approx_us_tz_from_lng(lng)
         local_now = _local_now_for_user(tz)
         if local_now.hour != 8:
             continue
@@ -21164,16 +21200,18 @@ def crew_apply_submit():
                                 geo_label = geo.get("name") or county
                                 if geo.get("admin1") and ", " not in geo_label:
                                     geo_label += ", " + geo["admin1"]
+                                tz_val = _tz_from_latlng(geo["lat"], geo["lng"])
                                 with conn.cursor() as cur:
                                     cur.execute(
                                         """UPDATE users
                                            SET crew_home_lat = %s,
                                                crew_home_lng = %s,
+                                               timezone = %s,
                                                crew_home_label = COALESCE(NULLIF(crew_home_label, ''), %s)
                                            WHERE id = %s
                                              AND (crew_home_lat IS NULL OR crew_home_lng IS NULL)""",
                                         (float(geo["lat"]), float(geo["lng"]),
-                                         geo_label, applicant_user_id),
+                                         tz_val, geo_label, applicant_user_id),
                                     )
                                     print(
                                         f"[crew-apply] geocoded county={county!r} → "
