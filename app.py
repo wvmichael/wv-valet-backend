@@ -348,6 +348,13 @@ TIERS = {
 # "usually under 30 minutes." This drives the dashboard's "overdue" flag.
 SLA_MINUTES = 30
 
+# How long a 'claimed' review is held for the claiming Met before it is
+# considered abandoned and returned to the queue (May 30, 2026 — claim
+# lock). Matches the SLA: if a Met claims a review and doesn't finish it
+# within the SLA window, another Met can pick it up. Stored timestamps on
+# verification_requests are in SECONDS (now_ts()), so TTL math uses seconds.
+REVIEW_CLAIM_TTL_MINUTES = 30
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # Database — Postgres, durable, multi-process safe
@@ -414,6 +421,16 @@ CREATE TABLE IF NOT EXISTS verification_requests (
 CREATE INDEX IF NOT EXISTS idx_status_created ON verification_requests(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_claim_token ON verification_requests(claim_token);
 CREATE INDEX IF NOT EXISTS idx_stripe_session ON verification_requests(stripe_session_id);
+
+-- Claim ownership (May 30, 2026 — review-queue claim lock).
+-- Tracks WHICH Met holds a 'claimed' review so two Mets can't unknowingly
+-- work the same request. NULL = unclaimed, or a legacy token-link claim
+-- made before this column existed (those are reclaimable once stale).
+-- Mirrors the proven pro_brief_drafts.claimed_by_user_id pattern.
+ALTER TABLE verification_requests
+    ADD COLUMN IF NOT EXISTS claimed_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_vr_claimed_by
+    ON verification_requests(claimed_by_user_id, status);
 
 -- ── Brief submission audit log ──
 -- Every POST to /admin/brief writes a row here. Lets the Meteorologist Portal
@@ -7464,6 +7481,27 @@ def meteorologist_complete(claim_token: str):
         if is_json:
             return jsonify({"ok": True, "already_completed": True})
         return redirect(f"/meteorologist/{claim_token}")
+
+    # Claim-lock guard (May 30, 2026 — Task #2). If this review is held by
+    # a *different* logged-in Met with a still-fresh claim, refuse the
+    # completion so two Mets can't both submit the same review (the loser
+    # used to be silently swallowed by the idempotent guard above).
+    #
+    # Permissive on purpose for the paths that legitimately have no owner:
+    #   - legacy token-link flow (no logged-in user) — claimed_by is NULL
+    #   - admins (oversight / can finish anyone's review)
+    #   - stale claims (the holder walked away; anyone may finish)
+    #   - the claim is the current Met's own, or unclaimed
+    actor_preview = _get_current_user()
+    if actor_preview is not None and "admin" not in (actor_preview.get("roles") or []):
+        owner_id = row.get("claimed_by_user_id")
+        claimed_at = row.get("claimed_at")
+        stale_before = now_ts() - (REVIEW_CLAIM_TTL_MINUTES * 60)
+        claim_is_fresh = claimed_at is not None and claimed_at >= stale_before
+        if owner_id and owner_id != actor_preview["id"] and claim_is_fresh:
+            if is_json:
+                return jsonify({"ok": False, "error": "claimed-by-another"}), 409
+            abort(409)
 
     # Pull verdict + notes from form OR JSON body
     if request.is_json:
@@ -15885,28 +15923,52 @@ def met_queue_list():
     if "met" not in roles and "admin" not in roles:
         return jsonify({"ok": False, "error": "forbidden"}), 403
 
+    is_admin = "admin" in roles
+    met_id = user["id"]
+    now = now_ts()
+    stale_before = now - (REVIEW_CLAIM_TTL_MINUTES * 60)
+
     with db() as conn:
         with conn.cursor() as cur:
-            # 'paid' rows are unclaimed; show all. 'claimed' rows belong
-            # to a specific Met (claimed_at, but we don't yet track WHICH
-            # Met claimed it — for now show all claimed rows so a Met can
-            # pick back up after switching devices). When we add a
-            # claimed_by_user_id column we can filter properly.
+            # Step 1 — self-healing reclaim. Any 'claimed' review whose
+            # claim has gone stale (older than the TTL, or a legacy claim
+            # with no claimed_at) is released back to 'paid' so it can't
+            # get stuck on a Met who walked away. Idempotent and cheap.
             cur.execute(
-                """SELECT id, created_at, updated_at, status, tier, price_cents,
+                """UPDATE verification_requests
+                   SET status='paid', claimed_at=NULL,
+                       claimed_by_user_id=NULL, updated_at=%s
+                   WHERE status='claimed'
+                     AND (claimed_at IS NULL OR claimed_at < %s)""",
+                (now, stale_before),
+            )
+
+            # Step 2 — visible queue. Everyone sees all 'paid' (unclaimed)
+            # rows. For 'claimed' rows: a Met sees only their own (so they
+            # can resume after a refresh / device switch); an admin sees
+            # all claimed rows for oversight.
+            if is_admin:
+                claimed_clause = "OR status = 'claimed'"
+                params = ()
+            else:
+                claimed_clause = "OR (status = 'claimed' AND claimed_by_user_id = %s)"
+                params = (met_id,)
+
+            cur.execute(
+                f"""SELECT id, created_at, updated_at, status, tier, price_cents,
                           customer_email, customer_phone, plan_text, plan_industry,
                           plan_location, plan_window, ai_brief_markdown, ai_status_key,
-                          claim_token, claimed_at
+                          claim_token, claimed_at, claimed_by_user_id
                    FROM verification_requests
-                   WHERE status IN ('paid', 'claimed')
+                   WHERE status = 'paid' {claimed_clause}
                    ORDER BY
                      CASE WHEN status = 'paid' THEN 0 ELSE 1 END,
                      created_at ASC
                    LIMIT 50""",
+                params,
             )
             rows = cur.fetchall()
 
-    now = now_ts()
     requests_out = [
         {
             "id": r["id"],
@@ -15924,6 +15986,8 @@ def met_queue_list():
             "ai_status_key": r["ai_status_key"],
             "claim_token": r["claim_token"],
             "claimed_at": r["claimed_at"],
+            "claimed_by_user_id": r["claimed_by_user_id"],
+            "claimed_by_me": (r["claimed_by_user_id"] == met_id),
             "created_at": r["created_at"],
             "paid_minutes_ago": max(0, (now - r["created_at"]) // 60),
         }
@@ -15939,6 +16003,163 @@ def _format_tier_label(tier_key: str) -> str:
         "day_pass": "Day Pass",
         "pro_monthly": "Pro",
     }.get(tier_key, tier_key.title())
+
+
+# ════════════════════════════════════════════════════════════════════
+# Review-queue claim lock (May 30, 2026 — Task #2 / #3)
+# ════════════════════════════════════════════════════════════════════
+#
+# Two Mets used to be able to open and work the same review unknowingly,
+# with the second submit silently lost to the idempotent "already
+# completed" guard. These endpoints add an explicit, atomic claim step
+# (mirroring the proven pro_brief_drafts claim pattern) plus a release so
+# a Met can hand a review back. Abandoned claims auto-return to the queue
+# after REVIEW_CLAIM_TTL_MINUTES (handled lazily in met_queue_list).
+#
+# Frontend wiring (claim-on-open, release-on-cancel, hide others' claims)
+# is Phase 2B; these endpoints are the backend foundation it will call.
+
+@app.route("/api/v1/met/queue/<int:request_id>/claim", methods=["OPTIONS"])
+def _met_queue_claim_preflight(request_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/met/queue/<int:request_id>/claim")
+def met_queue_claim(request_id: int):
+    """Atomically claim a paid review for the current Met.
+
+    Grants the claim when the row is:
+      - 'paid' (unclaimed), OR
+      - already claimed by this same Met (idempotent resume), OR
+      - 'claimed' but stale (older than REVIEW_CLAIM_TTL_MINUTES) — the
+        previous holder abandoned it.
+
+    The claim is a single guarded UPDATE ... RETURNING so two Mets racing
+    for the same row can't both win — exactly one UPDATE matches.
+
+    Returns:
+      200 {"ok": true, "claim_token": "...", "status": "claimed"}
+      409 {"ok": false, "error": "already-claimed"}        held by another Met
+      409 {"ok": false, "error": "already-completed"}      already done
+      404 {"ok": false, "error": "not-found"}
+      401 / 403 auth
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    met_id = user["id"]
+    now = now_ts()
+    stale_before = now - (REVIEW_CLAIM_TTL_MINUTES * 60)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            # Guarded atomic claim. The WHERE clause is the lock: it only
+            # matches a row that is claimable BY THIS MET right now.
+            cur.execute(
+                """UPDATE verification_requests
+                   SET status='claimed', claimed_at=%s,
+                       claimed_by_user_id=%s, updated_at=%s
+                   WHERE id=%s
+                     AND status IN ('paid', 'claimed')
+                     AND (
+                           status = 'paid'
+                           OR claimed_by_user_id = %s
+                           OR claimed_by_user_id IS NULL
+                           OR claimed_at IS NULL
+                           OR claimed_at < %s
+                         )
+                   RETURNING claim_token""",
+                (now, met_id, now, request_id, met_id, stale_before),
+            )
+            updated = cur.fetchone()
+
+            if updated:
+                return jsonify({
+                    "ok": True,
+                    "claim_token": updated["claim_token"],
+                    "status": "claimed",
+                })
+
+            # No row matched — figure out why so the Met gets a clear reason.
+            cur.execute(
+                "SELECT status, claimed_by_user_id FROM verification_requests WHERE id = %s",
+                (request_id,),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    if row["status"] == "completed":
+        return jsonify({"ok": False, "error": "already-completed"}), 409
+    # Held by a different Met with a still-fresh claim.
+    return jsonify({"ok": False, "error": "already-claimed"}), 409
+
+
+@app.route("/api/v1/met/queue/<int:request_id>/release", methods=["OPTIONS"])
+def _met_queue_release_preflight(request_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/met/queue/<int:request_id>/release")
+def met_queue_release(request_id: int):
+    """Release a claimed review back to the queue.
+
+    Only the Met who holds the claim (or an admin) can release it, and
+    only while it's still 'claimed' (a completed review can't be released).
+
+    Returns:
+      200 {"ok": true, "status": "paid"}
+      409 {"ok": false, "error": "not-claimed-by-you"}   not yours / not claimed
+      404 {"ok": false, "error": "not-found"}
+      401 / 403 auth
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    is_admin = "admin" in roles
+    met_id = user["id"]
+    now = now_ts()
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            # Admins can release any claimed row; a Met only their own.
+            if is_admin:
+                owner_clause = ""
+                params = (now, request_id)
+            else:
+                owner_clause = "AND claimed_by_user_id = %s"
+                params = (now, request_id, met_id)
+
+            cur.execute(
+                f"""UPDATE verification_requests
+                    SET status='paid', claimed_at=NULL,
+                        claimed_by_user_id=NULL, updated_at=%s
+                    WHERE id=%s AND status='claimed' {owner_clause}
+                    RETURNING id""",
+                params,
+            )
+            released = cur.fetchone()
+
+            if released:
+                return jsonify({"ok": True, "status": "paid"})
+
+            cur.execute(
+                "SELECT status FROM verification_requests WHERE id = %s",
+                (request_id,),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    return jsonify({"ok": False, "error": "not-claimed-by-you"}), 409
 
 
 # ════════════════════════════════════════════════════════════════════
