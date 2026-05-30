@@ -2077,6 +2077,13 @@ CREATE INDEX IF NOT EXISTS idx_crew_reports_geo
     ON crew_reports(latitude, longitude, created_at DESC)
     WHERE is_hidden = FALSE;
 
+-- Citation (May 30, 2026): a Meteorologist marks a Crew report as used /
+-- helpful. Closes the loop so the member hears their work mattered. The
+-- two-paths card already promises "cited by name", so we use that word.
+ALTER TABLE crew_reports ADD COLUMN IF NOT EXISTS cited_at BIGINT;
+ALTER TABLE crew_reports ADD COLUMN IF NOT EXISTS cited_by_user_id INTEGER;
+ALTER TABLE crew_reports ADD COLUMN IF NOT EXISTS cited_by_name TEXT;
+
 -- ── Crew report verifications ──
 -- One row per (report, verifier). Lets us count and prevent double-verify.
 CREATE TABLE IF NOT EXISTS crew_report_verifications (
@@ -2175,6 +2182,10 @@ CREATE TABLE IF NOT EXISTS crew_notification_prefs (
     notify_via_text        BOOLEAN NOT NULL DEFAULT FALSE,
     updated_at             BIGINT NOT NULL
 );
+
+-- Citation notification preference (May 30, 2026). Default TRUE: being
+-- cited by a Meteorologist is a rare, welcome moment.
+ALTER TABLE crew_notification_prefs ADD COLUMN IF NOT EXISTS notify_on_cited BOOLEAN NOT NULL DEFAULT TRUE;
 
 -- ── Pro Threads (Phase 10 — Met<>Subscriber DMs) ──
 -- One thread per subscriber, holding their conversation with the Met
@@ -21380,6 +21391,7 @@ _CREW_NOTIFY_DEFAULTS = {
     "notify_on_nearby_report": False,
     "notify_on_severe_alert": True,
     "notify_on_mission_response": True,
+    "notify_on_cited": True,
     "notify_via_email": True,
     "notify_via_text": False,
 }
@@ -21920,7 +21932,8 @@ def crew_reports_list():
                     cur.execute(
                         """SELECT id, user_id, user_name, report_type,
                                   latitude, longitude, notes, image_url,
-                                  verified_count, created_at
+                                  verified_count, created_at,
+                                  cited_at, cited_by_name
                            FROM crew_reports
                            WHERE is_hidden = FALSE
                              AND created_at >= %s
@@ -21936,7 +21949,8 @@ def crew_reports_list():
                     cur.execute(
                         """SELECT id, user_id, user_name, report_type,
                                   latitude, longitude, notes, image_url,
-                                  verified_count, created_at
+                                  verified_count, created_at,
+                                  cited_at, cited_by_name
                            FROM crew_reports
                            WHERE is_hidden = FALSE
                              AND created_at >= %s
@@ -21961,6 +21975,8 @@ def crew_reports_list():
             "image_url": r.get("image_url") or "",
             "verified_count": r.get("verified_count", 0),
             "created_at": r["created_at"],
+            "cited": bool(r.get("cited_at")),
+            "cited_by_name": r.get("cited_by_name") or "",
             "is_mine": (r["user_id"] == me_id),
         } for r in rows]
     })
@@ -22147,6 +22163,70 @@ def crew_report_verify(report_id: int):
         "verified_count": new_count,
         "already_verified": not inserted,
     })
+
+
+# ─── Meteorologist cites a Crew report (close the loop) ──────────────
+# A Met marks a Crew report as used / helpful. Sets citation fields and
+# notifies the report owner so they hear their work mattered. This is the
+# Crew-facing half of the loop; the Met taps it from the map popup.
+
+@app.route("/api/v1/met/crew-reports/<int:report_id>/cite", methods=["OPTIONS"])
+def _met_cite_crew_report_preflight(report_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/met/crew-reports/<int:report_id>/cite")
+def met_cite_crew_report(report_id: int):
+    """A Meteorologist (or admin) cites a Crew report. Sets citation
+    fields and notifies the owner. Idempotent: citing an already-cited
+    report refreshes the citing Met without re-notifying. Crew cannot
+    cite (this is the Meteorologist acknowledging ground truth)."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    now_ms = int(time.time() * 1000)
+    met_name = user.get("name") or "WeatherValet Meteorologist"
+    owner_id = None
+    already = False
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT user_id, cited_at FROM crew_reports WHERE id = %s",
+                    (report_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"ok": False, "error": "report-not-found"}), 404
+                owner_id = row["user_id"]
+                already = row.get("cited_at") is not None
+                cur.execute(
+                    """UPDATE crew_reports
+                       SET cited_at = %s, cited_by_user_id = %s, cited_by_name = %s
+                       WHERE id = %s""",
+                    (now_ms, user["id"], met_name, report_id),
+                )
+    except Exception as e:
+        print(f"[crew-cite] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+
+    # Notify the owner the first time their report is cited. Don't
+    # re-notify when a Met re-cites an already-cited report.
+    if owner_id and not already:
+        _notify_crew_member(
+            owner_id,
+            "notify_on_cited",
+            "A Meteorologist cited your WeatherValet report",
+            f"{met_name} marked your report as helpful and used it in their "
+            "work. Thank you for being out there.",
+            actor_user_id=user["id"],
+        )
+
+    return jsonify({"ok": True, "cited_by": met_name, "already_cited": already})
 
 
 # ─── Hide a report (Crew toggle-off) ─────────────────────────────────
@@ -22789,7 +22869,7 @@ def me_crew_i_was_there():
                 cur.execute(
                     """SELECT id, report_type, latitude, longitude,
                               notes, image_url, verified_count, created_at,
-                              is_hidden
+                              is_hidden, cited_at, cited_by_name
                        FROM crew_reports
                        WHERE user_id = %s
                        ORDER BY created_at DESC
@@ -22800,7 +22880,8 @@ def me_crew_i_was_there():
                 # Also get total count for pagination + lifetime stat
                 cur.execute(
                     """SELECT COUNT(*) AS total,
-                              COUNT(*) FILTER (WHERE verified_count >= 1) AS verified_total
+                              COUNT(*) FILTER (WHERE verified_count >= 1) AS verified_total,
+                              COUNT(*) FILTER (WHERE cited_at IS NOT NULL) AS cited_total
                        FROM crew_reports WHERE user_id = %s""",
                     (user["id"],),
                 )
@@ -22821,9 +22902,12 @@ def me_crew_i_was_there():
             "verified_count": r.get("verified_count", 0),
             "created_at": r["created_at"],
             "is_hidden": r.get("is_hidden", False),
+            "cited": bool(r.get("cited_at")),
+            "cited_by_name": r.get("cited_by_name") or "",
         } for r in rows],
         "total": stats.get("total", 0),
         "verified_total": stats.get("verified_total", 0),
+        "cited_total": stats.get("cited_total", 0),
         "limit": limit,
         "offset": offset,
     })
@@ -22871,6 +22955,7 @@ def me_crew_notif_get():
             "notify_on_nearby_report": row.get("notify_on_nearby_report", False),
             "notify_on_severe_alert": row.get("notify_on_severe_alert", True),
             "notify_on_mission_response": row.get("notify_on_mission_response", True),
+            "notify_on_cited": row.get("notify_on_cited", True),
             "notify_via_email": row.get("notify_via_email", True),
             "notify_via_text": row.get("notify_via_text", False),
         }
@@ -22887,7 +22972,7 @@ def me_crew_notif_update():
     data = request.get_json(silent=True) or {}
     allowed_keys = (
         "notify_on_verify", "notify_on_mission", "notify_on_nearby_report",
-        "notify_on_severe_alert", "notify_on_mission_response",
+        "notify_on_severe_alert", "notify_on_mission_response", "notify_on_cited",
         "notify_via_email", "notify_via_text",
     )
     updates = {k: bool(v) for k, v in data.items() if k in allowed_keys}
