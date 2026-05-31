@@ -26290,6 +26290,31 @@ def met_pro_briefs_list():
     ET = ZoneInfo("America/New_York")
     today_et = datetime.now(ET).date().isoformat()
 
+    # Lazy auto-expire (May 31, 2026 — Task #4). Drafts whose send window
+    # closed long ago and were never sent are dead — they shouldn't keep
+    # cluttering the Pro tab. window_end_at is "too late to send" per the
+    # schema; we add a grace buffer past it (a Met may legitimately finish
+    # a bit late) and only then flip pending/claimed drafts to 'expired'.
+    # The list query already excludes 'expired', so they drop off the tab.
+    # Lazy-on-read (no separate scheduler) — same self-healing pattern as
+    # the review-queue claim TTL. Idempotent and cheap.
+    EXPIRE_GRACE_MS = 12 * 60 * 60 * 1000  # 12h past the window end
+    expire_before = int(time.time() * 1000) - EXPIRE_GRACE_MS
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE pro_brief_drafts
+                       SET status = 'expired'
+                       WHERE status IN ('pending-review', 'claimed')
+                         AND window_end_at IS NOT NULL
+                         AND window_end_at < %s""",
+                    (expire_before,),
+                )
+    except Exception as e:
+        # Never let expiry housekeeping block the list — just log.
+        print(f"[pro-briefs] lazy-expire failed: {e}", flush=True)
+
     with db() as conn:
         with conn.cursor() as cur:
             if is_admin:
