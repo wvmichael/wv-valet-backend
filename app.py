@@ -26306,8 +26306,13 @@ def met_pro_briefs_list():
                        JOIN users u ON u.id = d.user_id
                        LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
                        LEFT JOIN users pm ON pm.id = sc.primary_met_id
-                       WHERE d.status IN ('pending-review', 'claimed')
-                          OR (d.status = 'sent' AND d.sent_at >= %s)
+                       WHERE (d.status IN ('pending-review', 'claimed')
+                              OR (d.status = 'sent' AND d.sent_at >= %s))
+                         -- Pro-tier only: never surface non-Pro (hobbyist)
+                         -- drafts here, regardless of how they got created
+                         -- (May 31, 2026 — hides existing strays + any path
+                         -- that bypasses the creation-time tier gate).
+                         AND u.subscription_tier IN ('pro_single', 'pro_multi', 'pro_enterprise')
                        ORDER BY
                          CASE d.status
                            WHEN 'pending-review' THEN 0
@@ -26338,6 +26343,9 @@ def met_pro_briefs_list():
                        LEFT JOIN users pm ON pm.id = sc.primary_met_id
                        WHERE (d.status IN ('pending-review', 'claimed')
                               OR (d.status = 'sent' AND d.sent_at >= %s))
+                         -- Pro-tier only (May 31, 2026): hide non-Pro drafts
+                         -- so hobbyist strays never appear in the Pro tab.
+                         AND u.subscription_tier IN ('pro_single', 'pro_multi', 'pro_enterprise')
                          AND (
                            -- (a) I am the primary Met for this subscriber
                            sc.primary_met_id = %s
@@ -26520,6 +26528,20 @@ def met_pro_brief_create_for_subscriber():
             sub = cur.fetchone()
     if not sub:
         return jsonify({"ok": False, "error": "subscriber-not-found"}), 404
+
+    # Tier gate (May 31, 2026 — fix: hobbyists were leaking into the Pro
+    # Briefs queue). pro_brief_drafts is the Pro-tier per-subscriber brief
+    # pipeline; only Pro subscribers belong here. The scheduled generator
+    # already gates on this same tier set — this manual "create for
+    # subscriber" path was missing the check, so generating a brief for a
+    # hobbyist created a draft that then showed up in the Pro Briefs tab.
+    if (sub.get("subscription_tier") or "") not in ("pro_single", "pro_multi", "pro_enterprise"):
+        return jsonify({
+            "ok": False,
+            "error": "not-pro-tier",
+            "message": "This subscriber isn't on a Pro plan, so a Pro brief can't be created for them.",
+        }), 400
+
     if not sub.get("lat") or not sub.get("lng"):
         return jsonify({"ok": False, "error": "no-location",
                         "message": "Subscriber has no saved location."}), 400
