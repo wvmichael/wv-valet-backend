@@ -14071,6 +14071,166 @@ def me_brief_history():
     return jsonify({"ok": True, "history": history})
 
 
+CREW_SHARE_TEMPLATE = """\
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Valet Crew | WeatherValet</title>
+<meta name="description" content="{{ share_desc }}">
+<link rel="canonical" href="https://weathervalet.ai/crew">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="WeatherValet">
+<meta property="og:title" content="The Valet Crew is watching the sky">
+<meta property="og:description" content="{{ share_desc }}">
+<meta property="og:url" content="https://wv-valet-backend.onrender.com/crew/live">
+<meta property="og:image" content="https://weathervalet.ai/og-crew.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="The Valet Crew is watching the sky">
+<meta name="twitter:description" content="{{ share_desc }}">
+<meta name="twitter:image" content="https://weathervalet.ai/og-crew.png">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:#0B1525; color:#E8EBF0;
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:560px; margin:0 auto; padding:40px 22px 56px; }
+  .eyebrow { font-size:12px; letter-spacing:2px; text-transform:uppercase;
+    color:#7AA0FF; font-weight:700; margin-bottom:14px; }
+  h1 { font-size:30px; line-height:1.2; margin:0 0 14px; font-weight:800; }
+  .lede { font-size:16px; line-height:1.6; color:rgba(232,235,240,0.78); margin:0 0 26px; }
+  .stats { display:flex; gap:12px; margin:0 0 28px; flex-wrap:wrap; }
+  .stat { flex:1 1 0; min-width:120px; background:rgba(255,255,255,0.04);
+    border:1px solid rgba(255,255,255,0.10); border-radius:14px; padding:18px 16px; }
+  .stat .n { font-size:30px; font-weight:800; color:#fff; line-height:1; }
+  .stat .l { font-size:12.5px; color:rgba(232,235,240,0.6); margin-top:8px; line-height:1.4; }
+  .recent { background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.08);
+    border-radius:14px; padding:8px 4px; margin:0 0 30px; }
+  .row { display:flex; align-items:center; gap:11px; padding:11px 14px;
+    border-bottom:1px solid rgba(255,255,255,0.05); }
+  .row:last-child { border-bottom:none; }
+  .dot { width:9px; height:9px; border-radius:50%; background:#5DECA8; flex:0 0 auto; }
+  .row .what { font-size:14px; color:#E8EBF0; }
+  .row .when { font-size:12px; color:rgba(232,235,240,0.5); margin-left:auto; flex:0 0 auto; }
+  .cta { display:block; text-align:center; background:#2E4FB8; color:#fff; text-decoration:none;
+    font-size:16px; font-weight:700; padding:16px; border-radius:12px; }
+  .cta:hover { background:#3a5fd0; }
+  .sub { text-align:center; font-size:13px; color:rgba(232,235,240,0.5); margin-top:14px; line-height:1.6; }
+  .foot { text-align:center; margin-top:40px; font-size:12px; color:rgba(232,235,240,0.35); }
+  .empty { padding:20px 14px; text-align:center; color:rgba(232,235,240,0.5); font-size:14px; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="eyebrow">WeatherValet &middot; The Valet Crew</div>
+    <h1>{{ headline }}</h1>
+    <p class="lede">Real people on the ground, reporting what the sky is actually doing,
+      so the forecast for your own neighborhood gets better. Free to join. Your reports
+      are yours, and a Meteorologist actually sees them.</p>
+
+    <div class="stats">
+      <div class="stat"><div class="n">{{ reports_today }}</div><div class="l">reports in the last 24 hours</div></div>
+      <div class="stat"><div class="n">{{ members_active }}</div><div class="l">Crew members reporting recently</div></div>
+    </div>
+
+    {% if recent %}
+    <div class="recent">
+      {% for r in recent %}
+      <div class="row"><span class="dot"></span><span class="what">{{ r.what }}</span><span class="when">{{ r.when }}</span></div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="recent"><div class="empty">Quiet skies right now. That is good news.</div></div>
+    {% endif %}
+
+    <a class="cta" href="https://weathervalet.ai/crew/workspace">Join the Crew, free</a>
+    <p class="sub">No cost. Report what you see, keep a record of the weather you have
+      witnessed, and watch the sky together with your neighbors.</p>
+
+    <div class="foot">WeatherValet &middot; Meteorologist-backed weather you can trust</div>
+  </div>
+</body>
+</html>"""
+
+
+@app.get("/crew/live")
+@app.get("/crew/share")
+def crew_share_page():
+    """Public, shareable landing page for the Valet Crew (lead generation).
+
+    A Crew member can share this link anywhere. It shows live community
+    activity drawn only from data that is already public on the map, never
+    private notes, and gives a non-member a clean view plus a Join free
+    button. Server-rendered so link previews (Open Graph) work when the
+    URL is pasted into a text, Facebook, or X.
+    """
+    reports_today = 0
+    members_active = 0
+    recent = []
+    try:
+        now_ms = int(time.time() * 1000)
+        day_ago = now_ms - 24 * 60 * 60 * 1000
+        recent_cut = now_ms - 6 * 60 * 60 * 1000  # last 6h for the visible list
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT COUNT(*) AS c,
+                              COUNT(DISTINCT user_id) AS m
+                       FROM crew_reports
+                       WHERE is_hidden = FALSE AND created_at >= %s""",
+                    (day_ago,),
+                )
+                agg = cur.fetchone() or {}
+                reports_today = int(agg.get("c") or 0)
+                members_active = int(agg.get("m") or 0)
+                cur.execute(
+                    """SELECT report_type, user_name, created_at
+                       FROM crew_reports
+                       WHERE is_hidden = FALSE AND created_at >= %s
+                       ORDER BY created_at DESC
+                       LIMIT 6""",
+                    (recent_cut,),
+                )
+                rows = cur.fetchall() or []
+        for r in rows:
+            rtype = (r.get("report_type") or "weather").replace("_", " ")
+            name = (r.get("user_name") or "A Crew member").split(" ")[0]
+            mins = max(1, int((int(time.time() * 1000) - int(r.get("created_at") or 0)) / 60000))
+            when = (str(mins) + " min ago") if mins < 60 else (str(mins // 60) + "h ago")
+            recent.append({"what": name + " reported " + rtype, "when": when})
+    except Exception as e:
+        print(f"[crew-share] stats failed: {e!r}", flush=True)
+
+    if reports_today > 0:
+        headline = "The Crew is watching the sky right now"
+        share_desc = (str(reports_today) + " ground reports in the last 24 hours from "
+                      + str(members_active) + " neighbors watching the weather together. "
+                      "Join free and see your own area.")
+    else:
+        headline = "Watch the sky together"
+        share_desc = ("Real people reporting real weather on the ground, so the forecast "
+                      "for your neighborhood gets better. Free to join.")
+
+    html = render_template_string(
+        CREW_SHARE_TEMPLATE,
+        headline=headline,
+        share_desc=share_desc,
+        reports_today=reports_today,
+        members_active=members_active,
+        recent=recent,
+    )
+    resp = make_response(html)
+    resp.headers["Content-Type"] = "text/html; charset=utf-8"
+    # Let social scrapers and CDNs cache briefly so a viral share does not
+    # hammer the database, but keep it fresh enough to feel live.
+    resp.headers["Cache-Control"] = "public, max-age=120"
+    return resp
+
+
 # Brief access endpoint — token-gated full-brief view (May 17, 2026).
 # Used by the web view at weathervalet.ai/brief/<token>. The frontend
 # fetches this endpoint, then renders the brief as a styled page if
@@ -24128,55 +24288,11 @@ def crew_report_hide(report_id: int):
     return jsonify({"ok": True})
 
 
-@app.route("/api/v1/crew/reports/<int:report_id>/photo", methods=["OPTIONS"])
-def _crew_report_photo_preflight(report_id: int):
-    return ("", 204)
-
-
-@app.post("/api/v1/crew/reports/<int:report_id>/photo")
-def crew_report_attach_photo(report_id: int):
-    """Attach a photo to one of the Crew member's own existing reports.
-
-    This supports the natural order people actually use: they tap a
-    condition first, then add a photo. The photo is attached to the report
-    they just posted, rather than being lost or forcing photo-first order.
-    The image is uploaded client-side to Cloudinary, so we receive a URL.
-    """
-    user = _get_current_user()
-    if user is None:
-        return jsonify({"ok": False, "error": "not-authenticated"}), 401
-    if not _is_crew_member(user):
-        return jsonify({"ok": False, "error": "not-crew"}), 403
-
-    data = request.get_json(silent=True) or {}
-    image_url = (data.get("image_url") or "").strip()
-    if not image_url:
-        return jsonify({"ok": False, "error": "missing-image-url"}), 400
-    # Only accept a Cloudinary https URL, matching how the uploader works,
-    # so a stray local blob or data URL can never be stored.
-    if not (image_url.startswith("https://") and "cloudinary.com" in image_url):
-        return jsonify({"ok": False, "error": "invalid-image-url"}), 400
-
-    try:
-        with db() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT user_id, image_url FROM crew_reports WHERE id = %s",
-                    (report_id,),
-                )
-                row = cur.fetchone()
-                if not row:
-                    return jsonify({"ok": False, "error": "report-not-found"}), 404
-                if row["user_id"] != user["id"]:
-                    return jsonify({"ok": False, "error": "not-your-report"}), 403
-                cur.execute(
-                    "UPDATE crew_reports SET image_url = %s WHERE id = %s",
-                    (image_url, report_id),
-                )
-    except Exception as e:
-        print(f"[crew-attach-photo] failed: {e!r}", flush=True)
-        return jsonify({"ok": False, "error": "db-error"}), 500
-    return jsonify({"ok": True, "report_id": report_id, "image_url": image_url})
+# ─── My active reports (Crew workspace toggle state) ────────────────
+#
+# Returns the calling Crew member's currently-active reports (last 60
+# minutes, not hidden). Used by the workspace on load to pre-highlight
+# the buttons matching what they've already posted.
 
 @app.route("/api/v1/me/crew/active-reports", methods=["OPTIONS"])
 def _me_crew_active_reports_preflight():
