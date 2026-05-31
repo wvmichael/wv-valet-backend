@@ -24128,11 +24128,55 @@ def crew_report_hide(report_id: int):
     return jsonify({"ok": True})
 
 
-# ─── My active reports (Crew workspace toggle state) ────────────────
-#
-# Returns the calling Crew member's currently-active reports (last 60
-# minutes, not hidden). Used by the workspace on load to pre-highlight
-# the buttons matching what they've already posted.
+@app.route("/api/v1/crew/reports/<int:report_id>/photo", methods=["OPTIONS"])
+def _crew_report_photo_preflight(report_id: int):
+    return ("", 204)
+
+
+@app.post("/api/v1/crew/reports/<int:report_id>/photo")
+def crew_report_attach_photo(report_id: int):
+    """Attach a photo to one of the Crew member's own existing reports.
+
+    This supports the natural order people actually use: they tap a
+    condition first, then add a photo. The photo is attached to the report
+    they just posted, rather than being lost or forcing photo-first order.
+    The image is uploaded client-side to Cloudinary, so we receive a URL.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if not _is_crew_member(user):
+        return jsonify({"ok": False, "error": "not-crew"}), 403
+
+    data = request.get_json(silent=True) or {}
+    image_url = (data.get("image_url") or "").strip()
+    if not image_url:
+        return jsonify({"ok": False, "error": "missing-image-url"}), 400
+    # Only accept a Cloudinary https URL, matching how the uploader works,
+    # so a stray local blob or data URL can never be stored.
+    if not (image_url.startswith("https://") and "cloudinary.com" in image_url):
+        return jsonify({"ok": False, "error": "invalid-image-url"}), 400
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT user_id, image_url FROM crew_reports WHERE id = %s",
+                    (report_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"ok": False, "error": "report-not-found"}), 404
+                if row["user_id"] != user["id"]:
+                    return jsonify({"ok": False, "error": "not-your-report"}), 403
+                cur.execute(
+                    "UPDATE crew_reports SET image_url = %s WHERE id = %s",
+                    (image_url, report_id),
+                )
+    except Exception as e:
+        print(f"[crew-attach-photo] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+    return jsonify({"ok": True, "report_id": report_id, "image_url": image_url})
 
 @app.route("/api/v1/me/crew/active-reports", methods=["OPTIONS"])
 def _me_crew_active_reports_preflight():
