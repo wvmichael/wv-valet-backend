@@ -7714,6 +7714,84 @@ def overlay_page():
     return resp
 
 
+@app.get("/api/v1/overlay/warnings")
+def overlay_warnings():
+    """Public endpoint: active NWS warnings matching a state + counties, for
+    the LIVE overlay (Chunk 2c). The overlay polls this on its own from
+    inside OBS, so it must be unauthenticated and cheap.
+
+    Query params:
+      state    two-letter state code, e.g. IN
+      counties comma-separated county names, e.g. Marion,Hamilton,Boone
+
+    Matching is a text match: an active alert is included if its area
+    description mentions one of the given counties. To cut down on false
+    matches from county names that repeat across states, when a state is
+    given we require the alert's area description to also mention that
+    state (NWS area descriptions are formatted like "Marion, IN").
+    Returns the most relevant warnings, newest/most-severe first.
+    """
+    state = (request.args.get("state") or "").strip().upper()
+    counties_raw = (request.args.get("counties") or "").strip()
+    counties = [c.strip().lower() for c in counties_raw.split(",") if c.strip()]
+
+    if not counties:
+        return jsonify({"ok": True, "warnings": []})
+
+    try:
+        alerts = _get_cached_nws_alerts() or []
+    except Exception as e:
+        print(f"[overlay-warnings] alert fetch failed: {e!r}", flush=True)
+        alerts = []
+
+    # Rank more severe events higher so the overlay leads with them.
+    severity_rank = {
+        "Tornado Warning": 0, "Tornado Watch": 3,
+        "Severe Thunderstorm Warning": 1, "Severe Thunderstorm Watch": 4,
+        "Flash Flood Warning": 2, "Flash Flood Watch": 5,
+    }
+
+    matched = []
+    for a in alerts:
+        area = (a.get("area_desc") or "")
+        area_l = area.lower()
+        if not area_l:
+            continue
+        # If a state was given, require the area text to reference it, so a
+        # county name shared across states does not over-match.
+        if state and (state.lower() not in area_l) and (("," + state.lower()) not in area_l):
+            # area_desc usually contains the 2-letter code like "Marion, IN";
+            # the checks above cover both " in" word and ", in" forms.
+            pass_state = False
+        else:
+            pass_state = True
+        if state and not pass_state:
+            continue
+        # County name match
+        hit = None
+        for c in counties:
+            if c and c in area_l:
+                hit = c
+                break
+        if not hit:
+            continue
+        event = a.get("event") or "Weather Alert"
+        matched.append({
+            "event": event,
+            "severity": a.get("severity") or "",
+            "area_desc": area,
+            "expires_at": a.get("expires_at"),
+            "_rank": severity_rank.get(event, 9),
+        })
+
+    matched.sort(key=lambda w: w["_rank"])
+    for w in matched:
+        w.pop("_rank", None)
+    # Cap to a sensible number for an on-screen crawl.
+    matched = matched[:6]
+    return jsonify({"ok": True, "warnings": matched})
+
+
 @app.get("/meteorologist/<claim_token>")
 def meteorologist_view(claim_token: str):
     """Meteorologist taps the link in their SMS and lands here.
