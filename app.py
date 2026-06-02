@@ -30752,6 +30752,51 @@ def met_storm_shelter_open():
     return jsonify({"ok": True, "activation_id": row["id"]})
 
 
+@app.route("/api/v1/met/storm-shelter/open-list", methods=["OPTIONS"])
+def _met_ss_open_list_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/storm-shelter/open-list")
+def met_storm_shelter_open_list():
+    """List the currently-open Storm Shelters, for the LIVE tab's overlay
+    setup (Chunk 2b-2). When a Meteorologist is going live during a storm,
+    they pick the open shelter they are covering, and its region_label
+    becomes the overlay's region. Met/admin only.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    shelters = []
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT s.id, s.region_label, s.nws_event, s.opened_at_ms,
+                              u.name AS met_name
+                       FROM storm_shelter_activations s
+                       LEFT JOIN users u ON u.id = s.met_user_id
+                       WHERE s.closed_at_ms IS NULL
+                       ORDER BY s.opened_at_ms DESC"""
+                )
+                for r in cur.fetchall():
+                    shelters.append({
+                        "id": r["id"],
+                        "region_label": r["region_label"],
+                        "nws_event": r["nws_event"],
+                        "met_name": r["met_name"],
+                        "opened_at_ms": r["opened_at_ms"],
+                    })
+    except Exception as e:
+        print(f"[storm-shelter] open-list failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+    return jsonify({"ok": True, "shelters": shelters})
+
+
 @app.route("/api/v1/met/storm-shelter/<int:activation_id>/close", methods=["OPTIONS"])
 def _met_ss_close_preflight(activation_id):
     return ("", 204)
