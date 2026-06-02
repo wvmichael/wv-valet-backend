@@ -7650,6 +7650,35 @@ OVERLAY_TEMPLATE = """\
   .wv-lower-sub {
     color: rgba(255,255,255,0.78); font-size: 21px; font-weight: 500; margin-top: 4px;
   }
+
+  /* ── Warning bar, top-center, slides in when warnings are active ── */
+  .wv-warn {
+    position: absolute; top: 0; left: 0; right: 0;
+    display: flex; justify-content: center;
+    transform: translateY(-120%);
+    transition: transform 0.5s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .wv-warn.is-active { transform: translateY(0); }
+  .wv-warn-inner {
+    margin-top: 18px;
+    display: flex; align-items: center; gap: 16px;
+    background: linear-gradient(100deg, rgba(150,20,20,0.97), rgba(110,12,12,0.95));
+    border: 1px solid rgba(255,180,180,0.35);
+    border-radius: 10px;
+    padding: 12px 26px;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.45);
+    max-width: 1500px;
+  }
+  .wv-warn-badge {
+    background: var(--wv-gold); color: #1a1a1a;
+    font-weight: 800; font-size: 15px; letter-spacing: 1.5px; text-transform: uppercase;
+    padding: 5px 12px; border-radius: 6px; white-space: nowrap;
+  }
+  .wv-warn-text {
+    color: #fff; font-size: 24px; font-weight: 600; line-height: 1.2;
+    text-shadow: 0 1px 4px rgba(0,0,0,0.4);
+  }
+  .wv-warn-text .wv-warn-where { color: rgba(255,255,255,0.82); font-weight: 500; font-size: 20px; }
 </style>
 </head>
 <body>
@@ -7659,6 +7688,13 @@ OVERLAY_TEMPLATE = """\
   </div>
 
   <div class="wv-clock" id="wv-clock">--:-- --</div>
+
+  <div class="wv-warn" id="wv-warn">
+    <div class="wv-warn-inner">
+      <span class="wv-warn-badge" id="wv-warn-badge">Warning</span>
+      <span class="wv-warn-text" id="wv-warn-text"></span>
+    </div>
+  </div>
 
   <div class="wv-lower">
     <div class="wv-lower-accent"></div>
@@ -7684,6 +7720,55 @@ OVERLAY_TEMPLATE = """\
     }
     wvTick();
     setInterval(wvTick, 1000);
+
+    // ── Live NWS warnings (Chunk 2c) ──────────────────────────────
+    // Region comes from the route as state + counties. We poll the public
+    // warnings endpoint and rotate any matches through the top bar. If
+    // there is no region or no warnings, the bar stays hidden.
+    var WV_STATE = "{{ warn_state }}";
+    var WV_COUNTIES = "{{ warn_counties }}";
+    var wvWarnings = [];
+    var wvWarnIdx = 0;
+
+    function wvShowWarning(w) {
+      var bar = document.getElementById('wv-warn');
+      var badge = document.getElementById('wv-warn-badge');
+      var text = document.getElementById('wv-warn-text');
+      if (!bar || !badge || !text) return;
+      if (!w) { bar.classList.remove('is-active'); return; }
+      // Badge = event type; text = event + where.
+      var ev = w.event || 'Weather Alert';
+      badge.textContent = ev.replace(/ (Warning|Watch)$/, '');
+      var where = w.area_desc ? (' \u00b7 ' + w.area_desc) : '';
+      text.innerHTML = ev + '<span class="wv-warn-where">' + where + '</span>';
+      bar.classList.add('is-active');
+    }
+
+    function wvRotateWarning() {
+      if (!wvWarnings.length) { wvShowWarning(null); return; }
+      var w = wvWarnings[wvWarnIdx % wvWarnings.length];
+      wvShowWarning(w);
+      wvWarnIdx++;
+    }
+
+    function wvFetchWarnings() {
+      if (!WV_COUNTIES) return;  // no region set, nothing to show
+      var url = '/api/v1/overlay/warnings?state=' + encodeURIComponent(WV_STATE)
+        + '&counties=' + encodeURIComponent(WV_COUNTIES);
+      fetch(url)
+        .then(function(r) { return r.json(); })
+        .then(function(j) {
+          wvWarnings = (j && j.ok && j.warnings) ? j.warnings : [];
+          if (!wvWarnings.length) { wvShowWarning(null); }
+        })
+        .catch(function() { /* keep last state on a transient error */ });
+    }
+
+    if (WV_COUNTIES) {
+      wvFetchWarnings();
+      setInterval(wvFetchWarnings, 30000);  // refresh the list every 30s
+      setInterval(wvRotateWarning, 7000);   // rotate the visible one every 7s
+    }
   </script>
 </body>
 </html>"""
@@ -7703,12 +7788,16 @@ def overlay_page():
     """
     region = (request.args.get("region") or "").strip()
     title = (request.args.get("title") or "").strip() or "Live Weather Coverage"
+    state = (request.args.get("state") or "").strip().upper()
+    counties = (request.args.get("counties") or "").strip()
     # The subtitle shows the region when given, else the generic line.
     subtitle = ("Live for " + region) if region else "Meteorologist on the air"
     resp = make_response(render_template_string(
         OVERLAY_TEMPLATE,
         title=title,
         subtitle=subtitle,
+        warn_state=state,
+        warn_counties=counties,
     ))
     resp.headers["Content-Type"] = "text/html; charset=utf-8"
     return resp
