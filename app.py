@@ -11613,11 +11613,20 @@ def admin_update_user(user_id):
 
             if phone is not None:
                 # Phone is optional and can be cleared with empty string.
-                # We store loosely formatted (allow "(317) 555-1234" or
-                # "+13175551234") and normalize at SMS send time.
-                phone_clean = phone.strip()
+                # Normalize to E.164 (+1XXXXXXXXXX) at save time so Twilio
+                # can always route it. A bare "785-470-1184" otherwise gets
+                # stored as-is and fails every send. If a non-empty value
+                # can't be normalized, reject it rather than store a number
+                # that will silently fail.
+                phone_raw = phone.strip()
+                if phone_raw:
+                    phone_clean = normalize_phone(phone_raw)
+                    if not phone_clean:
+                        return jsonify({"ok": False, "error": "invalid-phone"}), 400
+                else:
+                    phone_clean = None
                 updates.append("phone = %s")
-                params.append(phone_clean if phone_clean else None)
+                params.append(phone_clean)
 
             if is_active is not None:
                 updates.append("is_active = %s")
