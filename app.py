@@ -20319,19 +20319,108 @@ def _find_pro_subscribers_in_polygon(geom: dict) -> list:
     return matching
 
 
-def _page_met_for_alert(alert: dict, affected: list, page_token: str) -> bool:
-    """SMS the on-duty Met about a new severe alert. Returns True on
-    successful send (or stub mode), False on Twilio failure.
+def _on_duty_mets_today() -> list:
+    """All Mets assigned to any subscriber for today's date, i.e. the
+    on-duty set, read from the already-resolved daily_brief_tasks. Each
+    entry is {id, name, phone}. Used as the fallback target when an alert
+    hits a subscriber who has no assigned Met (a coverage gap)."""
+    today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    out = {}
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT DISTINCT mu.id, mu.name, mu.phone
+                       FROM daily_brief_tasks dbt
+                       JOIN users mu ON mu.id = dbt.assigned_met_id
+                       WHERE dbt.task_date = %s
+                         AND mu.is_active = TRUE
+                         AND mu.phone IS NOT NULL AND mu.phone <> ''""",
+                    (today,),
+                )
+                for r in cur.fetchall():
+                    out[r["id"]] = {"id": r["id"], "name": r["name"], "phone": r["phone"]}
+    except Exception as e:
+        print(f"[nws-route] on-duty lookup failed: {e!r}", flush=True)
+    return list(out.values())
 
-    The SMS includes the event name, area, # of affected subscribers, and
-    a link to the review page. Met reviews, decides to confirm or dismiss.
+
+def _resolve_mets_to_page(affected: list):
+    """Decide which Mets to page for an alert, routing by the Met actually
+    responsible for each affected subscriber today (options B + C combined).
+
+    For each affected subscriber we read today's assigned Met from
+    daily_brief_tasks (which already accounts for shift swaps and the
+    primary-Met fallback). Subscribers with no assigned Met today are a
+    coverage gap; for those we fall back to all on-duty Mets.
+
+    Returns (targets, had_gap):
+      targets : list of {id, name, phone} to page, de-duplicated
+      had_gap : True if any affected subscriber had no assigned Met
     """
-    if not METEOROLOGIST_PHONE:
-        print("[nws-page] METEOROLOGIST_PHONE not set, can't page", flush=True)
-        return False
+    sub_ids = [a["user_id"] for a in affected if a.get("user_id")]
+    if not sub_ids:
+        return ([], False)
+    today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    targets = {}
+    covered_subs = set()
+    try:
+        placeholders = ",".join(["%s"] * len(sub_ids))
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""SELECT dbt.subscriber_user_id, mu.id AS met_id,
+                               mu.name AS met_name, mu.phone AS met_phone
+                        FROM daily_brief_tasks dbt
+                        JOIN users mu ON mu.id = dbt.assigned_met_id
+                        WHERE dbt.task_date = %s
+                          AND dbt.subscriber_user_id IN ({placeholders})
+                          AND mu.is_active = TRUE
+                          AND mu.phone IS NOT NULL AND mu.phone <> ''""",
+                    (today, *sub_ids),
+                )
+                for r in cur.fetchall():
+                    covered_subs.add(r["subscriber_user_id"])
+                    targets[r["met_id"]] = {
+                        "id": r["met_id"], "name": r["met_name"], "phone": r["met_phone"]
+                    }
+    except Exception as e:
+        print(f"[nws-route] assigned-met lookup failed: {e!r}", flush=True)
 
+    had_gap = len(covered_subs) < len(set(sub_ids))
+    if had_gap:
+        # Some affected subscribers had no assigned Met today. Fall back to
+        # all on-duty Mets so the alert is never silently unrouted.
+        for m in _on_duty_mets_today():
+            targets.setdefault(m["id"], m)
+    return (list(targets.values()), had_gap)
+
+
+def _page_met_for_alert(alert: dict, affected: list, page_token: str,
+                        targets: Optional[list] = None) -> bool:
+    """SMS the responsible Met(s) about a new severe alert. Returns True on
+    at least one successful send (or stub mode), False otherwise.
+
+    targets is a list of {id, name, phone}. Each is paged at their own
+    number, so the alert reaches the Met actually on duty for the affected
+    subscribers rather than one shared phone. The SMS includes the event
+    name, area, # of affected subscribers, and a link to the review page.
+    """
     base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
     page_url = f"{base}/?nws-page={page_token}"
+
+    # targets: list of {id, name, phone}. Page each at their own number so
+    # alerts reach the Met actually responsible, not one shared phone. If
+    # the caller passed none (should not happen), fall back to the single
+    # METEOROLOGIST_PHONE env value so a deploy without routing still works.
+    if not targets:
+        if METEOROLOGIST_PHONE:
+            targets = [{"id": None, "name": "On-duty meteorologist",
+                        "phone": METEOROLOGIST_PHONE}]
+        else:
+            print("[nws-page] no target Mets and METEOROLOGIST_PHONE unset, "
+                  "can't page", flush=True)
+            return False
 
     body = (
         f"WV NWS PAGE: {alert['event']}\n"
@@ -20340,11 +20429,54 @@ def _page_met_for_alert(alert: dict, affected: list, page_token: str) -> bool:
         f"Review: {page_url}\n"
         f"Reply STOP to opt out."
     )
-    try:
-        return send_sms(METEOROLOGIST_PHONE, body)
-    except Exception as e:
-        print(f"[nws-page] SMS failed: {e}", flush=True)
-        return False
+    sent_any = False
+    for m in targets:
+        phone = (m.get("phone") or "").strip()
+        if not phone:
+            continue
+        try:
+            if send_sms(phone, body):
+                sent_any = True
+        except Exception as e:
+            print(f"[nws-page] SMS failed to {m.get('name')}: {e}", flush=True)
+    return sent_any
+
+
+def _email_admin_nws_page(alert: dict, affected: list, targets: list,
+                          had_gap: bool, page_token: str) -> None:
+    """Email the admin a record of every NWS page, clearly marking whether
+    it routed cleanly to assigned Mets or fell back to on-duty Mets because
+    of a coverage gap."""
+    admin_email = os.environ.get("ADMIN_NOTIFY_EMAIL", "").strip() or "hello@weathervalet.ai"
+    base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+    page_url = f"{base}/?nws-page={page_token}"
+
+    if had_gap:
+        tag = "COVERAGE GAP \u2014 fell back to on-duty Mets"
+        tag_color = "#B00020"
+    else:
+        tag = "Routed to assigned Met(s)"
+        tag_color = "#2E7D32"
+
+    met_list = "".join(
+        f"<li>{(m.get('name') or 'Meteorologist')}"
+        f"{(' &middot; ' + m['phone']) if m.get('phone') else ''}</li>"
+        for m in targets
+    ) or "<li>(none)</li>"
+
+    subject = f"WV NWS page: {alert.get('event','Alert')} ({len(affected)} Pro affected)"
+    html = (
+        f"<div style='font-family:Arial,sans-serif;font-size:14px;color:#1a1a1a;'>"
+        f"<p style='font-weight:700;color:{tag_color};margin:0 0 10px;'>{tag}</p>"
+        f"<p style='margin:0 0 6px;'><b>Event:</b> {alert.get('event','')}</p>"
+        f"<p style='margin:0 0 6px;'><b>Area:</b> {(alert.get('area_desc') or '')[:200]}</p>"
+        f"<p style='margin:0 0 6px;'><b>Affected Pro subscribers:</b> {len(affected)}</p>"
+        f"<p style='margin:10px 0 4px;'><b>Paged:</b></p>"
+        f"<ul style='margin:0 0 12px;'>{met_list}</ul>"
+        f"<p style='margin:0 0 6px;'><a href='{page_url}'>Open the review page</a></p>"
+        f"</div>"
+    )
+    _send_brief_email(admin_email, subject, html, html=True)
 
 
 def _notify_crew_in_severe_alert(alert: dict) -> None:
@@ -20737,6 +20869,14 @@ def _process_severe_alerts() -> None:
         now_ms = int(time.time() * 1000)
         affected_ids_csv = ",".join(str(a["user_id"]) for a in affected)
 
+        # Route by the Met responsible for each affected subscriber today
+        # (options B + C), with a fall back to all on-duty Mets for any
+        # coverage gap.
+        targets, had_gap = _resolve_mets_to_page(affected)
+        paged_phones_csv = ",".join(
+            (m.get("phone") or "") for m in targets if m.get("phone")
+        ) or METEOROLOGIST_PHONE
+
         try:
             with db() as conn:
                 with conn.cursor() as cur:
@@ -20754,7 +20894,7 @@ def _process_severe_alerts() -> None:
                          alert["instruction"], alert["area_desc"],
                          json.dumps(alert["geometry"]),
                          alert["expires_at"], page_token,
-                         affected_ids_csv, METEOROLOGIST_PHONE),
+                         affected_ids_csv, paged_phones_csv),
                     )
                     new_row = cur.fetchone()
         except Exception as e:
@@ -20763,11 +20903,18 @@ def _process_severe_alerts() -> None:
             print(f"[nws-process] insert failed for {nws_id}: {e}", flush=True)
             continue
 
-        # Send the SMS — fire-and-forget; failure logged inside.
-        _page_met_for_alert(alert, affected, page_token)
+        # Send the SMS to each routed Met — fire-and-forget; failures logged.
+        _page_met_for_alert(alert, affected, page_token, targets=targets)
+        # Email the admin a record of every page, marking clean assignment
+        # vs coverage-gap fallback.
+        try:
+            _email_admin_nws_page(alert, affected, targets, had_gap, page_token)
+        except Exception as e:
+            print(f"[nws-process] admin email failed: {e}", flush=True)
         print(
-            f"[nws-process] paged Met for alert={alert['event']!r} "
-            f"id={new_row['id']} affected={len(affected)}",
+            f"[nws-process] paged {len(targets)} Met(s) for "
+            f"alert={alert['event']!r} id={new_row['id']} "
+            f"affected={len(affected)} gap={had_gap}",
             flush=True,
         )
 
