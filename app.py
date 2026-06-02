@@ -20611,15 +20611,40 @@ _CREW_CONDITION_WORDS = {
     "fog": "fog", "foggy": "fog",
     "wind": "wind", "windy": "wind",
     "hail": "hail",
+    # Numbered quick-reply options, so a member can just text a digit back.
+    # The order here is the order shown in the daily nudge menu below; keep
+    # the two in sync.
+    "1": "clear", "2": "cloudy", "3": "rain", "4": "storm",
+    "5": "snow", "6": "fog", "7": "wind", "8": "hail",
 }
+
+# The quick-reply menu line appended to the daily nudge. Numbers map to the
+# digits in _CREW_CONDITION_WORDS above; keep the two in sync.
+_CREW_CHECKIN_MENU = (
+    "Reply with a number: 1 clear, 2 cloudy, 3 rain, 4 storm, "
+    "5 snow, 6 fog, 7 wind, 8 hail. Or add detail at weathervalet.ai/crew"
+)
 
 
 def _parse_crew_condition(body):
-    """Map the first recognizable word of an inbound reply to a condition,
-    or None if nothing matches. Forgiving: scans the whole message, not
-    just the first word, so 'it is raining' still resolves to rain."""
-    for raw in (body or "").lower().replace(",", " ").split():
+    """Map an inbound reply to a condition, or None if nothing matches.
+
+    Two ways to match, both forgiving:
+      - A standalone digit (the quick-reply menu), e.g. "3" -> rain. Only
+        when the whole reply is just that number, so "72 degrees and clear"
+        does not get read as menu option 2.
+      - Otherwise, scan the words for a recognizable condition term, so
+        "it is raining out" still resolves to rain.
+    """
+    text = (body or "").strip()
+    # Standalone digit menu choice
+    if text in ("1", "2", "3", "4", "5", "6", "7", "8"):
+        return _CREW_CONDITION_WORDS.get(text)
+    for raw in text.lower().replace(",", " ").split():
         w = raw.strip(".!?;:'\"")
+        # Skip bare digits here (handled above); only word terms below.
+        if w.isdigit():
+            continue
         if w in _CREW_CONDITION_WORDS:
             return _CREW_CONDITION_WORDS[w]
     return None
@@ -20751,7 +20776,7 @@ def _crew_daily_checkin_nudge() -> None:
             continue
         if not claimed:
             continue
-        msg = pool[(day_number + r["id"]) % len(pool)]
+        msg = pool[(day_number + r["id"]) % len(pool)] + "\n\n" + _CREW_CHECKIN_MENU
         try:
             send_sms(r["phone"], msg)
         except Exception as e:
