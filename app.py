@@ -1064,6 +1064,37 @@ CREATE INDEX IF NOT EXISTS idx_ssa_closed ON storm_shelter_activations(closed_at
 
 
 -- ──────────────────────────────────────────────────────────────────────
+-- Live broadcasts — a Met going LIVE inside the WeatherValet app (Phase 3)
+-- ──────────────────────────────────────────────────────────────────────
+-- A live broadcast is its own record, independent of a Storm Shelter (a
+-- Met can go live with or without one). The app embeds the Met's YouTube
+-- stream; we never host video. visibility controls who sees it in-app:
+--   'public'       — anyone (also public on YouTube); good for growth
+--   'subscribers'  — only signed-in subscribers in-app (YouTube unlisted)
+-- region_state + region_counties drive which subscribers it matches.
+-- shelter_activation_id optionally links to an open shelter when there is
+-- one, but is null for a standalone live session. ended_at_ms IS NULL
+-- means the broadcast is currently live.
+CREATE TABLE IF NOT EXISTS live_broadcasts (
+    id                    SERIAL PRIMARY KEY,
+    met_user_id           INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    youtube_id            TEXT NOT NULL,           -- normalized 11-char video id
+    youtube_url           TEXT NOT NULL,           -- the raw URL the Met pasted
+    title                 TEXT,
+    visibility            TEXT NOT NULL DEFAULT 'subscribers', -- 'public'|'subscribers'
+    region_label          TEXT,                    -- display label, e.g. "Marion, Hamilton (IN)"
+    region_state          TEXT,                    -- 2-letter, for matching
+    region_counties       TEXT,                    -- comma-separated, for matching
+    shelter_activation_id INTEGER REFERENCES storm_shelter_activations(id) ON DELETE SET NULL,
+    started_at_ms         BIGINT NOT NULL,
+    ended_at_ms           BIGINT,                  -- null = currently live
+    scheduled_for_ms      BIGINT                   -- optional "going live at" time
+);
+CREATE INDEX IF NOT EXISTS idx_lb_met ON live_broadcasts(met_user_id);
+CREATE INDEX IF NOT EXISTS idx_lb_live ON live_broadcasts(ended_at_ms);
+
+
+-- ──────────────────────────────────────────────────────────────────────
 -- Rosie — Met team AI assistant (Phase 1, May 17, 2026)
 -- ──────────────────────────────────────────────────────────────────────
 -- Rosie is an AI assistant for the Met team. She helps Mets with
@@ -30962,6 +30993,170 @@ def met_storm_shelter_open_list():
         print(f"[storm-shelter] open-list failed: {e!r}", flush=True)
         return jsonify({"ok": False, "error": "db-error"}), 500
     return jsonify({"ok": True, "shelters": shelters})
+
+
+# ── Live broadcasts: a Met going LIVE in the app (Phase 3, Chunk 3a) ──
+def _parse_youtube_id(url: str) -> Optional[str]:
+    """Pull the 11-char YouTube video id from common URL shapes. Returns
+    None if we can't find one. Accepts watch?v=, youtu.be/, live/, embed/,
+    and a bare id."""
+    if not url:
+        return None
+    url = url.strip()
+    # Bare 11-char id
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", url):
+        return url
+    patterns = [
+        r"[?&]v=([A-Za-z0-9_-]{11})",
+        r"youtu\.be/([A-Za-z0-9_-]{11})",
+        r"youtube\.com/live/([A-Za-z0-9_-]{11})",
+        r"youtube\.com/embed/([A-Za-z0-9_-]{11})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, url)
+        if m:
+            return m.group(1)
+    return None
+
+
+@app.route("/api/v1/met/live/start", methods=["OPTIONS"])
+def _met_live_start_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/met/live/start")
+def met_live_start():
+    """Met goes live in the app. Records a live_broadcasts row. Met/admin
+    only. Body: youtube_url, visibility ('public'|'subscribers'), region_label,
+    region_state, region_counties, title (optional), shelter_activation_id
+    (optional), scheduled_for_ms (optional)."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    body = request.get_json(silent=True) or {}
+    youtube_url = (body.get("youtube_url") or "").strip()
+    yid = _parse_youtube_id(youtube_url)
+    if not yid:
+        return jsonify({"ok": False, "error": "bad-youtube-url"}), 400
+    visibility = (body.get("visibility") or "subscribers").strip()
+    if visibility not in ("public", "subscribers"):
+        visibility = "subscribers"
+    title = (body.get("title") or "").strip() or None
+    region_label = (body.get("region_label") or "").strip() or None
+    region_state = (body.get("region_state") or "").strip().upper() or None
+    region_counties = (body.get("region_counties") or "").strip() or None
+    shelter_id = body.get("shelter_activation_id")
+    try:
+        shelter_id = int(shelter_id) if shelter_id else None
+    except (ValueError, TypeError):
+        shelter_id = None
+    scheduled_for_ms = body.get("scheduled_for_ms")
+    try:
+        scheduled_for_ms = int(scheduled_for_ms) if scheduled_for_ms else None
+    except (ValueError, TypeError):
+        scheduled_for_ms = None
+    now_ms = int(time.time() * 1000)
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                # End any of this Met's still-open broadcasts first, so a Met
+                # is only live in one place at a time.
+                cur.execute(
+                    """UPDATE live_broadcasts SET ended_at_ms = %s
+                       WHERE met_user_id = %s AND ended_at_ms IS NULL""",
+                    (now_ms, user["id"]),
+                )
+                cur.execute(
+                    """INSERT INTO live_broadcasts
+                       (met_user_id, youtube_id, youtube_url, title, visibility,
+                        region_label, region_state, region_counties,
+                        shelter_activation_id, started_at_ms, scheduled_for_ms)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                       RETURNING id""",
+                    (user["id"], yid, youtube_url, title, visibility,
+                     region_label, region_state, region_counties,
+                     shelter_id, now_ms, scheduled_for_ms),
+                )
+                row = cur.fetchone()
+    except Exception as e:
+        print(f"[live] start failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+    print(f"[live] START met={user['id']} yid={yid} vis={visibility} region={region_label!r}", flush=True)
+    return jsonify({"ok": True, "broadcast_id": row["id"], "youtube_id": yid})
+
+
+@app.route("/api/v1/met/live/stop", methods=["OPTIONS"])
+def _met_live_stop_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/met/live/stop")
+def met_live_stop():
+    """Met ends their current live broadcast (all their open ones)."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    now_ms = int(time.time() * 1000)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE live_broadcasts SET ended_at_ms = %s
+                       WHERE met_user_id = %s AND ended_at_ms IS NULL""",
+                    (now_ms, user["id"]),
+                )
+    except Exception as e:
+        print(f"[live] stop failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+    print(f"[live] STOP met={user['id']}", flush=True)
+    return jsonify({"ok": True})
+
+
+@app.get("/api/v1/met/live/mine")
+def met_live_mine():
+    """Return this Met's current live broadcast, if any (so the LIVE tab can
+    show live/not-live state and an End button)."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    live = None
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, youtube_id, youtube_url, title, visibility,
+                              region_label, started_at_ms
+                       FROM live_broadcasts
+                       WHERE met_user_id = %s AND ended_at_ms IS NULL
+                       ORDER BY started_at_ms DESC LIMIT 1""",
+                    (user["id"],),
+                )
+                r = cur.fetchone()
+                if r:
+                    live = {
+                        "id": r["id"],
+                        "youtube_id": r["youtube_id"],
+                        "youtube_url": r["youtube_url"],
+                        "title": r["title"],
+                        "visibility": r["visibility"],
+                        "region_label": r["region_label"],
+                        "started_at_ms": r["started_at_ms"],
+                    }
+    except Exception as e:
+        print(f"[live] mine failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+    return jsonify({"ok": True, "live": live})
 
 
 @app.route("/api/v1/met/storm-shelter/<int:activation_id>/close", methods=["OPTIONS"])
