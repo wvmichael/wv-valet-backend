@@ -7664,8 +7664,8 @@ OVERLAY_TEMPLATE = """\
     <div class="wv-lower-accent"></div>
     <div class="wv-lower-body">
       <div class="wv-lower-kicker">WeatherValet Live</div>
-      <div class="wv-lower-title">Live Weather Coverage</div>
-      <div class="wv-lower-sub">Meteorologist on the air</div>
+      <div class="wv-lower-title">{{ title }}</div>
+      <div class="wv-lower-sub">{{ subtitle }}</div>
     </div>
   </div>
 
@@ -7691,8 +7691,25 @@ OVERLAY_TEMPLATE = """\
 
 @app.get("/overlay")
 def overlay_page():
-    """Serve the branded LIVE overlay for OBS browser sources (Chunk 2a)."""
-    resp = make_response(render_template_string(OVERLAY_TEMPLATE))
+    """Serve the branded LIVE overlay for OBS browser sources.
+
+    Region-aware (Chunk 2b-1): the overlay reads its region and an optional
+    title from the URL query string, so a Meteorologist's overlay link can
+    carry the area they are covering. Examples:
+      /overlay?region=Indianapolis%20Metro
+      /overlay?region=NW%20Kansas&title=Daily%20Forecast
+    With no query params it falls back to the generic look, so the bare
+    /overlay link still renders correctly for positioning.
+    """
+    region = (request.args.get("region") or "").strip()
+    title = (request.args.get("title") or "").strip() or "Live Weather Coverage"
+    # The subtitle shows the region when given, else the generic line.
+    subtitle = ("Live for " + region) if region else "Meteorologist on the air"
+    resp = make_response(render_template_string(
+        OVERLAY_TEMPLATE,
+        title=title,
+        subtitle=subtitle,
+    ))
     resp.headers["Content-Type"] = "text/html; charset=utf-8"
     return resp
 
