@@ -4140,6 +4140,18 @@ def _add_cors_headers(response):
     browser will let our frontend read the response.
     """
     origin = request.headers.get("Origin", "")
+    # Public widget endpoints serve cookieless forecast data meant to be
+    # embedded on partner sites (e.g. nwksradio.net). Allow ANY origin for
+    # these, but WITHOUT credentials (no cookies), which is the safe form of
+    # open CORS. Every other endpoint keeps the strict allow-list below.
+    path = request.path or ""
+    if path.startswith("/api/v1/widget/"):
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        response.headers["Access-Control-Max-Age"] = "3600"
+        response.headers["Vary"] = "Origin"
+        return response
     # `null` is what browsers send when the page is loaded via file://.
     # Allow it during prototype testing — remove before production.
     if origin in ALLOWED_ORIGINS or origin == "null":
