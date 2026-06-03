@@ -13638,6 +13638,98 @@ def _me_saved_locations_preflight():
     return ("", 204)
 
 
+@app.get("/api/v1/me/live-now")
+def me_live_now():
+    """Tell the signed-in subscriber whether a Meteorologist is live in
+    their area right now (Chunk 3b). Powers the 'We're LIVE' bar.
+
+    Matching: we take the subscriber's primary saved location (its state
+    from address_text, and its county), and look for a currently-live
+    broadcast whose region includes them. Per product choice, only
+    region-matched broadcasts are surfaced here (a subscriber sees a live
+    Met for their own area). State-scoped county text-match, same approach
+    as the overlay warnings, so it stays tight without needing polygons.
+
+    Returns 200 {"ok": true, "live": {...}} or {"ok": true, "live": null}.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+
+    # The subscriber's primary location.
+    loc = None
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT address_text, county
+                       FROM saved_locations
+                       WHERE user_id = %s AND is_primary = TRUE
+                       LIMIT 1""",
+                    (user["id"],),
+                )
+                loc = cur.fetchone()
+    except Exception as e:
+        print(f"[live-now] location fetch failed: {e!r}", flush=True)
+        return jsonify({"ok": True, "live": None})
+
+    if not loc:
+        return jsonify({"ok": True, "live": None})
+
+    # Derive the subscriber's state (2-letter) and county name.
+    addr = (loc.get("address_text") or "")
+    sub_county = (loc.get("county") or "").lower().replace(" county", "").strip()
+    # state: last 2-letter token in address like "Lebanon, IN"
+    sub_state = ""
+    m = re.search(r"\b([A-Z]{2})\b\s*$", addr.strip())
+    if m:
+        sub_state = m.group(1).upper()
+
+    # Pull currently-live broadcasts and find the first region match.
+    match = None
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT b.id, b.youtube_id, b.title, b.visibility,
+                              b.region_label, b.region_state, b.region_counties,
+                              u.name AS met_name
+                       FROM live_broadcasts b
+                       LEFT JOIN users u ON u.id = b.met_user_id
+                       WHERE b.ended_at_ms IS NULL
+                       ORDER BY b.started_at_ms DESC"""
+                )
+                rows = cur.fetchall()
+        for b in rows:
+            b_state = (b.get("region_state") or "").upper()
+            counties_raw = (b.get("region_counties") or "")
+            b_counties = [c.strip().lower() for c in counties_raw.split(",") if c.strip()]
+            # State must match if both sides have one.
+            if b_state and sub_state and b_state != sub_state:
+                continue
+            # County must match if the broadcast specifies counties.
+            if b_counties:
+                if not sub_county or sub_county not in b_counties:
+                    continue
+            # If the broadcast has no region at all, don't surface it here
+            # (a regionless stream isn't targeted to this subscriber).
+            if not b_state and not b_counties:
+                continue
+            match = {
+                "id": b["id"],
+                "youtube_id": b["youtube_id"],
+                "title": b["title"],
+                "region_label": b["region_label"],
+                "met_name": b["met_name"],
+            }
+            break
+    except Exception as e:
+        print(f"[live-now] broadcast match failed: {e!r}", flush=True)
+        return jsonify({"ok": True, "live": None})
+
+    return jsonify({"ok": True, "live": match})
+
+
 @app.get("/api/v1/me/saved-locations")
 def me_saved_locations_list():
     """List the current user's saved locations, primary first.
