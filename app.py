@@ -4212,7 +4212,17 @@ def _add_security_headers(response):
     # always HTTPS, so this is belt-and-suspenders only)
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
+    # Frame protection: DENY everywhere to prevent clickjacking of the app
+    # (especially login). EXCEPT the public widget endpoints, which exist to
+    # be embedded on partner sites (e.g. nwksradio.net). For those, allow
+    # framing so the iframe is not refused. Widget data is public and
+    # cookieless, so there is no clickjacking risk in letting it be framed.
+    path = request.path or ""
+    if path.startswith("/api/v1/widget/"):
+        # Do not set X-Frame-Options (no DENY); permit embedding anywhere.
+        pass
+    else:
+        response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     # Disable browser features we don't use, reducing attack surface
     response.headers["Permissions-Policy"] = (
@@ -7631,39 +7641,65 @@ OVERLAY_TEMPLATE = """\
   html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
   * { box-sizing: border-box; }
   :root {
-    --wv-navy: #0B1525;
-    --wv-blue: #2E4FB8;
-    --wv-gold: #FFD17A;
+    --wv-ink: #0E1116;       /* site deep ink */
+    --wv-blue: #4169E1;      /* site royal blue (brand primary) */
+    --wv-blue-deep: #2E4FB8; /* site secondary blue */
+    --wv-gold: #F5A524;      /* site gold accent */
+    --wv-red: #C2342B;       /* site warning red */
     --wv-text: #FFFFFF;
   }
+  /* Fill whatever size OBS gives the browser source, instead of a fixed
+     1920x1080 box. This keeps the logo/clock/lower-third anchored to the
+     real corners at any source size. */
   body {
-    width: 1920px; height: 1080px;
-    font-family: 'Rajdhani', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+    width: 100vw; height: 100vh;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', Arial, sans-serif;
     position: relative;
     -webkit-font-smoothing: antialiased;
   }
 
-  /* ── Logo, top-left ─────────────────────────────────────────── */
-  .wv-logo {
-    position: absolute; top: 40px; left: 48px;
-    display: flex; align-items: center; gap: 14px;
+  /* ── Top strip: logo (left), warning (center), clock (right) on ONE line ── */
+  .wv-topbar {
+    position: absolute; top: 0; left: 0; right: 0;
+    display: flex; align-items: center; gap: 20px;
+    padding: 30px 44px;
   }
-  .wv-logo-mark {
-    width: 56px; height: 56px; border-radius: 12px;
-    background: linear-gradient(135deg, var(--wv-blue), #1a2f7a);
-    display: flex; align-items: center; justify-content: center;
-    box-shadow: 0 4px 18px rgba(0,0,0,0.35);
+  .wv-logo { flex: 0 0 auto; display: flex; align-items: center; }
+  .wv-logo img {
+    height: 52px; width: auto; display: block;
+    filter: drop-shadow(0 2px 10px rgba(0,0,0,0.7));
   }
-  .wv-logo-mark span { color: #fff; font-weight: 800; font-size: 26px; letter-spacing: -1px; }
-  .wv-logo-word {
-    color: #fff; font-weight: 700; font-size: 26px; letter-spacing: 0.3px;
-    text-shadow: 0 2px 10px rgba(0,0,0,0.5);
-  }
-  .wv-logo-word b { color: var(--wv-gold); font-weight: 700; }
 
-  /* ── Clock, top-right ───────────────────────────────────────── */
+  /* Warning sits in the middle of the top strip; hidden (faded) when none. */
+  .wv-warn {
+    flex: 1 1 auto; display: flex; justify-content: center;
+    opacity: 0; transform: translateY(-6px);
+    transition: opacity 0.4s ease, transform 0.4s ease;
+    pointer-events: none;
+  }
+  .wv-warn.is-active { opacity: 1; transform: translateY(0); }
+  .wv-warn-inner {
+    display: inline-flex; align-items: center; gap: 14px;
+    background: linear-gradient(100deg, var(--wv-red), #9B2823);
+    border: 1px solid rgba(255,190,190,0.4);
+    border-radius: 10px;
+    padding: 10px 22px;
+    box-shadow: 0 6px 22px rgba(0,0,0,0.45);
+    max-width: 100%;
+  }
+  .wv-warn-badge {
+    background: var(--wv-gold); color: var(--wv-ink);
+    font-weight: 800; font-size: 14px; letter-spacing: 1.5px; text-transform: uppercase;
+    padding: 5px 12px; border-radius: 6px; white-space: nowrap;
+  }
+  .wv-warn-text {
+    color: #fff; font-size: 22px; font-weight: 700; line-height: 1.2;
+    white-space: nowrap; text-shadow: 0 1px 4px rgba(0,0,0,0.4);
+  }
+  .wv-warn-text .wv-warn-where { color: rgba(255,255,255,0.85); font-weight: 500; font-size: 19px; }
+
   .wv-clock {
-    position: absolute; top: 44px; right: 48px;
+    flex: 0 0 auto; margin-left: auto;
     color: #fff; font-size: 30px; font-weight: 600; letter-spacing: 1px;
     text-shadow: 0 2px 10px rgba(0,0,0,0.55);
     font-variant-numeric: tabular-nums;
@@ -7671,7 +7707,7 @@ OVERLAY_TEMPLATE = """\
 
   /* ── Lower-third bar ────────────────────────────────────────── */
   .wv-lower {
-    position: absolute; left: 48px; bottom: 70px;
+    position: absolute; left: 48px; bottom: 64px;
     display: flex; align-items: stretch;
     box-shadow: 0 8px 30px rgba(0,0,0,0.4);
     border-radius: 10px; overflow: hidden;
@@ -7679,9 +7715,8 @@ OVERLAY_TEMPLATE = """\
   }
   .wv-lower-accent { width: 12px; background: var(--wv-gold); }
   .wv-lower-body {
-    background: linear-gradient(100deg, rgba(11,21,37,0.96), rgba(15,28,60,0.94));
+    background: linear-gradient(100deg, rgba(14,17,22,0.96), rgba(20,32,74,0.94));
     padding: 16px 30px 18px;
-    backdrop-filter: blur(2px);
   }
   .wv-lower-kicker {
     color: var(--wv-gold); font-size: 16px; font-weight: 700;
@@ -7691,52 +7726,22 @@ OVERLAY_TEMPLATE = """\
     color: #fff; font-size: 40px; font-weight: 700; line-height: 1.05;
   }
   .wv-lower-sub {
-    color: rgba(255,255,255,0.78); font-size: 21px; font-weight: 500; margin-top: 4px;
+    color: rgba(255,255,255,0.80); font-size: 21px; font-weight: 500; margin-top: 4px;
   }
-
-  /* ── Warning bar, top-center, slides in when warnings are active ── */
-  .wv-warn {
-    position: absolute; top: 0; left: 0; right: 0;
-    display: flex; justify-content: center;
-    transform: translateY(-120%);
-    transition: transform 0.5s cubic-bezier(0.22, 1, 0.36, 1);
-  }
-  .wv-warn.is-active { transform: translateY(0); }
-  .wv-warn-inner {
-    margin-top: 18px;
-    display: flex; align-items: center; gap: 16px;
-    background: linear-gradient(100deg, rgba(150,20,20,0.97), rgba(110,12,12,0.95));
-    border: 1px solid rgba(255,180,180,0.35);
-    border-radius: 10px;
-    padding: 12px 26px;
-    box-shadow: 0 8px 30px rgba(0,0,0,0.45);
-    max-width: 1500px;
-  }
-  .wv-warn-badge {
-    background: var(--wv-gold); color: #1a1a1a;
-    font-weight: 800; font-size: 15px; letter-spacing: 1.5px; text-transform: uppercase;
-    padding: 5px 12px; border-radius: 6px; white-space: nowrap;
-  }
-  .wv-warn-text {
-    color: #fff; font-size: 24px; font-weight: 600; line-height: 1.2;
-    text-shadow: 0 1px 4px rgba(0,0,0,0.4);
-  }
-  .wv-warn-text .wv-warn-where { color: rgba(255,255,255,0.82); font-weight: 500; font-size: 20px; }
 </style>
 </head>
 <body>
-  <div class="wv-logo">
-    <div class="wv-logo-mark"><span>WV</span></div>
-    <div class="wv-logo-word">Weather<b>Valet</b></div>
-  </div>
-
-  <div class="wv-clock" id="wv-clock">--:-- --</div>
-
-  <div class="wv-warn" id="wv-warn">
-    <div class="wv-warn-inner">
-      <span class="wv-warn-badge" id="wv-warn-badge">Warning</span>
-      <span class="wv-warn-text" id="wv-warn-text"></span>
+  <div class="wv-topbar">
+    <div class="wv-logo">
+      <img src="https://weathervalet.ai/screenshots/WVLogo_White_transparent.png" alt="WeatherValet">
     </div>
+    <div class="wv-warn" id="wv-warn">
+      <div class="wv-warn-inner">
+        <span class="wv-warn-badge" id="wv-warn-badge">Warning</span>
+        <span class="wv-warn-text" id="wv-warn-text"></span>
+      </div>
+    </div>
+    <div class="wv-clock" id="wv-clock">--:-- --</div>
   </div>
 
   <div class="wv-lower">
