@@ -7755,16 +7755,23 @@ OVERLAY_TEMPLATE = """\
 
   <script>
     // Live clock, updates every second.
+    // Clock. If the Met chose a timezone (tz param), render in it; else use
+    // the machine's local time. Uses Intl via toLocaleTimeString.
+    var WV_TZ = "{{ clock_tz }}";
     function wvTick() {
       var el = document.getElementById('wv-clock');
       if (!el) return;
-      var now = new Date();
-      var h = now.getHours();
-      var m = now.getMinutes();
-      var ampm = h >= 12 ? 'PM' : 'AM';
-      h = h % 12; if (h === 0) h = 12;
-      var mm = (m < 10 ? '0' : '') + m;
-      el.textContent = h + ':' + mm + ' ' + ampm;
+      try {
+        var opts = { hour: 'numeric', minute: '2-digit', hour12: true };
+        if (WV_TZ) opts.timeZone = WV_TZ;
+        el.textContent = new Date().toLocaleTimeString('en-US', opts);
+      } catch (e) {
+        // Bad/unknown tz falls back to local time.
+        var now = new Date();
+        var h = now.getHours(); var m = now.getMinutes();
+        var ampm = h >= 12 ? 'PM' : 'AM'; h = h % 12; if (h === 0) h = 12;
+        el.textContent = h + ':' + (m < 10 ? '0' : '') + m + ' ' + ampm;
+      }
     }
     wvTick();
     setInterval(wvTick, 1000);
@@ -7838,6 +7845,7 @@ def overlay_page():
     title = (request.args.get("title") or "").strip() or "Live Weather Coverage"
     state = (request.args.get("state") or "").strip().upper()
     counties = (request.args.get("counties") or "").strip()
+    tz = (request.args.get("tz") or "").strip()
     # The subtitle shows the region when given, else the generic line.
     subtitle = ("Live for " + region) if region else "Meteorologist on the air"
     resp = make_response(render_template_string(
@@ -7846,6 +7854,7 @@ def overlay_page():
         subtitle=subtitle,
         warn_state=state,
         warn_counties=counties,
+        clock_tz=tz,
     ))
     resp.headers["Content-Type"] = "text/html; charset=utf-8"
     return resp
