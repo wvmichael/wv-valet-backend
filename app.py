@@ -7794,12 +7794,31 @@ OVERLAY_TEMPLATE = """\
     }
 
     // Build one crawl item's HTML (badge + event + where).
+    // Format the expiry (ms) as a clock time in the overlay's timezone.
+    function wvUntil(ms) {
+      if (!ms) return '';
+      try {
+        var opts = { hour: 'numeric', minute: '2-digit', hour12: true };
+        if (WV_TZ) opts.timeZone = WV_TZ;
+        return new Date(ms).toLocaleTimeString('en-US', opts);
+      } catch (e) { return ''; }
+    }
+
     function wvItemHtml(w) {
       var ev = w.event || 'Weather Alert';
       var badge = ev.replace(/ (Warning|Watch)$/, '');
-      var where = w.area_desc ? ('<span class="wv-warn-where"> \u00b7 ' + wvEscape(w.area_desc) + '</span>') : '';
+      // Broadcast wording: "Tornado Warning for Boone County, IN until 7:45 PM"
+      var phrase = ev;
+      if (w.county) {
+        phrase += ' for ' + w.county + ' County';
+        if (w.state) phrase += ', ' + w.state;
+      } else if (w.area_desc) {
+        phrase += ' \u00b7 ' + w.area_desc;
+      }
+      var until = wvUntil(w.expires_at);
+      if (until) phrase += ' until ' + until;
       return '<span class="wv-warn-item"><span class="wv-warn-badge">' + wvEscape(badge)
-        + '</span><span>' + wvEscape(ev) + where + '</span></span>';
+        + '</span><span>' + wvEscape(phrase) + '</span></span>';
     }
 
     function wvRenderCrawl(warnings) {
@@ -7936,10 +7955,14 @@ def overlay_warnings():
         if not hit:
             continue
         event = a.get("event") or "Weather Alert"
+        # Title-case the matched county for display ("boone" -> "Boone").
+        county_display = " ".join(w.capitalize() for w in hit.split())
         matched.append({
             "event": event,
             "severity": a.get("severity") or "",
             "area_desc": area,
+            "county": county_display,
+            "state": state,
             "expires_at": a.get("expires_at"),
             "_rank": severity_rank.get(event, 9),
         })
