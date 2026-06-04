@@ -7658,13 +7658,14 @@ OVERLAY_TEMPLATE = """\
 
   /* ── Top: full-width warning CRAWL. Hidden until a warning is active. ── */
   .wv-warn {
-    position: absolute; top: 0; left: 0; right: 0;
+    position: absolute; top: 44px; left: 40px; right: 40px;
     height: 56px;
     background: linear-gradient(100deg, var(--wv-red), #9B2823);
     box-shadow: 0 4px 18px rgba(0,0,0,0.45);
+    border-radius: 8px;
     display: flex; align-items: center;
     overflow: hidden;
-    transform: translateY(-110%);
+    transform: translateY(-200%);
     transition: transform 0.45s cubic-bezier(0.22,1,0.36,1);
   }
   .wv-warn.is-active { transform: translateY(0); }
