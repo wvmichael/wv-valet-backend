@@ -7746,7 +7746,7 @@ OVERLAY_TEMPLATE = """\
   <div class="wv-lower">
     <div class="wv-lower-accent"></div>
     <div class="wv-lower-body">
-      <div class="wv-lower-kicker">WeatherValet Live</div>
+      <div class="wv-lower-kicker">{{ kicker }}</div>
       <div class="wv-lower-title">{{ title }}</div>
     </div>
   </div>
@@ -7856,6 +7856,9 @@ def overlay_page():
     state = (request.args.get("state") or "").strip().upper()
     counties = (request.args.get("counties") or "").strip()
     tz = (request.args.get("tz") or "").strip()
+    met_name = (request.args.get("met") or "").strip()
+    # Kicker shows the Met's name when given, else just the show name.
+    kicker = ("WeatherValet Live \u00b7 Meteorologist " + met_name) if met_name else "WeatherValet Live"
     # The subtitle shows the region when given, else the generic line.
     subtitle = ("Live for " + region) if region else "Meteorologist on the air"
     resp = make_response(render_template_string(
@@ -7865,6 +7868,7 @@ def overlay_page():
         warn_state=state,
         warn_counties=counties,
         clock_tz=tz,
+        kicker=kicker,
     ))
     resp.headers["Content-Type"] = "text/html; charset=utf-8"
     return resp
