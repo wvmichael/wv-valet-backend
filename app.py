@@ -7876,8 +7876,11 @@ def overlay_page():
     counties = (request.args.get("counties") or "").strip()
     tz = (request.args.get("tz") or "").strip()
     met_name = (request.args.get("met") or "").strip()
-    # Kicker shows the Met's name when given, else just the show name.
-    kicker = ("WeatherValet Live \u00b7 Meteorologist " + met_name) if met_name else "WeatherValet Live"
+    show = (request.args.get("show") or "").strip()
+    # Kicker base is the show name if given (e.g. "Evening Huddle"), else the
+    # default "WeatherValet Live". The Met name is appended when present.
+    kicker_base = show if show else "WeatherValet Live"
+    kicker = (kicker_base + " \u00b7 Meteorologist " + met_name) if met_name else kicker_base
     # The subtitle shows the region when given, else the generic line.
     subtitle = ("Live for " + region) if region else "Meteorologist on the air"
     resp = make_response(render_template_string(
