@@ -26140,6 +26140,7 @@ def met_daily_brief_audience_count():
                            WHERE u.is_active = TRUE
                              AND loc.county IS NOT NULL
                              AND loc.address_text ILIKE %s
+                             AND u.subscription_tier = 'hobbyist'
                              AND EXISTS (
                                SELECT 1 FROM user_roles ur
                                WHERE ur.user_id = u.id AND ur.role = 'subscriber'
@@ -26459,6 +26460,7 @@ def met_broadcast_brief_send():
                            WHERE u.is_active = TRUE
                              AND loc.county IS NOT NULL
                              AND loc.address_text ILIKE %s
+                             AND u.subscription_tier = 'hobbyist'
                              AND EXISTS (
                                SELECT 1 FROM user_roles ur
                                WHERE ur.user_id = u.id AND ur.role = 'subscriber'
