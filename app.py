@@ -7641,16 +7641,14 @@ OVERLAY_TEMPLATE = """\
   html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
   * { box-sizing: border-box; }
   :root {
-    --wv-ink: #0E1116;       /* site deep ink */
-    --wv-blue: #4169E1;      /* site royal blue (brand primary) */
-    --wv-blue-deep: #2E4FB8; /* site secondary blue */
-    --wv-gold: #F5A524;      /* site gold accent */
-    --wv-red: #C2342B;       /* site warning red */
+    --wv-ink: #0E1116;
+    --wv-blue: #4169E1;
+    --wv-blue-deep: #2E4FB8;
+    --wv-gold: #F5A524;
+    --wv-red: #C2342B;
     --wv-text: #FFFFFF;
   }
-  /* Fill whatever size OBS gives the browser source, instead of a fixed
-     1920x1080 box. This keeps the logo/clock/lower-third anchored to the
-     real corners at any source size. */
+  /* Fill the whole browser source at any size (no fixed box). */
   body {
     width: 100vw; height: 100vh;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', Arial, sans-serif;
@@ -7658,98 +7656,108 @@ OVERLAY_TEMPLATE = """\
     -webkit-font-smoothing: antialiased;
   }
 
-  /* ── Top strip: logo (left), warning (center), clock (right) on ONE line ── */
-  .wv-topbar {
-    position: absolute; top: 0; left: 0; right: 0;
-    display: flex; align-items: center; gap: 20px;
-    padding: 30px 44px;
-  }
-  .wv-logo { flex: 0 0 auto; display: flex; align-items: center; }
-  .wv-logo img {
-    height: 52px; width: auto; display: block;
-    filter: drop-shadow(0 2px 10px rgba(0,0,0,0.7));
-  }
-
-  /* Warning sits in the middle of the top strip; hidden (faded) when none. */
+  /* ── Top: full-width warning CRAWL. Hidden until a warning is active. ── */
   .wv-warn {
-    flex: 1 1 auto; display: flex; justify-content: center;
-    opacity: 0; transform: translateY(-6px);
-    transition: opacity 0.4s ease, transform 0.4s ease;
-    pointer-events: none;
-  }
-  .wv-warn.is-active { opacity: 1; transform: translateY(0); }
-  .wv-warn-inner {
-    display: inline-flex; align-items: center; gap: 14px;
+    position: absolute; top: 0; left: 0; right: 0;
+    height: 56px;
     background: linear-gradient(100deg, var(--wv-red), #9B2823);
-    border: 1px solid rgba(255,190,190,0.4);
-    border-radius: 10px;
-    padding: 10px 22px;
-    box-shadow: 0 6px 22px rgba(0,0,0,0.45);
-    max-width: 100%;
+    box-shadow: 0 4px 18px rgba(0,0,0,0.45);
+    display: flex; align-items: center;
+    overflow: hidden;
+    transform: translateY(-110%);
+    transition: transform 0.45s cubic-bezier(0.22,1,0.36,1);
+  }
+  .wv-warn.is-active { transform: translateY(0); }
+  /* The crawl track scrolls right-to-left; content duplicated for a seamless loop. */
+  .wv-warn-track {
+    display: inline-flex; align-items: center;
+    white-space: nowrap;
+    will-change: transform;
+    animation: wvCrawl 30s linear infinite;
+  }
+  .wv-warn-track .wv-warn-item {
+    display: inline-flex; align-items: center; gap: 12px;
+    padding: 0 40px;
+    color: #fff; font-size: 24px; font-weight: 700;
+    text-shadow: 0 1px 4px rgba(0,0,0,0.4);
   }
   .wv-warn-badge {
     background: var(--wv-gold); color: var(--wv-ink);
-    font-weight: 800; font-size: 14px; letter-spacing: 1.5px; text-transform: uppercase;
+    font-weight: 800; font-size: 15px; letter-spacing: 1.5px; text-transform: uppercase;
     padding: 5px 12px; border-radius: 6px; white-space: nowrap;
   }
-  .wv-warn-text {
-    color: #fff; font-size: 22px; font-weight: 700; line-height: 1.2;
-    white-space: nowrap; text-shadow: 0 1px 4px rgba(0,0,0,0.4);
-  }
-  .wv-warn-text .wv-warn-where { color: rgba(255,255,255,0.85); font-weight: 500; font-size: 19px; }
-
-  .wv-clock {
-    flex: 0 0 auto; margin-left: auto;
-    color: #fff; font-size: 30px; font-weight: 600; letter-spacing: 1px;
-    text-shadow: 0 2px 10px rgba(0,0,0,0.55);
-    font-variant-numeric: tabular-nums;
+  .wv-warn-where { color: rgba(255,255,255,0.85); font-weight: 500; font-size: 20px; }
+  @keyframes wvCrawl {
+    0%   { transform: translateX(0); }
+    100% { transform: translateX(-50%); }
   }
 
-  /* ── Lower-third bar ────────────────────────────────────────── */
+  /* ── Lower-third (bottom-left): HALF size, two rows only ── */
   .wv-lower {
-    position: absolute; left: 48px; bottom: 64px;
+    position: absolute; left: 40px; bottom: 44px;
     display: flex; align-items: stretch;
-    box-shadow: 0 8px 30px rgba(0,0,0,0.4);
-    border-radius: 10px; overflow: hidden;
-    max-width: 1100px;
+    box-shadow: 0 6px 22px rgba(0,0,0,0.4);
+    border-radius: 8px; overflow: hidden;
+    max-width: 60vw;
   }
-  .wv-lower-accent { width: 12px; background: var(--wv-gold); }
+  .wv-lower-accent { width: 7px; background: var(--wv-gold); }
   .wv-lower-body {
     background: linear-gradient(100deg, rgba(14,17,22,0.96), rgba(20,32,74,0.94));
-    padding: 16px 30px 18px;
+    padding: 9px 20px 11px;
   }
   .wv-lower-kicker {
-    color: var(--wv-gold); font-size: 16px; font-weight: 700;
-    letter-spacing: 2.5px; text-transform: uppercase; margin-bottom: 4px;
+    color: var(--wv-gold); font-size: 11px; font-weight: 700;
+    letter-spacing: 2px; text-transform: uppercase; margin-bottom: 2px;
   }
   .wv-lower-title {
-    color: #fff; font-size: 40px; font-weight: 700; line-height: 1.05;
+    color: #fff; font-size: 24px; font-weight: 700; line-height: 1.05;
   }
-  .wv-lower-sub {
-    color: rgba(255,255,255,0.80); font-size: 21px; font-weight: 500; margin-top: 4px;
+
+  /* ── Bottom-right: clock on top, logo below, right-aligned stack ── */
+  .wv-corner {
+    position: absolute; right: 40px; bottom: 44px;
+    display: flex; flex-direction: column; align-items: flex-end; gap: 8px;
   }
+  .wv-clock {
+    color: #fff; font-size: 26px; font-weight: 600; letter-spacing: 1px;
+    text-shadow: 0 2px 10px rgba(0,0,0,0.6);
+    font-variant-numeric: tabular-nums;
+  }
+  .wv-logo img {
+    height: 38px; width: auto; display: block;
+    filter: drop-shadow(0 2px 10px rgba(0,0,0,0.7));
+  }
+  /* Text fallback shown if the logo image fails to load. */
+  .wv-logo-fallback {
+    display: none;
+    color: #fff; font-size: 22px; font-weight: 700; letter-spacing: 0.3px;
+    text-shadow: 0 2px 10px rgba(0,0,0,0.7);
+  }
+  .wv-logo-fallback b { color: var(--wv-gold); }
 </style>
 </head>
 <body>
-  <div class="wv-topbar">
-    <div class="wv-logo">
-      <img src="https://weathervalet.ai/screenshots/WVLogo_White_transparent.png" alt="WeatherValet">
-    </div>
-    <div class="wv-warn" id="wv-warn">
-      <div class="wv-warn-inner">
-        <span class="wv-warn-badge" id="wv-warn-badge">Warning</span>
-        <span class="wv-warn-text" id="wv-warn-text"></span>
-      </div>
-    </div>
-    <div class="wv-clock" id="wv-clock">--:-- --</div>
+  <!-- Top: full-width warning crawl (hidden until warnings exist) -->
+  <div class="wv-warn" id="wv-warn">
+    <div class="wv-warn-track" id="wv-warn-track"></div>
   </div>
 
+  <!-- Bottom-left: half-size lower-third, two rows -->
   <div class="wv-lower">
     <div class="wv-lower-accent"></div>
     <div class="wv-lower-body">
       <div class="wv-lower-kicker">WeatherValet Live</div>
       <div class="wv-lower-title">{{ title }}</div>
-      <div class="wv-lower-sub">{{ subtitle }}</div>
+    </div>
+  </div>
+
+  <!-- Bottom-right: clock on top, logo below (with text fallback) -->
+  <div class="wv-corner">
+    <div class="wv-clock" id="wv-clock">--:-- --</div>
+    <div class="wv-logo">
+      <img src="https://weathervalet.ai/screenshots/WVLogo_White_transparent.png" alt="WeatherValet"
+           onerror="this.style.display='none'; var f=document.getElementById('wv-logo-fallback'); if(f) f.style.display='block';">
+      <div class="wv-logo-fallback" id="wv-logo-fallback">Weather<b>Valet</b>.com</div>
     </div>
   </div>
 
@@ -7776,53 +7784,55 @@ OVERLAY_TEMPLATE = """\
     wvTick();
     setInterval(wvTick, 1000);
 
-    // ── Live NWS warnings (Chunk 2c) ──────────────────────────────
-    // Region comes from the route as state + counties. We poll the public
-    // warnings endpoint and rotate any matches through the top bar. If
-    // there is no region or no warnings, the bar stays hidden.
+    // ── Live NWS warnings: scrolling crawl (most severe first) ──────
     var WV_STATE = "{{ warn_state }}";
     var WV_COUNTIES = "{{ warn_counties }}";
-    var wvWarnings = [];
-    var wvWarnIdx = 0;
 
-    function wvShowWarning(w) {
-      var bar = document.getElementById('wv-warn');
-      var badge = document.getElementById('wv-warn-badge');
-      var text = document.getElementById('wv-warn-text');
-      if (!bar || !badge || !text) return;
-      if (!w) { bar.classList.remove('is-active'); return; }
-      // Badge = event type; text = event + where.
+    function wvEscape(s) {
+      return String(s == null ? '' : s)
+        .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    // Build one crawl item's HTML (badge + event + where).
+    function wvItemHtml(w) {
       var ev = w.event || 'Weather Alert';
-      badge.textContent = ev.replace(/ (Warning|Watch)$/, '');
-      var where = w.area_desc ? (' \u00b7 ' + w.area_desc) : '';
-      text.innerHTML = ev + '<span class="wv-warn-where">' + where + '</span>';
+      var badge = ev.replace(/ (Warning|Watch)$/, '');
+      var where = w.area_desc ? ('<span class="wv-warn-where"> \u00b7 ' + wvEscape(w.area_desc) + '</span>') : '';
+      return '<span class="wv-warn-item"><span class="wv-warn-badge">' + wvEscape(badge)
+        + '</span><span>' + wvEscape(ev) + where + '</span></span>';
+    }
+
+    function wvRenderCrawl(warnings) {
+      var bar = document.getElementById('wv-warn');
+      var track = document.getElementById('wv-warn-track');
+      if (!bar || !track) return;
+      if (!warnings || !warnings.length) {
+        bar.classList.remove('is-active');
+        track.innerHTML = '';
+        return;
+      }
+      // The backend already ranks most-severe first (warnings over watches).
+      var seq = warnings.map(wvItemHtml).join('');
+      // Duplicate the sequence so the loop is seamless (track scrolls -50%).
+      track.innerHTML = seq + seq;
       bar.classList.add('is-active');
     }
 
-    function wvRotateWarning() {
-      if (!wvWarnings.length) { wvShowWarning(null); return; }
-      var w = wvWarnings[wvWarnIdx % wvWarnings.length];
-      wvShowWarning(w);
-      wvWarnIdx++;
-    }
-
     function wvFetchWarnings() {
-      if (!WV_COUNTIES) return;  // no region set, nothing to show
+      if (!WV_COUNTIES) return;  // no region set
       var url = '/api/v1/overlay/warnings?state=' + encodeURIComponent(WV_STATE)
         + '&counties=' + encodeURIComponent(WV_COUNTIES);
       fetch(url)
         .then(function(r) { return r.json(); })
         .then(function(j) {
-          wvWarnings = (j && j.ok && j.warnings) ? j.warnings : [];
-          if (!wvWarnings.length) { wvShowWarning(null); }
+          wvRenderCrawl((j && j.ok && j.warnings) ? j.warnings : []);
         })
         .catch(function() { /* keep last state on a transient error */ });
     }
 
     if (WV_COUNTIES) {
       wvFetchWarnings();
-      setInterval(wvFetchWarnings, 30000);  // refresh the list every 30s
-      setInterval(wvRotateWarning, 7000);   // rotate the visible one every 7s
+      setInterval(wvFetchWarnings, 30000);  // refresh every 30s
     }
   </script>
 </body>
