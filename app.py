@@ -7735,6 +7735,41 @@ OVERLAY_TEMPLATE = """\
     text-shadow: 0 2px 10px rgba(0,0,0,0.7);
   }
   .wv-logo-fallback b { color: var(--wv-gold); }
+
+  /* ── Bottom news ticker (Shows/prerecord). Blue bar, white text, scrolls
+     right-to-left along the very bottom edge. Shown only when ticker text
+     is provided. The lower-third floats above it. ── */
+  .wv-ticker {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    height: 40px;
+    background: linear-gradient(100deg, var(--wv-blue), var(--wv-blue-deep));
+    box-shadow: 0 -3px 14px rgba(0,0,0,0.35);
+    display: none; align-items: center; overflow: hidden;
+  }
+  .wv-ticker.is-active { display: flex; }
+  .wv-ticker-track {
+    display: inline-flex; align-items: center;
+    white-space: nowrap; will-change: transform;
+    animation: wvTicker 40s linear infinite;
+  }
+  .wv-ticker-item {
+    display: inline-flex; align-items: center;
+    padding: 0 60px;
+    color: #fff; font-size: 19px; font-weight: 600; letter-spacing: 0.3px;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.3);
+  }
+  .wv-ticker-item::before {
+    content: ""; display: inline-block;
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--wv-gold); margin-right: 18px;
+  }
+  @keyframes wvTicker {
+    0%   { transform: translateX(0); }
+    100% { transform: translateX(-50%); }
+  }
+  /* When the ticker is showing, float the lower-third and corner above it. */
+  body.wv-has-ticker .wv-lower { bottom: 58px; }
+  body.wv-has-ticker .wv-corner { bottom: 58px; }
 </style>
 </head>
 <body>
@@ -7762,6 +7797,11 @@ OVERLAY_TEMPLATE = """\
     </div>
   </div>
 
+  <!-- Bottom news ticker (Shows/prerecord). Hidden until ticker text exists. -->
+  <div class="wv-ticker" id="wv-ticker">
+    <div class="wv-ticker-track" id="wv-ticker-track"></div>
+  </div>
+
   <script>
     // Live clock, updates every second.
     // Clock. If the Met chose a timezone (tz param), render in it; else use
@@ -7784,6 +7824,21 @@ OVERLAY_TEMPLATE = """\
     }
     wvTick();
     setInterval(wvTick, 1000);
+
+    // ── Bottom news ticker (manual text from the Met) ───────────────
+    var WV_TICKER = "{{ ticker_text }}";
+    (function wvInitTicker() {
+      if (!WV_TICKER) return;
+      var bar = document.getElementById('wv-ticker');
+      var track = document.getElementById('wv-ticker-track');
+      if (!bar || !track) return;
+      // Build one item, duplicated so the scroll loops seamlessly (-50%).
+      function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+      var item = '<span class="wv-ticker-item">' + esc(WV_TICKER) + '</span>';
+      track.innerHTML = item + item;
+      bar.classList.add('is-active');
+      document.body.classList.add('wv-has-ticker');
+    })();
 
     // ── Live NWS warnings: scrolling crawl (most severe first) ──────
     var WV_STATE = "{{ warn_state }}";
@@ -7878,6 +7933,7 @@ def overlay_page():
     tz = (request.args.get("tz") or "").strip()
     met_name = (request.args.get("met") or "").strip()
     show = (request.args.get("show") or "").strip()
+    ticker = (request.args.get("ticker") or "").strip()
     # Kicker base is the show name if given (e.g. "Evening Huddle"), else the
     # default "WeatherValet Live". The Met name is appended when present.
     kicker_base = show if show else "WeatherValet Live"
@@ -7892,6 +7948,7 @@ def overlay_page():
         warn_counties=counties,
         clock_tz=tz,
         kicker=kicker,
+        ticker_text=ticker,
     ))
     resp.headers["Content-Type"] = "text/html; charset=utf-8"
     return resp
