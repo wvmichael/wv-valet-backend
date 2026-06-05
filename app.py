@@ -7714,10 +7714,13 @@ OVERLAY_TEMPLATE = """\
     color: #fff; font-size: 24px; font-weight: 700; line-height: 1.05;
   }
 
-  /* ── Bottom-right: clock on top, logo below, right-aligned stack ── */
+  /* ── Bottom-right: clock + logo. Sized to match the lower-third's height
+     and top-aligned so the clock sits level with the lower-third's top. ── */
   .wv-corner {
     position: absolute; right: 40px; bottom: 44px;
-    display: flex; flex-direction: column; align-items: flex-end; gap: 8px;
+    min-height: 62px;               /* ~ lower-third height, so tops align */
+    display: flex; flex-direction: column; align-items: flex-end;
+    justify-content: space-between; gap: 8px;
   }
   .wv-clock {
     color: #fff; font-size: 26px; font-weight: 600; letter-spacing: 1px;
@@ -7742,7 +7745,7 @@ OVERLAY_TEMPLATE = """\
   .wv-ticker {
     position: absolute; left: 0; right: 0; bottom: 0;
     height: 40px;
-    background: linear-gradient(100deg, var(--wv-blue), var(--wv-blue-deep));
+    background: var(--wv-blue);
     box-shadow: 0 -3px 14px rgba(0,0,0,0.35);
     display: none; align-items: center; overflow: hidden;
   }
