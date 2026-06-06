@@ -7703,7 +7703,7 @@ OVERLAY_TEMPLATE = """\
   }
   .wv-lower-accent { width: 7px; background: var(--wv-gold); }
   .wv-lower-body {
-    background: linear-gradient(100deg, rgba(14,17,22,0.96), rgba(20,32,74,0.94));
+    background: linear-gradient(100deg, #4169E1, #1C2F6E);
     padding: 9px 20px 11px;
   }
   .wv-lower-kicker {
@@ -7773,77 +7773,6 @@ OVERLAY_TEMPLATE = """\
   /* When the ticker is showing, float the lower-third and corner above it. */
   body.wv-has-ticker .wv-lower { bottom: 58px; }
   body.wv-has-ticker .wv-corner { bottom: 58px; }
-
-  /* ════════════════════════════════════════════════════════════════
-     CONNECTED BOTTOM BAR (trial layout). The title block sits ABOVE the
-     logo on the left; the crawl fills the full remaining width. The clock
-     appears at the right ONLY on live feeds (hidden for prerecorded).
-     Colors here are on-brand placeholders; fine-tune later.
-     ════════════════════════════════════════════════════════════════ */
-  .wv-bar {
-    position: absolute; left: 0; right: 0; bottom: 0;
-    height: 64px;
-    display: flex; align-items: stretch;
-    font-family: inherit;
-    background: linear-gradient(180deg, rgba(14,17,22,0.92), rgba(14,17,22,0.97));
-    box-shadow: 0 -4px 20px rgba(0,0,0,0.4);
-  }
-  /* Logo block, far left */
-  .wv-bar-logo {
-    flex: 0 0 auto; display: flex; align-items: center;
-    padding: 0 26px; background: rgba(0,0,0,0.25);
-  }
-  .wv-bar-logo img { height: 40px; width: auto; display: block;
-    filter: drop-shadow(0 2px 8px rgba(0,0,0,0.6)); }
-  .wv-bar-logo .wv-logo-fallback { display: none; color:#fff; font-size:20px; font-weight:800; }
-  .wv-bar-logo .wv-logo-fallback b { color: var(--wv-gold); }
-
-  /* Title block now sits ABOVE the logo (stacked on the left). */
-  .wv-bar-title {
-    position: absolute; left: 0; bottom: 64px;   /* directly above the bar */
-    display: flex; flex-direction: column; justify-content: center;
-    background: var(--wv-blue);
-    padding: 10px 40px 12px 26px; min-width: 280px; max-width: 46vw;
-    /* angled bottom-right corner = slim nod to the layered news look */
-    clip-path: polygon(0 0, 100% 0, 100% 100%, 22px 100%);
-    box-shadow: 0 -3px 14px rgba(0,0,0,0.3);
-  }
-  .wv-bar-kicker {
-    color: #fff; font-size: 12px; font-weight: 700; letter-spacing: 2px;
-    text-transform: uppercase; opacity: 0.92; margin-bottom: 3px;
-  }
-  .wv-bar-titletext { color: #fff; font-size: 26px; font-weight: 800; line-height: 1.02; }
-  .wv-bar-accent {
-    height: 3px; width: 46px; margin-top: 7px;
-    background: var(--wv-gold); border-radius: 2px;
-  }
-
-  /* Scrolling crawl, fills all the room to the right of the logo. */
-  .wv-bar-crawl {
-    flex: 1 1 auto; position: relative; overflow: hidden;
-    display: flex; align-items: center;
-    background: rgba(255,255,255,0.06);
-  }
-  .wv-bar-crawl-track {
-    display: inline-flex; align-items: center; white-space: nowrap;
-    will-change: transform; animation: wvTicker 40s linear infinite;
-    padding-left: 30px;
-  }
-  .wv-bar-crawl-item {
-    display: inline-flex; align-items: center; padding: 0 50px;
-    color: #fff; font-size: 20px; font-weight: 600;
-  }
-  .wv-bar-crawl-item::before {
-    content: ""; display: inline-block; width: 8px; height: 8px;
-    border-radius: 50%; background: var(--wv-gold); margin-right: 16px;
-  }
-  /* Clock, far right inside the bar — LIVE feeds only. */
-  .wv-bar-clock {
-    flex: 0 0 auto; display: flex; align-items: center; justify-content: center;
-    padding: 0 28px; background: rgba(0,0,0,0.30);
-    color: #fff; font-size: 24px; font-weight: 700; letter-spacing: 1px;
-    font-variant-numeric: tabular-nums;
-  }
 </style>
 </head>
 <body>
@@ -7878,26 +7807,31 @@ OVERLAY_TEMPLATE = """\
 
   <script>
     // Live clock, updates every second.
-    // Clock. If the Met chose a timezone (tz param), render in it; else use
-    // the machine's local time. Uses Intl via toLocaleTimeString.
+    // Clock = LIVE feeds only. A timezone is passed only on live overlays;
+    // prerecorded (Shows) overlays omit it, so the clock stays hidden (a live
+    // clock on a taped video would show the wrong time when replayed).
     var WV_TZ = "{{ clock_tz }}";
     function wvTick() {
       var el = document.getElementById('wv-clock');
       if (!el) return;
       try {
-        var opts = { hour: 'numeric', minute: '2-digit', hour12: true };
-        if (WV_TZ) opts.timeZone = WV_TZ;
+        var opts = { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: WV_TZ };
         el.textContent = new Date().toLocaleTimeString('en-US', opts);
       } catch (e) {
-        // Bad/unknown tz falls back to local time.
         var now = new Date();
         var h = now.getHours(); var m = now.getMinutes();
         var ampm = h >= 12 ? 'PM' : 'AM'; h = h % 12; if (h === 0) h = 12;
         el.textContent = h + ':' + (m < 10 ? '0' : '') + m + ' ' + ampm;
       }
     }
-    wvTick();
-    setInterval(wvTick, 1000);
+    if (WV_TZ) {
+      wvTick();
+      setInterval(wvTick, 1000);
+    } else {
+      // No timezone = prerecorded: hide the clock entirely.
+      var _clk = document.getElementById('wv-clock');
+      if (_clk) _clk.style.display = 'none';
+    }
 
     // ── Bottom news ticker (manual text from the Met) ───────────────
     var WV_TICKER = "{{ ticker_text }}";
