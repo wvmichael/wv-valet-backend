@@ -7773,6 +7773,77 @@ OVERLAY_TEMPLATE = """\
   /* When the ticker is showing, float the lower-third and corner above it. */
   body.wv-has-ticker .wv-lower { bottom: 58px; }
   body.wv-has-ticker .wv-corner { bottom: 58px; }
+
+  /* ════════════════════════════════════════════════════════════════
+     CONNECTED BOTTOM BAR (trial layout). The title block sits ABOVE the
+     logo on the left; the crawl fills the full remaining width. The clock
+     appears at the right ONLY on live feeds (hidden for prerecorded).
+     Colors here are on-brand placeholders; fine-tune later.
+     ════════════════════════════════════════════════════════════════ */
+  .wv-bar {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    height: 64px;
+    display: flex; align-items: stretch;
+    font-family: inherit;
+    background: linear-gradient(180deg, rgba(14,17,22,0.92), rgba(14,17,22,0.97));
+    box-shadow: 0 -4px 20px rgba(0,0,0,0.4);
+  }
+  /* Logo block, far left */
+  .wv-bar-logo {
+    flex: 0 0 auto; display: flex; align-items: center;
+    padding: 0 26px; background: rgba(0,0,0,0.25);
+  }
+  .wv-bar-logo img { height: 40px; width: auto; display: block;
+    filter: drop-shadow(0 2px 8px rgba(0,0,0,0.6)); }
+  .wv-bar-logo .wv-logo-fallback { display: none; color:#fff; font-size:20px; font-weight:800; }
+  .wv-bar-logo .wv-logo-fallback b { color: var(--wv-gold); }
+
+  /* Title block now sits ABOVE the logo (stacked on the left). */
+  .wv-bar-title {
+    position: absolute; left: 0; bottom: 64px;   /* directly above the bar */
+    display: flex; flex-direction: column; justify-content: center;
+    background: var(--wv-blue);
+    padding: 10px 40px 12px 26px; min-width: 280px; max-width: 46vw;
+    /* angled bottom-right corner = slim nod to the layered news look */
+    clip-path: polygon(0 0, 100% 0, 100% 100%, 22px 100%);
+    box-shadow: 0 -3px 14px rgba(0,0,0,0.3);
+  }
+  .wv-bar-kicker {
+    color: #fff; font-size: 12px; font-weight: 700; letter-spacing: 2px;
+    text-transform: uppercase; opacity: 0.92; margin-bottom: 3px;
+  }
+  .wv-bar-titletext { color: #fff; font-size: 26px; font-weight: 800; line-height: 1.02; }
+  .wv-bar-accent {
+    height: 3px; width: 46px; margin-top: 7px;
+    background: var(--wv-gold); border-radius: 2px;
+  }
+
+  /* Scrolling crawl, fills all the room to the right of the logo. */
+  .wv-bar-crawl {
+    flex: 1 1 auto; position: relative; overflow: hidden;
+    display: flex; align-items: center;
+    background: rgba(255,255,255,0.06);
+  }
+  .wv-bar-crawl-track {
+    display: inline-flex; align-items: center; white-space: nowrap;
+    will-change: transform; animation: wvTicker 40s linear infinite;
+    padding-left: 30px;
+  }
+  .wv-bar-crawl-item {
+    display: inline-flex; align-items: center; padding: 0 50px;
+    color: #fff; font-size: 20px; font-weight: 600;
+  }
+  .wv-bar-crawl-item::before {
+    content: ""; display: inline-block; width: 8px; height: 8px;
+    border-radius: 50%; background: var(--wv-gold); margin-right: 16px;
+  }
+  /* Clock, far right inside the bar — LIVE feeds only. */
+  .wv-bar-clock {
+    flex: 0 0 auto; display: flex; align-items: center; justify-content: center;
+    padding: 0 28px; background: rgba(0,0,0,0.30);
+    color: #fff; font-size: 24px; font-weight: 700; letter-spacing: 1px;
+    font-variant-numeric: tabular-nums;
+  }
 </style>
 </head>
 <body>
@@ -8000,22 +8071,25 @@ def overlay_warnings():
         area_l = area.lower()
         if not area_l:
             continue
-        # If a state was given, require the area text to reference it, so a
-        # county name shared across states does not over-match.
-        if state and (state.lower() not in area_l) and (("," + state.lower()) not in area_l):
-            # area_desc usually contains the 2-letter code like "Marion, IN";
-            # the checks above cover both " in" word and ", in" forms.
-            pass_state = False
-        else:
-            pass_state = True
-        if state and not pass_state:
-            continue
-        # County name match
+        # NWS area_desc is a semicolon-separated list of "County, ST" entries,
+        # e.g. "Tripp, SD; Boyd, NE; Holt, NE". To avoid matching a same-named
+        # county in another state, we look for the county paired WITH this
+        # state as a unit ("county, st"), not the county name on its own.
+        st = (state or "").strip().lower()
         hit = None
         for c in counties:
-            if c and c in area_l:
-                hit = c
-                break
+            if not c:
+                continue
+            # Require the "<county>, <state>" pairing when a state is set.
+            if st:
+                if (c + ", " + st) in area_l:
+                    hit = c
+                    break
+            else:
+                # No state given: fall back to a bare county-name match.
+                if c in area_l:
+                    hit = c
+                    break
         if not hit:
             continue
         event = a.get("event") or "Weather Alert"
