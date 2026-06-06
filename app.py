@@ -7871,10 +7871,21 @@ OVERLAY_TEMPLATE = """\
     function wvItemHtml(w) {
       var ev = w.event || 'Weather Alert';
       var badge = ev.replace(/ (Warning|Watch)$/, '');
-      // Broadcast wording: "Tornado Warning for Boone County, IN until 7:45 PM"
+      // Broadcast wording, e.g.:
+      //   "Tornado Warning for Boone County, IN until 7:45 PM"
+      //   "Severe Thunderstorm Warning for Clinton, Carroll, and Tippecanoe Counties, IN until ..."
       var phrase = ev;
-      if (w.county) {
-        phrase += ' for ' + w.county + ' County';
+      var cs = w.counties || (w.county ? [w.county] : []);
+      if (cs.length) {
+        var label;
+        if (cs.length === 1) {
+          label = cs[0] + ' County';
+        } else if (cs.length === 2) {
+          label = cs[0] + ' and ' + cs[1] + ' Counties';
+        } else {
+          label = cs.slice(0, -1).join(', ') + ', and ' + cs[cs.length - 1] + ' Counties';
+        }
+        phrase += ' for ' + label;
         if (w.state) phrase += ', ' + w.state;
       } else if (w.area_desc) {
         phrase += ' \u00b7 ' + w.area_desc;
@@ -8009,31 +8020,30 @@ def overlay_warnings():
         # e.g. "Tripp, SD; Boyd, NE; Holt, NE". To avoid matching a same-named
         # county in another state, we look for the county paired WITH this
         # state as a unit ("county, st"), not the county name on its own.
+        # Collect ALL of the Met's counties named in this warning (a single
+        # warning often covers several), so the scroll lists them together.
         st = (state or "").strip().lower()
-        hit = None
+        hit_counties = []
         for c in counties:
             if not c:
                 continue
-            # Require the "<county>, <state>" pairing when a state is set.
             if st:
                 if (c + ", " + st) in area_l:
-                    hit = c
-                    break
+                    hit_counties.append(c)
             else:
                 # No state given: fall back to a bare county-name match.
                 if c in area_l:
-                    hit = c
-                    break
-        if not hit:
+                    hit_counties.append(c)
+        if not hit_counties:
             continue
         event = a.get("event") or "Weather Alert"
-        # Title-case the matched county for display ("boone" -> "Boone").
-        county_display = " ".join(w.capitalize() for w in hit.split())
+        # Title-case each matched county for display ("boone" -> "Boone").
+        county_displays = [" ".join(w.capitalize() for w in c.split()) for c in hit_counties]
         matched.append({
             "event": event,
             "severity": a.get("severity") or "",
             "area_desc": area,
-            "county": county_display,
+            "counties": county_displays,
             "state": state,
             "expires_at": a.get("expires_at"),
             "_rank": severity_rank.get(event, 9),
