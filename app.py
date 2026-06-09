@@ -29955,6 +29955,74 @@ def _nws_page_preflight(response_token):
     return ("", 204)
 
 
+@app.get("/api/v1/met/nws/pending")
+def met_nws_pending():
+    """Backstop for the SMS page: list the severe-alert pages still awaiting
+    THIS Met's review, so they can see and send even if the SMS never
+    arrived. A page is "theirs" if any affected subscriber is assigned to
+    them (subscriber_coverage.primary_met_id). Only status='paged' (not yet
+    confirmed/dismissed) and not expired are returned.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    met_id = user["id"]
+    now_ms = int(time.time() * 1000)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            # Recent, still-open pages. Cap the window so this stays cheap.
+            cur.execute(
+                """SELECT id, nws_alert_id, event, severity, area_desc,
+                          response_token, affected_user_ids, created_at, expires_at
+                   FROM nws_alert_pages
+                   WHERE status = 'paged'
+                     AND (expires_at IS NULL OR expires_at > %s)
+                   ORDER BY created_at DESC
+                   LIMIT 50""",
+                (now_ms,),
+            )
+            pages = cur.fetchall()
+
+            out = []
+            for p in pages:
+                ids = []
+                if p["affected_user_ids"]:
+                    try:
+                        ids = [int(x) for x in p["affected_user_ids"].split(",") if x.strip()]
+                    except ValueError:
+                        ids = []
+                if not ids:
+                    continue
+                # How many of THIS Met's subscribers are in this alert?
+                placeholders = ",".join(["%s"] * len(ids))
+                cur.execute(
+                    f"""SELECT COUNT(*) AS n
+                        FROM subscriber_coverage cov
+                        WHERE cov.primary_met_id = %s
+                          AND cov.user_id IN ({placeholders})""",
+                    tuple([met_id] + ids),
+                )
+                mine = cur.fetchone()
+                my_count = (mine["n"] if mine else 0) or 0
+                if my_count <= 0:
+                    continue
+                out.append({
+                    "token": p["response_token"],
+                    "event": p["event"] or "",
+                    "severity": p["severity"] or "",
+                    "area_desc": p["area_desc"] or "",
+                    "my_affected": my_count,
+                    "created_at": p["created_at"],
+                    "expires_at": p["expires_at"],
+                })
+
+    return jsonify({"ok": True, "pending": out})
+
+
 @app.get("/api/v1/nws/page/<response_token>")
 def nws_page_get(response_token: str):
     """Return the alert details + list of affected subscribers for the
