@@ -20792,6 +20792,7 @@ _NWS_SEVERE_EVENTS = (
     "Severe Thunderstorm Warning",
     "Flash Flood Warning",
     "Tornado Watch",
+    "Severe Thunderstorm Watch",
     "Flood Warning",
 )
 
@@ -20832,11 +20833,14 @@ def _fetch_active_nws_alerts() -> list:
         nws_id = props.get("id") or f.get("id")  # the urn:oid alert ID
         if not nws_id:
             continue
-        if not geom or geom.get("type") not in ("Polygon", "MultiPolygon"):
-            # Some NWS alerts come without a geometry (county-based);
-            # those need a different match path. Skip for v1 — we'll
-            # add SAME-code matching later if needed.
-            continue
+        has_polygon = bool(geom) and geom.get("type") in ("Polygon", "MultiPolygon")
+        # Watches (and some warnings) arrive WITHOUT a polygon — they are
+        # county/zone-based. We keep those and match them by county text
+        # instead of point-in-polygon. SAME = FIPS county codes; areaDesc
+        # is the "County, ST; County, ST" list we match against.
+        geocode = props.get("geocode") or {}
+        same_codes = geocode.get("SAME") or []
+        match_mode = "polygon" if has_polygon else "county"
         expires_str = props.get("expires") or props.get("ends")
         expires_ms = None
         if expires_str:
@@ -20850,8 +20854,6 @@ def _fetch_active_nws_alerts() -> list:
         # ── Filter out expired alerts (May 18, 2026) ──
         # NWS /alerts/active sometimes returns alerts whose expiration
         # has already passed but haven't been removed from the feed yet.
-        # We trust the alert's own expires/ends timestamp: if it's in
-        # the past, treat the alert as inactive.
         if expires_ms is not None and expires_ms < now_ms:
             continue
         out.append({
@@ -20862,7 +20864,9 @@ def _fetch_active_nws_alerts() -> list:
             "description": props.get("description") or "",
             "instruction": props.get("instruction") or "",
             "area_desc": props.get("areaDesc") or "",
-            "geometry": geom,
+            "geometry": geom if has_polygon else None,
+            "match_mode": match_mode,
+            "same_codes": same_codes,
             "expires_at": expires_ms,
         })
     return out
@@ -20871,7 +20875,9 @@ def _fetch_active_nws_alerts() -> list:
 def _find_pro_subscribers_in_polygon(geom: dict) -> list:
     """Find Pro-tier subscribers whose primary saved_location is inside
     the alert polygon. Returns list of dicts with user info needed for
-    later notification (id, name, email, phone, location).
+    later notification (id, name, email, phone, location), plus the
+    subscriber's assigned primary Met (id, name, phone) so the pager can
+    route the alert to the right Met.
     """
     # Stringify geometry once so _point_in_polygon_geojson can parse it
     geom_str = json.dumps(geom)
@@ -20881,10 +20887,17 @@ def _find_pro_subscribers_in_polygon(geom: dict) -> list:
             cur.execute(
                 """SELECT u.id, u.name, u.email, u.phone,
                           u.subscription_tier,
-                          loc.label AS loc_label, loc.lat, loc.lng
+                          loc.label AS loc_label, loc.lat, loc.lng,
+                          cov.primary_met_id AS met_id,
+                          met.name  AS met_name,
+                          met.phone AS met_phone
                    FROM users u
                    JOIN saved_locations loc
                      ON loc.user_id = u.id AND loc.is_primary = TRUE
+                   LEFT JOIN subscriber_coverage cov
+                     ON cov.user_id = u.id
+                   LEFT JOIN users met
+                     ON met.id = cov.primary_met_id
                    WHERE u.is_active = TRUE
                      AND u.subscription_tier IN ('pro_single','pro_multi','pro_enterprise')
                      AND EXISTS (
@@ -20906,19 +20919,93 @@ def _find_pro_subscribers_in_polygon(geom: dict) -> list:
                 "phone": r.get("phone") or "",
                 "tier": r["subscription_tier"],
                 "loc_label": r["loc_label"],
+                "met_id": r.get("met_id"),
+                "met_name": r.get("met_name") or "",
+                "met_phone": r.get("met_phone") or "",
             })
     return matching
 
 
-def _page_met_for_alert(alert: dict, affected: list, page_token: str) -> bool:
-    """SMS the on-duty Met about a new severe alert. Returns True on
-    successful send (or stub mode), False on Twilio failure.
+def _find_pro_subscribers_by_county(alert: dict) -> list:
+    """Find Pro-tier subscribers whose saved location falls in a county-based
+    (geometry-less) alert, e.g. a Severe Thunderstorm Watch. Watches identify
+    their area by county, not a polygon, so we match the alert's areaDesc
+    ("County, ST; County, ST") against each subscriber's county + state.
 
-    The SMS includes the event name, area, # of affected subscribers, and
-    a link to the review page. Met reviews, decides to confirm or dismiss.
+    Matching is done on the "<county>, <ST>" pair to avoid cross-state false
+    matches (same logic that fixed the overlay warning scroll). The
+    subscriber's state is parsed from address_text (e.g. "Lebanon, IN"); the
+    county comes from the saved_locations.county field.
     """
-    if not METEOROLOGIST_PHONE:
-        print("[nws-page] METEOROLOGIST_PHONE not set, can't page", flush=True)
+    area_l = (alert.get("area_desc") or "").lower()
+    if not area_l:
+        return []
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.name, u.email, u.phone,
+                          u.subscription_tier,
+                          loc.label AS loc_label, loc.county, loc.address_text,
+                          cov.primary_met_id AS met_id,
+                          met.name  AS met_name,
+                          met.phone AS met_phone
+                   FROM users u
+                   JOIN saved_locations loc
+                     ON loc.user_id = u.id AND loc.is_primary = TRUE
+                   LEFT JOIN subscriber_coverage cov
+                     ON cov.user_id = u.id
+                   LEFT JOIN users met
+                     ON met.id = cov.primary_met_id
+                   WHERE u.is_active = TRUE
+                     AND u.subscription_tier IN ('pro_single','pro_multi','pro_enterprise')
+                     AND EXISTS (
+                       SELECT 1 FROM user_roles ur
+                        WHERE ur.user_id = u.id AND ur.role = 'subscriber'
+                     )"""
+            )
+            rows = cur.fetchall()
+
+    import re as _re
+    matching = []
+    for r in rows:
+        # County name without the trailing " county" word, lowercased.
+        county = (r.get("county") or "").lower().replace(" county", "").strip()
+        if not county:
+            continue
+        # State = the 2-letter code at the end of address_text ("Lebanon, IN").
+        addr = (r.get("address_text") or "").strip()
+        m = _re.search(r",\s*([A-Za-z]{2})\b\s*$", addr)
+        st = m.group(1).lower() if m else ""
+        if not st:
+            # Without a reliable state we can't safely pair-match; skip to
+            # avoid cross-state false positives.
+            continue
+        if (county + ", " + st) in area_l:
+            matching.append({
+                "user_id": r["id"],
+                "name": r.get("name") or "",
+                "email": r["email"],
+                "phone": r.get("phone") or "",
+                "tier": r["subscription_tier"],
+                "loc_label": r["loc_label"],
+                "met_id": r.get("met_id"),
+                "met_name": r.get("met_name") or "",
+                "met_phone": r.get("met_phone") or "",
+            })
+    return matching
+    """SMS a specific Met about a new severe alert affecting THEIR Pro
+    subscribers. Returns True on successful send (or stub mode), False on
+    Twilio failure or when no phone is available.
+
+    `affected` is the subset of Pro subscribers assigned to this Met that
+    fall inside the alert polygon. `met_phone` is the Met's own number; if
+    it is empty we cannot page (we do NOT fall back to a global number, per
+    the per-Met routing design).
+    """
+    target = (met_phone or "").strip()
+    if not target:
+        print(f"[nws-page] no phone for Met {met_name!r}; cannot page", flush=True)
         return False
 
     base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
@@ -20927,14 +21014,14 @@ def _page_met_for_alert(alert: dict, affected: list, page_token: str) -> bool:
     body = (
         f"WV NWS PAGE: {alert['event']}\n"
         f"Area: {(alert.get('area_desc') or '')[:80]}\n"
-        f"Affected Pro subs: {len(affected)}\n"
+        f"Your affected Pro subs: {len(affected)}\n"
         f"Review: {page_url}\n"
         f"Reply STOP to opt out."
     )
     try:
-        return send_sms(METEOROLOGIST_PHONE, body)
+        return send_sms(target, body)
     except Exception as e:
-        print(f"[nws-page] SMS failed: {e}", flush=True)
+        print(f"[nws-page] SMS failed for Met {met_name!r}: {e}", flush=True)
         return False
 
 
@@ -21315,18 +21402,52 @@ def _process_severe_alerts() -> None:
             print(f"[nws-process] dedupe check failed: {e}", flush=True)
             continue
 
-        # Find affected Pro subscribers
-        affected = _find_pro_subscribers_in_polygon(alert["geometry"])
+        # Find affected Pro subscribers, by polygon (warnings) or by county
+        # (geometry-less alerts like watches).
+        if alert.get("match_mode") == "county" or not alert.get("geometry"):
+            affected = _find_pro_subscribers_by_county(alert)
+        else:
+            affected = _find_pro_subscribers_in_polygon(alert["geometry"])
         if not affected:
             # No Pro subscribers in this alert's area; don't page, don't
             # record. (We could record for analytics but it'd pile up
             # quickly — every NWS alert nationally would create a row.)
             continue
 
-        # Insert the page row + send the Met SMS
+        # Group affected subscribers by their assigned primary Met, so each
+        # Met is paged with only their own affected subscribers. Subscribers
+        # with no assigned Met (met_id is None) are skipped per design — no
+        # fallback page.
+        by_met = {}
+        skipped_no_met = 0
+        for sub in affected:
+            mid = sub.get("met_id")
+            if not mid:
+                skipped_no_met += 1
+                continue
+            by_met.setdefault(mid, []).append(sub)
+
+        if not by_met:
+            # Everyone affected lacks an assigned Met; nothing to route.
+            print(
+                f"[nws-process] alert={alert['event']!r} hit {len(affected)} "
+                f"Pro sub(s) but none had an assigned Met; skipped",
+                flush=True,
+            )
+            continue
+
+        # Insert ONE page row for the alert (dedupe key is the alert id), then
+        # page each affected Met. We record the full affected set and the list
+        # of Met phones we paged.
         page_token = new_secure_token()
         now_ms = int(time.time() * 1000)
         affected_ids_csv = ",".join(str(a["user_id"]) for a in affected)
+        paged_phones = []
+        for subs in by_met.values():
+            ph = (subs[0].get("met_phone") or "").strip()
+            if ph:
+                paged_phones.append(ph)
+        paged_phones_csv = ",".join(paged_phones)
 
         try:
             with db() as conn:
@@ -21345,7 +21466,7 @@ def _process_severe_alerts() -> None:
                          alert["instruction"], alert["area_desc"],
                          json.dumps(alert["geometry"]),
                          alert["expires_at"], page_token,
-                         affected_ids_csv, METEOROLOGIST_PHONE),
+                         affected_ids_csv, paged_phones_csv),
                     )
                     new_row = cur.fetchone()
         except Exception as e:
@@ -21354,11 +21475,28 @@ def _process_severe_alerts() -> None:
             print(f"[nws-process] insert failed for {nws_id}: {e}", flush=True)
             continue
 
-        # Send the SMS — fire-and-forget; failure logged inside.
-        _page_met_for_alert(alert, affected, page_token)
+        # Page each affected Met with only their own subscribers.
+        paged_mets = 0
+        for mid, subs in by_met.items():
+            met_phone = (subs[0].get("met_phone") or "").strip()
+            met_name = subs[0].get("met_name") or ""
+            if not met_phone:
+                print(
+                    f"[nws-process] Met id={mid} ({met_name!r}) has "
+                    f"{len(subs)} affected sub(s) but no phone on file; "
+                    f"could not page",
+                    flush=True,
+                )
+                continue
+            ok = _page_met_for_alert(alert, subs, page_token,
+                                     met_phone=met_phone, met_name=met_name)
+            if ok:
+                paged_mets += 1
+
         print(
-            f"[nws-process] paged Met for alert={alert['event']!r} "
-            f"id={new_row['id']} affected={len(affected)}",
+            f"[nws-process] alert={alert['event']!r} id={new_row['id']} "
+            f"affected={len(affected)} mets_paged={paged_mets} "
+            f"no_met_subs={skipped_no_met}",
             flush=True,
         )
 
