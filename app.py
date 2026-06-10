@@ -7648,9 +7648,15 @@ OVERLAY_TEMPLATE = """\
     --wv-red: #C2342B;
     --wv-text: #FFFFFF;
   }
-  /* Fill the whole browser source at any size (no fixed box). */
+  /* The overlay is designed on a fixed 1920x1080 surface, then scaled with
+     JS (wvScaleStage) to fit whatever size the OBS/Streamlabs browser source
+     is. This makes it render identically and proportionally everywhere,
+     instead of depending on the source being an exact size. html stays the
+     transparent viewport; body is the design surface. */
+  html { width: 100%; height: 100%; overflow: hidden; background: transparent; }
   body {
-    width: 100vw; height: 100vh;
+    width: 1920px; height: 1080px;
+    transform-origin: top left;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', Arial, sans-serif;
     position: relative;
     -webkit-font-smoothing: antialiased;
@@ -7896,6 +7902,15 @@ OVERLAY_TEMPLATE = """\
         + '</span><span>' + wvEscape(phrase) + '</span></span>';
     }
 
+    // Crawl scroll speed in pixels per second (design-space px). The
+    // animation translates the track by -50% (one duplicated set), so the
+    // loop distance is the single-set width. Holding px/sec constant means
+    // one warning keeps the speed we like and more warnings simply take
+    // longer to loop, instead of scrolling faster and faster.
+    // 27 px/sec keeps a typical single warning (~800px) at ~30s, matching
+    // the speed that read well before this fix.
+    var WV_CRAWL_PX_PER_SEC = 27;
+
     function wvRenderCrawl(warnings) {
       var bar = document.getElementById('wv-warn');
       var track = document.getElementById('wv-warn-track');
@@ -7910,6 +7925,15 @@ OVERLAY_TEMPLATE = """\
       // Duplicate the sequence so the loop is seamless (track scrolls -50%).
       track.innerHTML = seq + seq;
       bar.classList.add('is-active');
+      // Constant speed: duration = single-set width / px-per-sec. Measured
+      // after layout so it reflects the real rendered width.
+      requestAnimationFrame(function() {
+        var singleSet = track.scrollWidth / 2;
+        if (singleSet > 0) {
+          var secs = singleSet / WV_CRAWL_PX_PER_SEC;
+          track.style.animationDuration = secs.toFixed(2) + 's';
+        }
+      });
     }
 
     function wvFetchWarnings() {
@@ -7928,6 +7952,22 @@ OVERLAY_TEMPLATE = """\
       wvFetchWarnings();
       setInterval(wvFetchWarnings, 30000);  // refresh every 30s
     }
+
+    // ── Fit the 1920x1080 design surface to the actual browser source ──
+    // OBS and Streamlabs may use different source dimensions. Scaling the
+    // body to fit means the overlay looks proportionally identical in both,
+    // filling widescreen sources and never overflowing. We scale by the
+    // smaller axis ratio so nothing is clipped, then center any letterbox.
+    function wvScaleStage() {
+      var vw = window.innerWidth, vh = window.innerHeight;
+      var scale = Math.min(vw / 1920, vh / 1080);
+      var offsetX = Math.round((vw - 1920 * scale) / 2);
+      var offsetY = Math.round((vh - 1080 * scale) / 2);
+      document.body.style.transform =
+        'translate(' + offsetX + 'px,' + offsetY + 'px) scale(' + scale + ')';
+    }
+    wvScaleStage();
+    window.addEventListener('resize', wvScaleStage);
   </script>
 </body>
 </html>"""
