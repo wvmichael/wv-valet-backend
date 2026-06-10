@@ -7907,9 +7907,10 @@ OVERLAY_TEMPLATE = """\
     // loop distance is the single-set width. Holding px/sec constant means
     // one warning keeps the speed we like and more warnings simply take
     // longer to loop, instead of scrolling faster and faster.
-    // 27 px/sec keeps a typical single warning (~800px) at ~30s, matching
-    // the speed that read well before this fix.
-    var WV_CRAWL_PX_PER_SEC = 27;
+    // 32 px/sec keeps a typical single warning (~800px) at ~25s. This is
+    // about 20% faster than the previous 27 px/sec, which read a touch slow
+    // on air.
+    var WV_CRAWL_PX_PER_SEC = 32;
 
     function wvRenderCrawl(warnings) {
       var bar = document.getElementById('wv-warn');
