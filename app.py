@@ -15300,6 +15300,44 @@ def replies_sms_inbound():
             except Exception:
                 pass
 
+        # Crew daily check-in (June 2026 fix): if the sender is a Crew
+        # member and their reply names a weather condition (clear, cloudy,
+        # rain, storm, etc.), record it as today's check-in. This is what
+        # feeds the streak counter and the Crew map. Without this, replies
+        # only landed in brief_replies and never counted.
+        if matched_user_id is not None:
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """SELECT u.timezone,
+                                      EXISTS (SELECT 1 FROM user_roles ur
+                                              WHERE ur.user_id = u.id AND ur.role = 'crew') AS is_crew
+                               FROM users u WHERE u.id = %s""",
+                            (matched_user_id,),
+                        )
+                        urow = cur.fetchone() or {}
+                if urow.get("is_crew"):
+                    condition = _parse_crew_condition(body)
+                    if condition:
+                        user_tz = urow.get("timezone") or "America/Indianapolis"
+                        date_key = _local_date_key(user_tz)
+                        with db() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    """INSERT INTO crew_checkins
+                                         (user_id, date_key, conditions, notes, checked_in_at)
+                                       VALUES (%s, %s, %s, %s, %s)
+                                       ON CONFLICT (user_id, date_key) DO UPDATE
+                                         SET conditions = EXCLUDED.conditions,
+                                             checked_in_at = EXCLUDED.checked_in_at""",
+                                    (matched_user_id, date_key, condition, None, now_ms),
+                                )
+                        print(f"[crew-checkin] recorded via SMS user={matched_user_id} "
+                              f"date={date_key} condition={condition}", flush=True)
+            except Exception as e:
+                print(f"[crew-checkin] SMS check-in record failed: {e!r}", flush=True)
+
         # Phase 2 (May 18, 2026): Thread the reply into Pro Threads if the
         # sender is a matched Pro-tier subscriber. The reply becomes a
         # message in their thread; their primary Met sees it in the
