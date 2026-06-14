@@ -2499,6 +2499,41 @@ CREATE INDEX IF NOT EXISTS idx_met_territories_sort
 ALTER TABLE users ADD COLUMN IF NOT EXISTS territory_id
     INTEGER REFERENCES met_territories(id) ON DELETE SET NULL;
 
+-- ── Boone County free-trial tracking (June 2026) ──
+-- A trial signup creates a real pro_single account (subscriber role +
+-- subscription_tier='pro_single') with NO card collected. These columns
+-- record that it is a trial so we can report on the funnel and, later,
+-- automate expiry. For now expiry is MANUAL: nothing auto-revokes; the
+-- team ends trials by hand. trial_ends_at is stamped at signup so the
+-- end date is known when automation is added.
+--   trial_cohort   : campaign tag, e.g. 'boone'. NULL for non-trial users.
+--   trial_category : which landing profile they came from (e.g. 'roofing').
+--   trial_started_at / trial_ends_at : ms-since-epoch window (30 days).
+--   trial_status   : 'active' | 'converted' | 'expired'. NULL for non-trial.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_cohort TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_category TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_started_at BIGINT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_ends_at BIGINT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_status TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_business_name TEXT;
+CREATE INDEX IF NOT EXISTS idx_users_trial_status ON users(trial_status) WHERE trial_status IS NOT NULL;
+
+-- Contact / demo requests from the Boone + category landing pages.
+-- The question/call/demo form posts here; we save a row and email the
+-- team. No account is created from a contact submission.
+CREATE TABLE IF NOT EXISTS boone_contacts (
+    id            SERIAL PRIMARY KEY,
+    name          TEXT,
+    business      TEXT,
+    email         TEXT,
+    phone         TEXT,
+    request_type  TEXT,                       -- 'question' | 'call' | 'demo'
+    message       TEXT,
+    category      TEXT,                       -- landing profile they came from, if any
+    created_at    BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_boone_contacts_created ON boone_contacts(created_at DESC);
+
 -- Shift assignments. Each row = one Met covering one (territory + date + shift).
 -- The "territory_id" column is NULL for the special Met Reviews national
 -- queue rows; we use a sentinel "is_reviews_pool" flag instead so reviews
@@ -7006,6 +7041,264 @@ def _revoke_subscriber_role(user_id: int, conn) -> bool:
         return removed
 
 
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Boone County free-trial signup + contact form (June 2026)
+#
+# Trial model (decided with Michael):
+#   - No credit card collected at signup.
+#   - Creates a REAL pro_single account: 'subscriber' role +
+#     subscription_tier='pro_single', so it looks and works exactly like
+#     a paying Pro Single account for 30 days.
+#   - Day-31 expiry is MANUAL for now (nothing auto-revokes). trial_ends_at
+#     is stamped so automation can be added later without a migration.
+#   - New user gets a welcome email with a magic sign-in link (reusing the
+#     same new-account flow as Stripe signups).
+#   - Every signup + contact submission emails the team.
+# ────────────────────────────────────────────────────────────────────────
+
+# Team notification recipients. Hardcoded per Michael's request (June 2026).
+# One-line change to update; could move to an env var later.
+BOONE_NOTIFY_RECIPIENTS = [
+    "michael@weathervalet.com",
+    "timmy@weathervalet.com",
+    "reynolds.evan.m@gmail.com",
+]
+
+BOONE_TRIAL_DAYS = 30
+
+
+def _send_team_notification(subject: str, html_body: str, text_body: str) -> bool:
+    """Email the Boone team (Michael, Timmy, Evan) about a signup or contact.
+
+    Reuses the Resend HTTP API like the rest of our outbound mail. If
+    RESEND_API_KEY / EMAIL_FROM are not set, logs and returns (stub mode),
+    matching _send_magic_link_email behavior so dev never hard-fails.
+    """
+    api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    from_addr = os.environ.get("EMAIL_FROM", "").strip() or "WeatherValet <hello@weathervalet.ai>"
+    if not api_key:
+        print(f"[boone-notify] no RESEND_API_KEY; would notify {BOONE_NOTIFY_RECIPIENTS}: {subject}", flush=True)
+        return True
+    payload = json.dumps({
+        "from": from_addr,
+        "to": BOONE_NOTIFY_RECIPIENTS,
+        "subject": subject,
+        "html": html_body,
+        "text": text_body,
+        "reply_to": "michael@weathervalet.ai",
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "WeatherValet-Backend/1.0 (+https://weathervalet.ai)",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if 200 <= resp.status < 300:
+                return True
+            print(f"[boone-notify] Resend returned status {resp.status}", flush=True)
+            return False
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        print(f"[boone-notify] Resend HTTPError {e.code}: {body}", flush=True)
+        return False
+    except Exception as e:
+        print(f"[boone-notify] send failed: {e!r}", flush=True)
+        return False
+
+
+@app.route("/api/v1/boone/trial-signup", methods=["OPTIONS"])
+def _boone_trial_signup_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/boone/trial-signup")
+def boone_trial_signup():
+    """Start a free 30-day Pro Single trial. No card. Creates a real account.
+
+    Body: { business, name, city, email, phone, category? }
+    Returns 200 {ok:true} on success. Idempotent-ish: if the email already
+    has an ACTIVE paid subscription, we do NOT touch it (return a friendly
+    message); if they previously trialed, we do not re-grant.
+    """
+    data = request.get_json(silent=True) or {}
+    business = (data.get("business") or "").strip()
+    name = (data.get("name") or "").strip()
+    city = (data.get("city") or "").strip()
+    email = (data.get("email") or "").strip()
+    phone = (data.get("phone") or "").strip()
+    category = (data.get("category") or "").strip().lower() or None
+
+    if not business or not email or "@" not in email:
+        return jsonify({"ok": False, "error": "Please include at least your business name and a valid email."}), 400
+
+    now = now_ts()
+    ends = now + BOONE_TRIAL_DAYS * 24 * 60 * 60 * 1000
+
+    try:
+        with db() as conn:
+            user_id = _get_or_create_user(email, conn)
+
+            # Don't clobber an existing paying subscriber.
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT subscription_tier, trial_status FROM users WHERE id = %s",
+                    (user_id,),
+                )
+                row = cur.fetchone() or {}
+            existing_tier = row.get("subscription_tier")
+            existing_trial = row.get("trial_status")
+
+            if existing_tier == "pro_single" and existing_trial == "active":
+                # They already have an active trial — treat as success (no dup).
+                return jsonify({"ok": True, "already": True})
+            if existing_tier in ("pro_single", "pro_multi", "pro_enterprise", "hobbyist") and existing_trial != "active":
+                # They already pay (or are a real subscriber). Don't downgrade
+                # them to a trial. Let the team know they tried to sign up.
+                _send_team_notification(
+                    subject=f"Boone trial: existing subscriber tried to sign up ({business})",
+                    html_body=f"<p>{name or 'Someone'} at <b>{business}</b> ({email}) submitted the trial form, but they already have a subscription. No change was made.</p>",
+                    text_body=f"{name or 'Someone'} at {business} ({email}) submitted the trial form but already has a subscription. No change made.",
+                )
+                return jsonify({"ok": True, "existing_account": True})
+
+            # Grant real Pro Single access + stamp the trial.
+            _grant_subscriber_role(user_id, conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE users
+                       SET subscription_tier = 'pro_single',
+                           name = COALESCE(NULLIF(name, ''), %s),
+                           phone = COALESCE(NULLIF(phone, ''), %s),
+                           trial_cohort = 'boone',
+                           trial_category = %s,
+                           trial_started_at = %s,
+                           trial_ends_at = %s,
+                           trial_status = 'active',
+                           trial_business_name = %s
+                       WHERE id = %s""",
+                    (name or None, phone or None, category, now, ends, business, user_id),
+                )
+
+            # Welcome email with a magic sign-in link (new-account intent),
+            # exactly like the Stripe new-subscriber flow.
+            base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai")
+            raw_token = new_secure_token()
+            token_hash = hash_token(raw_token)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO magic_link_tokens
+                       (token_hash, user_id, created_at, expires_at, ip_requested)
+                       VALUES (%s, %s, %s, %s, %s)""",
+                    (token_hash, user_id, now, now + MAGIC_LINK_TTL_SECONDS, "boone-trial"),
+                )
+            magic_link_url = f"{base}/?auth=verify&token={raw_token}&intent=new-account"
+
+        # Send the user their welcome (outside the txn).
+        _send_magic_link_email(email, magic_link_url, intent="new-account")
+
+        # Notify the team.
+        from datetime import datetime as _dt, timezone as _tz
+        ends_str = _dt.fromtimestamp(ends / 1000, tz=_tz.utc).strftime("%b %d, %Y")
+        _send_team_notification(
+            subject=f"New Boone trial: {business}",
+            html_body=(
+                f"<h2 style='font-family:sans-serif'>New Boone County trial started</h2>"
+                f"<table style='font-family:sans-serif;font-size:14px'>"
+                f"<tr><td><b>Business</b></td><td>{business}</td></tr>"
+                f"<tr><td><b>Name</b></td><td>{name or '(not given)'}</td></tr>"
+                f"<tr><td><b>City</b></td><td>{city or '(not given)'}</td></tr>"
+                f"<tr><td><b>Email</b></td><td>{email}</td></tr>"
+                f"<tr><td><b>Phone</b></td><td>{phone or '(not given)'}</td></tr>"
+                f"<tr><td><b>From page</b></td><td>{category or 'boone'}</td></tr>"
+                f"<tr><td><b>Trial ends</b></td><td>{ends_str} (manual)</td></tr>"
+                f"</table>"
+                f"<p style='font-family:sans-serif;font-size:13px;color:#555'>A real Pro Single account was created. No card on file. Set them up in the Met portal and follow up before the end date.</p>"
+            ),
+            text_body=(
+                f"New Boone trial started.\n\nBusiness: {business}\nName: {name}\n"
+                f"City: {city}\nEmail: {email}\nPhone: {phone}\nFrom page: {category or 'boone'}\n"
+                f"Trial ends: {ends_str} (manual)\n\nReal Pro Single account created, no card. "
+                f"Set them up and follow up before the end date."
+            ),
+        )
+        return jsonify({"ok": True})
+    except Exception as e:
+        print(f"[boone-trial-signup] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "Something went wrong starting your trial. Please try again, or email hello@weathervalet.ai."}), 500
+
+
+@app.route("/api/v1/boone/contact", methods=["OPTIONS"])
+def _boone_contact_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/boone/contact")
+def boone_contact():
+    """Save a contact/demo request and email the team. No account created.
+
+    Body: { name, business, email, phone, type, message, category? }
+    """
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    business = (data.get("business") or "").strip()
+    email = (data.get("email") or "").strip()
+    phone = (data.get("phone") or "").strip()
+    req_type = (data.get("type") or "question").strip().lower()
+    if req_type not in ("question", "call", "demo"):
+        req_type = "question"
+    message = (data.get("message") or "").strip()
+    category = (data.get("category") or "").strip().lower() or None
+
+    if not email or "@" not in email:
+        return jsonify({"ok": False, "error": "Please include a valid email so we can reach you."}), 400
+
+    now = now_ts()
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO boone_contacts
+                       (name, business, email, phone, request_type, message, category, created_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (name or None, business or None, email, phone or None, req_type, message or None, category, now),
+                )
+        type_label = {"question": "Question", "call": "Call request", "demo": "Demo request"}.get(req_type, "Question")
+        _send_team_notification(
+            subject=f"Boone {type_label}: {business or email}",
+            html_body=(
+                f"<h2 style='font-family:sans-serif'>Boone landing page: {type_label}</h2>"
+                f"<table style='font-family:sans-serif;font-size:14px'>"
+                f"<tr><td><b>Name</b></td><td>{name or '(not given)'}</td></tr>"
+                f"<tr><td><b>Business</b></td><td>{business or '(not given)'}</td></tr>"
+                f"<tr><td><b>Email</b></td><td>{email}</td></tr>"
+                f"<tr><td><b>Phone</b></td><td>{phone or '(not given)'}</td></tr>"
+                f"<tr><td><b>Type</b></td><td>{type_label}</td></tr>"
+                f"<tr><td><b>From page</b></td><td>{category or 'boone'}</td></tr>"
+                f"<tr><td valign='top'><b>Message</b></td><td>{(message or '(none)')}</td></tr>"
+                f"</table>"
+            ),
+            text_body=(
+                f"Boone {type_label}\n\nName: {name}\nBusiness: {business}\nEmail: {email}\n"
+                f"Phone: {phone}\nType: {type_label}\nFrom page: {category or 'boone'}\n\nMessage:\n{message or '(none)'}"
+            ),
+        )
+        return jsonify({"ok": True})
+    except Exception as e:
+        print(f"[boone-contact] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "Something went wrong. Please try again, or email hello@weathervalet.ai."}), 500
+
 def _find_user_for_stripe_customer(stripe_customer_id: str, email_fallback: Optional[str] = None) -> Optional[int]:
     """Look up the user matching a Stripe customer ID.
 
@@ -7229,6 +7522,13 @@ def stripe_webhook_v2():
                         cur.execute(
                             "UPDATE users SET subscription_tier = %s WHERE id = %s",
                             (tier_key, user_id),
+                        )
+                        # If this user was on an active free trial, mark it
+                        # converted now that they are paying (June 2026).
+                        cur.execute(
+                            """UPDATE users SET trial_status = 'converted'
+                               WHERE id = %s AND trial_status = 'active'""",
+                            (user_id,),
                         )
 
                     # Grant subscriber role
@@ -7907,8 +8207,8 @@ OVERLAY_TEMPLATE = """\
     // loop distance is the single-set width. Holding px/sec constant means
     // one warning keeps the speed we like and more warnings simply take
     // longer to loop, instead of scrolling faster and faster.
-    // 38 px/sec, tuned from live broadcast feedback (June 2026).
-    var WV_CRAWL_PX_PER_SEC = 38;
+    // 45 px/sec, tuned from live broadcast feedback (June 2026).
+    var WV_CRAWL_PX_PER_SEC = 45;
 
     function wvRenderCrawl(warnings) {
       var bar = document.getElementById('wv-warn');
