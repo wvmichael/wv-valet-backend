@@ -34942,6 +34942,124 @@ def met_my_subscribers():
     return jsonify({"ok": True, "subscribers": subscribers})
 
 
+@app.route("/api/v1/met/subscriber/<int:subscriber_id>/message", methods=["OPTIONS"])
+def _met_subscriber_message_preflight(subscriber_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/met/subscriber/<int:subscriber_id>/message")
+def met_subscriber_message(subscriber_id):
+    """Send a one-way individual message from a Met to a single subscriber
+    (any tier, including Hobbyist). Delivery follows the subscriber's own
+    brief channel preferences (brief_preferences.channels: sms|email|both),
+    exactly like the daily brief. This is NOT a Pro Thread: it is outbound
+    only. If a Hobbyist replies, it lands in the existing brief-reply
+    pending bucket, so two-way messaging stays a Pro-only feature.
+
+    Body: { "body": "message text" }
+    Returns: 200 { ok, delivered: ["sms","email"], skipped: [...] }
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    body = (data.get("body") or "").strip()
+    if not body:
+        return jsonify({"ok": False, "error": "Message text is required."}), 400
+    if len(body) > 1200:
+        return jsonify({"ok": False, "error": "Message is too long (1200 character max)."}), 400
+
+    # Look up the subscriber + their brief channel preference.
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.email, u.name, u.phone, u.subscription_tier,
+                          bp.channels AS channels_pref
+                   FROM users u
+                   LEFT JOIN brief_preferences bp ON bp.user_id = u.id
+                   WHERE u.id = %s AND u.is_active = TRUE
+                     AND EXISTS (
+                       SELECT 1 FROM user_roles ur
+                       WHERE ur.user_id = u.id AND ur.role = 'subscriber'
+                     )""",
+                (subscriber_id,),
+            )
+            sub = cur.fetchone()
+    if not sub:
+        return jsonify({"ok": False, "error": "Subscriber not found."}), 404
+
+    # Honor the subscriber's channel preference exactly like briefs do.
+    # Default to both if unset. SMS only goes out if they chose sms AND
+    # have a phone; email only if they chose email AND have an email.
+    prefs = (sub.get("channels_pref") or "sms,email").split(",")
+    prefs = [c.strip().lower() for c in prefs if c.strip()]
+    if not prefs:
+        prefs = ["sms", "email"]
+
+    sender_name = user.get("name") or (user.get("email") or "").split("@")[0] or "your meteorologist"
+    delivered = []
+    skipped = []
+
+    # SMS: include a STOP-out footer like other operational SMS.
+    if "sms" in prefs:
+        if sub.get("phone"):
+            sms_text = f"WeatherValet: {body}\n\n- {sender_name}\nReply STOP to opt out."
+            try:
+                if send_sms(sub["phone"], sms_text):
+                    delivered.append("sms")
+                else:
+                    skipped.append("sms-failed")
+            except Exception as e:
+                print(f"[met-subscriber-message] sms threw: {e!r}", flush=True)
+                skipped.append("sms-failed")
+        else:
+            skipped.append("sms-no-phone")
+
+    # Email
+    if "email" in prefs:
+        if sub.get("email"):
+            subject = "A message from your WeatherValet meteorologist"
+            email_text = f"{body}\n\n- {sender_name}, WeatherValet"
+            actor_reply_to = user.get("email")
+            try:
+                if _send_brief_email(sub["email"], subject, email_text, reply_to=actor_reply_to):
+                    delivered.append("email")
+                else:
+                    skipped.append("email-failed")
+            except Exception as e:
+                print(f"[met-subscriber-message] email threw: {e!r}", flush=True)
+                skipped.append("email-failed")
+        else:
+            skipped.append("email-no-email")
+
+    # Audit log (mirrors the nudge-subscriber pattern).
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO admin_audit_log
+                       (created_at, actor_user_id, actor_name, action, target_type,
+                        target_id, details_json)
+                       VALUES (%s, %s, %s, 'message_subscriber', 'user', %s, %s)""",
+                    (int(time.time() * 1000),
+                     user["id"],
+                     user.get("name") or user.get("email"),
+                     subscriber_id,
+                     json.dumps({"delivered": delivered, "skipped": skipped,
+                                 "len": len(body), "tier": sub.get("subscription_tier")})),
+                )
+    except Exception as e:
+        print(f"[met-subscriber-message] audit log failed: {e!r}", flush=True)
+
+    if not delivered:
+        return jsonify({"ok": False, "error": "Could not deliver. The subscriber has no reachable channel for their notification settings.",
+                        "skipped": skipped}), 422
+    return jsonify({"ok": True, "delivered": delivered, "skipped": skipped})
+
 @app.route("/api/v1/met/subscriber/<int:subscriber_id>/recent-sends", methods=["OPTIONS"])
 def _met_subscriber_recent_sends_preflight(subscriber_id):
     return ("", 204)
