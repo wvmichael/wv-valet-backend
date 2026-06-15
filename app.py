@@ -2508,7 +2508,7 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS territory_id
 -- end date is known when automation is added.
 --   trial_cohort   : campaign tag, e.g. 'boone'. NULL for non-trial users.
 --   trial_category : which landing profile they came from (e.g. 'roofing').
---   trial_started_at / trial_ends_at : ms-since-epoch window (30 days).
+--   trial_started_at / trial_ends_at : seconds-since-epoch window (30 days).
 --   trial_status   : 'active' | 'converted' | 'expired'. NULL for non-trial.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_cohort TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_category TEXT;
@@ -3306,6 +3306,33 @@ def _send_magic_link_email(email: str, magic_link_url: str, intent: str = "sign-
             "the link above."
         )
 
+    # "Start here" pointer shown right after the button. For new accounts
+    # this is the one mandatory setup step (saving a location), since
+    # without it no briefs or alerts can be delivered. Empty for other
+    # intents.
+    after_button_html = ""
+    after_button_text = ""
+    if intent in ("new-account", "migrated"):
+        after_button_html = (
+            '<div style="background:#F4F6FB;border:1px solid #DCE3F5;'
+            'border-radius:10px;padding:16px 18px;margin:0 0 24px;">'
+            '<p style="color:#0E1116;font-size:14.5px;font-weight:700;margin:0 0 6px;">'
+            'Start here: add your location</p>'
+            '<p style="color:#3D4148;font-size:13.5px;line-height:1.6;margin:0;">'
+            'Once you are signed in, the first thing to do is save your location, '
+            'it is required, and without it we cannot send your briefs or alerts. '
+            'On your account page, find Saved location, click Edit, type your '
+            'address, click Look up, select the matching address, then click '
+            'Save location. Your account page also walks you through the rest.</p>'
+            '</div>'
+        )
+        after_button_text = (
+            "START HERE: After you sign in, save your location first. It is "
+            "required, without it we cannot send your briefs or alerts. On your "
+            "account page, under Saved location, click Edit, type your address, "
+            "click Look up, select the address, then click Save location.\n\n"
+        )
+
     html_body_inner = (
         f'<h1 style="color:#0E1116;font-size:22px;margin:0 0 14px;'
         f'font-weight:600;letter-spacing:-0.01em;">{heading_text}</h1>'
@@ -3315,6 +3342,7 @@ def _send_magic_link_email(email: str, magic_link_url: str, intent: str = "sign-
         'style="display:inline-block;background:#2E4FB8;color:#fff;'
         'padding:13px 28px;border-radius:8px;text-decoration:none;'
         f'font-weight:600;font-size:15px;">{button_text}</a></p>'
+        f'{after_button_html}'
         '<p style="color:#6B7280;font-size:12.5px;line-height:1.5;margin:0 0 20px;">'
         'If the button doesn\'t work, copy and paste this link into your browser:'
         f'<br><span style="word-break:break-all;color:#2E4FB8;">{magic_link_url}</span></p>'
@@ -3329,6 +3357,7 @@ def _send_magic_link_email(email: str, magic_link_url: str, intent: str = "sign-
         f"{heading_text}\n\n"
         f"{body_text}\n\n"
         f"{magic_link_url}\n\n"
+        f"{after_button_text}"
         f"{safety_text}\n\n"
         f"---\n"
         f"WeatherValet \u00b7 Indianapolis, IN\n"
@@ -7143,8 +7172,8 @@ def boone_trial_signup():
     if not email or "@" not in email:
         return jsonify({"ok": False, "error": "Please include a valid email to start your trial."}), 400
 
-    now = now_ts()
-    ends = now + BOONE_TRIAL_DAYS * 24 * 60 * 60 * 1000
+    now = now_ts()  # seconds since epoch (codebase standard)
+    ends = now + BOONE_TRIAL_DAYS * 24 * 60 * 60
 
     try:
         with db() as conn:
@@ -7210,7 +7239,7 @@ def boone_trial_signup():
 
         # Notify the team.
         from datetime import datetime as _dt, timezone as _tz
-        ends_str = _dt.fromtimestamp(ends / 1000, tz=_tz.utc).strftime("%b %d, %Y")
+        ends_str = _dt.fromtimestamp(ends, tz=_tz.utc).strftime("%b %d, %Y")
         _send_team_notification(
             subject=f"New Boone trial: {business}",
             html_body=(
