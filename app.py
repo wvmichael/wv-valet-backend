@@ -7140,8 +7140,8 @@ def boone_trial_signup():
     phone = (data.get("phone") or "").strip()
     category = (data.get("category") or "").strip().lower() or None
 
-    if not business or not email or "@" not in email:
-        return jsonify({"ok": False, "error": "Please include at least your business name and a valid email."}), 400
+    if not email or "@" not in email:
+        return jsonify({"ok": False, "error": "Please include a valid email to start your trial."}), 400
 
     now = now_ts()
     ends = now + BOONE_TRIAL_DAYS * 24 * 60 * 60 * 1000
