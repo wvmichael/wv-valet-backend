@@ -20519,6 +20519,99 @@ def _pregenerate_pro_brief_drafts_inner() -> None:
             print(f"[pregen-pro] FAILED for user_id={c.get('user_id')}: {e!r}", flush=True)
 
 
+def _process_expired_trials() -> None:
+    """Auto-expire Boone free trials that have passed their end date and
+    have NOT converted to paid (June 2026).
+
+    For each user with trial_status = 'active' and trial_ends_at <= now,
+    we revoke their Pro access (subscriber role removed + subscription_tier
+    cleared to NULL via _revoke_subscriber_role) and set trial_status =
+    'expired'. The account itself is kept — only Pro access ends.
+
+    Conversions are excluded automatically: when a trial user pays through
+    Stripe, the webhook sets trial_status = 'converted', so they never
+    match this query.
+
+    Notifies the team so they have a record (no auto email to the
+    subscriber — follow-up is handled by the team).
+
+    Concurrency: Postgres advisory lock (key 91234572, distinct from the
+    other scheduler locks) so multi-worker deployments don't double-run.
+    """
+    _LOCK_KEY = 91234572
+    _lock_conn = _try_acquire_scheduler_lock(_LOCK_KEY)
+    if _lock_conn is None:
+        return  # Another worker holds the lock this tick; skip silently
+    try:
+        now = now_ts()  # seconds since epoch (codebase standard)
+        # Find trials that are due to expire.
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, email, name, trial_business_name, trial_ends_at
+                       FROM users
+                       WHERE trial_status = 'active'
+                         AND trial_ends_at IS NOT NULL
+                         AND trial_ends_at <= %s
+                       ORDER BY trial_ends_at ASC
+                       LIMIT 200""",
+                    (now,),
+                )
+                due = cur.fetchall() or []
+
+        if not due:
+            return
+
+        for row in due:
+            uid = row["id"]
+            try:
+                with db() as conn:
+                    # Re-check status inside the txn to avoid a race where
+                    # a conversion landed between the SELECT and now.
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT trial_status FROM users WHERE id = %s FOR UPDATE",
+                            (uid,),
+                        )
+                        cur_row = cur.fetchone() or {}
+                    if cur_row.get("trial_status") != "active":
+                        continue  # converted or already expired — leave alone
+                    _revoke_subscriber_role(uid, conn)
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE users SET trial_status = 'expired' WHERE id = %s",
+                            (uid,),
+                        )
+                print(f"[trial-expiry] expired trial for user={uid} "
+                      f"({row.get('email')})", flush=True)
+                # Team notification (record of the expiry).
+                biz = row.get("trial_business_name") or row.get("name") or row.get("email")
+                try:
+                    _send_team_notification(
+                        subject=f"Boone trial expired: {biz}",
+                        html_body=(
+                            f"<p>The free trial for <b>{biz}</b> ({row.get('email')}) "
+                            f"has reached day 31 without converting, so Pro access was "
+                            f"automatically removed. The account was kept.</p>"
+                            f"<p style='font-size:13px;color:#555'>If they still want to "
+                            f"continue, point them to checkout to start a paid Pro Single "
+                            f"plan.</p>"
+                        ),
+                        text_body=(
+                            f"Boone trial expired: {biz} ({row.get('email')}).\n\n"
+                            f"The trial reached day 31 without converting, so Pro access "
+                            f"was automatically removed. The account was kept. If they "
+                            f"still want to continue, point them to checkout for paid "
+                            f"Pro Single."
+                        ),
+                    )
+                except Exception as e:
+                    print(f"[trial-expiry] notify failed for user={uid}: {e!r}", flush=True)
+            except Exception as e:
+                print(f"[trial-expiry] failed to expire user={uid}: {e!r}", flush=True)
+    finally:
+        _release_scheduler_lock(_lock_conn, _LOCK_KEY)
+
 def _brief_scheduler_loop() -> None:
     """Main scheduler loop — runs in a daemon thread. Ticks every 60s.
 
@@ -20602,6 +20695,10 @@ def _brief_scheduler_loop() -> None:
             _maybe_run_accuracy_emails()
         except Exception as e:
             print(f"[accuracy-email] tick failed: {e!r}", flush=True)
+        try:
+            _process_expired_trials()
+        except Exception as e:
+            print(f"[trial-expiry] tick failed: {e!r}", flush=True)
         time.sleep(60)
 
 
