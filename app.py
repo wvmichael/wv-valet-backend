@@ -3199,7 +3199,8 @@ def _email_shell(content_html: str, preheader: str = "") -> str:
     )
 
 
-def _send_magic_link_email(email: str, magic_link_url: str, intent: str = "sign-in") -> bool:
+def _send_magic_link_email(email: str, magic_link_url: str, intent: str = "sign-in",
+                           subscriber_tier: Optional[str] = None) -> bool:
     """Send a magic-link email to the user.
 
     DELIVERY: Resend (resend.com) via their HTTP API.
@@ -3253,7 +3254,7 @@ def _send_magic_link_email(email: str, magic_link_url: str, intent: str = "sign-
         button_text = "Set your password"
         body_text = (
             "We are so glad you are here. You now have a team of real "
-            "meteorologists watching the weather for you. Let's get your "
+            "Meteorologists watching the weather for you. Let's get your "
             "account set up. It only takes a few minutes, and step one is "
             "right below. (Your sign-in link below expires in 15 minutes, "
             "so it is best to set your password now.)"
@@ -3307,67 +3308,82 @@ def _send_magic_link_email(email: str, magic_link_url: str, intent: str = "sign-
             "the link above."
         )
 
-    # "Start here" pointer shown right after the button. For new accounts
-    # this is the one mandatory setup step (saving a location), since
-    # without it no briefs or alerts can be delivered. Empty for other
-    # intents.
+    # Welcome to-do list shown right after the button (new accounts only).
+    # Tier-aware: every subscriber gets the core steps (password, location,
+    # brief time). Pro-tier subscribers also get "message your Meteorologist"
+    # and "add your team." Hobbyists do not (those are Pro features). The
+    # list only renders when a subscriber_tier is provided, so non-subscriber
+    # flows (like Valet Crew approval) do not receive it.
     after_button_html = ""
     after_button_text = ""
-    if intent in ("new-account", "migrated"):
+    _tier = (subscriber_tier or "").lower()
+    _is_pro = "pro" in _tier
+    if intent == "new-account" and _tier:
+        # Build the numbered steps as (title, body) pairs.
+        _steps = []
+        _steps.append((
+            "Set your password.",
+            "Tap the button above to set your password and sign in. That is step one."
+        ))
+        _steps.append((
+            "Save your location. This one is required.",
+            "Without it, we cannot send your forecasts or alerts. On your account "
+            "page, find Saved location and click Edit. Type your address, click "
+            "Look up, pick the matching address, then click Save location."
+        ))
+        _steps.append((
+            "Pick your morning brief time.",
+            "Choose when your daily forecast arrives each morning, written just for "
+            "your location."
+        ))
+        if _is_pro:
+            _steps.append((
+                "Say hello to your Meteorologist.",
+                "Send them a quick message about who you are and the weather "
+                "decisions that matter most to you, so they can tailor your "
+                "forecasts."
+            ))
+            _steps.append((
+                "Add your team.",
+                "Your plan includes up to three more people. Add them on your "
+                "account page so they get the briefs and alerts too."
+            ))
+
+        # Render HTML rows.
+        _rows = ""
+        for _i, (_t, _b) in enumerate(_steps):
+            _last = (_i == len(_steps) - 1)
+            _pad = "0" if _last else "0 0 14px"
+            _numpad = "0 10px 0 0" if _last else "0 10px 14px 0"
+            _rows += (
+                f'<tr><td style="vertical-align:top;padding:{_numpad};color:#2E4FB8;'
+                f'font-size:14px;font-weight:700;">{_i + 1}.</td>'
+                f'<td style="padding:{_pad};color:#3D4148;font-size:13.5px;line-height:1.6;">'
+                f'<b style="color:#0E1116;">{_t}</b> {_b}</td></tr>'
+            )
         after_button_html = (
             '<div style="background:#F4F6FB;border:1px solid #DCE3F5;'
             'border-radius:10px;padding:18px 20px;margin:0 0 24px;">'
             '<p style="color:#0E1116;font-size:15px;font-weight:700;margin:0 0 12px;">'
             'Your quick start list</p>'
             '<table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;">'
-            # Step 1
-            '<tr><td style="vertical-align:top;padding:0 10px 14px 0;color:#2E4FB8;'
-            'font-size:14px;font-weight:700;">1.</td>'
-            '<td style="padding:0 0 14px;color:#3D4148;font-size:13.5px;line-height:1.6;">'
-            '<b style="color:#0E1116;">Set your password.</b> Tap the button above to '
-            'set your password and sign in. That is step one.</td></tr>'
-            # Step 2
-            '<tr><td style="vertical-align:top;padding:0 10px 14px 0;color:#2E4FB8;'
-            'font-size:14px;font-weight:700;">2.</td>'
-            '<td style="padding:0 0 14px;color:#3D4148;font-size:13.5px;line-height:1.6;">'
-            '<b style="color:#0E1116;">Save your location. This one is required.</b> '
-            'Without it, we cannot send your forecasts or alerts. On your account page, '
-            'find Saved location and click Edit. Type your address, click Look up, pick '
-            'the matching address, then click Save location.</td></tr>'
-            # Step 3
-            '<tr><td style="vertical-align:top;padding:0 10px 14px 0;color:#2E4FB8;'
-            'font-size:14px;font-weight:700;">3.</td>'
-            '<td style="padding:0 0 14px;color:#3D4148;font-size:13.5px;line-height:1.6;">'
-            '<b style="color:#0E1116;">Pick your morning brief time.</b> Choose when '
-            'your daily forecast arrives each morning, written just for your location.</td></tr>'
-            # Step 4
-            '<tr><td style="vertical-align:top;padding:0 10px 0 0;color:#2E4FB8;'
-            'font-size:14px;font-weight:700;">4.</td>'
-            '<td style="padding:0;color:#3D4148;font-size:13.5px;line-height:1.6;">'
-            '<b style="color:#0E1116;">Say hello to your meteorologist.</b> Send them a '
-            'quick message about who you are and the weather decisions that matter most '
-            'to you, so they can tailor your forecasts.</td></tr>'
+            + _rows +
             '</table>'
             '<p style="color:#6B7280;font-size:12.5px;line-height:1.5;margin:14px 0 0;">'
             'Once you sign in, your account page walks you through each step. '
             'We cannot wait to get started.</p>'
             '</div>'
         )
+
+        # Render plaintext rows.
+        _text_rows = ""
+        for _i, (_t, _b) in enumerate(_steps):
+            _text_rows += f"{_i + 1}. {_t} {_b}\n"
         after_button_text = (
             "YOUR QUICK START LIST\n"
-            "1. Set your password. Tap the link above to set your password and sign "
-            "in. That is step one.\n"
-            "2. Save your location. This one is required. Without it, we cannot send "
-            "your forecasts or alerts. On your account page, find Saved location and "
-            "click Edit. Type your address, click Look up, pick the matching address, "
-            "then click Save location.\n"
-            "3. Pick your morning brief time. Choose when your daily forecast arrives "
-            "each morning, written just for your location.\n"
-            "4. Say hello to your meteorologist. Send them a quick message about who "
-            "you are and the weather decisions that matter most to you, so they can "
-            "tailor your forecasts.\n\n"
-            "Once you sign in, your account page walks you through each step. We "
-            "cannot wait to get started.\n\n"
+            + _text_rows +
+            "\nOnce you sign in, your account page walks you through each step. "
+            "We cannot wait to get started.\n\n"
         )
 
     html_body_inner = (
@@ -7272,7 +7288,8 @@ def boone_trial_signup():
             magic_link_url = f"{base}/?auth=verify&token={raw_token}&intent=new-account"
 
         # Send the user their welcome (outside the txn).
-        _send_magic_link_email(email, magic_link_url, intent="new-account")
+        _send_magic_link_email(email, magic_link_url, intent="new-account",
+                               subscriber_tier="pro_single")
 
         # Notify the team.
         from datetime import datetime as _dt, timezone as _tz
@@ -7663,7 +7680,8 @@ def stripe_webhook_v2():
                             (token_hash, user_id, now, now + MAGIC_LINK_TTL_SECONDS, "stripe-webhook"),
                         )
                 magic_link_url = f"{base}/?auth=verify&token={raw_token}&intent=new-account"
-                _send_magic_link_email(email, magic_link_url, intent="new-account")
+                _send_magic_link_email(email, magic_link_url, intent="new-account",
+                                       subscriber_tier=tier_key)
 
                 print(
                     f"[stripe-webhook] subscription provisioned: "
