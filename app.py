@@ -3248,18 +3248,19 @@ def _send_magic_link_email(email: str, magic_link_url: str, intent: str = "sign-
     # keeps the copy obvious and prevents accidental cross-wiring when
     # we later add new intents.
     if intent == "new-account":
-        subject = "Welcome to WeatherValet: set your password"
-        heading_text = "Welcome to WeatherValet"
+        subject = "Welcome to WeatherValet! Let's get you set up"
+        heading_text = "Welcome to WeatherValet!"
         button_text = "Set your password"
         body_text = (
-            "Thanks for subscribing. Tap the button below to set your "
-            "password and access your account. This link expires in "
-            "15 minutes and can only be used once."
+            "We are so glad you are here. You now have a team of real "
+            "meteorologists watching the weather for you. Let's get your "
+            "account set up. It only takes a few minutes, and step one is "
+            "right below. (Your sign-in link below expires in 15 minutes, "
+            "so it is best to set your password now.)"
         )
         safety_text = (
             "If you didn't sign up for WeatherValet, please reply to this "
-            "email so we can look into it. No charges have been finalized "
-            "until your account is activated."
+            "email so we can look into it."
         )
     elif intent == "migrated":
         # Welcome email for grandfathered subscribers being migrated from
@@ -3315,28 +3316,58 @@ def _send_magic_link_email(email: str, magic_link_url: str, intent: str = "sign-
     if intent in ("new-account", "migrated"):
         after_button_html = (
             '<div style="background:#F4F6FB;border:1px solid #DCE3F5;'
-            'border-radius:10px;padding:16px 18px;margin:0 0 24px;">'
-            '<p style="color:#0E1116;font-size:14.5px;font-weight:700;margin:0 0 6px;">'
-            'Start here: add your location</p>'
-            '<p style="color:#3D4148;font-size:13.5px;line-height:1.6;margin:0;">'
-            'Once you are signed in, the first thing to do is save your location. '
-            'This step is required. Without it, we cannot send you any briefs or '
-            'alerts. Here is how to add it. On your account page, find the section '
-            'called Saved location and click Edit. Type your address into the box, '
-            'then click Look up. Select the matching address from the list that '
-            'appears, then click Save location. Your account page will then walk '
-            'you through the rest of the setup.</p>'
+            'border-radius:10px;padding:18px 20px;margin:0 0 24px;">'
+            '<p style="color:#0E1116;font-size:15px;font-weight:700;margin:0 0 12px;">'
+            'Your quick start list</p>'
+            '<table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;">'
+            # Step 1
+            '<tr><td style="vertical-align:top;padding:0 10px 14px 0;color:#2E4FB8;'
+            'font-size:14px;font-weight:700;">1.</td>'
+            '<td style="padding:0 0 14px;color:#3D4148;font-size:13.5px;line-height:1.6;">'
+            '<b style="color:#0E1116;">Set your password.</b> Tap the button above to '
+            'set your password and sign in. That is step one.</td></tr>'
+            # Step 2
+            '<tr><td style="vertical-align:top;padding:0 10px 14px 0;color:#2E4FB8;'
+            'font-size:14px;font-weight:700;">2.</td>'
+            '<td style="padding:0 0 14px;color:#3D4148;font-size:13.5px;line-height:1.6;">'
+            '<b style="color:#0E1116;">Save your location. This one is required.</b> '
+            'Without it, we cannot send your forecasts or alerts. On your account page, '
+            'find Saved location and click Edit. Type your address, click Look up, pick '
+            'the matching address, then click Save location.</td></tr>'
+            # Step 3
+            '<tr><td style="vertical-align:top;padding:0 10px 14px 0;color:#2E4FB8;'
+            'font-size:14px;font-weight:700;">3.</td>'
+            '<td style="padding:0 0 14px;color:#3D4148;font-size:13.5px;line-height:1.6;">'
+            '<b style="color:#0E1116;">Pick your morning brief time.</b> Choose when '
+            'your daily forecast arrives each morning, written just for your location.</td></tr>'
+            # Step 4
+            '<tr><td style="vertical-align:top;padding:0 10px 0 0;color:#2E4FB8;'
+            'font-size:14px;font-weight:700;">4.</td>'
+            '<td style="padding:0;color:#3D4148;font-size:13.5px;line-height:1.6;">'
+            '<b style="color:#0E1116;">Say hello to your meteorologist.</b> Send them a '
+            'quick message about who you are and the weather decisions that matter most '
+            'to you, so they can tailor your forecasts.</td></tr>'
+            '</table>'
+            '<p style="color:#6B7280;font-size:12.5px;line-height:1.5;margin:14px 0 0;">'
+            'Once you sign in, your account page walks you through each step. '
+            'We cannot wait to get started.</p>'
             '</div>'
         )
         after_button_text = (
-            "START HERE: ADD YOUR LOCATION\n"
-            "Once you are signed in, the first thing to do is save your location. "
-            "This step is required. Without it, we cannot send you any briefs or "
-            "alerts. Here is how to add it. On your account page, find the section "
-            "called Saved location and click Edit. Type your address into the box, "
-            "then click Look up. Select the matching address from the list that "
-            "appears, then click Save location. Your account page will then walk "
-            "you through the rest of the setup.\n\n"
+            "YOUR QUICK START LIST\n"
+            "1. Set your password. Tap the link above to set your password and sign "
+            "in. That is step one.\n"
+            "2. Save your location. This one is required. Without it, we cannot send "
+            "your forecasts or alerts. On your account page, find Saved location and "
+            "click Edit. Type your address, click Look up, pick the matching address, "
+            "then click Save location.\n"
+            "3. Pick your morning brief time. Choose when your daily forecast arrives "
+            "each morning, written just for your location.\n"
+            "4. Say hello to your meteorologist. Send them a quick message about who "
+            "you are and the weather decisions that matter most to you, so they can "
+            "tailor your forecasts.\n\n"
+            "Once you sign in, your account page walks you through each step. We "
+            "cannot wait to get started.\n\n"
         )
 
     html_body_inner = (
