@@ -3319,18 +3319,24 @@ def _send_magic_link_email(email: str, magic_link_url: str, intent: str = "sign-
             '<p style="color:#0E1116;font-size:14.5px;font-weight:700;margin:0 0 6px;">'
             'Start here: add your location</p>'
             '<p style="color:#3D4148;font-size:13.5px;line-height:1.6;margin:0;">'
-            'Once you are signed in, the first thing to do is save your location, '
-            'it is required, and without it we cannot send your briefs or alerts. '
-            'On your account page, find Saved location, click Edit, type your '
-            'address, click Look up, select the matching address, then click '
-            'Save location. Your account page also walks you through the rest.</p>'
+            'Once you are signed in, the first thing to do is save your location. '
+            'This step is required. Without it, we cannot send you any briefs or '
+            'alerts. Here is how to add it. On your account page, find the section '
+            'called Saved location and click Edit. Type your address into the box, '
+            'then click Look up. Select the matching address from the list that '
+            'appears, then click Save location. Your account page will then walk '
+            'you through the rest of the setup.</p>'
             '</div>'
         )
         after_button_text = (
-            "START HERE: After you sign in, save your location first. It is "
-            "required, without it we cannot send your briefs or alerts. On your "
-            "account page, under Saved location, click Edit, type your address, "
-            "click Look up, select the address, then click Save location.\n\n"
+            "START HERE: ADD YOUR LOCATION\n"
+            "Once you are signed in, the first thing to do is save your location. "
+            "This step is required. Without it, we cannot send you any briefs or "
+            "alerts. Here is how to add it. On your account page, find the section "
+            "called Saved location and click Edit. Type your address into the box, "
+            "then click Look up. Select the matching address from the list that "
+            "appears, then click Save location. Your account page will then walk "
+            "you through the rest of the setup.\n\n"
         )
 
     html_body_inner = (
