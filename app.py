@@ -23291,6 +23291,25 @@ def crew_apply_submit():
                             )
                     except Exception as geo_e:
                         print(f"[crew-apply] geocode error: {geo_e!r}", flush=True)
+                # Auto-approval (June 2026): no admin step. Grant the crew
+                # role immediately and stamp the application approved, then
+                # send a welcome email with a sign-in link and the Crew
+                # to-do list. The applicant is a full Crew member right away.
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO user_roles (user_id, role, granted_at)
+                           VALUES (%s, 'crew', %s)
+                           ON CONFLICT (user_id, role) DO NOTHING""",
+                        (applicant_user_id, int(time.time() * 1000)),
+                    )
+                    cur.execute(
+                        """UPDATE crew_applications
+                           SET status='approved', reviewed_at=%s,
+                               created_user_id=%s, updated_at=%s
+                           WHERE id=%s""",
+                        (int(time.time() * 1000), applicant_user_id,
+                         int(time.time() * 1000), application_id_inner),
+                    )
                 raw_token = new_secure_token()
                 token_hash = hash_token(raw_token)
                 now_seconds = int(time.time())
@@ -23301,18 +23320,18 @@ def crew_apply_submit():
                              (token_hash, user_id, created_at, expires_at, ip_requested)
                            VALUES (%s, %s, %s, %s, %s)""",
                         (token_hash, applicant_user_id, now_seconds,
-                         now_seconds + seven_days, "crew-verify"),
+                         now_seconds + seven_days, "crew-welcome"),
                     )
-                print(f"[crew-apply] magic link token minted for user_id={applicant_user_id}", flush=True)
+                print(f"[crew-apply] crew role granted + approved for user_id={applicant_user_id}", flush=True)
             base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai")
-            magic_link_url = f"{base}/?auth=verify&token={raw_token}&intent=crew-verify"
-            print(f"[crew-apply] calling _send_crew_verify_email for {email}", flush=True)
+            magic_link_url = f"{base}/?auth=verify&token={raw_token}&intent=new-account"
+            print(f"[crew-apply] calling _send_crew_welcome_email for {email}", flush=True)
             try:
-                send_result = _send_crew_verify_email(email, magic_link_url,
-                                                     applicant_name=name)
-                print(f"[crew-apply] _send_crew_verify_email returned {send_result} for {email}", flush=True)
+                send_result = _send_crew_welcome_email(email, magic_link_url,
+                                                       member_name=name)
+                print(f"[crew-apply] _send_crew_welcome_email returned {send_result} for {email}", flush=True)
             except Exception as e:
-                print(f"[crew-apply] verify email send failed: {e!r}", flush=True)
+                print(f"[crew-apply] welcome email send failed: {e!r}", flush=True)
         except Exception as e:
             print(f"[crew-apply] verification setup failed: {e!r}", flush=True)
 
@@ -23340,8 +23359,8 @@ def crew_apply_submit():
                 f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">App ID</td><td>{application_id_inner}</td></tr>'
                 '</table>'
                 '<p style="font-size:13px;color:#6E7682;margin:18px 0 0;line-height:1.55;">'
-                'They&rsquo;ve been emailed a verification link. The Crew role is granted '
-                'automatically when they click it.</p>'
+                'They&rsquo;ve been added to the Crew automatically and emailed a '
+                'welcome link with their next steps. No approval needed.</p>'
                 '</body></html>'
             )
             _send_brief_email(admin_email, admin_subject, admin_html, html=True)
@@ -23359,11 +23378,18 @@ def crew_apply_submit():
                 existing = cur.fetchone()
                 if existing:
                     if existing["status"] == "approved":
-                        return jsonify({
-                            "ok": False,
-                            "error": "already-approved",
-                            "message": "You're already a Crew member. Sign in to access your workspace.",
-                        }), 409
+                        # Already a Crew member. Update their details and
+                        # re-send a fresh welcome/sign-in link so they can
+                        # get back in. No blocking error.
+                        cur.execute(
+                            """UPDATE crew_applications
+                               SET name = %s, handle = %s, phone = %s, county = %s,
+                                   mission_interests = %s, hours = %s, notify = %s,
+                                   updated_at = %s
+                               WHERE id = %s""",
+                            (name, handle, phone, county, mission_interests, hours,
+                             notify, now_ms, existing["id"]),
+                        )
                     if existing["status"] == "pending":
                         # Update the existing pending row rather than create a duplicate
                         cur.execute(
@@ -23375,10 +23401,9 @@ def crew_apply_submit():
                             (name, handle, phone, county, mission_interests, hours,
                              notify, now_ms, existing["id"]),
                         )
-        # Pending re-submission: send a fresh verify email so they can
-        # finish joining. Previously this branch silently exited without
-        # sending anything, leaving the applicant stuck.
-        if existing and existing["status"] == "pending":
+        # Existing member (approved or pending): re-send a fresh welcome
+        # + sign-in link so they can finish or get back in.
+        if existing and existing["status"] in ("approved", "pending"):
             _crew_send_verify_and_notify(existing["id"])
             return jsonify({
                 "ok": True,
@@ -23389,7 +23414,7 @@ def crew_apply_submit():
         with db() as conn:
             with conn.cursor() as cur:
                 if existing and existing["status"] == "rejected":
-                    # 'rejected' — allow them to re-apply by clearing rejection
+                    # 'rejected' — allow them to re-join by clearing rejection
                     cur.execute(
                         """UPDATE crew_applications
                            SET status='pending', name=%s, handle=%s, phone=%s, county=%s,
@@ -23402,7 +23427,9 @@ def crew_apply_submit():
                     )
                     reapply_id = existing["id"]
                 else:
-                    # New application
+                    # New application — created as 'pending', then the
+                    # helper below grants the crew role and flips it to
+                    # 'approved' (auto-approval, June 2026).
                     cur.execute(
                         """INSERT INTO crew_applications
                            (created_at, updated_at, status, name, handle, email, phone,
@@ -23415,7 +23442,7 @@ def crew_apply_submit():
                     row = cur.fetchone()
                     reapply_id = row["id"]
 
-        # Send verify + notify admin for both new applications and rejected-reapplies.
+        # Grant crew role + send welcome for new joins and rejected-rejoins.
         _crew_send_verify_and_notify(reapply_id)
 
         print(f"[crew-apply] application id={reapply_id} email={email}", flush=True)
@@ -23424,6 +23451,117 @@ def crew_apply_submit():
         print(f"[crew-apply] insert failed for {email}: {e!r}", flush=True)
         return jsonify({"ok": False, "error": "internal-error"}), 500
 
+
+def _send_crew_welcome_email(email: str, magic_link_url: str,
+                             member_name: str = "") -> bool:
+    """Send the Valet Crew welcome email with a sign-in link and the Crew
+    to-do list (June 2026). Sent the moment someone joins the Crew, since
+    joining is now instant with no approval step.
+
+    Uses urllib + Resend, matching the rest of our outbound mail. Returns
+    True if Resend accepted the request.
+    """
+    if not RESEND_API_KEY:
+        print("[crew-welcome-email] RESEND_API_KEY not set, skipping", flush=True)
+        return False
+    greeting_name = member_name.strip() if member_name and member_name.strip() else "there"
+    steps = [
+        ("Set your password.",
+         "Tap the button above to set your password and sign in. That is step one."),
+        ("Confirm your location.",
+         "On your Crew page, set your location so we know which part of the "
+         "community you are reporting for. This is how your reports help your "
+         "neighbors and our Meteorologists."),
+        ("Reply to your daily check-in.",
+         "Each day we will message you to ask what the weather looks like where "
+         "you are. Just reply with what you see (clear, cloudy, rain, storm, and "
+         "so on). Every reply keeps your streak going and puts you on the Crew map."),
+        ("Report it when weather hits.",
+         "When you see something worth flagging (storms, hail, high wind, "
+         "flooding), send a quick report. Your eyes on the ground help our "
+         "Meteorologists keep everyone safe."),
+    ]
+    rows_html = ""
+    for i, (t, b) in enumerate(steps):
+        last = (i == len(steps) - 1)
+        pad = "0" if last else "0 0 14px"
+        numpad = "0 10px 0 0" if last else "0 10px 14px 0"
+        rows_html += (
+            f'<tr><td style="vertical-align:top;padding:{numpad};color:#2E4FB8;'
+            f'font-size:14px;font-weight:700;">{i + 1}.</td>'
+            f'<td style="padding:{pad};color:#3D4148;font-size:13.5px;line-height:1.6;">'
+            f'<b style="color:#0E1116;">{t}</b> {b}</td></tr>'
+        )
+    rows_text = "".join(f"{i + 1}. {t} {b}\n" for i, (t, b) in enumerate(steps))
+    try:
+        subject = "Welcome to the Valet Crew! Let's get you started"
+        html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style="margin:0;padding:0;background:#F8F9FB;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#0E1116;">
+  <div style="max-width:560px;margin:32px auto;padding:32px 28px;background:#fff;border-radius:12px;box-shadow:0 1px 3px rgba(15,17,22,0.06);">
+    <h1 style="font-size:22px;font-weight:700;margin:0 0 14px;">Welcome to the Valet Crew, {greeting_name}!</h1>
+    <p style="font-size:15px;line-height:1.55;color:rgba(15,17,22,0.75);margin:0 0 22px;">
+      You are officially on the Crew. You will help your community and our Meteorologists by sharing what the weather is really doing where you are. Here is how to get started. It only takes a few minutes.
+    </p>
+    <div style="text-align:center;margin:24px 0;">
+      <a href="{magic_link_url}" style="display:inline-block;background:#2E4FB8;color:#fff;text-decoration:none;padding:13px 28px;border-radius:8px;font-weight:600;font-size:15px;">Set your password</a>
+    </div>
+    <div style="background:#F4F6FB;border:1px solid #DCE3F5;border-radius:10px;padding:18px 20px;margin:0 0 22px;">
+      <p style="color:#0E1116;font-size:15px;font-weight:700;margin:0 0 12px;">Your quick start list</p>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;">{rows_html}</table>
+      <p style="color:#6B7280;font-size:12.5px;line-height:1.5;margin:14px 0 0;">
+        Thank you for joining. Your reports make a real difference.
+      </p>
+    </div>
+    <p style="font-size:12.5px;line-height:1.55;color:rgba(15,17,22,0.55);margin:0;">
+      This sign-in link is valid for 7 days. Questions? Just reply to this email and a human will read it.
+    </p>
+  </div>
+</body></html>"""
+        text = (f"Welcome to the Valet Crew, {greeting_name}!\n\n"
+                "You are officially on the Crew. You will help your community and "
+                "our Meteorologists by sharing what the weather is really doing "
+                "where you are. Here is how to get started.\n\n"
+                f"Set your password: {magic_link_url}\n\n"
+                "YOUR QUICK START LIST\n"
+                f"{rows_text}\n"
+                "Thank you for joining. Your reports make a real difference. "
+                "This sign-in link is valid for 7 days. Questions? Just reply to "
+                "this email and a human will read it.")
+        from_addr = os.environ.get("EMAIL_FROM", "").strip() or "WeatherValet <hello@weathervalet.ai>"
+        payload = json.dumps({
+            "from": from_addr,
+            "to": [email],
+            "subject": subject,
+            "html": html,
+            "text": text,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "https://api.resend.com/emails",
+            data=payload,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json",
+                "User-Agent": "WeatherValet-Backend/1.0 (+https://weathervalet.ai)",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if 200 <= resp.status < 300:
+                return True
+            print(f"[crew-welcome-email] Resend returned status {resp.status}", flush=True)
+            return False
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        print(f"[crew-welcome-email] Resend HTTPError {e.code}: {body}", flush=True)
+        return False
+    except Exception as e:
+        print(f"[crew-welcome-email] failed: {e!r}", flush=True)
+        return False
 
 def _send_crew_verify_email(email: str, magic_link_url: str,
                             applicant_name: str = "") -> bool:
