@@ -15371,9 +15371,22 @@ def _match_user_by_phone(phone: str) -> tuple[int | None, int | None]:
 
 
 def _match_user_by_email(email: str) -> tuple[int | None, int | None]:
-    """Look up a subscriber by email. Returns (user_id, primary_met_id)."""
+    """Look up a subscriber by email. Returns (user_id, primary_met_id).
+
+    Parses a bare address out of display-name forms like
+    'Vanessa Smith <vanessa@county.gov>' before matching, so inbound
+    replies that arrive with a formatted From still match the account.
+    """
     if not email:
         return None, None
+    # Extract the bare address if the From arrived as "Name <addr>".
+    try:
+        from email.utils import parseaddr
+        parsed = parseaddr(email)[1]
+        if parsed:
+            email = parsed
+    except Exception:
+        pass
     e = email.strip().lower()
     if not e or "@" not in e:
         return None, None
