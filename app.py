@@ -14874,7 +14874,7 @@ def _send_team_invite_email(email: str, magic_link_url: str,
   <div style="max-width:560px;margin:32px auto;padding:32px 28px;background:#fff;border-radius:12px;box-shadow:0 1px 3px rgba(15,17,22,0.06);">
     <h1 style="font-size:22px;font-weight:600;margin:0 0 16px;">Hi {member_name},</h1>
     <p style="font-size:15px;line-height:1.55;color:rgba(15,17,22,0.75);margin:0 0 14px;">
-      {primary_name} has added you to their WeatherValet team. You&rsquo;ll receive their daily meteorologist briefs and severe weather alerts, plus you can message their meteorologist team directly.
+      {primary_name} has added you to their WeatherValet team. You&rsquo;ll receive their daily Meteorologist briefs and severe weather alerts, plus you can message their Meteorologist team directly.
     </p>
     <p style="font-size:15px;line-height:1.55;color:rgba(15,17,22,0.75);margin:0 0 22px;">
       Tap the button below to set your password and get started. This link is valid for 7 days.
@@ -14889,26 +14889,43 @@ def _send_team_invite_email(email: str, magic_link_url: str,
 </body></html>"""
         text = (f"Hi {member_name},\n\n"
                 f"{primary_name} has added you to their WeatherValet team. "
-                "You'll receive their daily meteorologist briefs and severe "
-                "weather alerts, plus you can message their meteorologist "
+                "You'll receive their daily Meteorologist briefs and severe "
+                "weather alerts, plus you can message their Meteorologist "
                 "team directly.\n\n"
                 "Tap the link below to set your password and get started. "
                 f"This link is valid for 7 days.\n\n{magic_link_url}\n\n"
                 "Questions? Just reply to this email and a human will read it.")
-        resend_headers = {
-            "Authorization": f"Bearer {RESEND_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        resend_body = {
-            "from": "WeatherValet <hello@weathervalet.ai>",
+        from_addr = os.environ.get("EMAIL_FROM", "").strip() or "WeatherValet <hello@weathervalet.ai>"
+        payload = json.dumps({
+            "from": from_addr,
             "to": [email],
             "subject": subject,
             "html": html,
             "text": text,
-        }
-        resp = requests.post("https://api.resend.com/emails",
-                              json=resend_body, headers=resend_headers, timeout=10)
-        return resp.status_code in (200, 201, 202)
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "https://api.resend.com/emails",
+            data=payload,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json",
+                "User-Agent": "WeatherValet-Backend/1.0 (+https://weathervalet.ai)",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if 200 <= resp.status < 300:
+                return True
+            print(f"[team-invite-email] Resend returned status {resp.status}", flush=True)
+            return False
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        print(f"[team-invite-email] Resend HTTPError {e.code}: {body}", flush=True)
+        return False
     except Exception as e:
         print(f"[team-invite-email] failed: {e!r}", flush=True)
         return False
