@@ -23189,6 +23189,12 @@ def crew_apply_submit():
     phone = normalize_phone(phone_raw) if phone_raw else None
     county = (data.get("county") or "").strip() or None
     state = (data.get("state") or "").strip() or None
+    zip_code = (data.get("zip") or "").strip() or None
+    # Keep only a clean 5-digit US zip; ignore anything else.
+    if zip_code:
+        import re as _re_zip
+        m = _re_zip.match(r"^(\d{5})", zip_code)
+        zip_code = m.group(1) if m else None
 
     interests_list = data.get("mission_interests") or []
     if isinstance(interests_list, str):
@@ -23238,21 +23244,26 @@ def crew_apply_submit():
                                WHERE id = %s AND (phone IS NULL OR phone = '')""",
                             (phone, applicant_user_id),
                         )
-                # Geocode the applicant's county (May 29, 2026) so they
-                # become targetable on the mission deploy map immediately.
-                # Non-blocking: if geocoding fails we still create the
-                # applicant + send the verify link; they can set a precise
-                # location later via /api/v1/me/crew-location.
-                if county:
+                # Geocode the applicant so they become targetable on the
+                # mission deploy map immediately. We prefer the zip code,
+                # which geocodes to a tight, accurate point; if there is no
+                # usable zip we fall back to county + state. Non-blocking:
+                # if geocoding fails we still create the applicant and send
+                # the welcome link; they can set a precise location later
+                # via /api/v1/me/crew-location.
+                if zip_code or county:
                     try:
-                        # Combine the county with the explicitly chosen state so
-                        # the geocoder cannot drift to a same-named place in
-                        # another state (e.g. "Nebraska" the small Indiana town
-                        # vs. the state of Nebraska). The confidence gate below
-                        # then checks the result against this fuller query.
-                        geo_query = county
-                        if state and state.lower() not in county.lower():
-                            geo_query = county + ", " + state
+                        # Build the geocode query, zip first (most precise).
+                        # State is appended for the county fallback so the
+                        # geocoder cannot drift to a same-named place in
+                        # another state. The confidence gate below then
+                        # checks the result against this query.
+                        if zip_code:
+                            geo_query = zip_code + ", USA"
+                        else:
+                            geo_query = county
+                            if state and state.lower() not in county.lower():
+                                geo_query = county + ", " + state
                         geo = _geocode_address(geo_query)
                         if geo and geo.get("lat") is not None and geo.get("lng") is not None:
                             conf_ok, conf_reason = _geocode_looks_confident(geo_query, geo)
