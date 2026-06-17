@@ -22475,12 +22475,16 @@ def _dispatch_mission_sms(mission_id: int, prompt: str, polygon_geojson: Optiona
         resp_token = new_secure_token()
         response_url = f"{base_url}/?mission={resp_token}"
 
-        # Compose the SMS. Short, scannable, with the prompt and a link.
-        # 160-char SMS limit is generous; we keep messages tight but
-        # don't artificially truncate the prompt.
+        # Compose the SMS. The prompt cap matches the compose field's
+        # 600-char limit so the full mission message the Met wrote goes
+        # out (a 300 cap was silently cutting longer prompts). Messages
+        # over 160 chars send as multiple SMS segments, which is fine;
+        # the 600 ceiling keeps a runaway prompt from ballooning cost or
+        # carrier-filtering risk.
+        _PROMPT_SMS_CAP = 600
         sms_body = (
             f"WeatherValet mission ({template_name}):\n"
-            f"{prompt[:300]}{'…' if len(prompt) > 300 else ''}\n\n"
+            f"{prompt[:_PROMPT_SMS_CAP]}{'…' if len(prompt) > _PROMPT_SMS_CAP else ''}\n\n"
             f"Respond: {response_url}\n"
             f"Reply STOP to opt out."
         )
