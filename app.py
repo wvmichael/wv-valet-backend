@@ -2160,6 +2160,14 @@ CREATE INDEX IF NOT EXISTS idx_pmm_primary
 CREATE INDEX IF NOT EXISTS idx_pmm_member
     ON pro_multi_memberships(member_user_id, status);
 
+-- invite_sent_at (June 2026): seconds-since-epoch when the invite email
+-- was last successfully sent. NULL means the member has never received a
+-- working invite. Used to (a) power the manual "Resend invite" action and
+-- (b) let a self-healing scheduler job re-send invites that never went out
+-- (e.g. the team-invite emails that silently failed before the send bug
+-- was fixed). Stamped only on a successful send.
+ALTER TABLE pro_multi_memberships ADD COLUMN IF NOT EXISTS invite_sent_at BIGINT;
+
 -- ── Storm Shelter Met messages (May 20, 2026) ──
 -- Optional Met-written messages that appear in subscribers' Storm
 -- Shelter during an active warning. Per the May 19 design discussion:
@@ -14798,6 +14806,17 @@ def me_team_invite():
                                    primary_name=primary_name,
                                    member_name=member_name):
             magic_link_sent = True
+            # Record that a working invite went out, so the self-healing
+            # job does not re-send and the UI can show invite status.
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE pro_multi_memberships SET invite_sent_at = %s WHERE id = %s",
+                            (now_ts(), membership_id),
+                        )
+            except Exception as e:
+                print(f"[team-invite] stamp invite_sent_at failed: {e!r}", flush=True)
     except Exception as e:
         print(f"[team-invite] email failed: {e!r}", flush=True)
 
@@ -14854,6 +14873,101 @@ def me_team_remove(membership_id: int):
 
     return jsonify({"ok": True})
 
+
+def _send_membership_invite(membership_id: int) -> bool:
+    """Mint a fresh 7-day magic link for a pending team member and send the
+    invite email. Stamps invite_sent_at on success. Shared by the manual
+    "Resend invite" action and the self-healing scheduler job.
+
+    Returns True if the invite email was accepted by Resend.
+    """
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT m.id, m.member_user_id, m.status,
+                              mu.email AS member_email, mu.name AS member_name,
+                              pu.name AS primary_name
+                       FROM pro_multi_memberships m
+                       JOIN users mu ON mu.id = m.member_user_id
+                       JOIN users pu ON pu.id = m.primary_user_id
+                       WHERE m.id = %s""",
+                    (membership_id,),
+                )
+                row = cur.fetchone()
+        if not row or not row.get("member_email"):
+            return False
+
+        now_seconds = now_ts()
+        seven_days_seconds = 7 * 24 * 60 * 60
+        raw_token = new_secure_token()
+        token_hash = hash_token(raw_token)
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO magic_link_tokens
+                         (token_hash, user_id, created_at, expires_at, ip_requested)
+                       VALUES (%s, %s, %s, %s, %s)""",
+                    (token_hash, row["member_user_id"], now_seconds,
+                     now_seconds + seven_days_seconds, "team-invite-resend"),
+                )
+        base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai")
+        magic_link_url = f"{base}/?auth=verify&token={raw_token}&intent=team-invite"
+        primary_name = row.get("primary_name") or "your team lead"
+        member_name = row.get("member_name") or "there"
+        if _send_team_invite_email(row["member_email"], magic_link_url,
+                                   primary_name=primary_name,
+                                   member_name=member_name):
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE pro_multi_memberships SET invite_sent_at = %s WHERE id = %s",
+                        (now_seconds, membership_id),
+                    )
+            return True
+        return False
+    except Exception as e:
+        print(f"[membership-invite] send failed for membership={membership_id}: {e!r}", flush=True)
+        return False
+
+
+@app.route("/api/v1/me/team/<int:membership_id>/resend-invite", methods=["OPTIONS"])
+def _me_team_resend_preflight(membership_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/me/team/<int:membership_id>/resend-invite")
+def me_team_resend_invite(membership_id: int):
+    """Resend the invite email to a pending team member. Owner-only."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    tier = (user.get("subscription_tier") or "").lower()
+    if tier not in TEAM_ELIGIBLE_TIERS:
+        return jsonify({"ok": False, "error": "not-team-eligible"}), 403
+
+    # Verify the membership belongs to THIS primary and is still pending.
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, status FROM pro_multi_memberships
+                       WHERE id = %s AND primary_user_id = %s""",
+                    (membership_id, user["id"]),
+                )
+                row = cur.fetchone()
+    except Exception as e:
+        print(f"[team-resend] lookup failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+    if not row:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    if row.get("status") == "removed":
+        return jsonify({"ok": False, "error": "removed"}), 400
+
+    if _send_membership_invite(membership_id):
+        return jsonify({"ok": True, "sent": True})
+    return jsonify({"ok": False, "error": "send-failed",
+                    "message": "We couldn't send the invite just now. Please try again in a moment."}), 502
 
 def _send_team_invite_email(email: str, magic_link_url: str,
                             primary_name: str, member_name: str) -> bool:
@@ -20591,6 +20705,54 @@ def _pregenerate_pro_brief_drafts_inner() -> None:
             print(f"[pregen-pro] FAILED for user_id={c.get('user_id')}: {e!r}", flush=True)
 
 
+def _process_pending_team_invites() -> None:
+    """Self-healing team invites (June 2026).
+
+    Finds pending team members who never received a working invite email
+    (invite_sent_at IS NULL) and who have not set up their account yet
+    (password_hash IS NULL), then sends the invite. This automatically
+    recovers members added while the invite-email send was broken, with
+    no action needed from the account owner.
+
+    Self-limiting: once an invite sends, invite_sent_at is stamped so the
+    row is never picked up again. New invites stamp on creation, so the
+    normal flow is untouched. Scoped to memberships invited in the last
+    30 days and capped per tick to avoid email bursts.
+
+    Concurrency: advisory lock (key 91234573), distinct from other jobs.
+    """
+    _LOCK_KEY = 91234573
+    _lock_conn = _try_acquire_scheduler_lock(_LOCK_KEY)
+    if _lock_conn is None:
+        return
+    try:
+        cutoff = now_ts() - 30 * 24 * 60 * 60
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT m.id
+                       FROM pro_multi_memberships m
+                       JOIN users mu ON mu.id = m.member_user_id
+                       WHERE m.status = 'pending'
+                         AND m.invite_sent_at IS NULL
+                         AND m.invited_at >= %s
+                         AND mu.password_hash IS NULL
+                       ORDER BY m.invited_at ASC
+                       LIMIT 25""",
+                    (cutoff,),
+                )
+                rows = cur.fetchall() or []
+        if not rows:
+            return
+        for r in rows:
+            mid = r["id"]
+            if _send_membership_invite(mid):
+                print(f"[team-invite-heal] sent recovery invite for membership={mid}", flush=True)
+            else:
+                print(f"[team-invite-heal] could not send for membership={mid}; will retry", flush=True)
+    finally:
+        _release_scheduler_lock(_lock_conn, _LOCK_KEY)
+
 def _process_expired_trials() -> None:
     """Auto-expire Boone free trials that have passed their end date and
     have NOT converted to paid (June 2026).
@@ -20771,6 +20933,10 @@ def _brief_scheduler_loop() -> None:
             _process_expired_trials()
         except Exception as e:
             print(f"[trial-expiry] tick failed: {e!r}", flush=True)
+        try:
+            _process_pending_team_invites()
+        except Exception as e:
+            print(f"[team-invite-heal] tick failed: {e!r}", flush=True)
         time.sleep(60)
 
 
