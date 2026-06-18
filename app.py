@@ -24811,6 +24811,147 @@ def crew_reports_list():
     })
 
 
+# ════════════════════════════════════════════════════════════════════
+# Public Crew report feed (June 18, 2026)
+# ════════════════════════════════════════════════════════════════════
+#
+# Read-only JSON feed of recent Valet Crew reports, built for the
+# separate 24/7 AI-hosted weather livestream product to poll about once
+# a minute and read aloud / display on air.
+#
+# It serves ONLY the fields already public on the in-app Live Feed map
+# (see crew_reports_list above): no email, phone, home address, or
+# account id. The "handle" is the same public display name the map
+# already shows. is_hidden (admin-moderated) reports are excluded, same
+# as the map. The report "id" is the stable crew_reports row id, so the
+# consumer will not re-read the same report on every poll.
+#
+# Auth: public by default. To gate it, set the CREW_PUBLIC_FEED_API_KEY
+# env var in Render and the caller must send a matching X-API-Key header.
+#
+# Test flag: every report carries is_test, read from the
+# CREW_PUBLIC_FEED_IS_TEST env var (default "true"). Flip that env var to
+# "false" in Render once real Crew reports are flowing, so the livestream
+# knows the feed is real.
+
+# Categories the consumer recognizes. Anything else maps to "other".
+_PUBLIC_CREW_FEED_CATEGORIES = {
+    "storm", "hail", "wind", "rain", "snow", "sleet", "freezing_rain",
+    "fog", "flood", "tornado", "lightning", "clear", "other",
+}
+
+
+@app.route("/public/crew-reports", methods=["OPTIONS"])
+def _public_crew_reports_preflight():
+    return ("", 204)
+
+
+@app.get("/public/crew-reports")
+def public_crew_reports():
+    """Public, read-only feed of recent Crew reports, newest first.
+
+    Query params:
+        minutes  - lookback window in minutes (default 180, max 10080)
+        state    - 2-letter filter, e.g. IN (see note below)
+        limit    - max rows (default 200, hard cap 1000)
+
+    NOTE on place/county/state: crew_reports stores only lat/lng, the
+    same as the public map. There is no stored state or place label, so
+    place/county/state are returned as null and the state filter is
+    currently a no-op. The fields are kept in the contract so the shape
+    is stable; they can be populated later by stamping a label at submit
+    time plus a one-time backfill.
+    """
+    # Optional API-key gate. Off unless CREW_PUBLIC_FEED_API_KEY is set.
+    required_key = os.environ.get("CREW_PUBLIC_FEED_API_KEY", "").strip()
+    if required_key:
+        sent_key = (request.headers.get("X-API-Key") or "").strip()
+        if sent_key != required_key:
+            resp = jsonify({"ok": False, "error": "unauthorized"})
+            resp.headers["Access-Control-Allow-Origin"] = "*"
+            return resp, 401
+
+    try:
+        minutes = int(request.args.get("minutes", 180))
+    except (TypeError, ValueError):
+        minutes = 180
+    if minutes < 1:
+        minutes = 1
+    if minutes > 10080:  # cap at 7 days
+        minutes = 10080
+
+    try:
+        limit = int(request.args.get("limit", 200))
+    except (TypeError, ValueError):
+        limit = 200
+    if limit < 1:
+        limit = 1
+    if limit > 1000:
+        limit = 1000
+
+    cutoff_ms = int(time.time() * 1000) - (minutes * 60 * 1000)
+    is_test = os.environ.get("CREW_PUBLIC_FEED_IS_TEST", "true").strip().lower() != "false"
+
+    rows = []
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, user_name, report_type,
+                              latitude, longitude, notes, image_url,
+                              verified_count, created_at, cited_at
+                       FROM crew_reports
+                       WHERE is_hidden = FALSE
+                         AND created_at >= %s
+                       ORDER BY created_at DESC LIMIT %s""",
+                    (cutoff_ms, limit),
+                )
+                rows = cur.fetchall()
+    except Exception as e:
+        print(f"[public-crew-reports] failed: {e!r}", flush=True)
+        resp = jsonify({"ok": False, "error": "db-error"})
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        return resp, 500
+
+    def _iso(ms):
+        try:
+            return datetime.fromtimestamp(
+                int(ms) / 1000, tz=timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
+
+    reports = []
+    for r in rows:
+        cat = (r.get("report_type") or "other").strip().lower()
+        if cat not in _PUBLIC_CREW_FEED_CATEGORIES:
+            cat = "other"
+        handle = (r.get("user_name") or "").strip() or "Anonymous"
+        reports.append({
+            "id": str(r["id"]),
+            "created_at": _iso(r["created_at"]),
+            "category": cat,
+            "note": r.get("notes") or "",
+            "lat": r["latitude"],
+            "lon": r["longitude"],
+            "place": None,
+            "county": None,
+            "state": None,
+            "handle": handle,
+            "photo_url": (r.get("image_url") or None),
+            "verified": bool(r.get("verified_count") or r.get("cited_at")),
+            "is_test": is_test,
+        })
+
+    resp = jsonify({
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "reports": reports,
+    })
+    resp.headers["Cache-Control"] = "public, max-age=30"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
 @app.post("/api/v1/crew/reports")
 def crew_reports_submit():
     """Submit a new Crew report. Crew only.
