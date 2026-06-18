@@ -14195,6 +14195,24 @@ def me_subscription():
     if not member_since_ms or member_since_ms < 1704067200000:  # Jan 1, 2024
         member_since_ms = None
 
+    # Is this user a team member of someone else's account? Members are
+    # full subscribers (own location, own briefs) but do not manage the
+    # team roster, so the onboarding checklist hides "add your team" for
+    # them.
+    is_team_member = False
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT 1 FROM pro_multi_memberships
+                       WHERE member_user_id = %s AND status IN ('pending','active')
+                       LIMIT 1""",
+                    (user["id"],),
+                )
+                is_team_member = cur.fetchone() is not None
+    except Exception:
+        is_team_member = False
+
     return jsonify({
         "ok": True,
         "plan": plan,
@@ -14203,6 +14221,7 @@ def me_subscription():
         "next_billing_at": next_billing_at,
         "member_since": member_since_ms,
         "is_active": row["is_active"] if "is_active" in row else True,
+        "is_team_member": is_team_member,
         "stripe_customer_id": row.get("stripe_customer_id"),
         "is_starter_month": is_starter_month,
         "starter_renews_at": starter_renews_ms,
@@ -14711,23 +14730,28 @@ def me_team_invite():
                 existing = cur.fetchone()
                 if existing:
                     member_user_id = existing["id"]
-                    # Update name/phone if provided, mark active
+                    # Update name/phone if provided, mark active, and give
+                    # the member the primary's subscription tier so they are
+                    # a full subscriber: their own location gets its own
+                    # daily brief, alerts, and Met messaging. The primary's
+                    # plan is what pays for it.
                     cur.execute(
                         """UPDATE users SET
                              name = COALESCE(NULLIF(%s, ''), name),
                              phone = COALESCE(NULLIF(%s, ''), phone),
+                             subscription_tier = COALESCE(subscription_tier, %s),
                              is_active = TRUE
                            WHERE id = %s""",
-                        (member_name, member_phone, member_user_id),
+                        (member_name, member_phone, tier, member_user_id),
                     )
                 else:
                     cur.execute(
                         """INSERT INTO users
-                             (email, name, phone, created_at, is_active,
-                              password_must_change)
-                           VALUES (%s, %s, %s, %s, TRUE, TRUE)
+                             (email, name, phone, subscription_tier, created_at,
+                              is_active, password_must_change)
+                           VALUES (%s, %s, %s, %s, %s, TRUE, TRUE)
                            RETURNING id""",
-                        (member_email, member_name, member_phone, now_ms),
+                        (member_email, member_name, member_phone, tier, now_ms),
                     )
                     member_user_id = cur.fetchone()["id"]
 
@@ -14988,27 +15012,48 @@ def _send_team_invite_email(email: str, magic_link_url: str,
   <div style="max-width:560px;margin:32px auto;padding:32px 28px;background:#fff;border-radius:12px;box-shadow:0 1px 3px rgba(15,17,22,0.06);">
     <h1 style="font-size:22px;font-weight:600;margin:0 0 16px;">Hi {member_name},</h1>
     <p style="font-size:15px;line-height:1.55;color:rgba(15,17,22,0.75);margin:0 0 14px;">
-      {primary_name} has added you to their WeatherValet team. You&rsquo;ll receive their daily Meteorologist briefs and severe weather alerts, plus you can message their Meteorologist team directly.
+      {primary_name} has added you to their WeatherValet team, and it is all set up and paid for. You get your own account with daily Meteorologist briefs and severe weather alerts for your own location, plus you can message your Meteorologist directly. Use it for work and for your own life.
     </p>
-    <p style="font-size:15px;line-height:1.55;color:rgba(15,17,22,0.75);margin:0 0 22px;">
-      Tap the button below to set your password and get started. This link is valid for 7 days.
-    </p>
-    <div style="text-align:center;margin:28px 0;">
-      <a href="{magic_link_url}" style="display:inline-block;background:#2E4FB8;color:#fff;text-decoration:none;padding:13px 28px;border-radius:8px;font-weight:600;font-size:15px;">Set up my access</a>
+    <div style="text-align:center;margin:24px 0;">
+      <a href="{magic_link_url}" style="display:inline-block;background:#2E4FB8;color:#fff;text-decoration:none;padding:13px 28px;border-radius:8px;font-weight:600;font-size:15px;">Set your password</a>
     </div>
-    <p style="font-size:13px;line-height:1.55;color:rgba(15,17,22,0.55);margin:22px 0 0;">
+    <div style="background:#F4F6FB;border:1px solid #DCE3F5;border-radius:10px;padding:18px 20px;margin:0 0 22px;">
+      <p style="color:#0E1116;font-size:15px;font-weight:700;margin:0 0 12px;">Your quick start list</p>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;">
+        <tr><td style="vertical-align:top;padding:0 10px 14px 0;color:#2E4FB8;font-size:14px;font-weight:700;">1.</td>
+          <td style="padding:0 0 14px;color:#3D4148;font-size:13.5px;line-height:1.6;"><b style="color:#0E1116;">Set your password.</b> Tap the button above to set your password and sign in.</td></tr>
+        <tr><td style="vertical-align:top;padding:0 10px 14px 0;color:#2E4FB8;font-size:14px;font-weight:700;">2.</td>
+          <td style="padding:0 0 14px;color:#3D4148;font-size:13.5px;line-height:1.6;"><b style="color:#0E1116;">Save your location. This one is required.</b> Without it, we cannot send your forecasts or alerts. On your account page, find Saved location and enter your zip code, then click Save location.</td></tr>
+        <tr><td style="vertical-align:top;padding:0 10px 14px 0;color:#2E4FB8;font-size:14px;font-weight:700;">3.</td>
+          <td style="padding:0 0 14px;color:#3D4148;font-size:13.5px;line-height:1.6;"><b style="color:#0E1116;">Pick your morning brief time.</b> Choose when your daily forecast arrives, written just for your location.</td></tr>
+        <tr><td style="vertical-align:top;padding:0 10px 0 0;color:#2E4FB8;font-size:14px;font-weight:700;">4.</td>
+          <td style="padding:0;color:#3D4148;font-size:13.5px;line-height:1.6;"><b style="color:#0E1116;">Say hello to your Meteorologist.</b> Send a quick message about who you are and the weather decisions that matter most to you.</td></tr>
+      </table>
+      <p style="color:#6B7280;font-size:12.5px;line-height:1.5;margin:14px 0 0;">Your account page walks you through each step. This link is valid for 7 days.</p>
+    </div>
+    <p style="font-size:13px;line-height:1.55;color:rgba(15,17,22,0.55);margin:0;">
       Questions? Just reply to this email and a human will read it.
     </p>
   </div>
 </body></html>"""
         text = (f"Hi {member_name},\n\n"
-                f"{primary_name} has added you to their WeatherValet team. "
-                "You'll receive their daily Meteorologist briefs and severe "
-                "weather alerts, plus you can message their Meteorologist "
-                "team directly.\n\n"
-                "Tap the link below to set your password and get started. "
-                f"This link is valid for 7 days.\n\n{magic_link_url}\n\n"
-                "Questions? Just reply to this email and a human will read it.")
+                f"{primary_name} has added you to their WeatherValet team, and "
+                "it is all set up and paid for. You get your own account with "
+                "daily Meteorologist briefs and severe weather alerts for your "
+                "own location, plus you can message your Meteorologist directly. "
+                "Use it for work and for your own life.\n\n"
+                f"Set your password: {magic_link_url}\n\n"
+                "YOUR QUICK START LIST\n"
+                "1. Set your password. Tap the link above to set your password and sign in.\n"
+                "2. Save your location. This one is required. Without it, we cannot "
+                "send your forecasts or alerts. On your account page, find Saved "
+                "location and enter your zip code, then click Save location.\n"
+                "3. Pick your morning brief time. Choose when your daily forecast "
+                "arrives, written just for your location.\n"
+                "4. Say hello to your Meteorologist. Send a quick message about who "
+                "you are and the weather decisions that matter most to you.\n\n"
+                "Your account page walks you through each step. This link is valid "
+                "for 7 days. Questions? Just reply to this email and a human will read it.")
         from_addr = os.environ.get("EMAIL_FROM", "").strip() or "WeatherValet <hello@weathervalet.ai>"
         payload = json.dumps({
             "from": from_addr,
@@ -20719,18 +20764,18 @@ def _pregenerate_pro_brief_drafts_inner() -> None:
 
 
 def _process_pending_team_invites() -> None:
-    """Self-healing team invites (June 2026).
+    """Self-healing team members (June 2026).
 
-    Finds pending team members who never received a working invite email
-    (invite_sent_at IS NULL) and who have not set up their account yet
-    (password_hash IS NULL), then sends the invite. This automatically
-    recovers members added while the invite-email send was broken, with
-    no action needed from the account owner.
-
-    Self-limiting: once an invite sends, invite_sent_at is stamped so the
-    row is never picked up again. New invites stamp on creation, so the
-    normal flow is untouched. Scoped to memberships invited in the last
-    30 days and capped per tick to avoid email bursts.
+    Three jobs in one, all idempotent and self-limiting:
+      1. Backfill subscription_tier on members (inherit the primary's) so
+         their own location gets its own daily brief and alerts.
+      2. Re-send the onboarding invite to members who never got a working
+         one (password not set).
+      3. Re-send onboarding to members who signed up but never saved a
+         location, so they are walked through setting their zip.
+    Groups 2 and 3 are throttled by invite_sent_at (stamped on a
+    successful send) so no member is emailed twice from here. Scoped to
+    memberships invited in the last 30 days and capped per tick.
 
     Concurrency: advisory lock (key 91234573), distinct from other jobs.
     """
@@ -20739,17 +20784,53 @@ def _process_pending_team_invites() -> None:
     if _lock_conn is None:
         return
     try:
+        # Tier backfill: existing team members were created without a
+        # subscription_tier, which left them out of the brief pipeline
+        # entirely (briefs only generate for pro-tier users). Give every
+        # member the primary's tier so their own location gets its own
+        # daily brief and alerts. Idempotent: only fills NULL tiers, so it
+        # does nothing once everyone is fixed.
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """UPDATE users mu
+                           SET subscription_tier = pu.subscription_tier
+                           FROM pro_multi_memberships m
+                           JOIN users pu ON pu.id = m.primary_user_id
+                           WHERE mu.id = m.member_user_id
+                             AND m.status IN ('pending','active')
+                             AND mu.subscription_tier IS NULL
+                             AND pu.subscription_tier IS NOT NULL""",
+                    )
+                    if cur.rowcount:
+                        print(f"[team-invite-heal] backfilled tier for {cur.rowcount} member(s)", flush=True)
+        except Exception as e:
+            print(f"[team-invite-heal] tier backfill failed: {e!r}", flush=True)
+
         cutoff = now_ts() - 30 * 24 * 60 * 60
         with db() as conn:
             with conn.cursor() as cur:
+                # Pick up two groups, both throttled by invite_sent_at so we
+                # never email the same member twice from here:
+                #   (a) never received a working invite (password not set), and
+                #   (b) signed up but never saved a location (so they get no
+                #       briefs/alerts) — the onboarding email walks them through
+                #       setting their zip.
                 cur.execute(
                     """SELECT m.id
                        FROM pro_multi_memberships m
                        JOIN users mu ON mu.id = m.member_user_id
-                       WHERE m.status = 'pending'
+                       WHERE m.status IN ('pending','active')
                          AND m.invite_sent_at IS NULL
                          AND m.invited_at >= %s
-                         AND mu.password_hash IS NULL
+                         AND (
+                               mu.password_hash IS NULL
+                               OR NOT EXISTS (
+                                   SELECT 1 FROM saved_locations sl
+                                   WHERE sl.user_id = mu.id AND sl.is_primary = TRUE
+                               )
+                             )
                        ORDER BY m.invited_at ASC
                        LIMIT 25""",
                     (cutoff,),
