@@ -27138,6 +27138,33 @@ def admin_audit_log_list():
 # pushes the brief through send_sms + _send_brief_email and records a
 # brief_history row (is_met_touched=TRUE).
 
+
+def _met_coverage_shift_dates():
+    """Calendar dates (ET) a Met is allowed to act on for coverage right now.
+
+    Always includes today. After 8 PM ET, it also includes tomorrow, so a
+    Met who is on the calendar for the next morning can see subscriber
+    cards, open the composer, and pre-write / schedule the brief the night
+    before. 8 PM is chosen deliberately: it is the same hour the Pro brief
+    pre-generation job runs, so by the time a covering Met can see the
+    cards, tonight's drafts already exist (and creating one on demand pulls
+    tomorrow's forecast).
+
+    Returns a list of datetime.date objects for use with
+    `shift_assignments.shift_date = ANY(%s)`.
+
+    Note: the rollover is evaluated in Eastern Time, consistent with the
+    rest of the coverage logic. That matches the Indiana launch; if Mets in
+    other timezones start covering, this is the one place to revisit.
+    """
+    ET = ZoneInfo("America/New_York")
+    now_et = datetime.now(ET)
+    dates = [now_et.date()]
+    if now_et.hour >= 20:
+        dates.append(now_et.date() + timedelta(days=1))
+    return dates
+
+
 @app.route("/api/v1/met/pro-briefs", methods=["OPTIONS"])
 def _met_pro_briefs_preflight():
     return ("", 204)
@@ -27301,10 +27328,10 @@ def met_pro_subscribers_queue():
                              WHERE t.met_user_id = sc.primary_met_id
                                AND sa.met_user_id = %s
                                AND sa.is_drop = FALSE
-                               AND sa.shift_date = %s
+                               AND sa.shift_date = ANY(%s)
                            )
                          )""",
-                    (me_id, me_id, today_et),
+                    (me_id, me_id, _met_coverage_shift_dates()),
                 )
             sub_rows = cur.fetchall()
 
@@ -28244,7 +28271,7 @@ def met_pro_briefs_list():
                              WHERE t.met_user_id = sc.primary_met_id
                                AND sa.met_user_id = %s
                                AND sa.is_drop = FALSE
-                               AND sa.shift_date = %s
+                               AND sa.shift_date = ANY(%s)
                            )
                          )
                        ORDER BY
@@ -28257,7 +28284,7 @@ def met_pro_briefs_list():
                          d.created_at ASC""",
                     (
                         int(time.time() * 1000) - 24 * 60 * 60 * 1000,
-                        me_id, me_id, today_et,
+                        me_id, me_id, _met_coverage_shift_dates(),
                     ),
                 )
             rows = cur.fetchall()
@@ -28367,11 +28394,11 @@ def met_pro_brief_create_for_subscriber():
                             ON sa.territory_id = t.id
                            AND sa.met_user_id = %s
                            AND sa.is_drop = FALSE
-                           AND sa.shift_date = %s
+                           AND sa.shift_date = ANY(%s)
                        WHERE sc.user_id = %s
                          AND (sc.primary_met_id = %s OR sa.id IS NOT NULL)
                        LIMIT 1""",
-                    (me_id, today_et, target_user_id, me_id),
+                    (me_id, _met_coverage_shift_dates(), target_user_id, me_id),
                 )
                 visible = cur.fetchone() is not None
         if not visible:
@@ -30946,11 +30973,11 @@ def met_pro_brief_compose_update():
                             ON sa.territory_id = t.id
                            AND sa.met_user_id = %s
                            AND sa.is_drop = FALSE
-                           AND sa.shift_date = %s
+                           AND sa.shift_date = ANY(%s)
                        WHERE sc.user_id = %s
                          AND (sc.primary_met_id = %s OR sa.id IS NOT NULL)
                        LIMIT 1""",
-                    (me_id, today_et, target_user_id, me_id),
+                    (me_id, _met_coverage_shift_dates(), target_user_id, me_id),
                 )
                 visible = cur.fetchone() is not None
         if not visible:
