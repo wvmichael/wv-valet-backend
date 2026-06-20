@@ -27278,8 +27278,10 @@ def met_pro_subscribers_queue():
                               u.subscription_tier AS tier,
                               COALESCE(u.timezone, 'America/Indiana/Indianapolis') AS timezone,
                               COALESCE(bp.morning_window_start, '07:00') AS morning_window_start,
+                              bp.morning_enabled AS morning_enabled,
                               loc.label AS location_label,
                               loc.address_text AS location_address,
+                              loc.lat AS loc_lat, loc.lng AS loc_lng,
                               sc.primary_met_id,
                               pm.name AS primary_met_name
                        FROM users u
@@ -27302,8 +27304,10 @@ def met_pro_subscribers_queue():
                               u.subscription_tier AS tier,
                               COALESCE(u.timezone, 'America/Indiana/Indianapolis') AS timezone,
                               COALESCE(bp.morning_window_start, '07:00') AS morning_window_start,
+                              bp.morning_enabled AS morning_enabled,
                               loc.label AS location_label,
                               loc.address_text AS location_address,
+                              loc.lat AS loc_lat, loc.lng AS loc_lng,
                               sc.primary_met_id,
                               pm.name AS primary_met_name
                        FROM users u
@@ -27383,6 +27387,31 @@ def met_pro_subscribers_queue():
         primary_met_id = s.get("primary_met_id")
         is_covering = (not is_admin) and primary_met_id is not None and primary_met_id != me_id
 
+        # Schedulability diagnostics (June 2026): a Met cannot generate OR
+        # schedule a morning brief without map coordinates. A saved location
+        # LABEL ("Home"/"Work") can exist with null lat/lng when geocoding
+        # never completed; that looks fine on the card but silently blocks
+        # draft creation and scheduling. Surface the reason so it is obvious
+        # why a card cannot be actioned.
+        has_coords = (s.get("loc_lat") is not None and s.get("loc_lng") is not None)
+        morning_enabled = s.get("morning_enabled")
+        if not has_coords:
+            schedulable = False
+            block_reason = "no-location"
+            block_detail = ("No mappable location. There may be a saved label, but "
+                            "it has no coordinates to forecast from. Re-save this "
+                            "subscriber's primary location in the Control Center.")
+        elif morning_enabled is False:
+            schedulable = True
+            block_reason = "morning-off"
+            block_detail = ("Morning brief is turned off for this subscriber, so it "
+                            "won't pre-generate or auto-deliver. You can still send or "
+                            "schedule one manually.")
+        else:
+            schedulable = True
+            block_reason = None
+            block_detail = None
+
         subscribers.append({
             "user_id": s["user_id"],
             "name": s.get("name") or "",
@@ -27397,6 +27426,9 @@ def met_pro_subscribers_queue():
             "primary_met_name": s.get("primary_met_name") or "",
             "is_covering": is_covering,
             "next_delivery_at_ms": next_delivery_ms,
+            "schedulable": schedulable,
+            "block_reason": block_reason,
+            "block_detail": block_detail,
             "today_sent": today_sent,
             "today_draft": ({
                 "id": draft["id"],
