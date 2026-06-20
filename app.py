@@ -28548,6 +28548,220 @@ def met_pro_brief_create_for_subscriber():
     return jsonify({"ok": True, "draft_id": new_id, "reused": False})
 
 
+@app.route("/api/v1/met/pro-briefs/bulk-schedule", methods=["OPTIONS"])
+def _met_pro_bulk_schedule_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/met/pro-briefs/bulk-schedule")
+def met_pro_bulk_schedule():
+    """Write one morning brief and schedule it for many subscribers at once.
+
+    Body:
+      { "subscriber_user_ids": [int, ...],
+        "met_verdict": "clear|caution|risk",
+        "met_snippet": "optional headline",
+        "met_body": "the message body (required)" }
+
+    For each subscriber the Met covers: reuse a pending-review draft if one
+    exists (else create a lightweight draft — no per-subscriber AI call, so
+    this scales to large regions), stamp the Met's content on it, and
+    schedule it for that subscriber's next morning window. Every subscriber
+    still gets their own individual scheduled send. Returns a per-subscriber
+    summary so the Met sees exactly who was skipped and why.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    is_admin = "admin" in roles
+    me_id = user["id"]
+
+    data = request.get_json(silent=True) or {}
+    raw_ids = data.get("subscriber_user_ids") or []
+    if not isinstance(raw_ids, list) or not raw_ids:
+        return jsonify({"ok": False, "error": "no-subscribers",
+                        "message": "Select at least one subscriber."}), 400
+    ids = []
+    for x in raw_ids:
+        try:
+            xi = int(x)
+        except (TypeError, ValueError):
+            continue
+        if xi not in ids:
+            ids.append(xi)
+    ids = ids[:1000]
+
+    verdict = (data.get("met_verdict") or "").strip().lower()
+    if verdict not in ("clear", "caution", "risk"):
+        return jsonify({"ok": False, "error": "invalid-verdict",
+                        "message": "Pick a verdict (clear, caution, or risk)."}), 400
+    snippet = (data.get("met_snippet") or "").strip()[:280]
+    body = (data.get("met_body") or "").strip()
+    if not body:
+        return jsonify({"ok": False, "error": "empty-body",
+                        "message": "Write the brief body before scheduling."}), 400
+    body = body[:4000]
+
+    coverage_dates = _met_coverage_shift_dates()
+    now_ms = int(time.time() * 1000)
+    eighteen_hours_ago_ms = now_ms - 18 * 60 * 60 * 1000
+    actor_name = (user.get("name") or "").strip() or user.get("email")
+
+    scheduled = []
+    skipped = []
+
+    for uid in ids:
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT u.id, u.name, u.email, u.subscription_tier,
+                                  COALESCE(u.timezone, 'America/Indiana/Indianapolis') AS timezone,
+                                  COALESCE(bp.morning_window_start, '07:00') AS mws,
+                                  bp.channels,
+                                  loc.label AS loc_label, loc.address_text AS loc_address,
+                                  loc.lat, loc.lng,
+                                  sc.primary_met_id,
+                                  EXISTS (
+                                    SELECT 1 FROM met_territories t
+                                    JOIN shift_assignments sa ON sa.territory_id = t.id
+                                    WHERE t.met_user_id = sc.primary_met_id
+                                      AND sa.met_user_id = %s AND sa.is_drop = FALSE
+                                      AND sa.shift_date = ANY(%s)
+                                  ) AS is_covering
+                           FROM users u
+                           LEFT JOIN brief_preferences bp ON bp.user_id = u.id
+                           LEFT JOIN saved_locations loc
+                                ON loc.user_id = u.id AND loc.is_primary = TRUE
+                           LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
+                           WHERE u.id = %s AND u.is_active = TRUE""",
+                        (me_id, coverage_dates, uid),
+                    )
+                    sub = cur.fetchone()
+                    if not sub:
+                        skipped.append({"user_id": uid, "name": None,
+                                        "reason": "Not found or inactive."})
+                        continue
+                    name = sub.get("name") or sub.get("email")
+
+                    if not is_admin and not (sub.get("primary_met_id") == me_id
+                                             or sub.get("is_covering")):
+                        skipped.append({"user_id": uid, "name": name,
+                                        "reason": "You don't cover this subscriber."})
+                        continue
+                    if (sub.get("subscription_tier") or "") not in (
+                            "pro_single", "pro_multi", "pro_enterprise"):
+                        skipped.append({"user_id": uid, "name": name,
+                                        "reason": "Not on a Pro plan."})
+                        continue
+                    if not sub.get("lat") or not sub.get("lng"):
+                        skipped.append({"user_id": uid, "name": name,
+                                        "reason": "No mappable location."})
+                        continue
+
+                    # Next morning window in the subscriber's timezone.
+                    try:
+                        sub_tz = ZoneInfo(sub["timezone"])
+                    except Exception:
+                        sub_tz = ZoneInfo("America/Indiana/Indianapolis")
+                    local_now = datetime.now(sub_tz)
+                    try:
+                        wh, wm = int(sub["mws"][:2]), int(sub["mws"][3:5])
+                    except (ValueError, TypeError, IndexError):
+                        wh, wm = 7, 0
+                    deliver_dt = local_now.replace(hour=wh, minute=wm,
+                                                   second=0, microsecond=0)
+                    if deliver_dt <= local_now + timedelta(minutes=1):
+                        deliver_dt = deliver_dt + timedelta(days=1)
+                    scheduled_for_ms = int(deliver_dt.timestamp() * 1000)
+                    window_end_ms = scheduled_for_ms + 2 * 60 * 60 * 1000
+
+                    # Reuse a pending-review draft; never clobber one a Met is
+                    # actively editing ('claimed'); otherwise create fresh.
+                    cur.execute(
+                        """SELECT id, status FROM pro_brief_drafts
+                           WHERE user_id = %s AND created_at >= %s
+                             AND status IN ('pending-review', 'claimed')
+                           ORDER BY created_at DESC LIMIT 1""",
+                        (uid, eighteen_hours_ago_ms),
+                    )
+                    existing = cur.fetchone()
+                    if existing and existing["status"] == "claimed":
+                        skipped.append({"user_id": uid, "name": name,
+                                        "reason": "A Met is currently editing this one."})
+                        continue
+
+                    loc_label = sub.get("loc_label") or sub.get("loc_address") or "your location"
+                    if existing:
+                        draft_id = existing["id"]
+                        cur.execute(
+                            """UPDATE pro_brief_drafts
+                               SET met_verdict = %s, met_snippet = %s, met_body = %s
+                               WHERE id = %s""",
+                            (verdict, snippet, body, draft_id),
+                        )
+                    else:
+                        cur.execute(
+                            """INSERT INTO pro_brief_drafts
+                                 (user_id, brief_type, created_at, window_end_at, status,
+                                  user_tier, location_label, location_lat, location_lng,
+                                  channels, ai_verdict, ai_snippet, ai_body,
+                                  met_verdict, met_snippet, met_body)
+                               VALUES (%s, 'morning', %s, %s, 'pending-review',
+                                       %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                               RETURNING id""",
+                            (uid, now_ms, window_end_ms,
+                             sub.get("subscription_tier") or "pro_single",
+                             loc_label, float(sub["lat"]), float(sub["lng"]),
+                             sub.get("channels") or "sms,email",
+                             verdict, snippet, body,
+                             verdict, snippet, body),
+                        )
+                        draft_id = cur.fetchone()["id"]
+
+                    content_json = json.dumps({
+                        "draft_id": draft_id,
+                        "final_body": body,
+                        "final_verdict": verdict,
+                    })
+                    target_json = json.dumps({
+                        "subscriber_user_id": uid,
+                        "subscriber_email": sub.get("email"),
+                    })
+                    cur.execute(
+                        """INSERT INTO scheduled_messages
+                             (type, scheduled_for_ms, scheduled_tz,
+                              scheduled_by_user_id, scheduled_by_name,
+                              status, content_payload, target_audience,
+                              created_at, updated_at)
+                           VALUES ('pro_brief', %s, %s, %s, %s, 'pending', %s, %s, %s, %s)""",
+                        (scheduled_for_ms, sub["timezone"], me_id, actor_name,
+                         content_json, target_json, now_ms, now_ms),
+                    )
+                    scheduled.append({
+                        "user_id": uid, "name": name,
+                        "scheduled_for_ms": scheduled_for_ms,
+                        "timezone": sub["timezone"],
+                    })
+        except Exception as e:
+            print(f"[bulk-schedule] subscriber {uid} failed: {e!r}", flush=True)
+            skipped.append({"user_id": uid, "name": None,
+                            "reason": "Server error scheduling this one."})
+
+    print(f"[bulk-schedule] met={me_id} scheduled={len(scheduled)} "
+          f"skipped={len(skipped)}", flush=True)
+    return jsonify({
+        "ok": True,
+        "scheduled_count": len(scheduled),
+        "skipped_count": len(skipped),
+        "scheduled": scheduled,
+        "skipped": skipped,
+    })
+
+
 @app.route("/api/v1/met/pro-briefs/<int:draft_id>/refresh-ai", methods=["OPTIONS"])
 def _met_pro_brief_refresh_ai_preflight(draft_id):
     return ("", 204)
@@ -40695,6 +40909,34 @@ def _fire_pro_brief_draft(draft_id: int, final_body: str | None,
                          pfire_preds.get("predicted_precip_in"),
                          pfire_preds.get("predicted_max_wind_mph")),
                     )
+
+                # Close out Rosie's daily_brief_tasks tracker so a SCHEDULED
+                # send is treated exactly like a manual "Send now". Without
+                # this, Rosie reads the task as unsent past its due time and
+                # texts the Met a false "overdue" warning even though the
+                # brief already went out. (June 2026)
+                try:
+                    cur.execute(
+                        "SELECT daily_brief_timezone FROM subscriber_coverage WHERE user_id = %s",
+                        (draft["user_id"],),
+                    )
+                    cov_row = cur.fetchone()
+                    tz_name = (cov_row or {}).get("daily_brief_timezone") or "America/New_York"
+                    try:
+                        sub_tz = ZoneInfo(tz_name)
+                    except Exception:
+                        sub_tz = ZoneInfo("America/New_York")
+                    local_date_str = datetime.now(sub_tz).strftime("%Y-%m-%d")
+                    cur.execute(
+                        """UPDATE daily_brief_tasks
+                           SET sent_at_ms = %s, status = 'sent'
+                           WHERE subscriber_user_id = %s
+                             AND task_date = %s
+                             AND status != 'sent'""",
+                        (now_ms, draft["user_id"], local_date_str),
+                    )
+                except Exception as e:
+                    print(f"[scheduled-fire] task mark-sent failed (non-fatal): {e}", flush=True)
         # SMS dispatch
         try:
             if sub and sub.get("phone"):
