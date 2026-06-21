@@ -28627,15 +28627,22 @@ def met_pro_bulk_schedule():
                         "message": "Write the brief body before scheduling."}), 400
     body = body[:4000]
 
+    # mode: "schedule" (next morning, default) or "send_now" (immediately)
+    mode = (data.get("mode") or "schedule").strip().lower()
+    if mode not in ("schedule", "send_now"):
+        mode = "schedule"
+
     coverage_dates = _met_coverage_shift_dates()
     now_ms = int(time.time() * 1000)
     eighteen_hours_ago_ms = now_ms - 18 * 60 * 60 * 1000
     actor_name = (user.get("name") or "").strip() or user.get("email")
 
     scheduled = []
+    sent = []
     skipped = []
 
     for uid in ids:
+        send_draft_id = None
         try:
             with db() as conn:
                 with conn.cursor() as cur:
@@ -28744,42 +28751,62 @@ def met_pro_bulk_schedule():
                         )
                         draft_id = cur.fetchone()["id"]
 
-                    content_json = json.dumps({
-                        "draft_id": draft_id,
-                        "final_body": body,
-                        "final_verdict": verdict,
-                    })
-                    target_json = json.dumps({
-                        "subscriber_user_id": uid,
-                        "subscriber_email": sub.get("email"),
-                    })
-                    cur.execute(
-                        """INSERT INTO scheduled_messages
-                             (type, scheduled_for_ms, scheduled_tz,
-                              scheduled_by_user_id, scheduled_by_name,
-                              status, content_payload, target_audience,
-                              created_at, updated_at)
-                           VALUES ('pro_brief', %s, %s, %s, %s, 'pending', %s, %s, %s, %s)""",
-                        (scheduled_for_ms, sub["timezone"], me_id, actor_name,
-                         content_json, target_json, now_ms, now_ms),
-                    )
-                    scheduled.append({
-                        "user_id": uid, "name": name,
-                        "scheduled_for_ms": scheduled_for_ms,
-                        "timezone": sub["timezone"],
-                    })
+                    if mode == "send_now":
+                        # Defer the actual send until the draft txn commits;
+                        # _fire_pro_brief_draft opens its own connection.
+                        send_draft_id = draft_id
+                    else:
+                        content_json = json.dumps({
+                            "draft_id": draft_id,
+                            "final_body": body,
+                            "final_verdict": verdict,
+                        })
+                        target_json = json.dumps({
+                            "subscriber_user_id": uid,
+                            "subscriber_email": sub.get("email"),
+                        })
+                        cur.execute(
+                            """INSERT INTO scheduled_messages
+                                 (type, scheduled_for_ms, scheduled_tz,
+                                  scheduled_by_user_id, scheduled_by_name,
+                                  status, content_payload, target_audience,
+                                  created_at, updated_at)
+                               VALUES ('pro_brief', %s, %s, %s, %s, 'pending', %s, %s, %s, %s)""",
+                            (scheduled_for_ms, sub["timezone"], me_id, actor_name,
+                             content_json, target_json, now_ms, now_ms),
+                        )
+                        scheduled.append({
+                            "user_id": uid, "name": name,
+                            "scheduled_for_ms": scheduled_for_ms,
+                            "timezone": sub["timezone"],
+                        })
+
+            # Send immediately (outside the draft txn) when requested. Reuses
+            # the same proven path as the single-card "Send now".
+            if mode == "send_now" and send_draft_id is not None:
+                ok2, err2 = _fire_pro_brief_draft(
+                    send_draft_id, body, verdict, me_id, actor_name)
+                if ok2:
+                    sent.append({"user_id": uid, "name": name})
+                else:
+                    skipped.append({"user_id": uid, "name": name,
+                                    "reason": "Send failed: " + (err2 or "unknown")})
         except Exception as e:
             print(f"[bulk-schedule] subscriber {uid} failed: {e!r}", flush=True)
             skipped.append({"user_id": uid, "name": None,
-                            "reason": "Server error scheduling this one."})
+                            "reason": "Server error on this one."})
 
-    print(f"[bulk-schedule] met={me_id} scheduled={len(scheduled)} "
+    print(f"[bulk-schedule] met={me_id} mode={mode} "
+          f"scheduled={len(scheduled)} sent={len(sent)} "
           f"skipped={len(skipped)}", flush=True)
     return jsonify({
         "ok": True,
+        "mode": mode,
         "scheduled_count": len(scheduled),
+        "sent_count": len(sent),
         "skipped_count": len(skipped),
         "scheduled": scheduled,
+        "sent": sent,
         "skipped": skipped,
     })
 
