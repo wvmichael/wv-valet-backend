@@ -9951,21 +9951,41 @@ def admin_command_center_stats():
                     "previous_seven_day": row.get("prev_seven_day") or 0,
                 }
 
-                # ── Subscribers ──
+                # ── Subscribers (paying accounts) vs Users (all people) ──
+                # One paid account can have up to 4 people: the owner plus
+                # added team members. Team members are full subscriber-role
+                # users (they get their own briefs), so counting subscriber
+                # roles counts PEOPLE, not paying accounts. A user is an added
+                # member if they appear as member_user_id in an active/pending
+                # pro_multi_memberships row. Accounts = everyone who is NOT an
+                # added member (owners + solo subscribers).
                 cur.execute(
                     """SELECT
-                          COUNT(*) FILTER (WHERE u.is_active = TRUE) AS total,
-                          COUNT(*) FILTER (WHERE u.is_active = TRUE AND u.created_at >= %s) AS new_7d,
-                          COUNT(*) FILTER (WHERE u.is_active = TRUE AND u.created_at >= %s AND u.created_at < %s) AS new_prev_7d
+                          COUNT(*) FILTER (WHERE u.is_active = TRUE) AS users_total,
+                          COUNT(*) FILTER (WHERE u.is_active = TRUE AND m.member_user_id IS NULL) AS accounts_total,
+                          COUNT(*) FILTER (WHERE u.is_active = TRUE AND m.member_user_id IS NULL AND u.created_at >= %s) AS acct_new_7d,
+                          COUNT(*) FILTER (WHERE u.is_active = TRUE AND m.member_user_id IS NULL AND u.created_at >= %s AND u.created_at < %s) AS acct_new_prev_7d,
+                          COUNT(*) FILTER (WHERE u.is_active = TRUE AND m.member_user_id IS NOT NULL) AS members_total
                        FROM users u
-                       JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'subscriber'""",
+                       JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'subscriber'
+                       LEFT JOIN (
+                           SELECT DISTINCT member_user_id
+                           FROM pro_multi_memberships
+                           WHERE status IN ('active', 'pending')
+                       ) m ON m.member_user_id = u.id""",
                     (week_ago_start_ms, two_weeks_ago_ms, week_ago_start_ms),
                 )
                 row = cur.fetchone() or {}
                 stats["subscribers"] = {
-                    "total": row.get("total") or 0,
-                    "new_seven_day": row.get("new_7d") or 0,
-                    "new_previous_seven_day": row.get("new_prev_7d") or 0,
+                    # 'total' is now paying ACCOUNTS (owners + solo), the
+                    # headline number. Same key so the tile delta keeps working.
+                    "total": row.get("accounts_total") or 0,
+                    "new_seven_day": row.get("acct_new_7d") or 0,
+                    "new_previous_seven_day": row.get("acct_new_prev_7d") or 0,
+                    # Total PEOPLE across all accounts, and how many of those
+                    # are added team members (seats beyond the owner).
+                    "users_total": row.get("users_total") or 0,
+                    "members_total": row.get("members_total") or 0,
                 }
 
                 # ── Crew members ──
