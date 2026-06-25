@@ -15615,17 +15615,21 @@ def replies_sms_inbound():
             except Exception:
                 pass
 
-        # Crew daily check-in (June 2026 fix): if the sender is a Crew
-        # member and their reply names a weather condition (clear, cloudy,
-        # rain, storm, etc.), record it as today's check-in. This is what
-        # feeds the streak counter and the Crew map. Without this, replies
-        # only landed in brief_replies and never counted.
+        # Crew daily check-in + map report. If the sender is a Crew member,
+        # the act of replying to the daily prompt IS the check-in, so we
+        # record it even when no specific weather word is recognized (that
+        # is what the streak counts, and gating it on the parser was leaving
+        # streaks at 0). When we DO recognize a condition and have the
+        # member's home coordinates, we also drop a pin on the Crew map —
+        # the map reads crew_reports, which the check-in table never fed,
+        # which is why texted-in replies never showed up there. (June 2026)
         if matched_user_id is not None:
             try:
                 with db() as conn:
                     with conn.cursor() as cur:
                         cur.execute(
-                            """SELECT u.timezone,
+                            """SELECT u.timezone, u.name,
+                                      u.crew_home_lat, u.crew_home_lng,
                                       EXISTS (SELECT 1 FROM user_roles ur
                                               WHERE ur.user_id = u.id AND ur.role = 'crew') AS is_crew
                                FROM users u WHERE u.id = %s""",
@@ -15634,24 +15638,50 @@ def replies_sms_inbound():
                         urow = cur.fetchone() or {}
                 if urow.get("is_crew"):
                     condition = _parse_crew_condition(body)
-                    if condition:
-                        user_tz = urow.get("timezone") or "America/Indianapolis"
-                        date_key = _local_date_key(user_tz)
-                        with db() as conn:
-                            with conn.cursor() as cur:
-                                cur.execute(
-                                    """INSERT INTO crew_checkins
-                                         (user_id, date_key, conditions, notes, checked_in_at)
-                                       VALUES (%s, %s, %s, %s, %s)
-                                       ON CONFLICT (user_id, date_key) DO UPDATE
-                                         SET conditions = EXCLUDED.conditions,
-                                             checked_in_at = EXCLUDED.checked_in_at""",
-                                    (matched_user_id, date_key, condition, None, now_ms),
-                                )
-                        print(f"[crew-checkin] recorded via SMS user={matched_user_id} "
-                              f"date={date_key} condition={condition}", flush=True)
+                    user_tz = urow.get("timezone") or "America/Indianapolis"
+                    date_key = _local_date_key(user_tz)
+                    # Store the recognized condition if we found one, else a
+                    # short snippet of what they actually said.
+                    checkin_label = condition or ((body or "").strip()[:40] or "reported")
+                    with db() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """INSERT INTO crew_checkins
+                                     (user_id, date_key, conditions, notes, checked_in_at)
+                                   VALUES (%s, %s, %s, %s, %s)
+                                   ON CONFLICT (user_id, date_key) DO UPDATE
+                                     SET conditions = EXCLUDED.conditions,
+                                         checked_in_at = EXCLUDED.checked_in_at""",
+                                (matched_user_id, date_key, checkin_label, None, now_ms),
+                            )
+                    print(f"[crew-checkin] recorded via SMS user={matched_user_id} "
+                          f"date={date_key} condition={condition}", flush=True)
+
+                    # Put it on the Crew map when we recognized a condition
+                    # and have home coordinates to place it.
+                    lat = urow.get("crew_home_lat")
+                    lng = urow.get("crew_home_lng")
+                    if condition and lat is not None and lng is not None:
+                        report_type = _CREW_CONDITION_TO_REPORT.get(condition, "other")
+                        try:
+                            with db() as conn:
+                                with conn.cursor() as cur:
+                                    cur.execute(
+                                        """INSERT INTO crew_reports
+                                             (user_id, user_name, report_type,
+                                              latitude, longitude, notes, image_url,
+                                              verified_count, is_hidden, created_at)
+                                           VALUES (%s, %s, %s, %s, %s, %s, NULL, 0, FALSE, %s)""",
+                                        (matched_user_id, urow.get("name") or "",
+                                         report_type, float(lat), float(lng),
+                                         (body or "").strip()[:500] or None, now_ms),
+                                    )
+                            print(f"[crew-report] mapped reply user={matched_user_id} "
+                                  f"type={report_type}", flush=True)
+                        except Exception as e:
+                            print(f"[crew-report] map insert failed: {e!r}", flush=True)
             except Exception as e:
-                print(f"[crew-checkin] SMS check-in record failed: {e!r}", flush=True)
+                print(f"[crew-checkin] SMS check-in/report failed: {e!r}", flush=True)
 
         # Phase 2 (May 18, 2026): Thread the reply into Pro Threads if the
         # sender is a matched Pro-tier subscriber. The reply becomes a
@@ -18435,6 +18465,256 @@ def _fetch_forecast(lat: float, lng: float) -> Optional[dict]:
         return None
 
 
+# ── Rain heads-up alerts (June 2026) ────────────────────────────────
+# Proactive "rain is arriving" detector. Uses Open-Meteo's 15-minute
+# precipitation nowcast plus the hourly probability to decide WHEN rain
+# will start at a location, then (test phase) texts the configured user.
+# Scoped to one account via the RAIN_ALERT_TEST_EMAIL env var so nobody
+# gets surprise texts; empty env = feature dormant. Next phase will route
+# the same detection to the on-duty Met instead of the subscriber.
+RAIN_ONSET_IN = 0.01          # inches in a 15-min block that counts as real rain
+_LAST_RAIN_ALERT_RUN_MS = 0   # throttle so we only poll every few minutes
+
+
+def _fetch_rain_nowcast(lat: float, lng: float) -> Optional[dict]:
+    """Open-Meteo 15-minute precip nowcast + hourly probability, UTC unixtime."""
+    try:
+        url = (
+            "https://api.open-meteo.com/v1/forecast"
+            f"?latitude={lat}&longitude={lng}"
+            "&minutely_15=precipitation"
+            "&hourly=precipitation,precipitation_probability"
+            "&precipitation_unit=inch&timeformat=unixtime&timezone=GMT"
+            "&forecast_days=1&forecast_minutely_15=12&forecast_hours=6"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "weathervalet/1.0"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[rain-alert] nowcast fetch failed ({lat},{lng}): {e}", flush=True)
+        return None
+
+
+def _check_rain_arriving(lat, lng, threshold_pct=80, lead_min=30):
+    """Is rain about to START at (lat,lng) within lead_min minutes, at
+    >= threshold_pct confidence, when it isn't already falling?
+
+    Returns {"arriving": True, "start_ms", "minutes_out", "prob"} or None.
+    """
+    data = _fetch_rain_nowcast(lat, lng)
+    if not data:
+        return None
+    now_s = int(time.time())
+    horizon_s = now_s + lead_min * 60 + 600   # small buffer past the window
+
+    m15 = data.get("minutely_15") or {}
+    m_times = m15.get("time") or []
+    m_precip = m15.get("precipitation") or []
+    hourly = data.get("hourly") or {}
+    h_times = hourly.get("time") or []
+    h_prob = hourly.get("precipitation_probability") or []
+    h_precip = hourly.get("precipitation") or []
+
+    def _hour_prob_at(ts):
+        best = None
+        for i, ht in enumerate(h_times):
+            if ht <= ts < ht + 3600:
+                return h_prob[i] if i < len(h_prob) else None
+            if ht <= ts:
+                best = i
+        if best is not None and best < len(h_prob):
+            return h_prob[best]
+        return None
+
+    if m_times and m_precip:
+        # Currently dry? Find the block covering 'now'.
+        for i, t in enumerate(m_times):
+            if t <= now_s < t + 900:
+                if i < len(m_precip) and (m_precip[i] or 0) >= RAIN_ONSET_IN:
+                    return None   # already raining; this is a heads-up, not a now-cast
+                break
+        # First FUTURE block with real precip inside the window.
+        for i, t in enumerate(m_times):
+            if t <= now_s:
+                continue
+            if t > horizon_s:
+                break
+            amt = m_precip[i] if i < len(m_precip) else 0
+            if amt and amt >= RAIN_ONSET_IN:
+                minutes_out = int(round((t - now_s) / 60.0))
+                if minutes_out > lead_min:
+                    return None   # rain exists but is further out than the heads-up window
+                prob = _hour_prob_at(t)
+                if prob is None or prob >= threshold_pct:
+                    return {"arriving": True, "start_ms": t * 1000,
+                            "minutes_out": max(minutes_out, 0),
+                            "prob": int(prob) if prob is not None else None}
+                return None
+        return None
+
+    # Fallback: no 15-minute data — use hourly only (coarser).
+    for i, ht in enumerate(h_times):
+        if ht <= now_s:
+            continue
+        if ht - now_s > lead_min * 60 + 600:
+            break
+        amt = h_precip[i] if i < len(h_precip) else 0
+        prob = h_prob[i] if i < len(h_prob) else None
+        if amt and amt >= RAIN_ONSET_IN and (prob is None or prob >= threshold_pct):
+            return {"arriving": True, "start_ms": ht * 1000,
+                    "minutes_out": max(int(round((ht - now_s) / 60.0)), 0),
+                    "prob": int(prob) if prob is not None else None}
+    return None
+
+
+def _rain_alert_message(place, start_ms, minutes_out, prob, tz_name):
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("America/Indiana/Indianapolis")
+    when = datetime.fromtimestamp(start_ms / 1000, tz).strftime("%I:%M %p").lstrip("0")
+    prob_txt = (f" ({prob}% chance)" if prob is not None else "")
+    return (f"WeatherValet heads-up: rain likely at {place or 'your location'} around "
+            f"{when}, about {minutes_out} minutes out{prob_txt}.")
+
+
+def _process_rain_alerts():
+    """Scheduler job: for the configured test account, text a 30-minute
+    heads-up when rain is about to start. Dedup so it fires once per event."""
+    global _LAST_RAIN_ALERT_RUN_MS
+    now_ms = int(time.time() * 1000)
+    if now_ms - _LAST_RAIN_ALERT_RUN_MS < 5 * 60 * 1000:
+        return
+    _LAST_RAIN_ALERT_RUN_MS = now_ms
+
+    test_email = (os.environ.get("RAIN_ALERT_TEST_EMAIL") or "").strip().lower()
+    if not test_email:
+        return  # dormant until an email is configured in Render
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS rain_alert_state (
+                       user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                       last_event_start_ms BIGINT,
+                       last_sent_ms BIGINT
+                   )"""
+            )
+            cur.execute(
+                """SELECT u.id, u.phone,
+                          COALESCE(u.timezone, 'America/Indiana/Indianapolis') AS timezone,
+                          loc.lat, loc.lng, loc.address_text
+                   FROM users u
+                   LEFT JOIN saved_locations loc
+                        ON loc.user_id = u.id AND loc.is_primary = TRUE
+                   WHERE LOWER(u.email) = %s AND u.is_active = TRUE
+                   LIMIT 1""",
+                (test_email,),
+            )
+            u = cur.fetchone()
+            if not u or u.get("lat") is None or u.get("lng") is None or not u.get("phone"):
+                return
+            cur.execute(
+                "SELECT last_event_start_ms, last_sent_ms FROM rain_alert_state WHERE user_id=%s",
+                (u["id"],),
+            )
+            st = cur.fetchone() or {}
+
+    res = _check_rain_arriving(float(u["lat"]), float(u["lng"]), threshold_pct=80, lead_min=30)
+    if not res or not res.get("arriving"):
+        return
+
+    start_ms = res["start_ms"]
+    last_sent = st.get("last_sent_ms") or 0
+    last_start = st.get("last_event_start_ms") or 0
+    # Never text more than once per 30 min; don't re-text the same event
+    # (arrival within 60 min of the last alerted arrival) for 3 hours.
+    if now_ms - last_sent < 30 * 60 * 1000:
+        return
+    if abs(start_ms - last_start) < 60 * 60 * 1000 and now_ms - last_sent < 3 * 60 * 60 * 1000:
+        return
+
+    msg = _rain_alert_message(u.get("address_text"), start_ms,
+                              res.get("minutes_out") or 0, res.get("prob"), u["timezone"])
+    if send_sms(u["phone"], msg):
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO rain_alert_state (user_id, last_event_start_ms, last_sent_ms)
+                       VALUES (%s, %s, %s)
+                       ON CONFLICT (user_id) DO UPDATE
+                         SET last_event_start_ms = EXCLUDED.last_event_start_ms,
+                             last_sent_ms = EXCLUDED.last_sent_ms""",
+                    (u["id"], start_ms, now_ms),
+                )
+        print(f"[rain-alert] sent to {test_email}: {msg}", flush=True)
+
+
+@app.route("/api/v1/admin/rain-alert/test", methods=["OPTIONS"])
+def _admin_rain_alert_test_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/rain-alert/test")
+def admin_rain_alert_test():
+    """Run the rain detector on demand so the result is visible immediately,
+    without waiting for the scheduler or for live rain. Body {"send": true}
+    also texts the alert if rain is arriving. Admin only."""
+    user = _get_current_user()
+    if user is None or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    do_send = bool(data.get("send"))
+    test_email = (os.environ.get("RAIN_ALERT_TEST_EMAIL") or "").strip().lower()
+    with db() as conn:
+        with conn.cursor() as cur:
+            if test_email:
+                cur.execute(
+                    """SELECT u.id, u.phone,
+                              COALESCE(u.timezone,'America/Indiana/Indianapolis') AS timezone,
+                              loc.lat, loc.lng, loc.address_text
+                       FROM users u
+                       LEFT JOIN saved_locations loc ON loc.user_id=u.id AND loc.is_primary=TRUE
+                       WHERE LOWER(u.email)=%s LIMIT 1""",
+                    (test_email,),
+                )
+            else:
+                cur.execute(
+                    """SELECT u.id, u.phone,
+                              COALESCE(u.timezone,'America/Indiana/Indianapolis') AS timezone,
+                              loc.lat, loc.lng, loc.address_text
+                       FROM users u
+                       LEFT JOIN saved_locations loc ON loc.user_id=u.id AND loc.is_primary=TRUE
+                       WHERE u.id=%s LIMIT 1""",
+                    (user["id"],),
+                )
+            u = cur.fetchone()
+    if not u or u.get("lat") is None or u.get("lng") is None:
+        return jsonify({"ok": False, "error": "no-location",
+                        "message": "No primary location with coordinates for the test account."}), 400
+
+    res = _check_rain_arriving(float(u["lat"]), float(u["lng"]), threshold_pct=80, lead_min=30)
+    out = {
+        "ok": True,
+        "checked_email": test_email or user.get("email"),
+        "location": u.get("address_text") or f'{u["lat"]},{u["lng"]}',
+        "arriving": bool(res and res.get("arriving")),
+    }
+    if res:
+        out["minutes_out"] = res.get("minutes_out")
+        out["prob"] = res.get("prob")
+        out["start_ms"] = res.get("start_ms")
+    if do_send and res and res.get("arriving") and u.get("phone"):
+        msg = _rain_alert_message(u.get("address_text"), res["start_ms"],
+                                  res.get("minutes_out") or 0, res.get("prob"), u["timezone"])
+        out["sent"] = bool(send_sms(u["phone"], msg))
+        out["message_text"] = msg
+    elif do_send:
+        out["sent"] = False
+        out["message_text"] = "No rain arriving in the next 30 minutes, so nothing to send."
+    return jsonify(out)
+
+
 # ── Widget forecast cache (May 28, 2026) ──
 # In-memory TTL cache for the radio-partner widget endpoint. Keys are
 # (lat, lng) tuples rounded to 4 decimal places (~10m precision); values
@@ -21018,6 +21298,10 @@ def _brief_scheduler_loop() -> None:
         except Exception as e:
             print(f"[nws-scheduler] tick failed: {e!r}", flush=True)
         try:
+            _process_rain_alerts()
+        except Exception as e:
+            print(f"[rain-alert] tick failed: {e!r}", flush=True)
+        try:
             _check_missed_pro_briefs()
         except Exception as e:
             print(f"[missed-brief-check] tick failed: {e!r}", flush=True)
@@ -21096,10 +21380,12 @@ def _coverage_generate_pending_tasks() -> None:
                 """SELECT u.id AS user_id, u.name, u.email,
                           u.subscription_tier AS tier,
                           sc.primary_met_id, sc.backup_met_id,
-                          sc.daily_brief_time, sc.daily_brief_timezone
+                          sc.daily_brief_time, sc.daily_brief_timezone,
+                          bp.morning_window_start
                    FROM users u
                    JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'subscriber'
                    LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
+                   LEFT JOIN brief_preferences bp ON bp.user_id = u.id
                    WHERE u.is_active = TRUE
                      AND u.subscription_tier IN ('pro_single','pro_multi','pro_enterprise')"""
             )
@@ -21134,7 +21420,17 @@ def _coverage_generate_pending_tasks() -> None:
 
     for sub in subs:
         tz_name = sub.get("daily_brief_timezone") or "America/New_York"
-        delivery_time_str = sub.get("daily_brief_time") or "07:00"
+        # Use the delivery time the subscriber actually set in their portal
+        # (brief_preferences.morning_window_start) — the same field the brief
+        # send uses. The older subscriber_coverage.daily_brief_time stays at
+        # its 07:00 default unless separately changed, so relying on it made
+        # Rosie flag a brief "overdue" at 7:00 AM even when the subscriber
+        # chose a later time. (June 2026)
+        delivery_time_str = (
+            sub.get("morning_window_start")
+            or sub.get("daily_brief_time")
+            or "07:00"
+        )
 
         try:
             sub_tz = ZoneInfo(tz_name)
@@ -22046,6 +22342,16 @@ def _parse_crew_condition(body):
         if w in _CREW_CONDITION_WORDS:
             return _CREW_CONDITION_WORDS[w]
     return None
+
+
+# Maps a parsed condition to a crew_reports.report_type so a texted-in
+# reply can be placed on the Crew map. 'clear'/'cloudy' have no dedicated
+# map type, so they land as 'other' (still a valid ground-truth pin).
+_CREW_CONDITION_TO_REPORT = {
+    "clear": "other", "cloudy": "other", "rain": "rain",
+    "storm": "storm", "snow": "snow", "fog": "fog",
+    "wind": "wind", "hail": "hail",
+}
 
 
 # Optional precise timezone lookup. If the `timezonefinder` package is
@@ -37380,6 +37686,69 @@ def _fetch_observations_for_station(station_id: str, start_ms: int, end_ms: int)
         return []
 
 
+def _fetch_observed_day_meteo(lat, lng, delivered_at_ms):
+    """Observed high/low/precip/max-wind for the brief's LOCAL calendar
+    day, at the subscriber's EXACT coordinates, from Open-Meteo.
+
+    Replaces the old approach (nearest NWS station, up to 30 miles away,
+    measured over a delivery-to-+24h window). That approach had two flaws
+    the Mets were getting dinged for:
+      1. The +24h window started at delivery (~7 AM), so it missed the
+         day's pre-dawn low and instead captured the NEXT night's low —
+         grading the wrong day's numbers.
+      2. A station 30 miles away in different terrain doesn't match the
+         subscriber's location, especially for precip.
+    Pulling Open-Meteo's daily aggregates for the exact point and the
+    correct local day fixes both, and matches the source the forecast
+    itself came from (apples to apples). timezone=auto buckets the daily
+    values by the LOCAL calendar day at that location.
+    """
+    blank = {"observed_high_f": None, "observed_low_f": None,
+             "observed_precip_in": None, "observed_max_wind_mph": None}
+    try:
+        url = (
+            "https://api.open-meteo.com/v1/forecast"
+            f"?latitude={lat}&longitude={lng}"
+            "&daily=temperature_2m_max,temperature_2m_min,"
+            "precipitation_sum,windspeed_10m_max"
+            "&temperature_unit=fahrenheit&windspeed_unit=mph"
+            "&precipitation_unit=inch&timezone=auto&past_days=5&forecast_days=1"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "weathervalet/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[grader] meteo observed fetch failed ({lat},{lng}): {e}", flush=True)
+        return blank
+
+    daily = data.get("daily") or {}
+    times = daily.get("time") or []
+    offset = data.get("utc_offset_seconds") or 0
+    # The brief's local calendar date at the subscriber's location.
+    local_date = datetime.fromtimestamp(
+        delivered_at_ms / 1000 + offset, tz=timezone.utc
+    ).strftime("%Y-%m-%d")
+    try:
+        idx = times.index(local_date)
+    except ValueError:
+        # Day not in range (brief older than past_days). Grade falls back
+        # to predicted-only rather than flagging a false miss.
+        return blank
+
+    def _at(key):
+        arr = daily.get(key) or []
+        return arr[idx] if 0 <= idx < len(arr) and arr[idx] is not None else None
+
+    hi, lo = _at("temperature_2m_max"), _at("temperature_2m_min")
+    pr, wd = _at("precipitation_sum"), _at("windspeed_10m_max")
+    return {
+        "observed_high_f": int(round(hi)) if hi is not None else None,
+        "observed_low_f": int(round(lo)) if lo is not None else None,
+        "observed_precip_in": round(float(pr), 2) if pr is not None else None,
+        "observed_max_wind_mph": int(round(wd)) if wd is not None else None,
+    }
+
+
 def _classify_observations(observations: list) -> tuple:
     """Inspect observations against NWS_OBS_THRESHOLDS.
 
@@ -37670,8 +38039,15 @@ def _run_brief_grader_for_day(grade_date: str, force_regrade: bool = False) -> d
             else:
                 predictions = _parse_predictions_from_brief_text(b.get("full_body"))
 
-            # ── Extract observed values (May 26, 2026) ──
-            observations = _extract_observations_for_grading(observations_list)
+            # ── Extract observed values ──
+            # Numbers (high/low/precip/wind) come from the subscriber's
+            # exact coordinates for the brief's local calendar day, not a
+            # far NWS station over a delivery+24h window. The NWS layer
+            # above still drives the severe-weather verdict grade; this
+            # only fixes the predicted-vs-observed number deltas. (June 2026)
+            observations = _fetch_observed_day_meteo(
+                b["lat"], b["lng"], b["delivered_at"]
+            )
 
             # ── Grade using work-impact rubric ──
             grade, score, grade_details = _grade_brief_work_impact(
