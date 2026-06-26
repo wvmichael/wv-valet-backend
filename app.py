@@ -12661,6 +12661,7 @@ def admin_view_as_met(met_user_id):
                               u.email AS subscriber_email,
                               u.name AS subscriber_name,
                               sc.primary_met_id,
+                              sc.notes AS coverage_notes,
                               pm.name AS primary_met_name
                        FROM pro_brief_drafts d
                        JOIN users u ON u.id = d.user_id
@@ -27631,6 +27632,7 @@ def met_pro_subscribers_queue():
                               loc.address_text AS location_address,
                               loc.lat AS loc_lat, loc.lng AS loc_lng,
                               sc.primary_met_id,
+                              sc.notes AS coverage_notes,
                               pm.name AS primary_met_name
                        FROM users u
                        LEFT JOIN brief_preferences bp ON bp.user_id = u.id
@@ -27657,6 +27659,7 @@ def met_pro_subscribers_queue():
                               loc.address_text AS location_address,
                               loc.lat AS loc_lat, loc.lng AS loc_lng,
                               sc.primary_met_id,
+                              sc.notes AS coverage_notes,
                               pm.name AS primary_met_name
                        FROM users u
                        LEFT JOIN brief_preferences bp ON bp.user_id = u.id
@@ -27772,6 +27775,7 @@ def met_pro_subscribers_queue():
             "morning_window_start": s["morning_window_start"],
             "primary_met_id": primary_met_id,
             "primary_met_name": s.get("primary_met_name") or "",
+            "notes": s.get("coverage_notes") or "",
             "is_covering": is_covering,
             "next_delivery_at_ms": next_delivery_ms,
             "schedulable": schedulable,
@@ -28593,6 +28597,7 @@ def met_pro_briefs_list():
                               sc.business_role, sc.weather_decisions,
                               sc.peak_need_times, sc.additional_context,
                               sc.primary_met_id,
+                              sc.notes AS coverage_notes,
                               pm.name AS primary_met_name
                        FROM pro_brief_drafts d
                        JOIN users u ON u.id = d.user_id
@@ -28628,6 +28633,7 @@ def met_pro_briefs_list():
                               sc.business_role, sc.weather_decisions,
                               sc.peak_need_times, sc.additional_context,
                               sc.primary_met_id,
+                              sc.notes AS coverage_notes,
                               pm.name AS primary_met_name
                        FROM pro_brief_drafts d
                        JOIN users u ON u.id = d.user_id
@@ -28719,6 +28725,44 @@ def met_pro_briefs_list():
             "is_covering": is_covering,
         })
     return jsonify({"ok": True, "drafts": drafts})
+
+
+@app.route("/api/v1/met/subscribers/<int:sub_user_id>/notes", methods=["OPTIONS"])
+def _met_subscriber_notes_preflight(sub_user_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/met/subscribers/<int:sub_user_id>/notes")
+def met_save_subscriber_notes(sub_user_id):
+    """Save a short, persistent note about a Pro subscriber that any Met
+    sees on the subscriber's card. Shared across the team (stored on
+    subscriber_coverage.notes), so a Met covering someone else's book
+    knows what that person cares about weather-wise. (June 2026)"""
+    user = _get_current_user()
+    roles = (user or {}).get("roles") or []
+    if user is None or not ("met" in roles or "admin" in roles):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    notes = (data.get("notes") or "").strip()
+    if len(notes) > 400:
+        notes = notes[:400]
+    notes_val = notes or None
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                # The coverage row exists for any Pro subscriber, but upsert
+                # so a missing row never drops the note. daily_brief_time /
+                # timezone fall back to their schema defaults.
+                cur.execute(
+                    """INSERT INTO subscriber_coverage (user_id, notes)
+                       VALUES (%s, %s)
+                       ON CONFLICT (user_id) DO UPDATE SET notes = EXCLUDED.notes""",
+                    (sub_user_id, notes_val),
+                )
+    except Exception as e:
+        print(f"[met-sub-notes] save failed user={sub_user_id}: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+    return jsonify({"ok": True, "notes": notes_val or ""})
 
 
 @app.route("/api/v1/met/pro-briefs/<int:draft_id>", methods=["OPTIONS"])
