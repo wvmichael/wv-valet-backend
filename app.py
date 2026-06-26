@@ -28747,17 +28747,21 @@ def met_save_subscriber_notes(sub_user_id):
     if len(notes) > 400:
         notes = notes[:400]
     notes_val = notes or None
+    now_ms = int(time.time() * 1000)
     try:
         with db() as conn:
             with conn.cursor() as cur:
                 # The coverage row exists for any Pro subscriber, but upsert
-                # so a missing row never drops the note. daily_brief_time /
-                # timezone fall back to their schema defaults.
+                # so a missing row never drops the note. updated_at is
+                # NOT NULL with no default, so it must be set explicitly;
+                # daily_brief_time / timezone fall back to schema defaults.
                 cur.execute(
-                    """INSERT INTO subscriber_coverage (user_id, notes)
-                       VALUES (%s, %s)
-                       ON CONFLICT (user_id) DO UPDATE SET notes = EXCLUDED.notes""",
-                    (sub_user_id, notes_val),
+                    """INSERT INTO subscriber_coverage (user_id, notes, updated_at)
+                       VALUES (%s, %s, %s)
+                       ON CONFLICT (user_id) DO UPDATE
+                         SET notes = EXCLUDED.notes,
+                             updated_at = EXCLUDED.updated_at""",
+                    (sub_user_id, notes_val, now_ms),
                 )
     except Exception as e:
         print(f"[met-sub-notes] save failed user={sub_user_id}: {e!r}", flush=True)
