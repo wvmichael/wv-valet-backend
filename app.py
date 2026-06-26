@@ -9895,61 +9895,69 @@ def admin_message_log():
                 return c
         return None
 
-    rows = []
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """SELECT bh.user_id, bh.delivered_at AS t, bh.brief_type AS kind,
-                          bh.verdict, bh.full_body AS body, bh.channels_used AS channels,
-                          bh.met_name, u.name AS sub_name, u.email,
-                          loc.address_text, loc.label AS loc_label
-                   FROM brief_history bh
-                   JOIN users u ON u.id = bh.user_id
-                   LEFT JOIN saved_locations loc ON loc.user_id = bh.user_id AND loc.is_primary = TRUE
-                   WHERE bh.delivery_status = 'sent'
-                     AND bh.delivered_at >= %s AND bh.delivered_at < %s""",
-                (start_ms, end_ms),
-            )
-            rows.extend(cur.fetchall())
-            cur.execute(
-                """SELECT d.user_id, d.sent_at_ms AS t, 'update' AS kind,
-                          d.met_verdict AS verdict, d.met_body AS body, NULL AS channels,
-                          d.met_name, u.name AS sub_name, u.email,
-                          loc.address_text, loc.label AS loc_label
-                   FROM pro_brief_drafts d
-                   JOIN users u ON u.id = d.user_id
-                   LEFT JOIN saved_locations loc ON loc.user_id = d.user_id AND loc.is_primary = TRUE
-                   WHERE d.brief_type = 'update' AND d.status = 'sent'
-                     AND d.sent_at_ms >= %s AND d.sent_at_ms < %s""",
-                (start_ms, end_ms),
-            )
-            rows.extend(cur.fetchall())
+    try:
+        rows = []
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT bh.user_id, bh.delivered_at AS t, bh.brief_type AS kind,
+                              bh.verdict, bh.full_body AS body, bh.channels_used AS channels,
+                              bh.met_name, u.name AS sub_name, u.email,
+                              loc.address_text, loc.label AS loc_label
+                       FROM brief_history bh
+                       JOIN users u ON u.id = bh.user_id
+                       LEFT JOIN saved_locations loc ON loc.user_id = bh.user_id AND loc.is_primary = TRUE
+                       WHERE bh.delivery_status = 'sent'
+                         AND bh.delivered_at >= %s AND bh.delivered_at < %s""",
+                    (start_ms, end_ms),
+                )
+                rows.extend(cur.fetchall())
+                # Ad-hoc updates that never wrote a brief_history row
+                # (history_id IS NULL), so we don't double-count.
+                cur.execute(
+                    """SELECT d.user_id, d.sent_at AS t, d.brief_type AS kind,
+                              COALESCE(d.final_verdict, d.met_verdict, d.ai_verdict) AS verdict,
+                              COALESCE(d.final_body, d.met_body, d.ai_body) AS body,
+                              d.channels, d.sent_by_name AS met_name,
+                              u.name AS sub_name, u.email,
+                              loc.address_text, loc.label AS loc_label
+                       FROM pro_brief_drafts d
+                       JOIN users u ON u.id = d.user_id
+                       LEFT JOIN saved_locations loc ON loc.user_id = d.user_id AND loc.is_primary = TRUE
+                       WHERE d.status = 'sent' AND d.brief_type = 'update'
+                         AND d.history_id IS NULL
+                         AND d.sent_at >= %s AND d.sent_at < %s""",
+                    (start_ms, end_ms),
+                )
+                rows.extend(cur.fetchall())
 
-    out = []
-    for r in rows:
-        addr = r.get("address_text")
-        st = parse_state(addr)
-        if state and st != state:
-            continue
-        t = r.get("t") or 0
-        try:
-            when = datetime.fromtimestamp(t / 1000, tz).strftime("%I:%M %p").lstrip("0")
-        except Exception:
-            when = ""
-        out.append({
-            "time_ms": t, "time": when,
-            "recipient": r.get("sub_name") or r.get("email") or "Subscriber",
-            "location": addr or r.get("loc_label") or "",
-            "state": st or "",
-            "kind": r.get("kind") or "",
-            "verdict": r.get("verdict") or "",
-            "channels": r.get("channels") or "",
-            "met_name": r.get("met_name") or "",
-            "text": r.get("body") or "",
-        })
-    out.sort(key=lambda x: x["time_ms"])
-    return jsonify({"ok": True, "date": date_str, "state": state,
-                    "count": len(out), "messages": out})
+        out = []
+        for r in rows:
+            addr = r.get("address_text")
+            st = parse_state(addr)
+            if state and st != state:
+                continue
+            t = r.get("t") or 0
+            try:
+                when = datetime.fromtimestamp(t / 1000, tz).strftime("%I:%M %p").lstrip("0")
+            except Exception:
+                when = ""
+            out.append({
+                "time_ms": t, "time": when,
+                "recipient": r.get("sub_name") or r.get("email") or "Subscriber",
+                "location": addr or r.get("loc_label") or "",
+                "state": st or "",
+                "kind": r.get("kind") or "",
+                "verdict": r.get("verdict") or "",
+                "channels": r.get("channels") or "",
+                "met_name": r.get("met_name") or "",
+                "text": r.get("body") or "",
+            })
+        out.sort(key=lambda x: x["time_ms"])
+        return jsonify({"ok": True, "date": date_str, "state": state,
+                        "count": len(out), "messages": out})
+    except Exception as e:
+        return jsonify({"ok": False, "error": "server", "message": str(e)}), 500
 
 
 @app.route("/api/v1/admin/command-center/stats", methods=["OPTIONS"])
