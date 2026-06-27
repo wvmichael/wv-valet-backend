@@ -19083,9 +19083,14 @@ def admin_rain_alert_test():
                     (user["id"],),
                 )
             u = cur.fetchone()
-    if not u or u.get("lat") is None or u.get("lng") is None:
+    if not u:
+        return jsonify({"ok": False, "error": "no-user",
+                        "message": ("No account matches RAIN_ALERT_TEST_EMAIL"
+                                    + (" (" + test_email + ")" if test_email else "")
+                                    + ". Check the email is spelled correctly, including the @.")}), 400
+    if u.get("lat") is None or u.get("lng") is None:
         return jsonify({"ok": False, "error": "no-location",
-                        "message": "No primary location with coordinates for the test account."}), 400
+                        "message": "That account has no primary location with coordinates set."}), 400
 
     res = _check_rain_arriving(float(u["lat"]), float(u["lng"]), threshold_pct=80, lead_min=30)
     out = {
