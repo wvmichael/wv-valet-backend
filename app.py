@@ -21748,7 +21748,23 @@ def _coverage_check_escalations() -> None:
     Each escalation level recorded in escalated_at_ms / escalated_admin_at_ms
     so we don't double-fire. If the brief is sent in between, the task
     transitions to 'sent' and escalations stop.
+
+    Concurrency (June 2026): wrapped in a Postgres advisory lock (key
+    91234574) so multi-worker deployments don't run this in two workers
+    at once and page every overdue task twice. This was the cause of the
+    duplicate overdue texts.
     """
+    _LOCK_KEY = 91234574
+    _lock_conn = _try_acquire_scheduler_lock(_LOCK_KEY)
+    if _lock_conn is None:
+        return  # Another worker is handling escalations this tick
+    try:
+        _coverage_check_escalations_inner()
+    finally:
+        _release_scheduler_lock(_lock_conn, _LOCK_KEY)
+
+
+def _coverage_check_escalations_inner() -> None:
     now_ms = int(time.time() * 1000)
     thirty_min_ms = 30 * 60 * 1000
 
