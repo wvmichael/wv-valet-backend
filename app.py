@@ -9910,19 +9910,32 @@ def media_upload():
     if not raw:
         return jsonify({"ok": False, "error": "empty",
                         "message": "The image was empty."}), 400
+    # Validate by file signature so this works with or without Pillow.
+    def _sniff(b):
+        if b[:8] == b"\x89PNG\r\n\x1a\n":
+            return ("image/png", "png")
+        if b[:3] == b"\xff\xd8\xff":
+            return ("image/jpeg", "jpg")
+        if b[:6] in (b"GIF87a", b"GIF89a"):
+            return ("image/gif", "gif")
+        return (None, None)
+    mime, ext = _sniff(raw)
+    if not mime:
+        return jsonify({"ok": False, "error": "bad-image",
+                        "message": "Please upload a PNG or JPG image."}), 400
+    data = raw
+    # Optimize with Pillow if it is installed (downscale wide graphics so the
+    # picture text stays deliverable). If Pillow is missing, store the original.
     try:
         import io
         from PIL import Image
         img = Image.open(io.BytesIO(raw))
         img.load()
-        src_fmt = (img.format or "").upper()
-        # Downscale wide graphics so the picture text stays deliverable.
-        max_w = 1400
-        if img.width > max_w:
-            ratio = max_w / float(img.width)
-            img = img.resize((max_w, max(1, int(img.height * ratio))))
+        if img.width > 1400:
+            ratio = 1400 / float(img.width)
+            img = img.resize((1400, max(1, int(img.height * ratio))))
         out = io.BytesIO()
-        if src_fmt == "PNG" or img.mode in ("RGBA", "LA", "P"):
+        if mime == "image/png" or img.mode in ("RGBA", "LA", "P"):
             img.save(out, format="PNG", optimize=True)
             mime, ext = "image/png", "png"
         else:
@@ -9930,8 +9943,7 @@ def media_upload():
             mime, ext = "image/jpeg", "jpg"
         data = out.getvalue()
     except Exception:
-        return jsonify({"ok": False, "error": "bad-image",
-                        "message": "That file did not look like a PNG or JPG image."}), 400
+        data = raw  # Pillow unavailable or failed; the original bytes are fine
     if len(data) > 5 * 1024 * 1024:
         return jsonify({"ok": False, "error": "too-large",
                         "message": "Image is too large even after optimizing. Try a simpler graphic."}), 400
