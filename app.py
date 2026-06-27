@@ -31856,6 +31856,7 @@ def met_pro_brief_compose_update():
         return jsonify({"ok": False, "error": "invalid-verdict"}), 400
     snippet = (data.get("snippet") or "").strip()
     body_text = (data.get("body") or "").strip()
+    image_url = (data.get("image_url") or "").strip()
     if not snippet and not body_text:
         return jsonify({"ok": False, "error": "empty-update",
                         "message": "Provide a snippet or body."}), 400
@@ -31926,15 +31927,19 @@ def met_pro_brief_compose_update():
             sms_text = "WeatherValet Update: " + (snippet or body_text[:140])
             if body_text and len(snippet) + len(body_text) < 1200:
                 sms_text = sms_text + "\n\n" + body_text[:1200]
-            ok = send_sms(sub["phone"], sms_text)
+            _media = [image_url] if image_url.startswith("http") else None
+            ok = send_sms(sub["phone"], sms_text, media_url=_media)
             if ok:
                 channels_used.append("sms")
                 any_success = True
         elif ch == "email" and sub["email"]:
             email_body_html = (body_text or snippet).replace("\n", "<br>")
+            _img_html = (f"<p><img src='{image_url}' alt='' style='max-width:100%;border-radius:8px;'></p>"
+                         if image_url.startswith("http") else "")
             email_body_full = (
                 f"<p><strong>{snippet}</strong></p>"
                 f"<p>{email_body_html}</p>"
+                f"{_img_html}"
                 f"<p style='color:#666;font-size:12px;'>Sent by your meteorologist via WeatherValet.</p>"
             )
             ok = _send_brief_email(sub["email"], update_subject, email_body_full, reply_to=update_reply_to)
