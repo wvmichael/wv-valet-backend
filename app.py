@@ -4012,7 +4012,12 @@ def send_sms(to: str, body: str, media_url=None) -> bool:
         print(f"[{tag}] to={to} media={media_url}\n{body}\n", flush=True)
         return True
     try:
-        client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        try:
+            from twilio.http.http_client import TwilioHttpClient
+            client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN,
+                                  http_client=TwilioHttpClient(timeout=15))
+        except Exception:
+            client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
         kwargs = dict(body=body, from_=TWILIO_FROM_NUMBER, to=to)
         if media_url:
             kwargs["media_url"] = list(media_url) if isinstance(media_url, (list, tuple)) else [media_url]
