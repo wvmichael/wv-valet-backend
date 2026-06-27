@@ -16744,9 +16744,9 @@ def me_threshold_alerts_create():
 
     data = request.get_json(silent=True) or {}
 
-    ALLOWED_METRICS = {"wind", "temp_low", "temp_high", "precip_chance", "humidity"}
+    ALLOWED_METRICS = {"wind", "temp_low", "temp_high", "heat_index", "precip_chance", "rain_amount", "snow_amount", "humidity"}
     ALLOWED_COMPS = {"gt", "lt", "gte", "lte", "eq"}
-    ALLOWED_UNITS = {"mph", "F", "C", "pct"}
+    ALLOWED_UNITS = {"mph", "F", "C", "pct", "in"}
     ALLOWED_CHANNELS = {"sms", "email", "push"}
 
     metric = (data.get("metric") or "").strip()
@@ -16828,9 +16828,9 @@ def me_threshold_alerts_update(alert_id):
 
     data = request.get_json(silent=True) or {}
 
-    ALLOWED_METRICS = {"wind", "temp_low", "temp_high", "precip_chance", "humidity"}
+    ALLOWED_METRICS = {"wind", "temp_low", "temp_high", "heat_index", "precip_chance", "rain_amount", "snow_amount", "humidity"}
     ALLOWED_COMPS = {"gt", "lt", "gte", "lte", "eq"}
-    ALLOWED_UNITS = {"mph", "F", "C", "pct"}
+    ALLOWED_UNITS = {"mph", "F", "C", "pct", "in"}
     ALLOWED_CHANNELS = {"sms", "email", "push"}
 
     set_clauses = []
@@ -21535,6 +21535,11 @@ def _brief_scheduler_loop() -> None:
             _process_rain_alerts()
         except Exception as e:
             print(f"[rain-alert] tick failed: {e!r}", flush=True)
+
+        try:
+            _process_threshold_alerts()
+        except Exception as e:
+            print(f"[scheduler] threshold alerts failed: {e}", flush=True)
         try:
             _check_missed_pro_briefs()
         except Exception as e:
@@ -22795,6 +22800,319 @@ def _send_crew_all_clears() -> None:
             )
         except Exception as e:
             print(f"[crew-allclear] notify failed for user {r['crew_user_id']}: {e!r}", flush=True)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Per-client threshold alerts (June 2026)
+#
+# Subscribers (via account settings or the onboarding profile) define
+# thresholds like "wind gusts above 35 mph" or "heat index above 100F".
+# This engine checks each enabled threshold against the subscriber's
+# primary location on BOTH the current conditions (it's happening) and the
+# next 12 hours of forecast (heads-up), and pages the subscriber's lead Met
+# so the Met can send a personalized message. It does NOT text the
+# subscriber directly.
+#
+# Safety, built deliberately conservative after the June duplicate-alert
+# incident: advisory lock (key 91234575) so it never runs in two workers at
+# once; a quiet window per threshold so a Met is paged once per event and
+# not every minute; pages the Met only (bounded blast radius); a kill
+# switch via the THRESHOLD_ALERTS_ENABLED env var (set to 0 to silence).
+# ──────────────────────────────────────────────────────────────────────
+
+_THRESHOLD_CURRENT_FIELDS = [
+    "temperature_2m", "apparent_temperature", "relative_humidity_2m",
+    "wind_speed_10m", "wind_gusts_10m",
+    "precipitation", "snowfall",
+]
+# Hourly adds precipitation_probability, which is a forecast-only variable
+# (there is no "current" probability), so it only ever trips on the forecast.
+_THRESHOLD_HOURLY_FIELDS = _THRESHOLD_CURRENT_FIELDS + ["precipitation_probability"]
+
+
+def _threshold_metric_fields(metric):
+    """Map a subscriber's metric label to Open-Meteo field name(s).
+    Returns the field(s) to check (trip if ANY crosses), or [] if the
+    metric isn't one we can read from the forecast yet (e.g. lightning,
+    which needs a separate feed)."""
+    m = (metric or "").strip().lower().replace(" ", "_")
+    mapping = {
+        "wind": ["wind_gusts_10m", "wind_speed_10m"],
+        "wind_speed": ["wind_speed_10m"],
+        "windspeed": ["wind_speed_10m"],
+        "wind_gust": ["wind_gusts_10m"],
+        "wind_gusts": ["wind_gusts_10m"],
+        "gust": ["wind_gusts_10m"],
+        "gusts": ["wind_gusts_10m"],
+        "temperature": ["temperature_2m"],
+        "temp": ["temperature_2m"],
+        "temp_high": ["temperature_2m"],
+        "temp_low": ["temperature_2m"],
+        "high_temp": ["temperature_2m"],
+        "low_temp": ["temperature_2m"],
+        "cold": ["temperature_2m"],
+        "heat": ["apparent_temperature"],
+        "heat_index": ["apparent_temperature"],
+        "feels_like": ["apparent_temperature"],
+        "wind_chill": ["apparent_temperature"],
+        "humidity": ["relative_humidity_2m"],
+        "precip_chance": ["precipitation_probability"],
+        "precipitation": ["precipitation"],
+        "precip": ["precipitation"],
+        "rain": ["precipitation"],
+        "rain_amount": ["precipitation"],
+        "rainfall": ["precipitation"],
+        "snow": ["snowfall"],
+        "snow_amount": ["snowfall"],
+        "snowfall": ["snowfall"],
+    }
+    return mapping.get(m, [])
+
+
+def _threshold_metric_label(metric):
+    m = (metric or "").strip().lower().replace(" ", "_")
+    labels = {
+        "wind": "Wind gusts", "wind_gust": "Wind gusts", "wind_gusts": "Wind gusts",
+        "gust": "Wind gusts", "gusts": "Wind gusts",
+        "wind_speed": "Wind", "windspeed": "Wind",
+        "temperature": "Temperature", "temp": "Temperature",
+        "temp_high": "Temperature", "temp_low": "Temperature",
+        "high_temp": "Temperature", "low_temp": "Temperature", "cold": "Temperature",
+        "heat": "Heat index", "heat_index": "Heat index", "feels_like": "Heat index",
+        "wind_chill": "Wind chill",
+        "humidity": "Humidity",
+        "precip_chance": "Rain chance",
+        "precipitation": "Rain", "precip": "Rain", "rain": "Rain",
+        "rain_amount": "Rainfall", "rainfall": "Rainfall",
+        "snow": "Snow", "snow_amount": "Snowfall", "snowfall": "Snowfall",
+    }
+    return labels.get(m, (metric or "Conditions").strip().title())
+
+
+def _threshold_cmp(value, comparator, threshold):
+    c = (comparator or "").strip().lower()
+    if c in (">", "gt", "above", "over", "greater"):
+        return value > threshold
+    if c in (">=", "gte", "at_least"):
+        return value >= threshold
+    if c in ("<", "lt", "below", "under", "less"):
+        return value < threshold
+    if c in ("<=", "lte", "at_most"):
+        return value <= threshold
+    if c in ("==", "=", "eq", "equals"):
+        return abs(value - threshold) < 1e-9
+    return value >= threshold
+
+
+def _threshold_cmp_label(comparator):
+    c = (comparator or "").strip().lower()
+    if c in (">", "gt", "above", "over", "greater"):
+        return "above"
+    if c in (">=", "gte", "at_least"):
+        return "at or above"
+    if c in ("<", "lt", "below", "under", "less"):
+        return "below"
+    if c in ("<=", "lte", "at_most"):
+        return "at or below"
+    return "at"
+
+
+def _fetch_threshold_forecast(lat, lng):
+    """Open-Meteo current + next-12h hourly for the threshold metrics, in
+    imperial units (mph, F, inch). UTC unixtime."""
+    try:
+        cur_fields = ",".join(_THRESHOLD_CURRENT_FIELDS)
+        hr_fields = ",".join(_THRESHOLD_HOURLY_FIELDS)
+        url = (
+            "https://api.open-meteo.com/v1/forecast"
+            f"?latitude={lat}&longitude={lng}"
+            f"&current={cur_fields}&hourly={hr_fields}"
+            "&wind_speed_unit=mph&temperature_unit=fahrenheit"
+            "&precipitation_unit=inch&timeformat=unixtime&timezone=GMT"
+            "&forecast_hours=12"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "weathervalet/1.0"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[threshold-alert] forecast fetch failed ({lat},{lng}): {e}", flush=True)
+        return None
+
+
+def _evaluate_threshold(metric, comparator, threshold_value, fc):
+    """Return {"kind","value","at_ms"} if the threshold is met now (observed)
+    or within the next 12h (forecast), else None. Observed wins over
+    forecast so a Met is told it's happening, not just expected."""
+    fields = _threshold_metric_fields(metric)
+    if not fields or fc is None:
+        return None
+    try:
+        tv = float(threshold_value)
+    except (TypeError, ValueError):
+        return None
+    now_s = int(time.time())
+
+    # Observed: the current block.
+    cur = fc.get("current") or {}
+    for f in fields:
+        v = cur.get(f)
+        if v is not None and _threshold_cmp(v, comparator, tv):
+            return {"kind": "observed", "value": v, "at_ms": now_s * 1000}
+
+    # Forecast: any hour in the next 12h.
+    hourly = fc.get("hourly") or {}
+    times = hourly.get("time") or []
+    horizon_s = now_s + 12 * 3600
+    for i, ts in enumerate(times):
+        if ts <= now_s or ts > horizon_s:
+            continue
+        for f in fields:
+            series = hourly.get(f) or []
+            v = series[i] if i < len(series) else None
+            if v is not None and _threshold_cmp(v, comparator, tv):
+                return {"kind": "forecast", "value": v, "at_ms": ts * 1000}
+    return None
+
+
+def _ensure_threshold_alert_state_table():
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """CREATE TABLE IF NOT EXISTS threshold_alert_state (
+                           threshold_id   INTEGER PRIMARY KEY
+                                          REFERENCES threshold_alerts(id) ON DELETE CASCADE,
+                           last_paged_ms  BIGINT NOT NULL,
+                           last_kind      TEXT,
+                           last_value     DOUBLE PRECISION
+                       )"""
+                )
+    except Exception as e:
+        print(f"[threshold-alert] state table ensure failed: {e}", flush=True)
+
+
+def _threshold_alert_message(sub_name, place, metric, comparator, value, units, hit):
+    label = _threshold_metric_label(metric)
+    cmp_l = _threshold_cmp_label(comparator)
+    u = (units or "").strip()
+    try:
+        val_txt = f"{float(value):g}"
+    except (TypeError, ValueError):
+        val_txt = str(value)
+    _unit_disp = {"mph": " mph", "F": "\u00b0F", "C": "\u00b0C", "pct": "%", "in": " in"}
+    val_txt = val_txt + _unit_disp.get(u, ((" " + u) if u else ""))
+    if hit["kind"] == "observed":
+        timing = "right now"
+    else:
+        try:
+            tz = ZoneInfo("America/Indiana/Indianapolis")
+            when = datetime.fromtimestamp(hit["at_ms"] / 1000, tz).strftime("%I:%M %p").lstrip("0")
+            timing = f"expected around {when}"
+        except Exception:
+            timing = "expected soon"
+    first = (sub_name or "this subscriber").split()[0] if sub_name else "them"
+    return (f"WeatherValet threshold alert: {sub_name or 'a subscriber'} at "
+            f"{place or 'their location'}. {label} {cmp_l} {val_txt} {timing}. "
+            f"Send {first} a personalized update.")
+
+
+def _process_threshold_alerts():
+    """Scheduler job: page Mets when a subscriber's threshold is met.
+    Advisory-locked (key 91234575) and gated by THRESHOLD_ALERTS_ENABLED."""
+    if (os.environ.get("THRESHOLD_ALERTS_ENABLED", "1") or "1").strip() != "1":
+        return
+    _LOCK_KEY = 91234575
+    _lock_conn = _try_acquire_scheduler_lock(_LOCK_KEY)
+    if _lock_conn is None:
+        return  # Another worker is handling thresholds this tick
+    try:
+        _process_threshold_alerts_inner()
+    finally:
+        _release_scheduler_lock(_lock_conn, _LOCK_KEY)
+
+
+def _process_threshold_alerts_inner():
+    _ensure_threshold_alert_state_table()
+    now_ms = int(time.time() * 1000)
+    quiet_ms = 3 * 60 * 60 * 1000  # once per event, then quiet ~3 hours
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT ta.id AS threshold_id, ta.user_id, ta.metric,
+                          ta.comparator, ta.threshold_value, ta.units,
+                          u.name AS sub_name,
+                          sc.primary_met_id,
+                          mu.name AS met_name, mu.phone AS met_phone,
+                          loc.lat AS lat, loc.lng AS lng,
+                          loc.address_text AS place,
+                          st.last_paged_ms AS last_paged_ms
+                   FROM threshold_alerts ta
+                   JOIN users u ON u.id = ta.user_id
+                   LEFT JOIN subscriber_coverage sc ON sc.user_id = ta.user_id
+                   LEFT JOIN users mu ON mu.id = sc.primary_met_id
+                   LEFT JOIN saved_locations loc
+                          ON loc.user_id = ta.user_id AND loc.is_primary = TRUE
+                   LEFT JOIN threshold_alert_state st ON st.threshold_id = ta.id
+                   WHERE ta.enabled = TRUE AND u.is_active = TRUE"""
+            )
+            rows = cur.fetchall()
+
+    if not rows:
+        return
+
+    # Group by location so each forecast is fetched once per tick.
+    by_loc = {}
+    for r in rows:
+        if r["lat"] is None or r["lng"] is None:
+            continue
+        key = (round(float(r["lat"]), 3), round(float(r["lng"]), 3))
+        by_loc.setdefault(key, []).append(r)
+
+    for (lat, lng), group in by_loc.items():
+        fc = _fetch_threshold_forecast(lat, lng)
+        if fc is None:
+            continue
+        for r in group:
+            try:
+                # Quiet window: if we paged this threshold within the last
+                # few hours, stay silent (one page per event).
+                lp = r.get("last_paged_ms") or 0
+                if now_ms - lp < quiet_ms:
+                    continue
+                hit = _evaluate_threshold(
+                    r["metric"], r["comparator"], r["threshold_value"], fc
+                )
+                if not hit:
+                    continue
+                met_phone = (r.get("met_phone") or "").strip()
+                if not met_phone:
+                    print(f"[threshold-alert] threshold {r['threshold_id']} tripped "
+                          f"for user {r['user_id']} but no lead Met phone; skipped",
+                          flush=True)
+                    continue
+                msg = _threshold_alert_message(
+                    r.get("sub_name"), r.get("place"), r["metric"],
+                    r["comparator"], r["threshold_value"], r.get("units"), hit,
+                )
+                if send_sms(met_phone, msg):
+                    with db() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """INSERT INTO threshold_alert_state
+                                       (threshold_id, last_paged_ms, last_kind, last_value)
+                                   VALUES (%s, %s, %s, %s)
+                                   ON CONFLICT (threshold_id) DO UPDATE
+                                       SET last_paged_ms = EXCLUDED.last_paged_ms,
+                                           last_kind = EXCLUDED.last_kind,
+                                           last_value = EXCLUDED.last_value""",
+                                (r["threshold_id"], now_ms, hit["kind"], float(hit["value"])),
+                            )
+                    print(f"[threshold-alert] paged Met {met_phone} for threshold "
+                          f"{r['threshold_id']} ({hit['kind']})", flush=True)
+            except Exception as e:
+                print(f"[threshold-alert] threshold {r.get('threshold_id')} failed: {e}",
+                      flush=True)
 
 
 def _process_severe_alerts() -> None:
@@ -27939,6 +28257,27 @@ def met_pro_subscribers_queue():
                 )
             sub_rows = cur.fetchall()
 
+    # Account-owner labels: an added user shows "[owner] User" on the card;
+    # a primary account owner (or solo subscriber) shows "Subscriber".
+    _owner_map = {}
+    _member_ids = [s["user_id"] for s in sub_rows]
+    if _member_ids:
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT pmm.member_user_id AS mid, ownr.name AS owner_name
+                           FROM pro_multi_memberships pmm
+                           JOIN users ownr ON ownr.id = pmm.primary_user_id
+                           WHERE pmm.status = 'active'
+                             AND pmm.member_user_id = ANY(%s)""",
+                        (_member_ids,),
+                    )
+                    for mr in cur.fetchall():
+                        _owner_map[mr["mid"]] = mr["owner_name"]
+        except Exception:
+            _owner_map = {}
+
     # For each subscriber, look up their latest pro_brief_drafts row from
     # the last 18 hours (so we catch tonight's pregen + this morning's draft).
     subscribers = []
@@ -28015,6 +28354,7 @@ def met_pro_subscribers_queue():
         subscribers.append({
             "user_id": s["user_id"],
             "name": s.get("name") or "",
+            "account_owner_name": _owner_map.get(s["user_id"], ""),
             "email": s["email"],
             "phone": s.get("phone") or "",
             "tier": s["tier"],
