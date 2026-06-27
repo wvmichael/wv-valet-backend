@@ -4000,17 +4000,23 @@ def normalize_phone(raw: Optional[str]) -> Optional[str]:
     return None  # caller treats None as "invalid number, ask again"
 
 
-def send_sms(to: str, body: str) -> bool:
-    """Fire-and-log SMS via Twilio. Returns True on success.
-    Failures are logged but never raised — SMS is best-effort, the request
-    record in SQLite is the source of truth."""
+def send_sms(to: str, body: str, media_url=None) -> bool:
+    """Fire-and-log SMS (or MMS) via Twilio. Returns True on success.
+    Pass media_url (a public image URL, or a list of them) to send the
+    message as a picture text (MMS). Failures are logged but never raised,
+    SMS is best-effort and the request record is the source of truth.
+    """
     if not (TwilioClient and TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER):
-        # Fallback for local dev — print to stdout so the developer can see the flow
-        print(f"[sms-stub] to={to}\n{body}\n", flush=True)
+        # Fallback for local dev so the developer can see the flow
+        tag = "mms-stub" if media_url else "sms-stub"
+        print(f"[{tag}] to={to} media={media_url}\n{body}\n", flush=True)
         return True
     try:
         client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        msg = client.messages.create(body=body, from_=TWILIO_FROM_NUMBER, to=to)
+        kwargs = dict(body=body, from_=TWILIO_FROM_NUMBER, to=to)
+        if media_url:
+            kwargs["media_url"] = list(media_url) if isinstance(media_url, (list, tuple)) else [media_url]
+        msg = client.messages.create(**kwargs)
         print(f"[sms] sent sid={msg.sid} to={to}", flush=True)
         return True
     except Exception as e:
@@ -9856,6 +9862,119 @@ def analytics_search():
     except Exception as e:
         print(f"[analytics-search] failed: {e}", flush=True)
     return jsonify({"ok": True})
+
+
+# ════════════════════════════════════════════════════════════════════
+# Image upload + hosting (own-domain media, for inline email + MMS)
+# ════════════════════════════════════════════════════════════════════
+#
+# Mets build graphics in Slides/PowerPoint, export a PNG, and upload it in
+# the composer. We optimize it (downscale + recompress so it stays small
+# enough to deliver as a picture text), store the bytes in Postgres, and
+# serve it from our own domain. That one URL powers the inline email image
+# AND the picture text (MMS), with no Google Drive link and no carrier
+# filtering risk. (June 2026)
+
+def _ensure_media_table():
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS uploaded_media (
+                       token       TEXT PRIMARY KEY,
+                       mime_type   TEXT NOT NULL,
+                       bytes       BYTEA NOT NULL,
+                       byte_size   INTEGER NOT NULL,
+                       filename    TEXT,
+                       uploaded_by INTEGER,
+                       created_at  BIGINT NOT NULL
+                   )"""
+            )
+
+
+@app.route("/api/v1/media/upload", methods=["OPTIONS"])
+def _media_upload_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/media/upload")
+def media_upload():
+    user = _get_current_user()
+    roles = (user.get("roles") or []) if user else []
+    if not user or ("met" not in roles and "admin" not in roles):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    f = request.files.get("file")
+    if f is None:
+        return jsonify({"ok": False, "error": "no-file",
+                        "message": "No image was attached."}), 400
+    raw = f.read()
+    if not raw:
+        return jsonify({"ok": False, "error": "empty",
+                        "message": "The image was empty."}), 400
+    try:
+        import io
+        from PIL import Image
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+        src_fmt = (img.format or "").upper()
+        # Downscale wide graphics so the picture text stays deliverable.
+        max_w = 1400
+        if img.width > max_w:
+            ratio = max_w / float(img.width)
+            img = img.resize((max_w, max(1, int(img.height * ratio))))
+        out = io.BytesIO()
+        if src_fmt == "PNG" or img.mode in ("RGBA", "LA", "P"):
+            img.save(out, format="PNG", optimize=True)
+            mime, ext = "image/png", "png"
+        else:
+            img.convert("RGB").save(out, format="JPEG", quality=82, optimize=True)
+            mime, ext = "image/jpeg", "jpg"
+        data = out.getvalue()
+    except Exception:
+        return jsonify({"ok": False, "error": "bad-image",
+                        "message": "That file did not look like a PNG or JPG image."}), 400
+    if len(data) > 5 * 1024 * 1024:
+        return jsonify({"ok": False, "error": "too-large",
+                        "message": "Image is too large even after optimizing. Try a simpler graphic."}), 400
+    token = secrets.token_urlsafe(18)
+    try:
+        _ensure_media_table()
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO uploaded_media
+                           (token, mime_type, bytes, byte_size, filename, uploaded_by, created_at)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                    (token, mime, psycopg2.Binary(data), len(data),
+                     (f.filename or "")[:200], user.get("id"), int(time.time() * 1000)),
+                )
+    except Exception as e:
+        return jsonify({"ok": False, "error": "server", "message": str(e)}), 500
+    url = request.host_url.rstrip("/") + "/media/" + token + "." + ext
+    return jsonify({"ok": True, "url": url, "bytes": len(data)})
+
+
+@app.get("/media/<path:token>")
+def media_serve(token):
+    """Public image serve (no auth): used by email <img>, the web brief,
+    and Twilio's MMS fetch. The token may carry a .png/.jpg extension."""
+    base = token.rsplit(".", 1)[0]
+    try:
+        _ensure_media_table()
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT mime_type, bytes FROM uploaded_media WHERE token = %s", (base,))
+                row = cur.fetchone()
+    except Exception:
+        row = None
+    if not row:
+        return ("Not found", 404)
+    data = row["bytes"]
+    if isinstance(data, memoryview):
+        data = data.tobytes()
+    resp = make_response(bytes(data))
+    resp.headers["Content-Type"] = row["mime_type"]
+    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return resp
 
 
 @app.route("/api/v1/admin/message-log", methods=["OPTIONS"])
@@ -31238,7 +31357,8 @@ def met_pro_brief_send(draft_id):
                 # Legacy fallback
                 sms_text = (final_snippet or legacy_body[:140]) + f"\n\nFull: {web_url}\n- {met_name}"
             try:
-                if send_sms(row["sub_phone"], sms_text):
+                _media = [image_url] if image_url.startswith("http") else None
+                if send_sms(row["sub_phone"], sms_text, media_url=_media):
                     channels_used.append("sms")
                     any_success = True
             except Exception as e:
