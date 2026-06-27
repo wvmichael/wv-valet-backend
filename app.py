@@ -16955,6 +16955,161 @@ def me_threshold_alerts_delete(alert_id):
 
 
 # ════════════════════════════════════════════════════════════════════
+# Operational profile (onboarding questionnaire) — save endpoint
+# ════════════════════════════════════════════════════════════════════
+#
+# The onboarding page (wv_onboarding.html) POSTs the client's operational
+# profile here. Two things happen: the structured context is written onto
+# subscriber_coverage so the Met composer sees it, and each watched
+# threshold we can actually monitor becomes a threshold_alerts row, so the
+# same engine that powers the settings builder picks it up. Categories we
+# can't read from the forecast yet (lightning, ice, fog) and "severe"
+# (already covered by NWS watch/warning alerting) are skipped and reported
+# back so the UI can say so.
+
+def _onboarding_label_to_cat(label):
+    """Fallback when the form didn't send a category key: map the visible
+    label back to a category."""
+    l = (label or "").strip().lower()
+    return {
+        "wind": "wind", "rain rate": "rain_rate", "rain total": "rain_total",
+        "lightning": "lightning", "heat": "heat", "cold / freeze": "cold",
+        "snow": "snow", "ice": "ice", "fog / visibility": "fog",
+        "humidity": "humidity", "severe / warning": "severe",
+    }.get(l, "")
+
+
+# onboarding category -> (engine metric, endpoint units)
+_ONBOARDING_CAT_TO_METRIC = {
+    "wind": ("wind", "mph"),
+    "rain_rate": ("rain_amount", "in"),
+    "rain_total": ("rain_amount", "in"),
+    "heat": ("heat_index", "F"),
+    "cold": ("temp_low", "F"),
+    "snow": ("snow_amount", "in"),
+    "humidity": ("humidity", "pct"),
+}
+_ONBOARDING_OP_TO_COMP = {
+    "over": "gt", "under": "lt",
+    "at or above": "gte", "at or below": "lte",
+    "gt": "gt", "lt": "lt", "gte": "gte", "lte": "lte",
+}
+
+
+@app.route("/api/v1/me/operational-profile", methods=["OPTIONS"])
+def me_operational_profile_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/me/operational-profile")
+def me_operational_profile_save():
+    user = _get_current_user()
+    if not user:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    data = request.get_json(silent=True) or {}
+    now_ms = int(time.time() * 1000)
+
+    # ── 1. Structured context onto subscriber_coverage ──
+    industry = (data.get("industry") or "").strip()[:200]
+    decisions = data.get("client_decisions") or []
+    decisions_txt = (", ".join([str(d) for d in decisions if d])
+                     if isinstance(decisions, list) else str(decisions or ""))[:2000]
+    cp = data.get("contact_protocol") or {}
+    peak_txt = (cp.get("operating_hours") or "").strip()[:500]
+    od = data.get("operation_detail") or {}
+    extra = []
+    if data.get("worst_event_history"):
+        extra.append("Worst past event: " + str(data["worst_event_history"]).strip())
+    if od.get("weather_exposed"):
+        extra.append("Weather-exposed: " + str(od["weather_exposed"]).strip())
+    if od.get("sensitive_times"):
+        extra.append("Sensitive times: " + str(od["sensitive_times"]).strip())
+    if od.get("bad_day_cost"):
+        extra.append("Cost of a bad day: " + str(od["bad_day_cost"]).strip())
+    for t in (data.get("watched_thresholds") or []):
+        imp = (t.get("client_impact") or "").strip()
+        wx = (t.get("weather") or "").strip()
+        if imp:
+            extra.append((wx + ": " if wx else "") + imp)
+    additional_ctx = "\n".join(extra)[:2000]
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id FROM subscriber_coverage WHERE user_id=%s", (user["id"],))
+                if cur.fetchone():
+                    cur.execute(
+                        """UPDATE subscriber_coverage
+                              SET business_role = COALESCE(NULLIF(%s,''), business_role),
+                                  weather_decisions = COALESCE(NULLIF(%s,''), weather_decisions),
+                                  peak_need_times = COALESCE(NULLIF(%s,''), peak_need_times),
+                                  additional_context = COALESCE(NULLIF(%s,''), additional_context),
+                                  updated_at = %s
+                            WHERE user_id = %s""",
+                        (industry, decisions_txt, peak_txt, additional_ctx, now_ms, user["id"]),
+                    )
+                else:
+                    cur.execute(
+                        """INSERT INTO subscriber_coverage
+                               (user_id, business_role, weather_decisions, peak_need_times,
+                                additional_context, updated_at)
+                           VALUES (%s,%s,%s,%s,%s,%s)""",
+                        (user["id"], industry, decisions_txt, peak_txt, additional_ctx, now_ms),
+                    )
+    except Exception as e:
+        print(f"[operational-profile] context save failed for user {user['id']}: {e}", flush=True)
+        # Non-fatal: still try to save thresholds below.
+
+    # ── 2. Watched thresholds -> threshold_alerts (dedup by content) ──
+    created = 0
+    skipped = []
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                for t in (data.get("watched_thresholds") or []):
+                    cat = (t.get("cat") or "").strip().lower() or _onboarding_label_to_cat(t.get("weather"))
+                    mm = _ONBOARDING_CAT_TO_METRIC.get(cat)
+                    if not mm:
+                        # Skip the ones we can't monitor yet, but only note the
+                        # real ones (not 'severe', handled by NWS, or 'other').
+                        if cat and cat not in ("severe", "other"):
+                            skipped.append(cat)
+                        continue
+                    metric, units = mm
+                    comp = _ONBOARDING_OP_TO_COMP.get((t.get("condition") or "").strip().lower())
+                    if not comp:
+                        comp = "lt" if metric == "temp_low" else "gt"
+                    try:
+                        tv = float(str(t.get("value")).strip())
+                    except (TypeError, ValueError):
+                        continue
+                    # Dedup by content so re-submitting the form doesn't pile up
+                    # duplicates, and builder-created thresholds aren't touched.
+                    cur.execute(
+                        """SELECT id FROM threshold_alerts
+                            WHERE user_id=%s AND metric=%s AND comparator=%s
+                              AND threshold_value=%s AND units=%s""",
+                        (user["id"], metric, comp, tv, units),
+                    )
+                    if cur.fetchone():
+                        continue
+                    cur.execute(
+                        """INSERT INTO threshold_alerts
+                               (user_id, metric, comparator, threshold_value, units,
+                                channels, enabled, created_at, updated_at)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (user["id"], metric, comp, tv, units, "sms,email", True, now_ms, now_ms),
+                    )
+                    created += 1
+    except Exception as e:
+        print(f"[operational-profile] threshold save failed for user {user['id']}: {e}", flush=True)
+        return jsonify({"ok": False, "error": "threshold-save-failed"}), 500
+
+    return jsonify({"ok": True, "thresholds_created": created, "skipped": skipped})
+
+
+
+# ════════════════════════════════════════════════════════════════════
 # Saved locations — write endpoints (Phase 10 Chunk B2)
 # ════════════════════════════════════════════════════════════════════
 #
