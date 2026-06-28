@@ -18860,15 +18860,48 @@ _BRIEF_SCHEDULER_STARTED = False
 _BRIEF_SCHEDULER_LOCK = threading.Lock()
 
 
-def _fetch_forecast(lat: float, lng: float) -> Optional[dict]:
+def _shift_forecast_to_day(data: dict, offset: int) -> dict:
+    """Shift Open-Meteo daily/hourly arrays so index [0] is `offset` days out.
+
+    The brief generator and value extractor read index [0] for "the day this
+    brief is about." When we pre-generate the night before, the brief is about
+    TOMORROW, so we fetch two days and shift the arrays up by one. Callers keep
+    reading [0] and transparently get the right day. Falls back to leaving the
+    data untouched if the API returned fewer days than requested."""
+    if offset <= 0 or not isinstance(data, dict):
+        return data
+    daily = data.get("daily")
+    if isinstance(daily, dict):
+        for k, v in list(daily.items()):
+            if isinstance(v, list) and len(v) > offset:
+                daily[k] = v[offset:]
+    hourly = data.get("hourly")
+    if isinstance(hourly, dict):
+        shift = offset * 24
+        for k, v in list(hourly.items()):
+            if isinstance(v, list) and len(v) > shift:
+                hourly[k] = v[shift:]
+    return data
+
+
+def _fetch_forecast(lat: float, lng: float, day_offset: int = 0) -> Optional[dict]:
     """Fetch a forecast from Open-Meteo for the given lat/lng.
 
     Returns a dict with the day's high/low, hourly precipitation,
     wind, and overall conditions; or None on failure. Used by the
     brief generator — no user is present so we hit the API directly
     from the backend (unlike ticket forecasts which the frontend fetches).
+
+    day_offset: which day the brief is about, relative to "today" in the
+        location's local timezone. 0 = today (the default, for same-morning
+        sends). 1 = tomorrow (for night-before pre-generation). When >0 we
+        request the extra days and shift the arrays so index [0] is the
+        target day, so callers reading [0] need no changes. (June 2026 fix:
+        pre-gen was fetching forecast_days=1 at 8 PM, which returns TODAY's
+        forecast, so every pre-generated brief shipped yesterday's high.)
     """
     try:
+        days = 1 + max(0, int(day_offset))
         url = (
             "https://api.open-meteo.com/v1/forecast"
             f"?latitude={lat}&longitude={lng}"
@@ -18876,11 +18909,14 @@ def _fetch_forecast(lat: float, lng: float) -> Optional[dict]:
             "&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,"
             "windspeed_10m_max,weathercode,sunrise,sunset"
             "&temperature_unit=fahrenheit&windspeed_unit=mph"
-            "&precipitation_unit=inch&timezone=auto&forecast_days=1"
+            f"&precipitation_unit=inch&timezone=auto&forecast_days={days}"
         )
         req = urllib.request.Request(url, headers={"User-Agent": "weathervalet/1.0"})
         with urllib.request.urlopen(req, timeout=6) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            data = json.loads(resp.read().decode("utf-8"))
+        if day_offset:
+            data = _shift_forecast_to_day(data, int(day_offset))
+        return data
     except Exception as e:
         print(f"[brief-forecast] fetch failed for ({lat},{lng}): {e}", flush=True)
         return None
@@ -21473,9 +21509,11 @@ def _pregenerate_pro_brief_drafts_inner() -> None:
                 print(f"[pregen-pro] dup check failed user_id={c['user_id']}: {e}", flush=True)
                 continue
 
-            # Generate the AI draft for tomorrow morning.
+            # Generate the AI draft for tomorrow morning. Fetch TOMORROW's
+            # forecast (day_offset=1), not tonight's, so the high/low match the
+            # day the subscriber receives the brief.
             location_label = c["loc_label"] or c["loc_address"] or "your location"
-            forecast = _fetch_forecast(float(c["loc_lat"]), float(c["loc_lng"]))
+            forecast = _fetch_forecast(float(c["loc_lat"]), float(c["loc_lng"]), day_offset=1)
             ai_verdict, ai_snippet, ai_body = _generate_ai_brief(
                 location_label, forecast or {}, address=c.get("loc_address") or "")
 
