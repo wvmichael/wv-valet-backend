@@ -21058,15 +21058,34 @@ def _process_pending_briefs_inner() -> None:
 
             # ── Generate the brief content ──
             if existing_draft and existing_draft["status"] in ("pending-review", "claimed"):
-                # Use Met's edits if any, else fall back to AI content
-                verdict = existing_draft["met_verdict"] or existing_draft["ai_verdict"] or "clear"
-                snippet = existing_draft["met_snippet"] or existing_draft["ai_snippet"] or ""
-                full_body = existing_draft["met_body"] or existing_draft["ai_body"] or ""
-                is_met_touched = bool(existing_draft["met_verdict"]
-                                      or existing_draft["met_snippet"]
-                                      or existing_draft["met_body"])
-                met_name_for_record = existing_draft["sent_by_name"] or None
                 location_label = c["loc_label"] or c["loc_address"] or "your location"
+                # At pre-gen we copy ai_* into met_* , so "met fields present"
+                # does NOT mean a Met edited. The reliable signal is whether
+                # met_body actually differs from ai_body.
+                _met_body = (existing_draft["met_body"] or "").strip()
+                _ai_body = (existing_draft["ai_body"] or "").strip()
+                real_met_edit = bool(_met_body) and _met_body != _ai_body
+                if real_met_edit:
+                    # Met wrote their own words — send exactly those, untouched.
+                    verdict = existing_draft["met_verdict"] or existing_draft["ai_verdict"] or "clear"
+                    snippet = existing_draft["met_snippet"] or existing_draft["ai_snippet"] or ""
+                    full_body = existing_draft["met_body"] or existing_draft["ai_body"] or ""
+                    is_met_touched = True
+                    met_name_for_record = existing_draft["sent_by_name"] or None
+                else:
+                    # Met didn't change the content — regenerate from the fresh
+                    # send-time forecast (fetched above) so the auto-sent brief
+                    # shows current numbers, not the night-before snapshot.
+                    rv, rs, rb = _generate_ai_brief(
+                        location_label, forecast or {}, address=c.get("loc_address") or "")
+                    if rv != "suppress" and rb:
+                        verdict, snippet, full_body = rv, rs, rb
+                    else:
+                        verdict = existing_draft["ai_verdict"] or "clear"
+                        snippet = existing_draft["ai_snippet"] or ""
+                        full_body = existing_draft["ai_body"] or ""
+                    is_met_touched = False
+                    met_name_for_record = None
             else:
                 # No draft — generate fresh AI brief (Hobbyist auto-send flow)
                 # May 23, 2026: upgraded to LLM-first generation with template
@@ -31897,6 +31916,50 @@ def met_pro_brief_send(draft_id):
     met_name = user.get("name") or "Your meteorologist"
     location_label = row["location_label"] or "your location"
     now_ms = int(time.time() * 1000)
+
+    # Accuracy refresh (June 2026): if the Met is sending the AI draft
+    # untouched (no structured edits and the legacy body is still the AI
+    # body), re-pull the forecast now so the brief reflects current numbers
+    # rather than the night-before snapshot. If the Met wrote ANY of their
+    # own content, we never touch it. We also persist the fresh AI content
+    # and predictions onto the draft so the brief_history snapshot used for
+    # accuracy grading matches what actually went out.
+    _ai_body_txt = (row.get("ai_body") or "").strip()
+    _met_body_txt = (row.get("met_body") or "").strip()
+    _is_untouched_ai = (not is_structured) and (not _met_body_txt or _met_body_txt == _ai_body_txt)
+    if (_is_untouched_ai and row.get("location_lat") is not None
+            and row.get("location_lng") is not None):
+        try:
+            _fresh = _fetch_forecast(float(row["location_lat"]), float(row["location_lng"]))
+            if _fresh:
+                _rv, _rs, _rb = _generate_ai_brief(
+                    location_label, _fresh, address=row.get("location_address") or "")
+                if _rv != "suppress" and _rb:
+                    final_verdict = (_rv or final_verdict).strip()
+                    final_snippet = (_rs or final_snippet).strip()
+                    legacy_body = (_rb or legacy_body).strip()
+                    _p = _extract_predicted_values_from_forecast(_fresh)
+                    with db() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """UPDATE pro_brief_drafts
+                                   SET ai_verdict = %s, ai_snippet = %s, ai_body = %s,
+                                       met_verdict = %s, met_snippet = %s, met_body = %s,
+                                       predicted_high_f = %s, predicted_low_f = %s,
+                                       predicted_precip_in = %s, predicted_max_wind_mph = %s
+                                   WHERE id = %s""",
+                                (_rv, _rs, _rb, _rv, _rs, _rb,
+                                 _p.get("predicted_high_f"), _p.get("predicted_low_f"),
+                                 _p.get("predicted_precip_in"), _p.get("predicted_max_wind_mph"),
+                                 draft_id),
+                            )
+                    # Keep the in-memory row consistent for the rest of this send
+                    row["predicted_high_f"] = _p.get("predicted_high_f")
+                    row["predicted_low_f"] = _p.get("predicted_low_f")
+                    row["predicted_precip_in"] = _p.get("predicted_precip_in")
+                    row["predicted_max_wind_mph"] = _p.get("predicted_max_wind_mph")
+        except Exception as e:
+            print(f"[pro-brief-send] send-time refresh skipped for draft={draft_id}: {e}", flush=True)
 
     # Verdict label for display
     verdict_label = {
