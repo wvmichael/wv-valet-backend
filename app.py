@@ -19059,6 +19059,7 @@ def admin_rain_alert_test():
         return jsonify({"ok": False, "error": "forbidden"}), 403
     data = request.get_json(silent=True) or {}
     do_send = bool(data.get("send"))
+    force = bool(data.get("force"))
     test_email = (os.environ.get("RAIN_ALERT_TEST_EMAIL") or "").strip().lower()
     with db() as conn:
         with conn.cursor() as cur:
@@ -19088,6 +19089,26 @@ def admin_rain_alert_test():
                         "message": ("No account matches RAIN_ALERT_TEST_EMAIL"
                                     + (" (" + test_email + ")" if test_email else "")
                                     + ". Check the email is spelled correctly, including the @.")}), 400
+
+    # Force a sample text regardless of weather, to confirm the SMS path
+    # (phone on file + Twilio working). This is separate from the detector.
+    if force:
+        twilio_ok = bool(TwilioClient and TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER)
+        if not u.get("phone"):
+            return jsonify({"ok": True, "forced": True, "sent": False,
+                            "message": "No phone number is on file for this account, so there is nothing to text. Add a number to that subscriber and try again."})
+        if not twilio_ok:
+            return jsonify({"ok": True, "forced": True, "sent": False,
+                            "message": "Texting is not fully configured on the server (missing Twilio settings), so no text could be sent."})
+        sample = ("WeatherValet test: this is a sample rain heads-up to confirm your texts are working. "
+                  "Real alerts fire only when rain is actually on the way.")
+        sent = bool(send_sms(u["phone"], sample))
+        return jsonify({"ok": True, "forced": True, "sent": sent,
+                        "to": u.get("phone"),
+                        "message": ("Test text sent to " + str(u.get("phone")) + ". If it doesn't arrive, the number may be unverified or opted out at Twilio.")
+                                   if sent else
+                                   "Tried to send but Twilio reported a failure. Check the Render logs and your Twilio number."})
+
     if u.get("lat") is None or u.get("lng") is None:
         return jsonify({"ok": False, "error": "no-location",
                         "message": "That account has no primary location with coordinates set."}), 400
@@ -21907,13 +21928,59 @@ def _coverage_generate_pending_tasks() -> None:
         print(f"[coverage-tasks] generated {created_count} new task rows", flush=True)
 
 
+# How long after a Pro brief's delivery time we wait before paging admins.
+# Pro briefs are Meteorologist-owned and are NOT auto-sent, so a brief that
+# is neither sent nor scheduled by this grace genuinely won't go out and
+# needs a human. The grace keeps a Met who is a few minutes late from
+# triggering a page. Tunable via env (minutes); default 30.
+try:
+    _PRO_BRIEF_ADMIN_GRACE_MS = int(
+        float(os.environ.get("PRO_BRIEF_ADMIN_GRACE_MIN", "30")) * 60 * 1000)
+except Exception:
+    _PRO_BRIEF_ADMIN_GRACE_MS = 30 * 60 * 1000
+
+
+def _pro_brief_is_scheduled(subscriber_user_id) -> bool:
+    """True if a Met has a pending scheduled Pro brief queued for this
+    subscriber. A scheduled brief keeps its draft in 'pending-review', so
+    without this check it looks identical to a missed brief. We never page
+    admins for a brief that is going to send itself on the Met's schedule."""
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT target_audience FROM scheduled_messages
+                       WHERE type = 'pro_brief' AND status = 'pending'"""
+                )
+                rows = cur.fetchall()
+        target = str(subscriber_user_id)
+        for row in rows:
+            ta = row.get("target_audience")
+            if not ta:
+                continue
+            try:
+                obj = json.loads(ta)
+            except Exception:
+                continue
+            if str(obj.get("subscriber_user_id")) == target:
+                return True
+    except Exception as e:
+        print(f"[coverage-escalate] scheduled-check failed: {e}", flush=True)
+    return False
+
+
 def _coverage_check_escalations() -> None:
     """For pending daily brief tasks approaching their deadline, fire
     SMS escalations.
 
     Schedule:
       - T-30 minutes (before deadline), Met not started → SMS assigned Met
-      - T+0 (deadline), still not sent → SMS admin + Chief Met (Joe)
+      - T+grace (delivery time passed by the grace window), still not sent
+        and not scheduled → SMS admin + Chief Met (Joe). Pro briefs are
+        never auto-sent, so this means no brief will go out until a Met
+        acts. (June 2026: was T+0, which paged before the Met realistically
+        had time and before the old auto-send safety net ran. Auto-send of
+        unreviewed AI drafts has since been removed at Michael's direction.)
 
     Each escalation level recorded in escalated_at_ms / escalated_admin_at_ms
     so we don't double-fire. If the brief is sent in between, the task
@@ -21973,10 +22040,15 @@ def _coverage_check_escalations_inner() -> None:
             and r["escalated_at_ms"] is None
             and r["assigned_met_id"]):
             _coverage_escalate_to_met(r)
-        # Level 2: T+0 (deadline passed), not sent, not yet admin-escalated
-        elif (time_to_deadline <= 0
+        # Level 2: delivery time passed by the grace window, still not sent,
+        # not yet admin-escalated, and the Met has not scheduled it. Because
+        # Pro briefs are never auto-sent, this means the subscriber will get
+        # nothing unless a human acts, which is the only thing worth paging
+        # admins about.
+        elif (time_to_deadline <= -_PRO_BRIEF_ADMIN_GRACE_MS
               and r["sent_at_ms"] is None
-              and r["escalated_admin_at_ms"] is None):
+              and r["escalated_admin_at_ms"] is None
+              and not _pro_brief_is_scheduled(r["subscriber_user_id"])):
             _coverage_escalate_to_admin(r)
 
 
@@ -22031,9 +22103,9 @@ def _coverage_escalate_to_admin(task_row) -> None:
     sub_name = task_row.get("subscriber_name") or "a Pro subscriber"
     met_name = task_row.get("met_name") or "(unassigned)"
     msg = (
-        f"WeatherValet ALERT: daily brief for {sub_name} is OVERDUE. "
-        f"Assigned Met: {met_name}. Date: {task_row['task_date']}. "
-        f"Coverage gap, needs immediate attention."
+        f"WeatherValet ALERT: the Pro brief for {sub_name} has not been sent "
+        f"or scheduled and its delivery time has passed. Assigned Met: {met_name}. "
+        f"Date: {task_row['task_date']}. No brief will go out until a Meteorologist sends it."
     )
 
     # Find escalation targets: all active admins + any user with name
@@ -22341,20 +22413,18 @@ def _autosend_missed_pro_briefs() -> None:
                     # we can do here.
                     continue
 
-                ok, reason = _autosend_pro_brief_draft(draft_row["id"])
+                # Pro briefs are Meteorologist-owned. We do NOT auto-send the
+                # AI draft on the Met's behalf (Michael's direction, June
+                # 2026). If the Met hasn't sent or scheduled by now, no brief
+                # goes out; the coverage escalation pages admins about the
+                # miss. We keep this job only to log the gap for visibility.
                 sub_name = (c.get("name") or "").strip() or c["email"]
-                if ok:
-                    print(
-                        f"[autosend-scheduler] auto-sent draft={draft_row['id']} "
-                        f"for {sub_name} (user_id={c['user_id']})",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        f"[autosend-scheduler] held draft={draft_row['id']} "
-                        f"for {sub_name}: {reason}",
-                        flush=True,
-                    )
+                print(
+                    f"[autosend-scheduler] auto-send disabled (Met-owned); "
+                    f"not sending draft={draft_row['id']} for {sub_name} "
+                    f"(user_id={c['user_id']})",
+                    flush=True,
+                )
             except Exception as e:
                 print(
                     f"[autosend-scheduler] per-sub error user_id={c.get('user_id')}: {e!r}",
