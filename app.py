@@ -4267,6 +4267,39 @@ ALLOWED_ORIGINS = set(
 )
 
 
+@app.before_request
+def _handle_cors_preflight():
+    """Answer every CORS preflight (OPTIONS) directly, with full headers.
+
+    A cross-origin POST/PATCH/DELETE carrying a JSON body triggers a browser
+    preflight OPTIONS request. If that response is missing any of the
+    allow-origin / allow-methods / allow-headers / allow-credentials headers,
+    the browser silently blocks the real request — so cross-origin *writes*
+    fail while same-origin writes and cross-origin *reads* (no preflight) keep
+    working. That exact pattern was breaking the threshold-alert save from the
+    SPA. Handling preflight here, before routing, guarantees a correct response
+    regardless of per-route OPTIONS handlers or Flask's automatic-OPTIONS.
+    """
+    if request.method != "OPTIONS":
+        return None
+    path = request.path or ""
+    resp = make_response("", 204)
+    origin = request.headers.get("Origin", "")
+    req_headers = request.headers.get("Access-Control-Request-Headers", "Content-Type")
+    if path.startswith("/api/v1/widget/"):
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = req_headers or "Content-Type"
+    elif origin in ALLOWED_ORIGINS or origin == "null":
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = req_headers or "Content-Type"
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+    resp.headers["Access-Control-Max-Age"] = "3600"
+    resp.headers["Vary"] = "Origin"
+    return resp
+
+
 @app.after_request
 def _add_cors_headers(response):
     """Attach CORS headers to every response when the origin is allowed.
