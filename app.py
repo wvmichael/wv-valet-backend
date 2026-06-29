@@ -8115,337 +8115,380 @@ OVERLAY_TEMPLATE = """\
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>WeatherValet Overlay</title>
 <style>
-  /* Transparent canvas so OBS shows only the graphics over the video. */
   html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
   * { box-sizing: border-box; }
   :root {
-    --wv-ink: #0E1116;
-    --wv-blue: #4169E1;
-    --wv-blue-deep: #2E4FB8;
-    --wv-gold: #F5A524;
-    --wv-red: #C2342B;
-    --wv-text: #FFFFFF;
+    --ink: #0b0e14;
+    --panel: rgba(11,14,20,0.92);
+    --hair: rgba(255,255,255,0.10);
+    --royal: #2E4FB8;
+    --royal-lt: #4169E1;
+    --text: #ffffff;
+    --muted: rgba(255,255,255,0.62);
+    --tor: #ff3b3b;
+    --svr: #ff9f1c;
+    --ffw: #38c172;
   }
-  /* The overlay is designed on a fixed 1920x1080 surface, then scaled with
-     JS (wvScaleStage) to fit whatever size the OBS/Streamlabs browser source
-     is. This makes it render identically and proportionally everywhere,
-     instead of depending on the source being an exact size. html stays the
-     transparent viewport; body is the design surface. */
   html { width: 100%; height: 100%; overflow: hidden; background: transparent; }
   body {
     width: 1920px; height: 1080px;
     transform-origin: top left;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', Arial, sans-serif;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
     position: relative;
+    color: var(--text);
     -webkit-font-smoothing: antialiased;
   }
 
-  /* ── Top: full-width warning CRAWL. Hidden until a warning is active. ── */
-  .wv-warn {
-    position: absolute; top: 44px; left: 40px; right: 40px;
-    height: 56px;
-    background: linear-gradient(100deg, var(--wv-red), #9B2823);
-    box-shadow: 0 4px 18px rgba(0,0,0,0.45);
-    border-radius: 8px;
-    display: flex; align-items: center;
-    overflow: hidden;
-    transform: translateY(-200%);
-    transition: transform 0.45s cubic-bezier(0.22,1,0.36,1);
+  /* ── Header bar ───────────────────────────────────────────── */
+  .ov-head {
+    position: absolute; top: 0; left: 0; width: 1920px; height: 64px;
+    background: var(--ink); border-bottom: 1px solid var(--hair);
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 24px;
   }
-  .wv-warn.is-active { transform: translateY(0); }
-  /* The crawl track scrolls right-to-left; content duplicated for a seamless loop. */
-  .wv-warn-track {
-    display: inline-flex; align-items: center;
-    white-space: nowrap;
-    will-change: transform;
-    animation: wvCrawl 30s linear infinite;
+  .ov-brand { font-weight: 800; font-size: 24px; letter-spacing: 0.2px; }
+  .ov-brand b { color: var(--royal-lt); }
+  .ov-head-right { display: flex; align-items: center; gap: 14px; }
+  .ov-live {
+    display: inline-flex; align-items: center; gap: 8px;
+    background: #C2342B; color: #fff; font-weight: 800; font-size: 14px;
+    letter-spacing: 1.5px; padding: 6px 12px; border-radius: 999px;
   }
-  .wv-warn-track .wv-warn-item {
-    display: inline-flex; align-items: center; gap: 12px;
-    padding: 0 40px;
-    color: #fff; font-size: 24px; font-weight: 700;
-    text-shadow: 0 1px 4px rgba(0,0,0,0.4);
-  }
-  .wv-warn-badge {
-    background: var(--wv-gold); color: var(--wv-ink);
-    font-weight: 800; font-size: 15px; letter-spacing: 1.5px; text-transform: uppercase;
-    padding: 5px 12px; border-radius: 6px; white-space: nowrap;
-  }
-  .wv-warn-where { color: rgba(255,255,255,0.85); font-weight: 500; font-size: 20px; }
-  @keyframes wvCrawl {
-    0%   { transform: translateX(0); }
-    100% { transform: translateX(-50%); }
-  }
+  .ov-live .dot { width: 9px; height: 9px; border-radius: 50%; background: #fff; animation: ovpulse 1.4s infinite; }
+  .ov-date { color: var(--muted); font-size: 15px; font-weight: 600;
+             background: rgba(255,255,255,0.06); padding: 6px 12px; border-radius: 8px; }
+  @keyframes ovpulse { 0%,100%{opacity:1;} 50%{opacity:0.35;} }
 
-  /* ── Lower-third (bottom-left): HALF size, two rows only ── */
-  .wv-lower {
-    position: absolute; left: 40px; bottom: 44px;
-    display: flex; align-items: stretch;
-    box-shadow: 0 6px 22px rgba(0,0,0,0.4);
-    border-radius: 8px; overflow: hidden;
-    max-width: 60vw;
+  /* ── Left content window (transparent; Met radar shows through) ── */
+  .ov-content {
+    position: absolute; left: 28px; top: 88px; width: 1512px; height: 824px;
+    border: 2px solid rgba(65,105,225,0.55); border-radius: 12px;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.05);
+    background: transparent;
   }
-  .wv-lower-accent { width: 7px; background: var(--wv-gold); }
-  .wv-lower-body {
-    background: linear-gradient(100deg, #4169E1, #1C2F6E);
-    padding: 9px 20px 11px;
+  .ov-content-chip {
+    position: absolute; top: 12px; right: 12px;
+    display: inline-flex; align-items: center; gap: 7px;
+    background: rgba(11,14,20,0.78); color: #fff; font-weight: 800;
+    font-size: 13px; letter-spacing: 1.4px; padding: 5px 10px; border-radius: 7px;
   }
-  .wv-lower-kicker {
-    color: var(--wv-gold); font-size: 11px; font-weight: 700;
-    letter-spacing: 2px; text-transform: uppercase; margin-bottom: 2px;
-  }
-  .wv-lower-title {
-    color: #fff; font-size: 24px; font-weight: 700; line-height: 1.05;
-  }
+  .ov-content-chip .dot { width: 8px; height: 8px; border-radius: 50%; background: #ff5959; animation: ovpulse 1.4s infinite; }
 
-  /* ── Bottom-right: clock + logo. Sized to match the lower-third's height
-     and top-aligned so the clock sits level with the lower-third's top. ── */
-  .wv-corner {
-    position: absolute; right: 40px; bottom: 44px;
-    min-height: 62px;               /* ~ lower-third height, so tops align */
-    display: flex; flex-direction: column; align-items: flex-end;
-    justify-content: space-between; gap: 8px;
+  /* ── Right rail ───────────────────────────────────────────── */
+  .ov-rail { position: absolute; left: 1568px; top: 64px; width: 352px; height: 872px; }
+  /* Face-cam window: transparent hole, framed as a nameplate. */
+  .ov-cam {
+    position: absolute; left: 16px; top: 24px; width: 320px; height: 180px;
+    border: 2px solid rgba(65,105,225,0.65); border-radius: 14px;
+    background: transparent;
+    box-shadow: 0 0 0 4px rgba(11,14,20,0.55);
   }
-  .wv-clock {
-    color: #fff; font-size: 26px; font-weight: 600; letter-spacing: 1px;
-    text-shadow: 0 2px 10px rgba(0,0,0,0.6);
-    font-variant-numeric: tabular-nums;
+  .ov-cam-onair {
+    position: absolute; top: 10px; left: 10px;
+    display: inline-flex; align-items: center; gap: 6px;
+    background: rgba(194,52,43,0.92); color: #fff; font-weight: 800;
+    font-size: 11px; letter-spacing: 1.2px; padding: 4px 8px; border-radius: 6px;
   }
-  .wv-logo img {
-    height: 38px; width: auto; display: block;
-    filter: drop-shadow(0 2px 10px rgba(0,0,0,0.7));
+  .ov-cam-onair .dot { width: 7px; height: 7px; border-radius: 50%; background: #fff; animation: ovpulse 1.4s infinite; }
+  .ov-plate {
+    position: absolute; left: 16px; top: 214px; width: 320px;
+    text-align: center;
   }
-  /* Text fallback shown if the logo image fails to load. */
-  .wv-logo-fallback {
-    display: none;
-    color: #fff; font-size: 22px; font-weight: 700; letter-spacing: 0.3px;
-    text-shadow: 0 2px 10px rgba(0,0,0,0.7);
-  }
-  .wv-logo-fallback b { color: var(--wv-gold); }
+  .ov-plate-name { font-weight: 800; font-size: 19px; }
+  .ov-plate-name .reg { color: var(--royal-lt); }
+  .ov-plate-sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
 
-  /* ── Bottom news ticker (Shows/prerecord). Blue bar, white text, scrolls
-     right-to-left along the very bottom edge. Shown only when ticker text
-     is provided. The lower-third floats above it. ── */
-  .wv-ticker {
-    position: absolute; left: 0; right: 0; bottom: 0;
-    height: 40px;
-    background: var(--wv-blue);
-    box-shadow: 0 -3px 14px rgba(0,0,0,0.35);
-    display: none; align-items: center; overflow: hidden;
+  /* Count tiles */
+  .ov-tiles { position: absolute; left: 16px; top: 270px; width: 320px; display: flex; flex-direction: column; gap: 12px; }
+  .ov-tile {
+    background: var(--panel); border-radius: 12px; padding: 14px 16px;
+    display: flex; align-items: center; justify-content: space-between;
+    border-left: 5px solid var(--royal-lt);
   }
-  .wv-ticker.is-active { display: flex; }
-  .wv-ticker-track {
-    display: inline-flex; align-items: center;
-    white-space: nowrap; will-change: transform;
-    animation: wvTicker 40s linear infinite;
+  .ov-tile.tor { border-left-color: var(--tor); }
+  .ov-tile.svr { border-left-color: var(--svr); }
+  .ov-tile.ffw { border-left-color: var(--ffw); }
+  .ov-tile-label { font-size: 13px; line-height: 1.2; font-weight: 700; letter-spacing: 0.4px; text-transform: uppercase; color: rgba(255,255,255,0.82); }
+  .ov-tile-num { font-family: 'IBM Plex Mono', ui-monospace, monospace; font-size: 38px; font-weight: 700; }
+  .ov-tile.tor .ov-tile-num { color: var(--tor); }
+  .ov-tile.svr .ov-tile-num { color: var(--svr); }
+  .ov-tile.ffw .ov-tile-num { color: var(--ffw); }
+
+  /* Rail footer: brand + clock */
+  .ov-rail-foot {
+    position: absolute; left: 16px; bottom: 0; width: 320px;
+    background: var(--panel); border-radius: 12px; padding: 12px 16px;
+    display: flex; align-items: center; justify-content: space-between;
   }
-  .wv-ticker-item {
-    display: inline-flex; align-items: center;
-    padding: 0 60px;
-    color: #fff; font-size: 19px; font-weight: 600; letter-spacing: 0.3px;
-    text-shadow: 0 1px 3px rgba(0,0,0,0.3);
+  .ov-rail-foot .mark { font-weight: 800; font-size: 15px; }
+  .ov-rail-foot .mark b { color: var(--royal-lt); }
+  .ov-clock { font-family: 'IBM Plex Mono', ui-monospace, monospace; font-size: 18px; font-weight: 700; }
+
+  /* ── Bottom active-alerts strip + crawl ───────────────────── */
+  .ov-strip { position: absolute; left: 0; bottom: 0; width: 1920px; height: 144px;
+              background: var(--ink); border-top: 2px solid var(--royal); }
+  .ov-strip-label {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 24px 0; font-size: 13px; font-weight: 800; letter-spacing: 1.6px;
+    text-transform: uppercase; color: var(--royal-lt);
   }
-  .wv-ticker-item::before {
-    content: ""; display: inline-block;
-    width: 7px; height: 7px; border-radius: 50%;
-    background: var(--wv-gold); margin-right: 18px;
+  .ov-strip-label .n { color: var(--muted); font-weight: 700; letter-spacing: 0.5px; }
+  .ov-feature { padding: 4px 24px 0; display: flex; align-items: baseline; gap: 14px; }
+  .ov-feature-ev { font-family: 'Archivo Narrow', 'Inter', sans-serif; font-weight: 800; font-size: 30px; }
+  .ov-feature-meta { color: var(--muted); font-size: 17px; font-weight: 600; }
+  .ov-feature.tor .ov-feature-ev { color: var(--tor); }
+  .ov-feature.svr .ov-feature-ev { color: var(--svr); }
+  .ov-feature.ffw .ov-feature-ev { color: var(--ffw); }
+  .ov-crawl { position: absolute; left: 0; bottom: 0; width: 1920px; height: 40px;
+              background: rgba(255,255,255,0.05); overflow: hidden; display: flex; align-items: center; }
+  .ov-crawl-track { display: inline-flex; white-space: nowrap; will-change: transform; animation: ovcrawl 34s linear infinite; }
+  .ov-crawl-item { padding: 0 36px; font-size: 16px; font-weight: 600; color: rgba(255,255,255,0.9); }
+  .ov-crawl-item b { color: var(--royal-lt); }
+  @keyframes ovcrawl { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+
+  /* Calm state */
+  .ov-calm .ov-feature, .ov-calm .ov-crawl { display: none; }
+  .ov-calm-line { display: none; padding: 8px 24px; color: var(--muted); font-size: 18px; font-weight: 600; }
+  .ov-calm .ov-calm-line { display: block; }
+
+  /* ── Breaking banner ──────────────────────────────────────── */
+  .ov-breaking {
+    position: absolute; top: 0; left: 0; width: 1920px;
+    background: var(--tor); color: #fff; padding: 12px 24px;
+    transform: translateY(-110%); transition: transform 0.45s cubic-bezier(0.22,1,0.36,1);
+    z-index: 20; box-shadow: 0 8px 30px rgba(0,0,0,0.4);
   }
-  @keyframes wvTicker {
-    0%   { transform: translateX(0); }
-    100% { transform: translateX(-50%); }
-  }
-  /* When the ticker is showing, float the lower-third and corner above it. */
-  body.wv-has-ticker .wv-lower { bottom: 58px; }
-  body.wv-has-ticker .wv-corner { bottom: 58px; }
+  .ov-breaking.show { transform: translateY(0); }
+  .ov-breaking.svr { background: var(--svr); color: #1a1205; }
+  .ov-breaking.ffw { background: var(--ffw); color: #07210f; }
+  .ov-breaking-kick { font-weight: 900; font-size: 13px; letter-spacing: 2px; opacity: 0.9; }
+  .ov-breaking-head { font-family: 'Archivo', 'Inter', sans-serif; font-weight: 900; font-size: 30px; line-height: 1.1; }
+  .ov-breaking-sub { font-size: 17px; font-weight: 600; opacity: 0.95; }
+
+  /* Shows mode: hide all the live-data chrome. */
+  body.mode-shows .ov-tiles, body.mode-shows .ov-strip-label,
+  body.mode-shows .ov-feature, body.mode-shows .ov-calm-line,
+  body.mode-shows .ov-breaking { display: none !important; }
+  /* Shows lower-third uses the strip area for a clean name plate + ticker. */
+  .ov-shows-lt { position: absolute; left: 24px; bottom: 52px; }
+  .ov-shows-lt .bar { width: 64px; height: 5px; background: var(--royal-lt); border-radius: 3px; margin-bottom: 8px; }
+  .ov-shows-lt .nm { font-family: 'Archivo Narrow','Inter',sans-serif; font-weight: 800; font-size: 30px; }
+  .ov-shows-lt .ti { color: var(--muted); font-size: 18px; font-weight: 600; }
+  body:not(.mode-shows) .ov-shows-lt { display: none; }
+
+  /* Alignment guide (?guide=1): dashed outlines on the two windows. */
+  body.guide .ov-content { outline: 3px dashed rgba(65,105,225,0.95); }
+  body.guide .ov-cam { outline: 3px dashed rgba(255,160,30,0.95); }
+  .ov-guide-tag { position: absolute; background: rgba(11,14,20,0.85); color: #fff;
+                  font-size: 12px; font-weight: 700; padding: 3px 7px; border-radius: 5px; display: none; }
+  body.guide .ov-guide-tag { display: block; }
+  .ov-guide-content { left: 36px; top: 96px; }
+  .ov-guide-cam { left: 1584px; top: 92px; }
 </style>
 </head>
-<body>
-  <!-- Top: full-width warning crawl (hidden until warnings exist) -->
-  <div class="wv-warn" id="wv-warn">
-    <div class="wv-warn-track" id="wv-warn-track"></div>
+<body class="mode-{{ mode }}">
+  <!-- Breaking banner -->
+  <div class="ov-breaking" id="ovBreaking">
+    <div class="ov-breaking-kick">BREAKING</div>
+    <div class="ov-breaking-head" id="ovBreakHead">TORNADO WARNING</div>
+    <div class="ov-breaking-sub" id="ovBreakSub"></div>
   </div>
 
-  <!-- Bottom-left: half-size lower-third, two rows -->
-  <div class="wv-lower">
-    <div class="wv-lower-accent"></div>
-    <div class="wv-lower-body">
-      <div class="wv-lower-kicker">{{ kicker }}</div>
-      <div class="wv-lower-title">{{ title }}</div>
+  <!-- Header -->
+  <div class="ov-head">
+    <div class="ov-brand"><b>&#9889;</b> Weather<b>Valet</b></div>
+    <div class="ov-head-right">
+      <span class="ov-live"><span class="dot"></span>LIVE</span>
+      <span class="ov-date" id="ovDate"></span>
     </div>
   </div>
 
-  <!-- Bottom-right: clock on top, logo below (with text fallback) -->
-  <div class="wv-corner">
-    <div class="wv-clock" id="wv-clock">--:-- --</div>
-    <div class="wv-logo">
-      <img src="https://weathervalet.ai/screenshots/WVLogo_White_transparent.png" alt="WeatherValet"
-           onerror="this.style.display='none'; var f=document.getElementById('wv-logo-fallback'); if(f) f.style.display='block';">
-      <div class="wv-logo-fallback" id="wv-logo-fallback">Weather<b>Valet</b>.com</div>
+  <!-- Left content window (radar shows through) -->
+  <div class="ov-content">
+    <div class="ov-content-chip"><span class="dot"></span>LIVE</div>
+  </div>
+  <div class="ov-guide-tag ov-guide-content">RADAR / SCREEN HERE</div>
+
+  <!-- Right rail -->
+  <div class="ov-rail">
+    <div class="ov-cam"><span class="ov-cam-onair"><span class="dot"></span>ON AIR</span></div>
+    <div class="ov-guide-tag ov-guide-cam">FACE CAM HERE</div>
+    <div class="ov-plate">
+      <div class="ov-plate-name" id="ovPlateName">Meteorologist <span class="reg">on the air</span></div>
+      <div class="ov-plate-sub" id="ovPlateSub"></div>
+    </div>
+    <div class="ov-tiles">
+      <div class="ov-tile tor"><div class="ov-tile-label">Tornado<br>Warnings</div><div class="ov-tile-num" id="ovTor">0</div></div>
+      <div class="ov-tile svr"><div class="ov-tile-label">Severe Thunderstorm<br>Warnings</div><div class="ov-tile-num" id="ovSvr">0</div></div>
+      <div class="ov-tile ffw"><div class="ov-tile-label">Flash Flood<br>Warnings</div><div class="ov-tile-num" id="ovFfw">0</div></div>
+    </div>
+    <div class="ov-rail-foot">
+      <span class="mark"><b>&#9889;</b> WeatherValet</span>
+      <span class="ov-clock" id="ovClock">--:-- --</span>
     </div>
   </div>
 
-  <!-- Bottom news ticker (Shows/prerecord). Hidden until ticker text exists. -->
-  <div class="wv-ticker" id="wv-ticker">
-    <div class="wv-ticker-track" id="wv-ticker-track"></div>
+  <!-- Bottom strip -->
+  <div class="ov-strip" id="ovStrip">
+    <div class="ov-strip-label">Active Alerts <span class="n" id="ovActiveN">&middot; 0 active</span></div>
+    <div class="ov-feature" id="ovFeature">
+      <span class="ov-feature-ev" id="ovFeatEv"></span>
+      <span class="ov-feature-meta" id="ovFeatMeta"></span>
+    </div>
+    <div class="ov-calm-line" id="ovCalm">No active warnings in your coverage area.</div>
+    <div class="ov-shows-lt">
+      <div class="bar"></div>
+      <div class="nm" id="ovShowsName"></div>
+      <div class="ti" id="ovShowsTitle"></div>
+    </div>
+    <div class="ov-crawl" id="ovCrawl"><div class="ov-crawl-track" id="ovCrawlTrack"></div></div>
   </div>
 
-  <script>
-    // Live clock, updates every second.
-    // Clock = LIVE feeds only. A timezone is passed only on live overlays;
-    // prerecorded (Shows) overlays omit it, so the clock stays hidden (a live
-    // clock on a taped video would show the wrong time when replayed).
-    var WV_TZ = "{{ clock_tz }}";
-    function wvTick() {
-      var el = document.getElementById('wv-clock');
-      if (!el) return;
-      try {
-        var opts = { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: WV_TZ };
-        el.textContent = new Date().toLocaleTimeString('en-US', opts);
-      } catch (e) {
-        var now = new Date();
-        var h = now.getHours(); var m = now.getMinutes();
-        var ampm = h >= 12 ? 'PM' : 'AM'; h = h % 12; if (h === 0) h = 12;
-        el.textContent = h + ':' + (m < 10 ? '0' : '') + m + ' ' + ampm;
-      }
+<script>
+  var WARN_STATE = "{{ warn_state }}";
+  var WARN_COUNTIES = "{{ warn_counties }}";
+  var WV_TZ = "{{ clock_tz }}";
+  var MET_NAME = "{{ met_name }}";
+  var REGION = "{{ region }}";
+  var MODE = "{{ mode }}";
+  var GUIDE = "{{ guide }}";
+  var SHOW = "{{ show }}";
+  var KICKER = "{{ kicker }}";
+  var TICKER = "{{ ticker_text }}";
+
+  if (GUIDE === "1") document.body.classList.add("guide");
+
+  // Scale the fixed 1920x1080 surface to the OBS source size.
+  function ovScale() {
+    var sx = window.innerWidth / 1920, sy = window.innerHeight / 1080;
+    var s = Math.min(sx, sy);
+    document.body.style.transform = "scale(" + s + ")";
+  }
+  window.addEventListener("resize", ovScale); ovScale();
+
+  // Nameplate + shows lower-third
+  (function () {
+    var nm = document.getElementById("ovPlateName");
+    if (MET_NAME) nm.innerHTML = "Meteorologist <span class='reg'>" + MET_NAME + "</span>";
+    var sub = document.getElementById("ovPlateSub");
+    sub.textContent = SHOW || REGION || "";
+    document.getElementById("ovShowsName").textContent = MET_NAME ? ("Meteorologist " + MET_NAME) : (SHOW || "WeatherValet");
+    document.getElementById("ovShowsTitle").textContent = SHOW || REGION || "";
+    if (MODE === "shows" && TICKER) {
+      var t = document.getElementById("ovCrawlTrack");
+      t.innerHTML = "<span class='ov-crawl-item'>" + TICKER + "</span>";
     }
-    if (WV_TZ) {
-      wvTick();
-      setInterval(wvTick, 1000);
+  })();
+
+  // Clock in the selected timezone (never the streaming machine's local clock).
+  function ovTick() {
+    var el = document.getElementById("ovClock");
+    var dEl = document.getElementById("ovDate");
+    try {
+      var opt = { hour: "numeric", minute: "2-digit", second: "2-digit", hour12: true };
+      if (WV_TZ) opt.timeZone = WV_TZ;
+      el.textContent = new Date().toLocaleTimeString("en-US", opt);
+      var dopt = { weekday: "short", month: "short", day: "numeric" };
+      if (WV_TZ) dopt.timeZone = WV_TZ;
+      dEl.textContent = new Date().toLocaleDateString("en-US", dopt);
+    } catch (e) {
+      if (WV_TZ) { /* bad tz: fall back to local */ WV_TZ = ""; }
+    }
+  }
+  ovTick(); setInterval(ovTick, 1000);
+
+  // ── Live NWS warnings ──────────────────────────────────────
+  var seenIds = {};
+  var firstPoll = true;
+  function hazClass(ev) {
+    ev = (ev || "").toLowerCase();
+    if (ev.indexOf("tornado") > -1) return "tor";
+    if (ev.indexOf("severe thunderstorm") > -1) return "svr";
+    if (ev.indexOf("flood") > -1) return "ffw";
+    return "";
+  }
+  function fmtExpiry(ms) {
+    if (!ms) return "";
+    try {
+      var opt = { hour: "numeric", minute: "2-digit", hour12: true };
+      if (WV_TZ) opt.timeZone = WV_TZ;
+      return new Date(ms).toLocaleTimeString("en-US", opt);
+    } catch (e) { return ""; }
+  }
+  function showBreaking(w) {
+    var b = document.getElementById("ovBreaking");
+    b.className = "ov-breaking " + hazClass(w.event);
+    document.getElementById("ovBreakHead").textContent = (w.event || "WARNING").toUpperCase();
+    var where = (w.counties && w.counties.length) ? w.counties.join(", ") : "your area";
+    var until = fmtExpiry(w.expires_at);
+    document.getElementById("ovBreakSub").textContent = where + (until ? (" until " + until) : "");
+    void b.offsetWidth;
+    b.classList.add("show");
+    var hold = (hazClass(w.event) === "tor") ? 20000 : 12000;
+    clearTimeout(window._ovBrkT);
+    window._ovBrkT = setTimeout(function () { b.classList.remove("show"); }, hold);
+  }
+  function render(data) {
+    var c = (data && data.counts) || { tornado: 0, severe: 0, flood: 0 };
+    document.getElementById("ovTor").textContent = c.tornado || 0;
+    document.getElementById("ovSvr").textContent = c.severe || 0;
+    document.getElementById("ovFfw").textContent = c.flood || 0;
+    var warnings = (data && data.warnings) || [];
+    var active = (data && data.active) || warnings.length;
+    document.getElementById("ovActiveN").innerHTML = "&middot; " + active + " active";
+    var strip = document.getElementById("ovStrip");
+    var feat = document.getElementById("ovFeature");
+    var calm = document.getElementById("ovCalm");
+    if (!active) {
+      strip.classList.add("ov-calm");
     } else {
-      // No timezone = prerecorded: hide the clock entirely.
-      var _clk = document.getElementById('wv-clock');
-      if (_clk) _clk.style.display = 'none';
-    }
-
-    // ── Bottom news ticker (manual text from the Met) ───────────────
-    var WV_TICKER = "{{ ticker_text }}";
-    (function wvInitTicker() {
-      if (!WV_TICKER) return;
-      var bar = document.getElementById('wv-ticker');
-      var track = document.getElementById('wv-ticker-track');
-      if (!bar || !track) return;
-      // Build one item, duplicated so the scroll loops seamlessly (-50%).
-      function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-      var item = '<span class="wv-ticker-item">' + esc(WV_TICKER) + '</span>';
-      track.innerHTML = item + item;
-      bar.classList.add('is-active');
-      document.body.classList.add('wv-has-ticker');
-    })();
-
-    // ── Live NWS warnings: scrolling crawl (most severe first) ──────
-    var WV_STATE = "{{ warn_state }}";
-    var WV_COUNTIES = "{{ warn_counties }}";
-
-    function wvEscape(s) {
-      return String(s == null ? '' : s)
-        .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    }
-
-    // Build one crawl item's HTML (badge + event + where).
-    // Format the expiry (ms) as a clock time in the overlay's timezone.
-    function wvUntil(ms) {
-      if (!ms) return '';
-      try {
-        var opts = { hour: 'numeric', minute: '2-digit', hour12: true };
-        if (WV_TZ) opts.timeZone = WV_TZ;
-        return new Date(ms).toLocaleTimeString('en-US', opts);
-      } catch (e) { return ''; }
-    }
-
-    function wvItemHtml(w) {
-      var ev = w.event || 'Weather Alert';
-      var badge = ev.replace(/ (Warning|Watch)$/, '');
-      // Broadcast wording, e.g.:
-      //   "Tornado Warning for Boone County, IN until 7:45 PM"
-      //   "Severe Thunderstorm Warning for Clinton, Carroll, and Tippecanoe Counties, IN until ..."
-      var phrase = ev;
-      var cs = w.counties || (w.county ? [w.county] : []);
-      if (cs.length) {
-        var label;
-        if (cs.length === 1) {
-          label = cs[0] + ' County';
-        } else if (cs.length === 2) {
-          label = cs[0] + ' and ' + cs[1] + ' Counties';
-        } else {
-          label = cs.slice(0, -1).join(', ') + ', and ' + cs[cs.length - 1] + ' Counties';
-        }
-        phrase += ' for ' + label;
-        if (w.state) phrase += ', ' + w.state;
-      } else if (w.area_desc) {
-        phrase += ' \u00b7 ' + w.area_desc;
+      strip.classList.remove("ov-calm");
+      var f = data.featured || warnings[0];
+      feat.className = "ov-feature " + hazClass(f.event);
+      document.getElementById("ovFeatEv").textContent = f.event || "Weather Alert";
+      var where = (f.counties && f.counties.length) ? f.counties.join(", ") : "";
+      var until = fmtExpiry(f.expires_at);
+      document.getElementById("ovFeatMeta").textContent =
+        (until ? ("until " + until) : "") + (where ? (" \u00b7 " + where) : "");
+      var items = "";
+      for (var i = 0; i < warnings.length; i++) {
+        var w = warnings[i];
+        var wh = (w.counties && w.counties.length) ? w.counties.join(", ") : "";
+        items += "<span class='ov-crawl-item'><b>" + (w.event || "Alert") + "</b> &mdash; " + wh + "</span>";
       }
-      var until = wvUntil(w.expires_at);
-      if (until) phrase += ' until ' + until;
-      return '<span class="wv-warn-item"><span class="wv-warn-badge">' + wvEscape(badge)
-        + '</span><span>' + wvEscape(phrase) + '</span></span>';
+      var track = document.getElementById("ovCrawlTrack");
+      track.innerHTML = items + items;  // duplicate for seamless loop
     }
-
-    // Crawl scroll speed in pixels per second (design-space px). The
-    // animation translates the track by -50% (one duplicated set), so the
-    // loop distance is the single-set width. Holding px/sec constant means
-    // one warning keeps the speed we like and more warnings simply take
-    // longer to loop, instead of scrolling faster and faster.
-    // 45 px/sec, tuned from live broadcast feedback (June 2026).
-    var WV_CRAWL_PX_PER_SEC = 45;
-
-    function wvRenderCrawl(warnings) {
-      var bar = document.getElementById('wv-warn');
-      var track = document.getElementById('wv-warn-track');
-      if (!bar || !track) return;
-      if (!warnings || !warnings.length) {
-        bar.classList.remove('is-active');
-        track.innerHTML = '';
-        return;
-      }
-      // The backend already ranks most-severe first (warnings over watches).
-      var seq = warnings.map(wvItemHtml).join('');
-      // Duplicate the sequence so the loop is seamless (track scrolls -50%).
-      track.innerHTML = seq + seq;
-      bar.classList.add('is-active');
-      // Constant speed: duration = single-set width / px-per-sec. Measured
-      // after layout so it reflects the real rendered width.
-      requestAnimationFrame(function() {
-        var singleSet = track.scrollWidth / 2;
-        if (singleSet > 0) {
-          var secs = singleSet / WV_CRAWL_PX_PER_SEC;
-          track.style.animationDuration = secs.toFixed(2) + 's';
+    // Breaking banner on newly-seen alert ids (skip the very first poll).
+    if (MODE !== "shows") {
+      for (var k = 0; k < warnings.length; k++) {
+        var id = warnings[k].id;
+        if (!id) continue;
+        if (!seenIds[id]) {
+          seenIds[id] = true;
+          if (!firstPoll) { showBreaking(warnings[k]); break; }
         }
-      });
+      }
     }
-
-    function wvFetchWarnings() {
-      if (!WV_COUNTIES) return;  // no region set
-      var url = '/api/v1/overlay/warnings?state=' + encodeURIComponent(WV_STATE)
-        + '&counties=' + encodeURIComponent(WV_COUNTIES);
-      fetch(url)
-        .then(function(r) { return r.json(); })
-        .then(function(j) {
-          wvRenderCrawl((j && j.ok && j.warnings) ? j.warnings : []);
-        })
-        .catch(function() { /* keep last state on a transient error */ });
+    firstPoll = false;
+  }
+  function poll() {
+    if (MODE === "shows" || !WARN_COUNTIES) { return; }
+    var url = "/api/v1/overlay/warnings?state=" + encodeURIComponent(WARN_STATE) +
+              "&counties=" + encodeURIComponent(WARN_COUNTIES);
+    fetch(url).then(function (r) { return r.json(); })
+      .then(function (d) { if (d && d.ok) render(d); })
+      .catch(function () { /* keep last good state */ });
+  }
+  if (MODE !== "shows") {
+    if (!WARN_COUNTIES) {
+      document.getElementById("ovStrip").classList.add("ov-calm");
     }
-
-    if (WV_COUNTIES) {
-      wvFetchWarnings();
-      setInterval(wvFetchWarnings, 30000);  // refresh every 30s
-    }
-
-    // ── Fit the 1920x1080 design surface to the actual browser source ──
-    // OBS and Streamlabs may use different source dimensions. Scaling the
-    // body to fit means the overlay looks proportionally identical in both,
-    // filling widescreen sources and never overflowing. We scale by the
-    // smaller axis ratio so nothing is clipped, then center any letterbox.
-    function wvScaleStage() {
-      var vw = window.innerWidth, vh = window.innerHeight;
-      var scale = Math.min(vw / 1920, vh / 1080);
-      var offsetX = Math.round((vw - 1920 * scale) / 2);
-      var offsetY = Math.round((vh - 1080 * scale) / 2);
-      document.body.style.transform =
-        'translate(' + offsetX + 'px,' + offsetY + 'px) scale(' + scale + ')';
-    }
-    wvScaleStage();
-    window.addEventListener('resize', wvScaleStage);
-  </script>
+    poll(); setInterval(poll, 45000);
+  } else {
+    document.getElementById("ovStrip").classList.add("ov-calm");
+  }
+</script>
 </body>
 </html>"""
 
@@ -8470,6 +8513,11 @@ def overlay_page():
     met_name = (request.args.get("met") or "").strip()
     show = (request.args.get("show") or "").strip()
     ticker = (request.args.get("ticker") or "").strip()
+    mode = (request.args.get("mode") or "live").strip().lower()
+    if mode not in ("live", "shows"):
+        mode = "live"
+    guide = "1" if (request.args.get("guide") or "").strip() in ("1", "true", "yes") else ""
+    chime = "1" if (request.args.get("chime") or "").strip() in ("1", "true", "yes") else ""
     # Kicker base is the show name if given (e.g. "Evening Huddle"), else the
     # default "WeatherValet Live". The Met name is appended when present.
     kicker_base = show if show else "WeatherValet Live"
@@ -8485,6 +8533,12 @@ def overlay_page():
         clock_tz=tz,
         kicker=kicker,
         ticker_text=ticker,
+        met_name=met_name,
+        region=region,
+        mode=mode,
+        guide=guide,
+        chime=chime,
+        show=show,
     ))
     resp.headers["Content-Type"] = "text/html; charset=utf-8"
     return resp
@@ -8557,6 +8611,7 @@ def overlay_warnings():
         # Title-case each matched county for display ("boone" -> "Boone").
         county_displays = [" ".join(w.capitalize() for w in c.split()) for c in hit_counties]
         matched.append({
+            "id": a.get("nws_id"),
             "event": event,
             "severity": a.get("severity") or "",
             "area_desc": area,
@@ -8569,9 +8624,25 @@ def overlay_warnings():
     matched.sort(key=lambda w: w["_rank"])
     for w in matched:
         w.pop("_rank", None)
-    # Cap to a sensible number for an on-screen crawl.
-    matched = matched[:6]
-    return jsonify({"ok": True, "warnings": matched})
+
+    # Per-hazard counts for the overlay tiles, over ALL matched alerts
+    # (not just the capped crawl list).
+    counts = {"tornado": 0, "severe": 0, "flood": 0}
+    for w in matched:
+        ev = (w.get("event") or "").lower()
+        if "tornado warning" in ev:
+            counts["tornado"] += 1
+        elif "severe thunderstorm warning" in ev:
+            counts["severe"] += 1
+        elif "flash flood warning" in ev or "flood warning" in ev:
+            counts["flood"] += 1
+
+    # The single most urgent alert leads the active-alerts strip.
+    featured = matched[0] if matched else None
+    # Cap the crawl list to a sensible number for on-screen scrolling.
+    crawl = matched[:8]
+    return jsonify({"ok": True, "warnings": crawl, "counts": counts,
+                    "featured": featured, "active": len(matched)})
 
 
 @app.get("/meteorologist/<claim_token>")
