@@ -8138,25 +8138,37 @@ body.metov .sponsor, body.metov .rankcard, body.metov .pollcard,
 body.metov .tropcard, body.metov .qrcard, body.metov .superchat,
 body.metov .standby { display: none !important; }
 body.metov .map { outline: 2px solid rgba(65,105,225,0.45); outline-offset: -2px; border-radius: 6px; }
-/* Face-cam window: the ENTIRE top-right box is the Met's camera. The box
-   becomes a clean transparent 16:9 rectangle; the Met's name sits as a slim
-   broadcast lower-third along the bottom so identity stays without crowding. */
+/* Top-right box = the Met's camera (a clean 16:9 rectangle), with a LIVE pill
+   in the corner and the name centered on its own line just below. The WX Index
+   tile is dropped (a derived number can't match the 24/7 channel). */
 body.metov .rail-host {
-  position: relative; display: block; flex: none;
-  height: 222px; padding: 0; gap: 0; align-items: stretch;
-  border: 2px solid rgba(65,105,225,0.6); border-radius: 14px;
-  background: transparent !important; overflow: hidden;
+  display: flex; flex-direction: column; align-items: stretch; gap: 12px;
+  padding: 0; flex: none; background: transparent !important;
 }
-body.metov .rail-host .badge { display: none !important; }
+/* The camera window itself: a true 16:9 transparent rectangle. */
+body.metov .rail-host .badge {
+  display: block !important; position: relative;
+  width: 100% !important; height: 0 !important; padding-bottom: 56.25% !important;
+  border-radius: 14px !important; border: 2px solid rgba(65,105,225,0.6);
+  background: transparent !important; overflow: hidden; box-shadow: none !important;
+}
+body.metov .rail-host .badge svg,
+body.metov .rail-host .badge__face,
+body.metov .rail-host .badge .wave { display: none !important; }
+/* LIVE pill, top-right of the camera. */
+body.metov .rail-host .badge::after {
+  content: "\25CF LIVE"; position: absolute; top: 9px; right: 9px; z-index: 3;
+  background: #C2342B; color: #fff; font: 800 12px/1 Inter, sans-serif;
+  letter-spacing: 1px; padding: 5px 9px; border-radius: 999px;
+}
+/* Name: centered, plain nameplate (not a fourth tile). */
+body.metov .rail-host__name { text-align: center; margin: 0; }
 body.metov .rail-host__meta { display: none !important; }
-body.metov .rail-host__name {
-  position: absolute; left: 0; right: 0; bottom: 0; margin: 0;
-  padding: 22px 14px 11px; z-index: 2; text-align: left; line-height: 1.15;
-  background: linear-gradient(to top, rgba(7,9,14,0.94) 35%, rgba(7,9,14,0));
-}
+/* Drop the WX Index tile. */
+body.metov .stat--idx { display: none !important; }
 /* Alignment guide (?guide=1): dashed outlines on the two windows. */
 body.metov.guide .map { outline: 3px dashed rgba(65,105,225,0.95) !important; }
-body.metov.guide .rail-host { outline: 3px dashed rgba(255,160,30,0.95); }
+body.metov.guide .rail-host .badge { outline: 3px dashed rgba(255,160,30,0.95); }
 body.metov.guide .map::after { content: "RADAR / SCREEN HERE"; position: absolute; top: 8px; left: 10px;
   background: rgba(11,14,20,0.85); color:#fff; font:700 12px Inter,sans-serif; padding:3px 7px; border-radius:5px; }
 
@@ -8511,7 +8523,7 @@ var CFG = { counties: "{{ warn_counties }}", state: "{{ warn_state }}", tz: "{{ 
   // ── Nameplate ────────────────────────────────────────────────
   (function(){
     var hn=$("hostName"); if(hn) hn.textContent = CFG.met ? ("Meteorologist " + CFG.met) : "WeatherValet";
-    var hr=$("hostRole"); if(hr) hr.textContent = "LIVE";
+    var hr=$("hostRole"); if(hr) hr.textContent = "";
     var hd=$("hostDuty"); if(hd) hd.textContent = "On Air";
     var hs=$("hostSeg");  if(hs) hs.textContent = CFG.region || "Live coverage";
   })();
