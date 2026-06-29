@@ -19206,11 +19206,29 @@ def admin_rain_alert_test():
                     (user["id"],),
                 )
             u = cur.fetchone()
+    used_fallback = False
+    if not u:
+        # RAIN_ALERT_TEST_EMAIL is unset or misspelled (no account matched).
+        # Rather than dead-end the admin who just wants to confirm texting
+        # works, fall back to their own account and note it in the response.
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT u.id, u.phone,
+                              COALESCE(u.timezone,'America/Indiana/Indianapolis') AS timezone,
+                              loc.lat, loc.lng, loc.address_text
+                       FROM users u
+                       LEFT JOIN saved_locations loc ON loc.user_id=u.id AND loc.is_primary=TRUE
+                       WHERE u.id=%s LIMIT 1""",
+                    (user["id"],),
+                )
+                u = cur.fetchone()
+        used_fallback = bool(u)
     if not u:
         return jsonify({"ok": False, "error": "no-user",
                         "message": ("No account matches RAIN_ALERT_TEST_EMAIL"
                                     + (" (" + test_email + ")" if test_email else "")
-                                    + ". Check the email is spelled correctly, including the @.")}), 400
+                                    + ", and your own account couldn't be loaded either.")}), 400
 
     # Force a sample text regardless of weather, to confirm the SMS path
     # (phone on file + Twilio working). This is separate from the detector.
@@ -19225,9 +19243,12 @@ def admin_rain_alert_test():
         sample = ("WeatherValet test: this is a sample rain heads-up to confirm your texts are working. "
                   "Real alerts fire only when rain is actually on the way.")
         sent = bool(send_sms(u["phone"], sample))
+        fb_note = (" (sent to your own admin number, since RAIN_ALERT_TEST_EMAIL didn't match an account)"
+                   if used_fallback else "")
         return jsonify({"ok": True, "forced": True, "sent": sent,
-                        "to": u.get("phone"),
-                        "message": ("Test text sent to " + str(u.get("phone")) + ". If it doesn't arrive, the number may be unverified or opted out at Twilio.")
+                        "to": u.get("phone"), "used_fallback": used_fallback,
+                        "message": ("Test text sent to " + str(u.get("phone")) + fb_note
+                                    + ". If it doesn't arrive, the number may be unverified or opted out at Twilio.")
                                    if sent else
                                    "Tried to send but Twilio reported a failure. Check the Render logs and your Twilio number."})
 
