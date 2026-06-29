@@ -7274,6 +7274,25 @@ def _send_team_notification(subject: str, html_body: str, text_body: str) -> boo
         return False
 
 
+_TRIAL_REGION_LABELS = {
+    "kansas": "Northwest Kansas",
+    "boone": "Boone County",
+}
+
+
+def _trial_region_meta(category):
+    """Map a trial category to (cohort, region_label).
+
+    Most landing pages are the Boone County (Indiana) launch; 'kansas' is the
+    Northwest Kansas expansion. Anything unknown falls back to Boone so we
+    never crash, but known regions get their real label in cohort + emails.
+    """
+    c = (category or "").strip().lower()
+    if c == "kansas":
+        return ("kansas", "Northwest Kansas")
+    return ("boone", "Boone County")
+
+
 @app.route("/api/v1/boone/trial-signup", methods=["OPTIONS"])
 def _boone_trial_signup_preflight():
     return ("", 204)
@@ -7295,6 +7314,7 @@ def boone_trial_signup():
     email = (data.get("email") or "").strip()
     phone = (data.get("phone") or "").strip()
     category = (data.get("category") or "").strip().lower() or None
+    cohort, region_label = _trial_region_meta(category)
 
     if not email or "@" not in email:
         return jsonify({"ok": False, "error": "Please include a valid email to start your trial."}), 400
@@ -7323,7 +7343,7 @@ def boone_trial_signup():
                 # They already pay (or are a real subscriber). Don't downgrade
                 # them to a trial. Let the team know they tried to sign up.
                 _send_team_notification(
-                    subject=f"Boone trial: existing subscriber tried to sign up ({business})",
+                    subject=f"{region_label} trial: existing subscriber tried to sign up ({business})",
                     html_body=f"<p>{name or 'Someone'} at <b>{business}</b> ({email}) submitted the trial form, but they already have a subscription. No change was made.</p>",
                     text_body=f"{name or 'Someone'} at {business} ({email}) submitted the trial form but already has a subscription. No change made.",
                 )
@@ -7337,14 +7357,14 @@ def boone_trial_signup():
                        SET subscription_tier = 'pro_single',
                            name = COALESCE(NULLIF(name, ''), %s),
                            phone = COALESCE(NULLIF(phone, ''), %s),
-                           trial_cohort = 'boone',
+                           trial_cohort = %s,
                            trial_category = %s,
                            trial_started_at = %s,
                            trial_ends_at = %s,
                            trial_status = 'active',
                            trial_business_name = %s
                        WHERE id = %s""",
-                    (name or None, phone or None, category, now, ends, business, user_id),
+                    (name or None, phone or None, cohort, category, now, ends, business, user_id),
                 )
 
             # Welcome email with a magic sign-in link (new-account intent),
@@ -7369,9 +7389,9 @@ def boone_trial_signup():
         from datetime import datetime as _dt, timezone as _tz
         ends_str = _dt.fromtimestamp(ends, tz=_tz.utc).strftime("%b %d, %Y")
         _send_team_notification(
-            subject=f"New Boone trial: {business}",
+            subject=f"New {region_label} trial: {business}",
             html_body=(
-                f"<h2 style='font-family:sans-serif'>New Boone County trial started</h2>"
+                f"<h2 style='font-family:sans-serif'>New {region_label} trial started</h2>"
                 f"<table style='font-family:sans-serif;font-size:14px'>"
                 f"<tr><td><b>Business</b></td><td>{business}</td></tr>"
                 f"<tr><td><b>Name</b></td><td>{name or '(not given)'}</td></tr>"
@@ -7384,7 +7404,7 @@ def boone_trial_signup():
                 f"<p style='font-family:sans-serif;font-size:13px;color:#555'>A real Pro Single account was created. No card on file. Set them up in the Met portal and follow up before the end date.</p>"
             ),
             text_body=(
-                f"New Boone trial started.\n\nBusiness: {business}\nName: {name}\n"
+                f"New {region_label} trial started.\n\nBusiness: {business}\nName: {name}\n"
                 f"City: {city}\nEmail: {email}\nPhone: {phone}\nFrom page: {category or 'boone'}\n"
                 f"Trial ends: {ends_str} (manual)\n\nReal Pro Single account created, no card. "
                 f"Set them up and follow up before the end date."
