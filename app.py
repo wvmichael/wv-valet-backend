@@ -12094,6 +12094,11 @@ def _serialize_user_for_admin(row):
         "primary_loc_lat":     row.get("primary_loc_lat"),
         "primary_loc_lng":     row.get("primary_loc_lng"),
         "primary_loc_county":  row.get("primary_loc_county") or "",
+        # Business grouping (June 2026) — one card per account in the Control
+        # Center. account_owner_id groups team members under their primary
+        # owner; falls back to the user's own id for owners and solo accounts.
+        "business_name":    row.get("business_name") or "",
+        "account_owner_id": row.get("account_owner_id") or row["id"],
     }
 
 
@@ -12113,6 +12118,8 @@ def admin_list_users():
         cur.execute("""
             SELECT u.id, u.email, u.name, u.phone, u.created_at, u.last_login_at, u.is_active,
                    u.subscription_tier,
+                   u.trial_business_name AS business_name,
+                   pmm.primary_user_id AS account_owner_id,
                    u.welcome_sent_at,
                    bp.user_configured_at,
                    sc.primary_met_id,
@@ -12130,8 +12137,11 @@ def admin_list_users():
             LEFT JOIN brief_preferences bp ON bp.user_id = u.id
             LEFT JOIN saved_locations loc
               ON loc.user_id = u.id AND loc.is_primary = TRUE
+            LEFT JOIN pro_multi_memberships pmm
+              ON pmm.member_user_id = u.id AND pmm.status = 'active'
             GROUP BY u.id, sc.primary_met_id, met_user.name, bp.user_configured_at,
-                     loc.label, loc.address_text, loc.lat, loc.lng, loc.county
+                     loc.label, loc.address_text, loc.lat, loc.lng, loc.county,
+                     u.trial_business_name, pmm.primary_user_id
             ORDER BY u.is_active DESC, u.created_at DESC
         """)
         rows = cur.fetchall()
