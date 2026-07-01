@@ -7222,24 +7222,40 @@ BOONE_NOTIFY_RECIPIENTS = [
     "reynolds.evan.m@gmail.com",
 ]
 
+# Lead Meteorologist per trial region. A new signup notifies this Met on top
+# of the core team above, so the Met who will actually cover the subscriber
+# hears about them right away. Add a line here as regions and Mets are added.
+TRIAL_REGION_MET = {
+    "boone":  "timmy@weathervalet.com",
+    "kansas": "sramek@weathervalet.com",
+}
+
 BOONE_TRIAL_DAYS = 30
 
 
-def _send_team_notification(subject: str, html_body: str, text_body: str) -> bool:
-    """Email the Boone team (Michael, Timmy, Evan) about a signup or contact.
+def _send_team_notification(subject: str, html_body: str, text_body: str,
+                            extra_recipients=None) -> bool:
+    """Email the core team about a signup or contact, optionally copying the
+    region's Meteorologist (extra_recipients) so they hear about their own new
+    subscribers.
 
     Reuses the Resend HTTP API like the rest of our outbound mail. If
     RESEND_API_KEY / EMAIL_FROM are not set, logs and returns (stub mode),
     matching _send_magic_link_email behavior so dev never hard-fails.
     """
+    recipients = list(BOONE_NOTIFY_RECIPIENTS)
+    for r in (extra_recipients or []):
+        r = (r or "").strip()
+        if r and r.lower() not in [x.lower() for x in recipients]:
+            recipients.append(r)
     api_key = os.environ.get("RESEND_API_KEY", "").strip()
     from_addr = os.environ.get("EMAIL_FROM", "").strip() or "WeatherValet <hello@weathervalet.ai>"
     if not api_key:
-        print(f"[boone-notify] no RESEND_API_KEY; would notify {BOONE_NOTIFY_RECIPIENTS}: {subject}", flush=True)
+        print(f"[boone-notify] no RESEND_API_KEY; would notify {recipients}: {subject}", flush=True)
         return True
     payload = json.dumps({
         "from": from_addr,
-        "to": BOONE_NOTIFY_RECIPIENTS,
+        "to": recipients,
         "subject": subject,
         "html": html_body,
         "text": text_body,
@@ -7346,6 +7362,7 @@ def boone_trial_signup():
                     subject=f"{region_label} trial: existing subscriber tried to sign up ({business})",
                     html_body=f"<p>{name or 'Someone'} at <b>{business}</b> ({email}) submitted the trial form, but they already have a subscription. No change was made.</p>",
                     text_body=f"{name or 'Someone'} at {business} ({email}) submitted the trial form but already has a subscription. No change made.",
+                    extra_recipients=[TRIAL_REGION_MET.get(cohort)],
                 )
                 return jsonify({"ok": True, "existing_account": True})
 
@@ -7409,6 +7426,7 @@ def boone_trial_signup():
                 f"Trial ends: {ends_str} (manual)\n\nReal Pro Single account created, no card. "
                 f"Set them up and follow up before the end date."
             ),
+            extra_recipients=[TRIAL_REGION_MET.get(cohort)],
         )
         return jsonify({"ok": True})
     except Exception as e:
@@ -23763,6 +23781,184 @@ def _process_threshold_alerts_inner():
             except Exception as e:
                 print(f"[threshold-alert] threshold {r.get('threshold_id')} failed: {e}",
                       flush=True)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Outreach (Jun 30, 2026)
+# A Met can email their own Pro subscribers; an admin can email all Pro
+# subscribers. Each goes out as an individual, personalized email with the
+# reply-to set to whoever sent it, so replies land in the sender's inbox.
+# Reuses the Resend email path.
+# ──────────────────────────────────────────────────────────────────────
+
+def _ensure_outreach_table():
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """CREATE TABLE IF NOT EXISTS outreach_sends (
+                           id                SERIAL PRIMARY KEY,
+                           batch_id          TEXT NOT NULL,
+                           sender_user_id    INTEGER NOT NULL,
+                           sender_email      TEXT,
+                           subject           TEXT,
+                           recipient_user_id INTEGER,
+                           recipient_email   TEXT,
+                           status            TEXT NOT NULL,
+                           created_at        BIGINT NOT NULL
+                       )"""
+                )
+    except Exception as e:
+        print(f"[outreach] table ensure failed: {e}", flush=True)
+
+
+def _send_outreach_email(to_email, subject, text_body, reply_to, from_name):
+    """Individual outreach email via Resend. The From display name is the
+    sender (so the subscriber sees their Met by name) over the verified
+    hello@ address; reply_to routes replies straight back to the sender."""
+    api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    base_from = os.environ.get("EMAIL_FROM", "").strip() or "WeatherValet <hello@weathervalet.ai>"
+    m = re.search(r"<([^>]+)>", base_from)
+    addr = m.group(1) if m else base_from
+    from_field = (from_name + " <" + addr + ">") if from_name else base_from
+    if not api_key:
+        print(f"[outreach-stub] To {to_email} from {from_field} reply-to {reply_to}: {subject}", flush=True)
+        return True
+    try:
+        html_body = _email_shell("<p>" + text_body.replace("\n", "<br>") + "</p>")
+    except Exception:
+        html_body = "<p>" + text_body + "</p>"
+    payload = {"from": from_field, "to": [to_email], "subject": subject,
+               "html": html_body, "text": text_body}
+    if reply_to:
+        payload["reply_to"] = reply_to
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers={"Authorization": "Bearer " + api_key,
+                 "Content-Type": "application/json",
+                 "User-Agent": "WeatherValet-Backend/1.0 (+https://weathervalet.ai)"})
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            return 200 <= resp.status < 300
+    except Exception as e:
+        print(f"[outreach] send failed to {to_email}: {e}", flush=True)
+        return False
+
+
+def _outreach_recipients_for(user):
+    """Pro subscribers this user may email: a Met's own, or all (admin)."""
+    roles = user.get("roles") or []
+    is_admin = "admin" in roles
+    rows = []
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                if is_admin:
+                    cur.execute(
+                        """SELECT u.id, u.name, u.email
+                           FROM users u
+                           WHERE u.subscription_tier LIKE %s
+                             AND u.is_active = TRUE
+                             AND COALESCE(u.email,'') <> ''
+                           ORDER BY u.name""", ("pro%",))
+                else:
+                    cur.execute(
+                        """SELECT u.id, u.name, u.email
+                           FROM users u
+                           JOIN subscriber_coverage sc ON sc.user_id = u.id
+                           WHERE sc.primary_met_id = %s
+                             AND u.subscription_tier LIKE %s
+                             AND u.is_active = TRUE
+                             AND COALESCE(u.email,'') <> ''
+                           ORDER BY u.name""", (user["id"], "pro%"))
+                rows = cur.fetchall()
+    except Exception as e:
+        print(f"[outreach] recipient lookup failed: {e}", flush=True)
+    out = []
+    for r in rows:
+        nm = (r.get("name") or "").strip()
+        first = nm.split()[0] if nm else "there"
+        out.append({"user_id": r["id"], "name": nm or r.get("email"),
+                    "email": r.get("email"), "first_name": first})
+    return out
+
+
+@app.route("/api/v1/outreach/recipients", methods=["OPTIONS"])
+def outreach_recipients_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/outreach/recipients")
+def outreach_recipients():
+    user = _get_current_user()
+    if not user:
+        return jsonify({"ok": False, "error": "auth"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    return jsonify({"ok": True, "recipients": _outreach_recipients_for(user),
+                    "is_admin": "admin" in roles})
+
+
+@app.route("/api/v1/outreach/send", methods=["OPTIONS"])
+def outreach_send_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/outreach/send")
+def outreach_send():
+    user = _get_current_user()
+    if not user:
+        return jsonify({"ok": False, "error": "auth"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    subject = (data.get("subject") or "").strip()
+    body = (data.get("body") or "").strip()
+    ids = data.get("recipient_ids") or []
+    if not subject or not body:
+        return jsonify({"ok": False, "message": "Subject and message are both required."}), 400
+    try:
+        ids = set(int(i) for i in ids)
+    except Exception:
+        return jsonify({"ok": False, "message": "Bad recipient list."}), 400
+    if not ids:
+        return jsonify({"ok": False, "message": "Pick at least one recipient."}), 400
+    # Only allow recipients within the sender's own permitted set.
+    allowed = {r["user_id"]: r for r in _outreach_recipients_for(user)}
+    targets = [allowed[i] for i in ids if i in allowed]
+    if not targets:
+        return jsonify({"ok": False, "message": "None of those recipients are available to you."}), 400
+    _ensure_outreach_table()
+    sender_email = (user.get("email") or "").strip()
+    sender_name = (user.get("name") or "Your Meteorologist").strip()
+    batch_id = new_secure_token()
+    now_ms = int(time.time() * 1000)
+    sent = failed = 0
+    for t in targets:
+        personalized = body.replace("{name}", t["first_name"]).replace("{first}", t["first_name"])
+        ok = _send_outreach_email(t["email"], subject, personalized,
+                                  reply_to=(sender_email or None), from_name=sender_name)
+        status = "sent" if ok else "failed"
+        if ok:
+            sent += 1
+        else:
+            failed += 1
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO outreach_sends
+                               (batch_id, sender_user_id, sender_email, subject,
+                                recipient_user_id, recipient_email, status, created_at)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (batch_id, user["id"], sender_email, subject,
+                         t["user_id"], t["email"], status, now_ms))
+        except Exception as e:
+            print(f"[outreach] log failed: {e}", flush=True)
+    return jsonify({"ok": True, "sent": sent, "failed": failed, "reply_to": sender_email})
 
 
 def _process_severe_alerts() -> None:
