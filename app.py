@@ -7384,6 +7384,34 @@ def boone_trial_signup():
                     (name or None, phone or None, cohort, category, now, ends, business, user_id),
                 )
 
+            # Auto-assign the region's Meteorologist as this subscriber's
+            # primary Met (June 2026). Signups previously landed with no Met,
+            # which silently excluded them from Pro briefs routing and severe
+            # paging until someone noticed in the Control Center. Uses the
+            # same cohort -> Met mapping as the signup notification. Never
+            # overwrites an existing assignment.
+            met_email = TRIAL_REGION_MET.get(cohort)
+            if met_email:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id FROM users WHERE LOWER(email) = LOWER(%s)",
+                        (met_email,),
+                    )
+                    met_row = cur.fetchone()
+                    if met_row:
+                        cur.execute(
+                            """INSERT INTO subscriber_coverage (user_id, primary_met_id, updated_at)
+                               VALUES (%s, %s, %s)
+                               ON CONFLICT (user_id) DO UPDATE
+                               SET primary_met_id = EXCLUDED.primary_met_id,
+                                   updated_at = EXCLUDED.updated_at
+                               WHERE subscriber_coverage.primary_met_id IS NULL""",
+                            (user_id, met_row["id"], int(time.time() * 1000)),
+                        )
+                    else:
+                        print(f"[boone-trial-signup] no Met user for {met_email!r}; "
+                              f"signup {email} left unassigned", flush=True)
+
             # Welcome email with a magic sign-in link (new-account intent),
             # exactly like the Stripe new-subscriber flow.
             base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai")
@@ -23223,6 +23251,10 @@ def _find_pro_subscribers_by_county(alert: dict) -> list:
                 "backup_met_phone": r.get("backup_met_phone") or "",
             })
     return matching
+
+
+def _page_met_for_alert(alert: dict, affected: list, page_token: str,
+                        *, met_phone: str = "", met_name: str = "") -> bool:
     """SMS a specific Met about a new severe alert affecting THEIR Pro
     subscribers. Returns True on successful send (or stub mode), False on
     Twilio failure or when no phone is available.
