@@ -19547,7 +19547,114 @@ def admin_rain_alert_test():
     return jsonify(out)
 
 
-# ── Widget forecast cache (May 28, 2026) ──
+@app.route("/api/v1/admin/nws/test-page", methods=["OPTIONS"])
+def _admin_nws_test_page_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/nws/test-page")
+def admin_nws_test_page():
+    """Seed a CLEARLY-LABELED simulated severe-weather page targeting ONLY the
+    admin's own account, then page the admin, so the whole alert chain can be
+    watched end to end (page text -> portal 'Review & send' banner -> confirm
+    -> the sample subscriber alert) without touching a single real subscriber.
+    Admin only.
+    """
+    user = _get_current_user()
+    if user is None or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    admin_id = user["id"]
+    admin_name = user.get("name") or user.get("email") or "Admin"
+
+    # Admin's phone for the page text. Missing is not fatal: the portal banner
+    # still surfaces the page, so the chain can be tested without a number.
+    admin_phone = ""
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT phone FROM users WHERE id = %s", (admin_id,))
+                r = cur.fetchone()
+                admin_phone = (r.get("phone") or "").strip() if r else ""
+    except Exception as e:
+        print(f"[nws-test] phone lookup failed: {e}", flush=True)
+
+    now_ms = int(time.time() * 1000)
+    test_alert = {
+        "nws_id": "TEST-" + new_secure_token()[:16],
+        "event": "Tornado Warning",
+        "severity": "Extreme",
+        "headline": "TEST PAGE — WeatherValet system test, not a real warning",
+        "description": ("This is a test of the WeatherValet severe-weather alert "
+                        "chain. No real subscribers were notified; only your own "
+                        "account is on this test page."),
+        "instruction": "This is only a test. No action is needed.",
+        "area_desc": "TEST (your account only)",
+        "geometry": None,
+        "expires_at": now_ms + 60 * 60 * 1000,
+    }
+
+    page_token = new_secure_token()
+    affected_ids_csv = str(admin_id)     # ONLY the admin; no real subscribers
+    paged_phones_csv = admin_phone
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO nws_alert_pages
+                       (created_at, nws_alert_id, event, severity, headline,
+                        description, instruction, area_desc, polygon_geojson,
+                        expires_at, response_token, status, affected_user_ids,
+                        met_paged_phone)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                               'paged', %s, %s)
+                       RETURNING id""",
+                    (now_ms, test_alert["nws_id"], test_alert["event"],
+                     test_alert["severity"], test_alert["headline"],
+                     test_alert["description"], test_alert["instruction"],
+                     test_alert["area_desc"], json.dumps(test_alert["geometry"]),
+                     test_alert["expires_at"], page_token,
+                     affected_ids_csv, paged_phones_csv),
+                )
+                new_row = cur.fetchone()
+    except Exception as e:
+        print(f"[nws-test] insert failed: {e}", flush=True)
+        return jsonify({"ok": False, "error": "insert-failed",
+                        "message": "Could not create the test page."}), 500
+
+    paged = False
+    if admin_phone:
+        try:
+            paged = _page_met_for_alert(
+                test_alert, [{"user_id": admin_id, "name": admin_name}],
+                page_token, met_phone=admin_phone, met_name=admin_name)
+        except Exception as e:
+            print(f"[nws-test] page send failed: {e}", flush=True)
+
+    base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+    review_url = f"{base}/?nws-page={page_token}"
+
+    if paged:
+        note = "A page text was sent to your number, and "
+    elif not admin_phone:
+        note = "No phone is on file for your account, but "
+    else:
+        note = "The page text could not be sent (check Twilio), but "
+    msg = ("Test page created. " + note
+           + "it also appears in your Met portal's 'Review & send' banner. "
+           + "Open it there (or the review link), tap confirm, and the sample "
+           + "subscriber alert will go only to your own account.")
+
+    print(f"[nws-test] admin={admin_id} page_id={new_row['id']} paged={paged}", flush=True)
+    return jsonify({
+        "ok": True,
+        "page_id": new_row["id"],
+        "review_url": review_url,
+        "paged_phone": bool(paged),
+        "phone_on_file": bool(admin_phone),
+        "message": msg,
+    })
 # In-memory TTL cache for the radio-partner widget endpoint. Keys are
 # (lat, lng) tuples rounded to 4 decimal places (~10m precision); values
 # are (timestamp_ms, payload) tuples. Widget pages embed on partner
@@ -33346,6 +33453,7 @@ def met_nws_pending():
     if "met" not in roles and "admin" not in roles:
         return jsonify({"ok": False, "error": "forbidden"}), 403
     met_id = user["id"]
+    is_admin = "admin" in roles
     now_ms = int(time.time() * 1000)
 
     with db() as conn:
@@ -33373,25 +33481,35 @@ def met_nws_pending():
                         ids = []
                 if not ids:
                     continue
-                # How many of THIS Met's subscribers are in this alert?
+                # Surface this page to any Met who could act on it, regardless
+                # of where they're logged in (June 2026 fix): the primary OR
+                # backup Met for an affected subscriber, ANY Met when affected
+                # subscribers have no assigned Met (orphans page the whole
+                # roster), and admins (who see everything).
                 placeholders = ",".join(["%s"] * len(ids))
                 cur.execute(
-                    f"""SELECT COUNT(*) AS n
+                    f"""SELECT
+                          COUNT(*) FILTER (
+                            WHERE cov.primary_met_id = %s OR cov.backup_met_id = %s
+                          ) AS mine,
+                          COUNT(*) FILTER (WHERE cov.primary_met_id IS NOT NULL) AS has_primary
                         FROM subscriber_coverage cov
-                        WHERE cov.primary_met_id = %s
-                          AND cov.user_id IN ({placeholders})""",
-                    tuple([met_id] + ids),
+                        WHERE cov.user_id IN ({placeholders})""",
+                    tuple([met_id, met_id] + ids),
                 )
-                mine = cur.fetchone()
-                my_count = (mine["n"] if mine else 0) or 0
-                if my_count <= 0:
+                row = cur.fetchone()
+                mine = (row["mine"] if row else 0) or 0
+                has_primary = (row["has_primary"] if row else 0) or 0
+                orphan = len(ids) - has_primary
+                if not (is_admin or mine > 0 or orphan > 0):
                     continue
+                shown = len(ids) if is_admin else (mine + orphan)
                 out.append({
                     "token": p["response_token"],
                     "event": p["event"] or "",
                     "severity": p["severity"] or "",
                     "area_desc": p["area_desc"] or "",
-                    "my_affected": my_count,
+                    "my_affected": shown,
                     "created_at": p["created_at"],
                     "expires_at": p["expires_at"],
                 })
