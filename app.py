@@ -29038,6 +29038,7 @@ def met_pro_subscribers_queue():
                 cur.execute(
                     """SELECT u.id AS user_id, u.email, u.name, u.phone,
                               u.subscription_tier AS tier,
+                              u.trial_business_name AS business_name,
                               COALESCE(u.timezone, 'America/Indiana/Indianapolis') AS timezone,
                               COALESCE(bp.morning_window_start, '07:00') AS morning_window_start,
                               bp.morning_enabled AS morning_enabled,
@@ -29065,6 +29066,7 @@ def met_pro_subscribers_queue():
                 cur.execute(
                     """SELECT u.id AS user_id, u.email, u.name, u.phone,
                               u.subscription_tier AS tier,
+                              u.trial_business_name AS business_name,
                               COALESCE(u.timezone, 'America/Indiana/Indianapolis') AS timezone,
                               COALESCE(bp.morning_window_start, '07:00') AS morning_window_start,
                               bp.morning_enabled AS morning_enabled,
@@ -29106,13 +29108,14 @@ def met_pro_subscribers_queue():
     # Account-owner labels: an added user shows "[owner] User" on the card;
     # a primary account owner (or solo subscriber) shows "Subscriber".
     _owner_map = {}
+    _owner_id_map = {}
     _member_ids = [s["user_id"] for s in sub_rows]
     if _member_ids:
         try:
             with db() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        """SELECT pmm.member_user_id AS mid, ownr.name AS owner_name
+                        """SELECT pmm.member_user_id AS mid, pmm.primary_user_id AS oid, ownr.name AS owner_name
                            FROM pro_multi_memberships pmm
                            JOIN users ownr ON ownr.id = pmm.primary_user_id
                            WHERE pmm.status = 'active'
@@ -29121,8 +29124,10 @@ def met_pro_subscribers_queue():
                     )
                     for mr in cur.fetchall():
                         _owner_map[mr["mid"]] = mr["owner_name"]
+                        _owner_id_map[mr["mid"]] = mr["oid"]
         except Exception:
             _owner_map = {}
+            _owner_id_map = {}
 
     # For each subscriber, look up their latest pro_brief_drafts row from
     # the last 18 hours (so we catch tonight's pregen + this morning's draft).
@@ -29201,6 +29206,8 @@ def met_pro_subscribers_queue():
             "user_id": s["user_id"],
             "name": s.get("name") or "",
             "account_owner_name": _owner_map.get(s["user_id"], ""),
+            "account_owner_id": _owner_id_map.get(s["user_id"]) or s["user_id"],
+            "business_name": s.get("business_name") or "",
             "county": s.get("location_county") or "",
             "email": s["email"],
             "phone": s.get("phone") or "",
