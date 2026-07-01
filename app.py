@@ -29043,7 +29043,7 @@ def met_pro_subscribers_queue():
                               bp.morning_enabled AS morning_enabled,
                               loc.label AS location_label,
                               loc.address_text AS location_address,
-                              loc.lat AS loc_lat, loc.lng AS loc_lng,
+                              loc.lat AS loc_lat, loc.lng AS loc_lng, loc.county AS location_county,
                               sc.primary_met_id,
                               sc.notes AS coverage_notes,
                               pm.name AS primary_met_name
@@ -29070,7 +29070,7 @@ def met_pro_subscribers_queue():
                               bp.morning_enabled AS morning_enabled,
                               loc.label AS location_label,
                               loc.address_text AS location_address,
-                              loc.lat AS loc_lat, loc.lng AS loc_lng,
+                              loc.lat AS loc_lat, loc.lng AS loc_lng, loc.county AS location_county,
                               sc.primary_met_id,
                               sc.notes AS coverage_notes,
                               pm.name AS primary_met_name
@@ -29201,6 +29201,7 @@ def met_pro_subscribers_queue():
             "user_id": s["user_id"],
             "name": s.get("name") or "",
             "account_owner_name": _owner_map.get(s["user_id"], ""),
+            "county": s.get("location_county") or "",
             "email": s["email"],
             "phone": s.get("phone") or "",
             "tier": s["tier"],
