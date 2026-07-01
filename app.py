@@ -22986,7 +22986,10 @@ def _find_pro_subscribers_in_polygon(geom: dict) -> list:
                           loc.label AS loc_label, loc.lat, loc.lng,
                           cov.primary_met_id AS met_id,
                           met.name  AS met_name,
-                          met.phone AS met_phone
+                          met.phone AS met_phone,
+                          cov.backup_met_id AS backup_met_id,
+                          bm.name  AS backup_met_name,
+                          bm.phone AS backup_met_phone
                    FROM users u
                    JOIN saved_locations loc
                      ON loc.user_id = u.id AND loc.is_primary = TRUE
@@ -22994,6 +22997,8 @@ def _find_pro_subscribers_in_polygon(geom: dict) -> list:
                      ON cov.user_id = u.id
                    LEFT JOIN users met
                      ON met.id = cov.primary_met_id
+                   LEFT JOIN users bm
+                     ON bm.id = cov.backup_met_id
                    WHERE u.is_active = TRUE
                      AND u.subscription_tier IN ('pro_single','pro_multi','pro_enterprise')
                      AND EXISTS (
@@ -23018,6 +23023,9 @@ def _find_pro_subscribers_in_polygon(geom: dict) -> list:
                 "met_id": r.get("met_id"),
                 "met_name": r.get("met_name") or "",
                 "met_phone": r.get("met_phone") or "",
+                "backup_met_id": r.get("backup_met_id"),
+                "backup_met_name": r.get("backup_met_name") or "",
+                "backup_met_phone": r.get("backup_met_phone") or "",
             })
     return matching
 
@@ -23045,7 +23053,10 @@ def _find_pro_subscribers_by_county(alert: dict) -> list:
                           loc.label AS loc_label, loc.county, loc.address_text,
                           cov.primary_met_id AS met_id,
                           met.name  AS met_name,
-                          met.phone AS met_phone
+                          met.phone AS met_phone,
+                          cov.backup_met_id AS backup_met_id,
+                          bm.name  AS backup_met_name,
+                          bm.phone AS backup_met_phone
                    FROM users u
                    JOIN saved_locations loc
                      ON loc.user_id = u.id AND loc.is_primary = TRUE
@@ -23053,6 +23064,8 @@ def _find_pro_subscribers_by_county(alert: dict) -> list:
                      ON cov.user_id = u.id
                    LEFT JOIN users met
                      ON met.id = cov.primary_met_id
+                   LEFT JOIN users bm
+                     ON bm.id = cov.backup_met_id
                    WHERE u.is_active = TRUE
                      AND u.subscription_tier IN ('pro_single','pro_multi','pro_enterprise')
                      AND EXISTS (
@@ -23088,6 +23101,9 @@ def _find_pro_subscribers_by_county(alert: dict) -> list:
                 "met_id": r.get("met_id"),
                 "met_name": r.get("met_name") or "",
                 "met_phone": r.get("met_phone") or "",
+                "backup_met_id": r.get("backup_met_id"),
+                "backup_met_name": r.get("backup_met_name") or "",
+                "backup_met_phone": r.get("backup_met_phone") or "",
             })
     return matching
     """SMS a specific Met about a new severe alert affecting THEIR Pro
@@ -23961,6 +23977,33 @@ def outreach_send():
     return jsonify({"ok": True, "sent": sent, "failed": failed, "reply_to": sender_email})
 
 
+def _severe_fallback_pages() -> list:
+    """On-call fallback for affected subscribers who have no reachable primary
+    OR backup Met. Returns (phone, name) for every active Met with a phone, so
+    a no-Met subscriber's tornado page still reaches a human who can confirm it.
+    Falls back to METEOROLOGIST_PHONE if the roster somehow has no phones.
+    """
+    out = []
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT DISTINCT u.name, u.phone
+                       FROM users u
+                       JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'met'
+                       WHERE u.is_active = TRUE AND COALESCE(u.phone, '') <> ''"""
+                )
+                for r in cur.fetchall():
+                    ph = (r.get("phone") or "").strip()
+                    if ph:
+                        out.append((ph, r.get("name") or "On-call Meteorologist"))
+    except Exception as e:
+        print(f"[nws-process] fallback roster lookup failed: {e}", flush=True)
+    if not out and METEOROLOGIST_PHONE:
+        out.append((METEOROLOGIST_PHONE, "On-call Meteorologist"))
+    return out
+
+
 def _process_severe_alerts() -> None:
     """One scheduler tick: fetch alerts, match against subscribers, page Met."""
     # Relief half (#C14): send all-clears for alerts that have passed their
@@ -24011,24 +24054,53 @@ def _process_severe_alerts() -> None:
             # quickly — every NWS alert nationally would create a row.)
             continue
 
-        # Group affected subscribers by their assigned primary Met, so each
-        # Met is paged with only their own affected subscribers. Subscribers
-        # with no assigned Met (met_id is None) are skipped per design — no
-        # fallback page.
-        by_met = {}
-        skipped_no_met = 0
-        for sub in affected:
-            mid = sub.get("met_id")
-            if not mid:
-                skipped_no_met += 1
-                continue
-            by_met.setdefault(mid, []).append(sub)
+        # Route affected subscribers to the humans who can confirm the alert
+        # (primary Met, backup Met, on-call fallback). See routing below.
+        # Route affected subscribers to page targets so a human reliably gets
+        # paged for EVERY affected subscriber (June 2026 reliability fix):
+        #   - primary Met (as before)
+        #   - backup Met too, so one unresponsive Met can't leave subs uncovered
+        #   - on-call fallback for subs with no reachable Met, instead of
+        #     silently skipping them
+        # Keyed by phone, so a Met covering many affected subs is paged once.
+        targets = {}          # phone -> {"name": str, "subs": [], "_ids": set()}
 
-        if not by_met:
-            # Everyone affected lacks an assigned Met; nothing to route.
+        def _route(phone, name, sub):
+            phone = (phone or "").strip()
+            if not phone:
+                return False
+            t = targets.get(phone)
+            if t is None:
+                t = {"name": name or "", "subs": [], "_ids": set()}
+                targets[phone] = t
+            if sub["user_id"] not in t["_ids"]:
+                t["_ids"].add(sub["user_id"])
+                t["subs"].append(sub)
+            return True
+
+        uncovered = []
+        for sub in affected:
+            covered = False
+            if sub.get("met_id") and _route(sub.get("met_phone"), sub.get("met_name"), sub):
+                covered = True
+            if sub.get("backup_met_id") and _route(sub.get("backup_met_phone"), sub.get("backup_met_name"), sub):
+                covered = True
+            if not covered:
+                uncovered.append(sub)
+
+        # Fallback: subscribers with no reachable primary/backup Met go to the
+        # on-call roster so they are still covered by a human who can confirm.
+        fallback_subs = len(uncovered)
+        if uncovered:
+            for ph, nm in _severe_fallback_pages():
+                for sub in uncovered:
+                    _route(ph, nm, sub)
+
+        if not targets:
+            # No reachable human anywhere (no Met phones and no fallback).
             print(
                 f"[nws-process] alert={alert['event']!r} hit {len(affected)} "
-                f"Pro sub(s) but none had an assigned Met; skipped",
+                f"Pro sub(s) but no reachable Met or fallback phone; skipped",
                 flush=True,
             )
             continue
@@ -24039,12 +24111,7 @@ def _process_severe_alerts() -> None:
         page_token = new_secure_token()
         now_ms = int(time.time() * 1000)
         affected_ids_csv = ",".join(str(a["user_id"]) for a in affected)
-        paged_phones = []
-        for subs in by_met.values():
-            ph = (subs[0].get("met_phone") or "").strip()
-            if ph:
-                paged_phones.append(ph)
-        paged_phones_csv = ",".join(paged_phones)
+        paged_phones_csv = ",".join(targets.keys())
 
         try:
             with db() as conn:
@@ -24072,28 +24139,19 @@ def _process_severe_alerts() -> None:
             print(f"[nws-process] insert failed for {nws_id}: {e}", flush=True)
             continue
 
-        # Page each affected Met with only their own subscribers.
+        # Page every routed target: primary Mets, backup Mets, and any
+        # on-call fallback. Each target gets only the subs they cover.
         paged_mets = 0
-        for mid, subs in by_met.items():
-            met_phone = (subs[0].get("met_phone") or "").strip()
-            met_name = subs[0].get("met_name") or ""
-            if not met_phone:
-                print(
-                    f"[nws-process] Met id={mid} ({met_name!r}) has "
-                    f"{len(subs)} affected sub(s) but no phone on file; "
-                    f"could not page",
-                    flush=True,
-                )
-                continue
-            ok = _page_met_for_alert(alert, subs, page_token,
-                                     met_phone=met_phone, met_name=met_name)
+        for phone, t in targets.items():
+            ok = _page_met_for_alert(alert, t["subs"], page_token,
+                                     met_phone=phone, met_name=t["name"])
             if ok:
                 paged_mets += 1
 
         print(
             f"[nws-process] alert={alert['event']!r} id={new_row['id']} "
-            f"affected={len(affected)} mets_paged={paged_mets} "
-            f"no_met_subs={skipped_no_met}",
+            f"affected={len(affected)} pages_sent={paged_mets} "
+            f"fallback_subs={fallback_subs}",
             flush=True,
         )
 
