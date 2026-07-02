@@ -7230,6 +7230,78 @@ TRIAL_REGION_MET = {
     "kansas": "sramek@weathervalet.com",
 }
 
+
+def _notify_rep_of_signup(rep_slug: str, who: str, kind: str) -> None:
+    """Win alert (July 2026): the moment a signup lands through a rep's
+    tagged link, message the rep so they know it worked. Salespeople run
+    on this feedback loop. kind is 'trial' or 'starter'. Best-effort:
+    any failure is logged and never breaks the signup.
+    """
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT name, email, phone FROM sales_reps
+                       WHERE slug = %s AND is_active = TRUE""",
+                    (rep_slug,),
+                )
+                rep = cur.fetchone()
+        if not rep:
+            print(f"[rep-win] no active rep for slug {rep_slug!r}; no alert sent", flush=True)
+            return
+        first = (rep.get("name") or "").split(" ")[0] or "there"
+        if kind == "trial":
+            what = "a free 30-day trial"
+        elif kind == "starter":
+            what = "the $99 Starter Month"
+        else:
+            what = "a paid subscription"
+        sms_body = (f"WeatherValet win: {who} just started {what} from your link. "
+                    f"Nice work, {first}!")
+        phone = (rep.get("phone") or "").strip()
+        if phone:
+            send_sms(phone, sms_body)
+        to_email = (rep.get("email") or "").strip()
+        api_key = os.environ.get("RESEND_API_KEY", "").strip()
+        if to_email and api_key:
+            from_addr = os.environ.get("RESEND_FROM_EMAIL", "WeatherValet <hello@weathervalet.ai>")
+            subject = f"You landed one: {who}"
+            body_html = (
+                "<div style='font-family:Arial,sans-serif;max-width:520px;'>"
+                f"<h2 style='color:#2E4FB8;margin:0 0 12px;'>Nice work, {_html_escape(first)}!</h2>"
+                f"<p style='margin:0 0 12px;font-size:15px;'><strong>{_html_escape(who)}</strong> "
+                f"just started {_html_escape(what)} from your link.</p>"
+                "<p style='margin:0 0 12px;font-size:14px;color:#4B5563;'>Their Meteorologist takes it "
+                "from here with a personal brief every morning. Your commission window is running: "
+                "20 percent of what they pay for 6 months from today.</p>"
+                "<p style='color:#6B7280;font-size:13px;margin:0;'>WeatherValet</p>"
+                "</div>"
+            )
+            body_text = (f"Nice work, {first}! {who} just started {what} from your link. "
+                         "Your 6-month commission window starts today.")
+            payload = json.dumps({
+                "from": from_addr,
+                "to": [to_email],
+                "subject": subject,
+                "html": body_html,
+                "text": body_text,
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                "https://api.resend.com/emails",
+                data=payload,
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "WeatherValet-Backend/1.0 (+https://weathervalet.ai)",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+        print(f"[rep-win] alerted rep {rep_slug!r} about {who!r} ({kind})", flush=True)
+    except Exception as e:
+        print(f"[rep-win] alert failed for {rep_slug!r}: {e!r}", flush=True)
+
 BOONE_TRIAL_DAYS = 30
 
 
@@ -7441,6 +7513,9 @@ def boone_trial_signup():
                           f"rep={rep_slug}", flush=True)
                 except Exception as e:
                     print(f"[boone-trial-signup] attribution write failed: {e!r}", flush=True)
+                # Win alert to the rep, outside the attribution try so an
+                # alert failure can't be mistaken for an attribution failure.
+                _notify_rep_of_signup(rep_slug, business or name or email, "trial")
 
             # Welcome email with a magic sign-in link (new-account intent),
             # exactly like the Stripe new-subscriber flow.
@@ -7833,6 +7908,11 @@ def stripe_webhook_v2():
                         # Attribution failure shouldn't break the signup —
                         # log it loudly and move on.
                         print(f"[stripe-webhook] attribution write failed: {e!r}", flush=True)
+                    # Win alert (July 2026): paid signup through a rep's link.
+                    if rep_slug:
+                        _notify_rep_of_signup(
+                            rep_slug, customer_name or email,
+                            "starter" if sess_starter else "paid")
 
                 # Send the password-reset email so the new subscriber can set
                 # their password and sign in. Reusing the magic-link infra —
@@ -43441,7 +43521,8 @@ def _compute_commissions_for_month(year: int, month: int) -> dict:
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT a.user_id, a.rep_slug, a.signed_up_at, a.starter_used,
-                          u.email, u.name, u.subscription_tier, u.is_active
+                          u.email, u.name, u.subscription_tier, u.is_active,
+                          u.trial_status, u.trial_business_name
                    FROM sales_attributions a
                    JOIN users u ON u.id = a.user_id
                    WHERE a.rep_slug IS NOT NULL AND a.rep_slug != 'organic'"""
@@ -43486,7 +43567,14 @@ def _compute_commissions_for_month(year: int, month: int) -> dict:
 
         # What did they pay this month?
         tier = a["subscription_tier"] or ""
-        if a["starter_used"] and delta_months == 0:
+        on_free_trial = (a.get("trial_status") == "active")
+        if on_free_trial:
+            # Free-trial signups carry a pro tier but pay nothing yet.
+            # They stay visible in the statement (so the rep sees their
+            # pipeline) but earn $0 until the trial converts. The 6-month
+            # window still runs from signup, as promised at attribution.
+            month_cents = 0
+        elif a["starter_used"] and delta_months == 0:
             month_cents = STARTER_MONTH_CENTS
         else:
             month_cents = TIER_MONTHLY_CENTS_FOR_COMMISSION.get(tier, 0)
@@ -43498,8 +43586,10 @@ def _compute_commissions_for_month(year: int, month: int) -> dict:
             "user_id": a["user_id"],
             "email": a["email"],
             "name": a["name"],
+            "business_name": a.get("trial_business_name") or "",
             "signed_up_at": a["signed_up_at"],
             "tier": tier,
+            "on_free_trial": on_free_trial,
             "month_index": delta_months,
             "starter_used": bool(a["starter_used"]),
             "month_cents": month_cents,
@@ -43530,6 +43620,172 @@ def admin_commissions(year: int, month: int):
     result = _compute_commissions_for_month(year, month)
     result["ok"] = True
     return jsonify(result)
+
+
+# ════════════════════════════════════════════════════════════════════
+# Sales Portal (July 2026) — rep-facing, self-scoped
+# ════════════════════════════════════════════════════════════════════
+# A rep signs in with the same magic-link login as everyone else; their
+# rep identity is their sales_reps row matched by email. Every endpoint
+# below returns ONLY that rep's own data. No new auth machinery.
+
+def _current_sales_rep():
+    """(user, rep) for the signed-in rep, or (user, None) if the signed-in
+    user has no active sales_reps row, or (None, None) if not signed in."""
+    user = _get_current_user()
+    if user is None:
+        return None, None
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, slug, name, email, phone FROM sales_reps
+                       WHERE LOWER(email) = LOWER(%s) AND is_active = TRUE""",
+                    ((user.get("email") or "").strip(),),
+                )
+                rep = cur.fetchone()
+        return user, rep
+    except Exception as e:
+        print(f"[sales-portal] rep lookup failed: {e!r}", flush=True)
+        return user, None
+
+
+@app.route("/api/v1/sales/me", methods=["OPTIONS"])
+def _sales_me_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/sales/me")
+def sales_me():
+    user, rep = _current_sales_rep()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-signed-in"}), 401
+    if rep is None:
+        return jsonify({"ok": False, "error": "not-a-rep"}), 403
+    return jsonify({"ok": True, "rep": {"slug": rep["slug"], "name": rep["name"] or rep["slug"]}})
+
+
+@app.route("/api/v1/sales/pipeline", methods=["OPTIONS"])
+def _sales_pipeline_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/sales/pipeline")
+def sales_pipeline():
+    """Every signup attributed to the signed-in rep, newest first, with a
+    computed status so the portal can show 'Day 12 of 30' at a glance."""
+    user, rep = _current_sales_rep()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-signed-in"}), 401
+    if rep is None:
+        return jsonify({"ok": False, "error": "not-a-rep"}), 403
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT a.signed_up_at, a.starter_used,
+                          u.id AS user_id, u.name, u.email,
+                          u.trial_business_name, u.trial_status,
+                          u.trial_started_at, u.trial_ends_at,
+                          u.subscription_tier, u.is_active
+                   FROM sales_attributions a
+                   JOIN users u ON u.id = a.user_id
+                   WHERE a.rep_slug = %s
+                   ORDER BY a.signed_up_at DESC""",
+                (rep["slug"],),
+            )
+            rows = cur.fetchall()
+    now_ms = int(time.time() * 1000)
+    out = []
+    for r in rows:
+        status, day, days_total = "paying", None, None
+        if not r["is_active"]:
+            status = "deactivated"
+        elif r.get("trial_status") == "active":
+            ends = r.get("trial_ends_at") or 0
+            started = r.get("trial_started_at") or r["signed_up_at"]
+            if ends and now_ms >= ends:
+                status = "trial_ended"
+            else:
+                status = "trial"
+                day = max(1, int((now_ms - started) // 86400000) + 1)
+                if ends and started:
+                    days_total = max(day, int(round((ends - started) / 86400000)))
+        elif (r.get("subscription_tier") or "").startswith("pro"):
+            status = "paying"
+        else:
+            status = "ended"
+        out.append({
+            "user_id": r["user_id"],
+            "display_name": r.get("trial_business_name") or r.get("name") or r.get("email"),
+            "contact_name": r.get("name") or "",
+            "signed_up_at": r["signed_up_at"],
+            "starter_used": bool(r.get("starter_used")),
+            "status": status,
+            "trial_day": day,
+            "trial_days_total": days_total,
+        })
+    return jsonify({"ok": True, "pipeline": out})
+
+
+@app.route("/api/v1/sales/commissions", methods=["OPTIONS"])
+def _sales_commissions_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/sales/commissions")
+def sales_commissions():
+    """The signed-in rep's money: this month's statement plus lifetime
+    total, computed with the exact same engine the admin report uses so
+    the numbers can never disagree."""
+    user, rep = _current_sales_rep()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-signed-in"}), 401
+    if rep is None:
+        return jsonify({"ok": False, "error": "not-a-rep"}), 403
+    ET = ZoneInfo("America/New_York")
+    now_dt = datetime.now(tz=ET)
+
+    def _mine(result):
+        for rrow in result.get("reps", []):
+            if rrow.get("slug") == rep["slug"]:
+                return rrow
+        return {"customer_count": 0, "commission_cents": 0, "customers": []}
+
+    this_month = _compute_commissions_for_month(now_dt.year, now_dt.month)
+    mine_now = _mine(this_month)
+
+    # Lifetime: walk back from the current month to the rep's earliest
+    # attribution (capped at 24 months, the system is young).
+    lifetime_cents = mine_now["commission_cents"]
+    earliest_ms = None
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT MIN(signed_up_at) AS m FROM sales_attributions WHERE rep_slug = %s",
+                (rep["slug"],),
+            )
+            r = cur.fetchone()
+            earliest_ms = r["m"] if r else None
+    if earliest_ms:
+        earliest_dt = datetime.fromtimestamp(earliest_ms / 1000, tz=ET)
+        y, m = now_dt.year, now_dt.month
+        steps = 0
+        while steps < 24:
+            m -= 1
+            if m == 0:
+                y, m = y - 1, 12
+            if (y, m) < (earliest_dt.year, earliest_dt.month):
+                break
+            lifetime_cents += _mine(_compute_commissions_for_month(y, m))["commission_cents"]
+            steps += 1
+
+    return jsonify({
+        "ok": True,
+        "month_label": this_month.get("month"),
+        "month_cents": mine_now["commission_cents"],
+        "lifetime_cents": lifetime_cents,
+        "customers": mine_now["customers"],
+    })
 
 
 # ════════════════════════════════════════════════════════════════════
