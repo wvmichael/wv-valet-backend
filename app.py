@@ -753,6 +753,23 @@ CREATE TABLE IF NOT EXISTS sales_rep_nudges (
     nudged_at   BIGINT NOT NULL
 );
 
+-- Trial satisfaction survey (July 2026). One row per invited subscriber;
+-- the token IS the auth (same pattern as brief web views and NWS pages).
+-- Answers live on the row once submitted. q_messaged_met = 'no' triggers
+-- the automatic "your Meteorologist works for you" follow-up.
+CREATE TABLE IF NOT EXISTS trial_surveys (
+    token           TEXT PRIMARY KEY,
+    user_id         BIGINT NOT NULL,
+    created_at      BIGINT NOT NULL,
+    submitted_at    BIGINT,
+    q_read_freq     TEXT,
+    q_messaged_met  TEXT,
+    q_decision      TEXT,
+    q_missing       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_trial_surveys_user
+    ON trial_surveys(user_id, created_at DESC);
+
 -- ── Custom mission templates (F-X2) ──
 --
 -- Built-in templates live in the frontend (CREW_MISSIONS dict in index.html).
@@ -43943,6 +43960,263 @@ def sales_commissions():
         "lifetime_cents": lifetime_cents,
         "customers": mine_now["customers"],
     })
+
+
+# ════════════════════════════════════════════════════════════════════
+# Trial satisfaction survey (July 2026)
+# ════════════════════════════════════════════════════════════════════
+# Four questions, two minutes, one job: set up the conversion conversation.
+# The "have you messaged your Meteorologist" question is the diagnostic:
+# a "no" plus a wishlist means the gap is onboarding, not the Met's
+# forecasting, and a "no" answer triggers an automatic follow-up teaching
+# them to message their Met.
+
+def _send_user_email(to_email: str, subject: str, body_html: str, body_text: str) -> None:
+    """Minimal Resend send, best-effort."""
+    api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    if not (to_email and api_key):
+        print(f"[survey-email] skipped for {to_email!r} (no key or address)", flush=True)
+        return
+    try:
+        from_addr = os.environ.get("RESEND_FROM_EMAIL", "WeatherValet <hello@weathervalet.ai>")
+        payload = json.dumps({
+            "from": from_addr, "to": [to_email], "subject": subject,
+            "html": body_html, "text": body_text,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "https://api.resend.com/emails", data=payload, method="POST",
+            headers={"Authorization": f"Bearer {api_key}",
+                     "Content-Type": "application/json",
+                     "User-Agent": "WeatherValet-Backend/1.0 (+https://weathervalet.ai)"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except Exception as e:
+        print(f"[survey-email] send failed for {to_email!r}: {e!r}", flush=True)
+
+
+def _met_first_name_for_user(user_id: int) -> str:
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT m.name FROM subscriber_coverage sc
+                       JOIN users m ON m.id = sc.primary_met_id
+                       WHERE sc.user_id = %s""",
+                    (user_id,),
+                )
+                r = cur.fetchone()
+        nm = ((r or {}).get("name") or "").split(" ")[0]
+        return nm or "your Meteorologist"
+    except Exception:
+        return "your Meteorologist"
+
+
+@app.route("/api/v1/admin/trial-survey/send", methods=["OPTIONS"])
+def _trial_survey_send_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/trial-survey/send")
+def admin_trial_survey_send():
+    """Send the survey to every active trial subscriber who hasn't been
+    invited in the last 14 days. Safe to click repeatedly: repeats only
+    reach subscribers who joined since the last send. Admin only."""
+    user = _get_current_user()
+    if user is None or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    now_ms = int(time.time() * 1000)
+    fresh_cutoff = now_ms - 14 * 86400000
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.name, u.email, u.phone, u.trial_business_name
+                   FROM users u
+                   WHERE u.is_active = TRUE
+                     AND u.trial_status = 'active'
+                     AND NOT EXISTS (
+                       SELECT 1 FROM trial_surveys t
+                       WHERE t.user_id = u.id AND t.created_at > %s
+                     )""",
+                (fresh_cutoff,),
+            )
+            targets = cur.fetchall()
+    base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+    sent = 0
+    for t in targets:
+        token = new_secure_token()
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO trial_surveys (token, user_id, created_at)
+                           VALUES (%s, %s, %s)""",
+                        (token, t["id"], now_ms),
+                    )
+        except Exception as e:
+            print(f"[survey-send] token insert failed for user {t['id']}: {e!r}", flush=True)
+            continue
+        link = f"{base}/survey?t={token}"
+        first = (t.get("name") or "").split(" ")[0] or "there"
+        met_first = _met_first_name_for_user(t["id"])
+        sms = (f"Hi {first}, it's {met_first} with WeatherValet. I want to make your "
+               f"briefs perfect for you. Two minutes and brutal honesty, please: {link}")
+        phone = (t.get("phone") or "").strip()
+        if phone:
+            send_sms(phone, sms)
+        subject = "Two minutes and brutal honesty, please"
+        body_html = (
+            "<div style='font-family:Arial,sans-serif;max-width:520px;'>"
+            f"<p style='font-size:15px;'>Hi {_html_escape(first)},</p>"
+            f"<p style='font-size:15px;'>It's {_html_escape(met_first)} with WeatherValet. "
+            "I want to make your briefs perfect for you, and the only way I can is if you "
+            "tell me the truth. Four quick questions, about two minutes:</p>"
+            f"<p style='margin:18px 0;'><a href='{link}' style='background:#4169E1;color:#fff;"
+            "padding:11px 22px;border-radius:7px;text-decoration:none;font-weight:700;'>"
+            "Take the survey</a></p>"
+            "<p style='color:#6B7280;font-size:13px;'>WeatherValet</p></div>"
+        )
+        body_text = (f"Hi {first}, it's {met_first} with WeatherValet. I want to make your "
+                     f"briefs perfect for you. Two minutes and brutal honesty, please: {link}")
+        _send_user_email((t.get("email") or "").strip(), subject, body_html, body_text)
+        sent += 1
+    return jsonify({"ok": True, "sent": sent,
+                    "message": (f"Survey sent to {sent} active trial "
+                                f"{'subscriber' if sent == 1 else 'subscribers'}."
+                                if sent else
+                                "No one to send to. Everyone active on trial was already "
+                                "invited in the last 14 days.")})
+
+
+@app.route("/api/v1/survey/<token>", methods=["OPTIONS"])
+def _trial_survey_get_preflight(token):
+    return ("", 204)
+
+
+@app.get("/api/v1/survey/<token>")
+def trial_survey_get(token):
+    """Public, token-authed: who is this survey for, and is it done?"""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT t.user_id, t.submitted_at, u.name
+                   FROM trial_surveys t JOIN users u ON u.id = t.user_id
+                   WHERE t.token = %s""",
+                (token,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    return jsonify({
+        "ok": True,
+        "first_name": (row.get("name") or "").split(" ")[0],
+        "met_first": _met_first_name_for_user(row["user_id"]),
+        "submitted": bool(row.get("submitted_at")),
+    })
+
+
+@app.post("/api/v1/survey/<token>")
+def trial_survey_submit(token):
+    """Public, token-authed: save the answers, once. A 'no' on the
+    messaged-your-Met question fires the automatic 'they work for you'
+    follow-up by text and email."""
+    data = request.get_json(silent=True) or {}
+
+    def _clean(key, limit):
+        return str(data.get(key) or "").strip()[:limit]
+
+    read_freq = _clean("read_freq", 20)
+    messaged = _clean("messaged_met", 10).lower()
+    decision = _clean("decision", 2000)
+    missing = _clean("missing", 2000)
+    if read_freq not in ("every-day", "most-days", "sometimes", "rarely"):
+        return jsonify({"ok": False, "error": "missing-read-freq"}), 400
+    if messaged not in ("yes", "no"):
+        return jsonify({"ok": False, "error": "missing-messaged"}), 400
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE trial_surveys
+                   SET submitted_at = %s, q_read_freq = %s, q_messaged_met = %s,
+                       q_decision = %s, q_missing = %s
+                   WHERE token = %s AND submitted_at IS NULL
+                   RETURNING user_id""",
+                (now_ms, read_freq, messaged, decision, missing, token),
+            )
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "already-submitted-or-invalid"}), 409
+    followup = False
+    if messaged == "no":
+        followup = True
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT name, email, phone FROM users WHERE id = %s",
+                                (row["user_id"],))
+                    u = cur.fetchone() or {}
+            first = (u.get("name") or "").split(" ")[0] or "there"
+            met_first = _met_first_name_for_user(row["user_id"])
+            sms = (f"Thanks for the feedback, {first}! One thing worth knowing: "
+                   f"{met_first} works for YOU. Message your Meteorologist anytime with "
+                   "what is coming up on your schedule and what you need to know. "
+                   "That is exactly what we are here for.")
+            phone = (u.get("phone") or "").strip()
+            if phone:
+                send_sms(phone, sms)
+            subject = "Your Meteorologist works for you"
+            body_html = (
+                "<div style='font-family:Arial,sans-serif;max-width:520px;'>"
+                f"<p style='font-size:15px;'>Thanks for the feedback, {_html_escape(first)}!</p>"
+                f"<p style='font-size:15px;'>One thing worth knowing: <strong>{_html_escape(met_first)} "
+                "works for you.</strong> Message your Meteorologist anytime with what is coming up "
+                "on your schedule and what you need to know: the earlier they know your week, the "
+                "sharper your briefs get. That is exactly what we are here for.</p>"
+                "<p style='color:#6B7280;font-size:13px;'>WeatherValet</p></div>"
+            )
+            body_text = (f"Thanks for the feedback, {first}! {met_first} works for you. "
+                         "Message your Meteorologist anytime with what is coming up on your "
+                         "schedule and what you need to know.")
+            _send_user_email((u.get("email") or "").strip(), subject, body_html, body_text)
+        except Exception as e:
+            print(f"[survey-followup] failed for user {row['user_id']}: {e!r}", flush=True)
+    return jsonify({"ok": True, "followup": followup})
+
+
+@app.route("/api/v1/admin/trial-survey/results", methods=["OPTIONS"])
+def _trial_survey_results_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/trial-survey/results")
+def admin_trial_survey_results():
+    user = _get_current_user()
+    if user is None or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT t.created_at, t.submitted_at, t.q_read_freq,
+                          t.q_messaged_met, t.q_decision, t.q_missing,
+                          u.name, u.email, u.trial_business_name
+                   FROM trial_surveys t JOIN users u ON u.id = t.user_id
+                   ORDER BY COALESCE(t.submitted_at, 0) DESC, t.created_at DESC
+                   LIMIT 200""",
+            )
+            rows = cur.fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "who": r.get("trial_business_name") or r.get("name") or r.get("email"),
+            "contact": r.get("name") or "",
+            "created_at": r.get("created_at"),
+            "submitted_at": r.get("submitted_at"),
+            "read_freq": r.get("q_read_freq") or "",
+            "messaged_met": r.get("q_messaged_met") or "",
+            "decision": r.get("q_decision") or "",
+            "missing": r.get("q_missing") or "",
+        })
+    return jsonify({"ok": True, "results": out})
 
 
 # ════════════════════════════════════════════════════════════════════
