@@ -7412,6 +7412,29 @@ def boone_trial_signup():
                         print(f"[boone-trial-signup] no Met user for {met_email!r}; "
                               f"signup {email} left unassigned", flush=True)
 
+            # ── Sales rep attribution (July 2026) ──
+            # Trial links can carry ?rep=<slug> (e.g. /trial?cat=ks&rep=laura).
+            # Locked at signup, same rules as the /starter funnel: written
+            # once, never overwritten, and a failure here must not break the
+            # signup. The 6-month commission window starts now, so the rep
+            # is credited when the trial converts to paid.
+            rep_raw = str(data.get("rep") or "").strip().lower()
+            rep_slug = "".join(c for c in rep_raw if c.isalnum() or c == "_")[:40] or None
+            if rep_slug:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """INSERT INTO sales_attributions
+                               (user_id, rep_slug, signed_up_at, starter_used, locked)
+                               VALUES (%s, %s, %s, FALSE, TRUE)
+                               ON CONFLICT (user_id) DO NOTHING""",
+                            (user_id, rep_slug, int(time.time() * 1000)),
+                        )
+                    print(f"[boone-trial-signup] attribution: user_id={user_id} "
+                          f"rep={rep_slug}", flush=True)
+                except Exception as e:
+                    print(f"[boone-trial-signup] attribution write failed: {e!r}", flush=True)
+
             # Welcome email with a magic sign-in link (new-account intent),
             # exactly like the Stripe new-subscriber flow.
             base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai")
