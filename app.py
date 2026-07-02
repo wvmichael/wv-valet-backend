@@ -7296,13 +7296,20 @@ _TRIAL_REGION_LABELS = {
 }
 
 
-def _trial_region_meta(category):
-    """Map a trial category to (cohort, region_label).
+def _trial_region_meta(category, region=None):
+    """Map a trial category (and optional explicit region) to
+    (cohort, region_label).
 
     Most landing pages are the Boone County (Indiana) launch; 'kansas' is the
-    Northwest Kansas expansion. Anything unknown falls back to Boone so we
-    never crash, but known regions get their real label in cohort + emails.
+    Northwest Kansas expansion. Industry pages (?cat=construction etc.) can
+    now carry ?region=ks to route to Kansas while keeping their industry
+    pitch, so an explicit region wins over the category. Anything unknown
+    falls back to Boone so we never crash, but known regions get their real
+    label in cohort + emails.
     """
+    r = (region or "").strip().lower()
+    if r in ("ks", "kansas", "nwkansas", "nw-kansas"):
+        return ("kansas", "Northwest Kansas")
     c = (category or "").strip().lower()
     if c == "kansas":
         return ("kansas", "Northwest Kansas")
@@ -7330,7 +7337,7 @@ def boone_trial_signup():
     email = (data.get("email") or "").strip()
     phone = (data.get("phone") or "").strip()
     category = (data.get("category") or "").strip().lower() or None
-    cohort, region_label = _trial_region_meta(category)
+    cohort, region_label = _trial_region_meta(category, data.get("region"))
 
     if not email or "@" not in email:
         return jsonify({"ok": False, "error": "Please include a valid email to start your trial."}), 400
