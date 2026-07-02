@@ -44188,6 +44188,51 @@ def _trial_survey_results_preflight():
     return ("", 204)
 
 
+@app.route("/api/v1/met/trial-survey/results", methods=["OPTIONS"])
+def _met_trial_survey_results_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/trial-survey/results")
+def met_trial_survey_results():
+    """Survey results for the signed-in Met, scoped to subscribers whose
+    primary Meteorologist they are. Admins see everything. Same row shape
+    as the admin results so both views can never disagree."""
+    user = _get_current_user()
+    roles = (user.get("roles") or []) if user else []
+    if user is None or not ("met" in roles or "admin" in roles):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    is_admin = "admin" in roles
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT t.created_at, t.submitted_at, t.q_read_freq,
+                          t.q_messaged_met, t.q_decision, t.q_missing,
+                          u.name, u.email, u.trial_business_name
+                   FROM trial_surveys t
+                   JOIN users u ON u.id = t.user_id
+                   LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
+                   WHERE %s OR sc.primary_met_id = %s
+                   ORDER BY COALESCE(t.submitted_at, 0) DESC, t.created_at DESC
+                   LIMIT 200""",
+                (is_admin, user["id"]),
+            )
+            rows = cur.fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "who": r.get("trial_business_name") or r.get("name") or r.get("email"),
+            "contact": r.get("name") or "",
+            "created_at": r.get("created_at"),
+            "submitted_at": r.get("submitted_at"),
+            "read_freq": r.get("q_read_freq") or "",
+            "messaged_met": r.get("q_messaged_met") or "",
+            "decision": r.get("q_decision") or "",
+            "missing": r.get("q_missing") or "",
+        })
+    return jsonify({"ok": True, "results": out})
+
+
 @app.get("/api/v1/admin/trial-survey/results")
 def admin_trial_survey_results():
     user = _get_current_user()
