@@ -744,6 +744,15 @@ CREATE TABLE IF NOT EXISTS sales_attributions (
 CREATE INDEX IF NOT EXISTS idx_sales_attrib_rep
     ON sales_attributions(rep_slug, signed_up_at DESC);
 
+-- Rep trial-ending nudges (July 2026): one row per attributed customer so
+-- the rep gets exactly one heads-up as the customer's free trial nears its
+-- end. Written when the nudge is sent; presence of the row = already sent.
+CREATE TABLE IF NOT EXISTS sales_rep_nudges (
+    user_id     BIGINT PRIMARY KEY,
+    rep_slug    TEXT NOT NULL,
+    nudged_at   BIGINT NOT NULL
+);
+
 -- ── Custom mission templates (F-X2) ──
 --
 -- Built-in templates live in the frontend (CREW_MISSIONS dict in index.html).
@@ -7231,12 +7240,10 @@ TRIAL_REGION_MET = {
 }
 
 
-def _notify_rep_of_signup(rep_slug: str, who: str, kind: str) -> None:
-    """Win alert (July 2026): the moment a signup lands through a rep's
-    tagged link, message the rep so they know it worked. Salespeople run
-    on this feedback loop. kind is 'trial' or 'starter'. Best-effort:
-    any failure is logged and never breaks the signup.
-    """
+def _send_rep_message(rep_slug: str, sms_body: str, subject: str,
+                      body_html: str, body_text: str) -> bool:
+    """Send a text + email to an active sales rep by slug. Best-effort:
+    failures are logged and never raised. Returns True if the rep exists."""
     try:
         with db() as conn:
             with conn.cursor() as cur:
@@ -7247,38 +7254,15 @@ def _notify_rep_of_signup(rep_slug: str, who: str, kind: str) -> None:
                 )
                 rep = cur.fetchone()
         if not rep:
-            print(f"[rep-win] no active rep for slug {rep_slug!r}; no alert sent", flush=True)
-            return
-        first = (rep.get("name") or "").split(" ")[0] or "there"
-        if kind == "trial":
-            what = "a free 30-day trial"
-        elif kind == "starter":
-            what = "the $99 Starter Month"
-        else:
-            what = "a paid subscription"
-        sms_body = (f"WeatherValet win: {who} just started {what} from your link. "
-                    f"Nice work, {first}!")
+            print(f"[rep-msg] no active rep for slug {rep_slug!r}; nothing sent", flush=True)
+            return False
         phone = (rep.get("phone") or "").strip()
-        if phone:
+        if phone and sms_body:
             send_sms(phone, sms_body)
         to_email = (rep.get("email") or "").strip()
         api_key = os.environ.get("RESEND_API_KEY", "").strip()
-        if to_email and api_key:
+        if to_email and api_key and subject:
             from_addr = os.environ.get("RESEND_FROM_EMAIL", "WeatherValet <hello@weathervalet.ai>")
-            subject = f"You landed one: {who}"
-            body_html = (
-                "<div style='font-family:Arial,sans-serif;max-width:520px;'>"
-                f"<h2 style='color:#2E4FB8;margin:0 0 12px;'>Nice work, {_html_escape(first)}!</h2>"
-                f"<p style='margin:0 0 12px;font-size:15px;'><strong>{_html_escape(who)}</strong> "
-                f"just started {_html_escape(what)} from your link.</p>"
-                "<p style='margin:0 0 12px;font-size:14px;color:#4B5563;'>Their Meteorologist takes it "
-                "from here with a personal brief every morning. Your commission window is running: "
-                "20 percent of what they pay for 6 months from today.</p>"
-                "<p style='color:#6B7280;font-size:13px;margin:0;'>WeatherValet</p>"
-                "</div>"
-            )
-            body_text = (f"Nice work, {first}! {who} just started {what} from your link. "
-                         "Your 6-month commission window starts today.")
             payload = json.dumps({
                 "from": from_addr,
                 "to": [to_email],
@@ -7298,9 +7282,156 @@ def _notify_rep_of_signup(rep_slug: str, who: str, kind: str) -> None:
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
                 resp.read()
+        return True
+    except Exception as e:
+        print(f"[rep-msg] send failed for {rep_slug!r}: {e!r}", flush=True)
+        return False
+
+
+def _rep_first_name(rep_slug: str) -> str:
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT name FROM sales_reps WHERE slug = %s", (rep_slug,))
+                r = cur.fetchone()
+        return ((r or {}).get("name") or "").split(" ")[0] or "there"
+    except Exception:
+        return "there"
+
+
+def _notify_rep_of_signup(rep_slug: str, who: str, kind: str) -> None:
+    """Win alert (July 2026): the moment a signup lands through a rep's
+    tagged link, message the rep so they know it worked. Salespeople run
+    on this feedback loop. kind is 'trial', 'starter', 'paid', or
+    'converted' (a trial that just became a paying subscriber). Best-effort:
+    any failure is logged and never breaks the signup.
+    """
+    try:
+        first = _rep_first_name(rep_slug)
+        if kind == "converted":
+            sms_body = (f"WeatherValet win: {who} just converted to a PAYING "
+                        f"subscription. Your commission on them is live. Way to go, {first}!")
+            subject = f"They converted: {who}"
+            body_html = (
+                "<div style='font-family:Arial,sans-serif;max-width:520px;'>"
+                f"<h2 style='color:#2E4FB8;margin:0 0 12px;'>They converted, {_html_escape(first)}!</h2>"
+                f"<p style='margin:0 0 12px;font-size:15px;'><strong>{_html_escape(who)}</strong> "
+                "just became a paying subscriber. Your 20 percent commission on their payments is "
+                "live for the rest of your 6-month window.</p>"
+                "<p style='color:#6B7280;font-size:13px;margin:0;'>WeatherValet</p>"
+                "</div>"
+            )
+            body_text = (f"{who} just converted to a paying subscription. "
+                         "Your commission is live.")
+            _send_rep_message(rep_slug, sms_body, subject, body_html, body_text)
+            print(f"[rep-win] alerted rep {rep_slug!r} about {who!r} (converted)", flush=True)
+            return
+        if kind == "trial":
+            what = "a free 30-day trial"
+        elif kind == "starter":
+            what = "the $99 Starter Month"
+        else:
+            what = "a paid subscription"
+        sms_body = (f"WeatherValet win: {who} just started {what} from your link. "
+                    f"Nice work, {first}!")
+        subject = f"You landed one: {who}"
+        body_html = (
+            "<div style='font-family:Arial,sans-serif;max-width:520px;'>"
+            f"<h2 style='color:#2E4FB8;margin:0 0 12px;'>Nice work, {_html_escape(first)}!</h2>"
+            f"<p style='margin:0 0 12px;font-size:15px;'><strong>{_html_escape(who)}</strong> "
+            f"just started {_html_escape(what)} from your link.</p>"
+            "<p style='margin:0 0 12px;font-size:14px;color:#4B5563;'>Their Meteorologist takes it "
+            "from here with a personal brief every morning. Your commission window is running: "
+            "20 percent of what they pay for 6 months from today.</p>"
+            "<p style='color:#6B7280;font-size:13px;margin:0;'>WeatherValet</p>"
+            "</div>"
+        )
+        body_text = (f"Nice work, {first}! {who} just started {what} from your link. "
+                     "Your 6-month commission window starts today.")
+        _send_rep_message(rep_slug, sms_body, subject, body_html, body_text)
         print(f"[rep-win] alerted rep {rep_slug!r} about {who!r} ({kind})", flush=True)
     except Exception as e:
         print(f"[rep-win] alert failed for {rep_slug!r}: {e!r}", flush=True)
+
+
+_REP_NUDGE_LAST_RUN = 0.0
+
+
+def _process_rep_trial_nudges() -> None:
+    """Trial-ending nudges (July 2026). When an attributed customer's free
+    trial is within 5 days of ending, message the rep once so the
+    conversion conversation happens BEFORE the trial quietly expires.
+    Runs in the scheduler tick; self-throttles to every 30 minutes; the
+    sales_rep_nudges row is the sent-once guarantee.
+    """
+    global _REP_NUDGE_LAST_RUN
+    now_s = time.time()
+    if now_s - _REP_NUDGE_LAST_RUN < 1800:
+        return
+    _REP_NUDGE_LAST_RUN = now_s
+    now_ms = int(now_s * 1000)
+    window_ms = 5 * 86400000
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT a.user_id, a.rep_slug,
+                              u.trial_business_name, u.name, u.email, u.trial_ends_at
+                       FROM sales_attributions a
+                       JOIN users u ON u.id = a.user_id
+                       LEFT JOIN sales_rep_nudges n ON n.user_id = a.user_id
+                       WHERE a.rep_slug IS NOT NULL AND a.rep_slug != 'organic'
+                         AND u.is_active = TRUE
+                         AND u.trial_status = 'active'
+                         AND u.trial_ends_at IS NOT NULL
+                         AND u.trial_ends_at > %s
+                         AND u.trial_ends_at <= %s
+                         AND n.user_id IS NULL""",
+                    (now_ms, now_ms + window_ms),
+                )
+                due = cur.fetchall()
+        for row in due:
+            who = row.get("trial_business_name") or row.get("name") or row.get("email")
+            days_left = max(1, int(round((row["trial_ends_at"] - now_ms) / 86400000)))
+            day_word = "day" if days_left == 1 else "days"
+            first = _rep_first_name(row["rep_slug"])
+            sms_body = (f"WeatherValet heads-up: {who}'s free trial ends in "
+                        f"{days_left} {day_word}. Good week to check in and talk next steps.")
+            subject = f"Trial ending soon: {who}"
+            body_html = (
+                "<div style='font-family:Arial,sans-serif;max-width:520px;'>"
+                f"<h2 style='color:#2E4FB8;margin:0 0 12px;'>Heads-up, {_html_escape(first)}</h2>"
+                f"<p style='margin:0 0 12px;font-size:15px;'><strong>{_html_escape(who)}</strong>'s "
+                f"free trial ends in {days_left} {day_word}.</p>"
+                "<p style='margin:0 0 12px;font-size:14px;color:#4B5563;'>This is the week to check "
+                "in: ask how the briefs have been, what decisions they have made with them, and "
+                "whether they are ready to keep their Meteorologist. Your pipeline is at "
+                "<a href='https://weathervalet.ai/sales'>weathervalet.ai/sales</a>.</p>"
+                "<p style='color:#6B7280;font-size:13px;margin:0;'>WeatherValet</p>"
+                "</div>"
+            )
+            body_text = (f"{who}'s free trial ends in {days_left} {day_word}. "
+                         "Good week to check in and talk next steps.")
+            # Record BEFORE sending so a send crash can't cause repeats.
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """INSERT INTO sales_rep_nudges (user_id, rep_slug, nudged_at)
+                               VALUES (%s, %s, %s)
+                               ON CONFLICT (user_id) DO NOTHING""",
+                            (row["user_id"], row["rep_slug"], now_ms),
+                        )
+                        recorded = (cur.rowcount == 1)
+            except Exception as e:
+                print(f"[rep-nudge] record failed for user {row['user_id']}: {e!r}", flush=True)
+                continue
+            if recorded:
+                _send_rep_message(row["rep_slug"], sms_body, subject, body_html, body_text)
+                print(f"[rep-nudge] nudged {row['rep_slug']!r} about {who!r} "
+                      f"({days_left} {day_word} left)", flush=True)
+    except Exception as e:
+        print(f"[rep-nudge] sweep failed: {e!r}", flush=True)
 
 BOONE_TRIAL_DAYS = 30
 
@@ -7890,6 +8021,7 @@ def stripe_webhook_v2():
                     sess_starter = (session_metadata.get("wv_starter") or "") == "1"
                     rep_slug = "".join(c for c in sess_rep_raw if c.isalnum() or c == "_")[:40] or None
                     signup_ms = int(time.time() * 1000)
+                    attribution_inserted = False
                     try:
                         with conn.cursor() as cur:
                             cur.execute(
@@ -7899,20 +8031,41 @@ def stripe_webhook_v2():
                                    ON CONFLICT (user_id) DO NOTHING""",
                                 (user_id, rep_slug or "organic", signup_ms, sess_starter),
                             )
+                            attribution_inserted = (cur.rowcount == 1)
                         print(
                             f"[stripe-webhook] attribution: user_id={user_id} "
-                            f"rep={rep_slug or 'organic'} starter={sess_starter}",
+                            f"rep={rep_slug or 'organic'} starter={sess_starter} "
+                            f"inserted={attribution_inserted}",
                             flush=True,
                         )
                     except Exception as e:
                         # Attribution failure shouldn't break the signup —
                         # log it loudly and move on.
                         print(f"[stripe-webhook] attribution write failed: {e!r}", flush=True)
-                    # Win alert (July 2026): paid signup through a rep's link.
-                    if rep_slug:
-                        _notify_rep_of_signup(
-                            rep_slug, customer_name or email,
-                            "starter" if sess_starter else "paid")
+                    # Win alerts (July 2026). A fresh insert = a new paid
+                    # signup through the rep's link. A conflict = this user
+                    # was attributed earlier (usually a free trial), so this
+                    # checkout is a CONVERSION and the original rep gets the
+                    # best text of all.
+                    if attribution_inserted:
+                        if rep_slug:
+                            _notify_rep_of_signup(
+                                rep_slug, customer_name or email,
+                                "starter" if sess_starter else "paid")
+                    else:
+                        try:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    "SELECT rep_slug FROM sales_attributions WHERE user_id = %s",
+                                    (user_id,),
+                                )
+                                prior = cur.fetchone()
+                            prior_slug = (prior or {}).get("rep_slug") or ""
+                            if prior_slug and prior_slug != "organic":
+                                _notify_rep_of_signup(
+                                    prior_slug, customer_name or email, "converted")
+                        except Exception as e:
+                            print(f"[stripe-webhook] conversion alert failed: {e!r}", flush=True)
 
                 # Send the password-reset email so the new subscriber can set
                 # their password and sign in. Reusing the magic-link infra —
@@ -22426,6 +22579,10 @@ def _brief_scheduler_loop() -> None:
             _process_scheduled_messages()
         except Exception as e:
             print(f"[scheduled-msg-tick] tick failed: {e!r}", flush=True)
+        try:
+            _process_rep_trial_nudges()
+        except Exception as e:
+            print(f"[rep-nudge] tick failed: {e!r}", flush=True)
         try:
             _crew_daily_checkin_nudge()
         except Exception as e:
