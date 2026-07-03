@@ -30934,6 +30934,11 @@ def met_pro_bulk_schedule():
         return jsonify({"ok": False, "error": "empty-body",
                         "message": "Write the brief body before scheduling."}), 400
     body = body[:4000]
+    # Optional attached image (July 2026): full parity with the single-card
+    # composer. Must be an uploaded http(s) URL; anything else is dropped.
+    image_url = (data.get("image_url") or "").strip()[:500]
+    if not image_url.startswith("http"):
+        image_url = ""
 
     # mode: "schedule" (next morning, default) or "send_now" (immediately)
     mode = (data.get("mode") or "schedule").strip().lower()
@@ -31036,9 +31041,10 @@ def met_pro_bulk_schedule():
                         draft_id = existing["id"]
                         cur.execute(
                             """UPDATE pro_brief_drafts
-                               SET met_verdict = %s, met_snippet = %s, met_body = %s
+                               SET met_verdict = %s, met_snippet = %s, met_body = %s,
+                                   image_url = COALESCE(NULLIF(%s, ''), image_url)
                                WHERE id = %s""",
-                            (verdict, snippet, body, draft_id),
+                            (verdict, snippet, body, image_url, draft_id),
                         )
                     else:
                         cur.execute(
@@ -31046,16 +31052,16 @@ def met_pro_bulk_schedule():
                                  (user_id, brief_type, created_at, window_end_at, status,
                                   user_tier, location_label, location_lat, location_lng,
                                   channels, ai_verdict, ai_snippet, ai_body,
-                                  met_verdict, met_snippet, met_body)
+                                  met_verdict, met_snippet, met_body, image_url)
                                VALUES (%s, 'morning', %s, %s, 'pending-review',
-                                       %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                       %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                                RETURNING id""",
                             (uid, now_ms, window_end_ms,
                              sub.get("subscription_tier") or "pro_single",
                              loc_label, float(sub["lat"]), float(sub["lng"]),
                              sub.get("channels") or "sms,email",
                              verdict, snippet, body,
-                             verdict, snippet, body),
+                             verdict, snippet, body, image_url or None),
                         )
                         draft_id = cur.fetchone()["id"]
 
@@ -43322,7 +43328,8 @@ def _fire_pro_brief_draft(draft_id: int, final_body: str | None,
                 cur.execute(
                     "SELECT id, user_id, status, location_lat, location_lng, "
                     "predicted_high_f, predicted_low_f, predicted_precip_in, "
-                    "predicted_max_wind_mph FROM pro_brief_drafts WHERE id = %s",
+                    "predicted_max_wind_mph, image_url "
+                    "FROM pro_brief_drafts WHERE id = %s",
                     (draft_id,),
                 )
                 draft = cur.fetchone()
@@ -43428,7 +43435,9 @@ def _fire_pro_brief_draft(draft_id: int, final_body: str | None,
         # SMS dispatch
         try:
             if sub and sub.get("phone"):
-                send_sms(sub["phone"], (final_body or "")[:480])
+                _img = (draft.get("image_url") or "").strip()
+                _media = [_img] if _img.startswith("http") else None
+                send_sms(sub["phone"], (final_body or "")[:480], media_url=_media)
         except Exception as e:
             print(f"[scheduled-fire] pro_brief SMS failed: {e}", flush=True)
         return True, None
