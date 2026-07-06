@@ -16361,6 +16361,12 @@ def _match_user_by_phone(phone: str) -> tuple[int | None, int | None]:
     normalized = _normalize_phone(phone)
     if not normalized:
         return None, None
+    # Match on the last 10 digits so stored formats like "(317) 555-0123"
+    # or "317-555-0123" still match Twilio's "+13175550123" (July 2026).
+    digits = "".join(c for c in normalized if c.isdigit())
+    last10 = digits[-10:] if len(digits) >= 10 else None
+    if not last10:
+        return None, None
     try:
         with db() as conn:
             with conn.cursor() as cur:
@@ -16369,7 +16375,9 @@ def _match_user_by_phone(phone: str) -> tuple[int | None, int | None]:
                     """SELECT u.id, sc.primary_met_id
                        FROM users u
                        LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
-                       WHERE u.phone = %s AND u.is_active = TRUE
+                       WHERE RIGHT(regexp_replace(COALESCE(u.phone, ''),
+                                                  '\\D', '', 'g'), 10) = %s
+                         AND u.is_active = TRUE
                          AND EXISTS (
                            SELECT 1 FROM user_roles ur
                             WHERE ur.user_id = u.id
@@ -16381,7 +16389,7 @@ def _match_user_by_phone(phone: str) -> tuple[int | None, int | None]:
                               AND ur2.role = 'subscriber')) DESC,
                          u.id DESC
                        LIMIT 1""",
-                    (normalized,),
+                    (last10,),
                 )
                 row = cur.fetchone()
                 if row:
@@ -16433,44 +16441,97 @@ def _match_user_by_email(email: str) -> tuple[int | None, int | None]:
 def _notify_met_of_reply(reply_id: int, channel: str, from_addr: str,
                           body: str, matched_user_id: int | None,
                           primary_met_id: int | None) -> None:
-    """Phase 1: post a heads-up to Discord. Phase 2 will SMS the
-    specific Met and thread into Pro Threads.
-
-    Posts to #general for now since we don't have a dedicated
-    #replies channel set up yet.
+    """Phase 2 (July 2026): actively notify the right human that a
+    subscriber replied. Emails AND texts the subscriber's primary Met;
+    if there is no matched Met (unmatched sender, Hobbyist without
+    coverage, etc.), every active admin is notified instead so no reply
+    can silently vanish. The old Phase 1 Discord post is kept as a bonus
+    when the webhook env var is set.
     """
+    # Who replied?
+    sub_name = None
+    if matched_user_id:
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT name, email, trial_business_name FROM users WHERE id = %s",
+                        (matched_user_id,),
+                    )
+                    urow = cur.fetchone() or {}
+            sub_name = (urow.get("trial_business_name") or urow.get("name")
+                        or urow.get("email"))
+        except Exception:
+            pass
+    sub_label = sub_name or f"an unrecognized sender ({from_addr})"
+    via = "by text" if channel == "sms" else "by email"
+
+    # Who should hear about it? The primary Met, else every active admin.
+    recipients = []
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                if primary_met_id:
+                    cur.execute(
+                        "SELECT name, email, phone FROM users WHERE id = %s AND is_active = TRUE",
+                        (primary_met_id,),
+                    )
+                    r = cur.fetchone()
+                    if r:
+                        recipients.append(r)
+                if not recipients:
+                    cur.execute(
+                        """SELECT u.name, u.email, u.phone FROM users u
+                           JOIN user_roles ur ON ur.user_id = u.id
+                           WHERE ur.role = 'admin' AND u.is_active = TRUE""",
+                    )
+                    recipients.extend(cur.fetchall() or [])
+    except Exception as e:
+        print(f"[reply-route] recipient lookup failed: {e}", flush=True)
+
+    quoted = (body or "").strip()
+    sms_quote = quoted[:160] + ("\u2026" if len(quoted) > 160 else "")
+    subject = f"Reply from {sub_label}"
+    body_html = (
+        "<div style='font-family:Arial,sans-serif;max-width:520px;'>"
+        f"<p style='font-size:15px;margin:0 0 10px;'><strong>{_html_escape(sub_label)}</strong> "
+        f"replied {via}:</p>"
+        "<blockquote style='margin:0 0 14px;padding:10px 14px;background:#F4F5F8;"
+        "border-left:4px solid #4169E1;font-size:14px;line-height:1.55;'>"
+        f"{_html_escape(quoted) or '(empty message)'}</blockquote>"
+        "<p style='font-size:13px;color:#4B5563;margin:0 0 10px;'>Answer them from your "
+        "portal Messages at <a href='https://weathervalet.ai'>weathervalet.ai</a>. "
+        "Fast replies are the product.</p>"
+        "<p style='color:#6B7280;font-size:12px;margin:0;'>WeatherValet</p></div>"
+    )
+    body_text = (f"{sub_label} replied {via}:\n\n{quoted}\n\n"
+                 "Answer them from your portal Messages at weathervalet.ai.")
+    for rec in recipients:
+        try:
+            to_email = (rec.get("email") or "").strip()
+            if to_email:
+                _send_user_email(to_email, subject, body_html, body_text)
+            phone = (rec.get("phone") or "").strip()
+            if phone:
+                send_sms(phone, (f"WeatherValet: {sub_label} replied {via}: "
+                                 f"\"{sms_quote}\" Answer them in your portal Messages."))
+        except Exception as e:
+            print(f"[reply-route] notify send failed: {e}", flush=True)
+    print(f"[reply-route] notified {len(recipients)} recipient(s) about reply #{reply_id}",
+          flush=True)
+
+    # Phase 1 Discord post, kept as a bonus channel when configured.
     try:
         webhook = os.environ.get("DISCORD_WEBHOOK_GENERAL", "").strip()
-        if not webhook:
-            return
-        # Look up subscriber name if matched
-        sub_name = "Unknown subscriber"
-        if matched_user_id:
-            try:
-                with db() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            "SELECT name, email FROM users WHERE id = %s",
-                            (matched_user_id,),
-                        )
-                        urow = cur.fetchone()
-                        if urow:
-                            sub_name = urow.get("name") or urow.get("email") or sub_name
-            except Exception:
-                pass
-
-        channel_emoji = "📱" if channel == "sms" else "📧"
-        match_note = (
-            f"\u2192 {sub_name}" if matched_user_id
-            else f"\u2192 unmatched ({from_addr})"
-        )
-        truncated_body = body[:240] + ("…" if len(body) > 240 else "")
-        msg = (
-            f"{channel_emoji} **New brief reply** {match_note}\n"
-            f"> {truncated_body}\n"
-            f"_(reply #{reply_id}, Phase 1 capture only; full routing comes Monday)_"
-        )
-        _discord_post(webhook, msg, username="WV Replies")
+        if webhook:
+            channel_emoji = "\U0001F4F1" if channel == "sms" else "\U0001F4E7"
+            truncated_body = quoted[:240] + ("\u2026" if len(quoted) > 240 else "")
+            match_note = (f"\u2192 {sub_label}" if matched_user_id
+                          else f"\u2192 unmatched ({from_addr})")
+            msg = (f"{channel_emoji} **New brief reply** {match_note}\n"
+                   f"> {truncated_body}\n"
+                   f"_(reply #{reply_id})_")
+            _discord_post(webhook, msg, username="WV Replies")
     except Exception as e:
         print(f"[reply-route] discord notify failed: {e}", flush=True)
 
@@ -16540,14 +16601,6 @@ def replies_sms_inbound():
             f"matched_user={matched_user_id} body_len={len(body)}",
             flush=True,
         )
-
-        # Notify Mets via Discord (best effort, async-ish)
-        if reply_id is not None:
-            try:
-                _notify_met_of_reply(reply_id, "sms", from_addr, body,
-                                     matched_user_id, primary_met_id)
-            except Exception:
-                pass
 
         # Crew daily check-in + map report. If the sender is a Crew member,
         # the act of replying to the daily prompt IS the check-in, so we
@@ -16640,6 +16693,18 @@ def replies_sms_inbound():
                 )
             except Exception as e:
                 print(f"[reply-route] pro thread routing failed: {e}", flush=True)
+
+        # Notify the Met (or admins) — but NOT for crew-only check-ins.
+        # A crew member answering the morning conditions nudge gets the
+        # "Got it, logged" ack and lands on the Crew map; blasting every
+        # admin with "a reply from X" each morning would be pure noise
+        # (July 2026).
+        if reply_id is not None and not _crew_ack:
+            try:
+                _notify_met_of_reply(reply_id, "sms", from_addr, body,
+                                     matched_user_id, primary_met_id)
+            except Exception:
+                pass
 
         # Twilio expects TwiML (or 200 OK with empty body works fine)
         if _crew_ack:
@@ -36818,13 +36883,16 @@ def sms_inbound_router():
     if from_phone:
         try:
             normalized = _normalize_phone(from_phone)
+            _digits = "".join(c for c in normalized if c.isdigit())
+            _last10 = _digits[-10:] if len(_digits) >= 10 else None
             with db() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """SELECT ur.role
                            FROM users u
                            JOIN user_roles ur ON ur.user_id = u.id
-                           WHERE u.phone IN (%s, %s)
+                           WHERE RIGHT(regexp_replace(COALESCE(u.phone, ''),
+                                                      '\\D', '', 'g'), 10) = %s
                              AND u.is_active = TRUE
                              AND ur.role IN ('admin', 'met', 'subscriber', 'crew')
                            ORDER BY CASE ur.role
@@ -36835,7 +36903,7 @@ def sms_inbound_router():
                              ELSE 5
                            END
                            LIMIT 1""",
-                        (from_phone, normalized),
+                        (_last10 or "##nomatch##",),
                     )
                     row = cur.fetchone()
                     if row:
