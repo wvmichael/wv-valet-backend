@@ -1535,6 +1535,15 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS welcome_sent_at BIGINT;
 -- units: 'mph' | 'F' | 'C' | 'pct' — display-only, doesn't affect logic
 -- channels: same comma-separated channel list as brief_preferences
 -- enabled: false = silenced without deleting
+-- One-shot migrations (July 2026). A row here means the named data
+-- migration already ran; init_db skips it forever after. This is how we
+-- run a one-time UPDATE without re-forcing it on every deploy (which
+-- would silently revert settings users changed in between).
+CREATE TABLE IF NOT EXISTS wv_one_shot_migrations (
+    mig_key     TEXT PRIMARY KEY,
+    applied_at  BIGINT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS threshold_alerts (
     id              SERIAL PRIMARY KEY,
     user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -2719,6 +2728,41 @@ def db():
         conn.close()
 
 
+def _migrate_channels_to_both() -> None:
+    """One-shot (July 2026): set every existing subscriber's brief delivery
+    to BOTH text and email. Texts truncate; email carries the full brief
+    and images, so from here on both is the baseline. New rows already
+    default to 'sms,email' at the schema level; this fixes rows created
+    or edited before that was the rule. Runs exactly once: the guard row
+    in wv_one_shot_migrations makes re-runs a no-op, so anyone who later
+    narrows their channels in settings stays narrowed.
+    """
+    mig_key = "brief-channels-both-202607"
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO wv_one_shot_migrations (mig_key, applied_at)
+                       VALUES (%s, %s)
+                       ON CONFLICT (mig_key) DO NOTHING""",
+                    (mig_key, int(time.time() * 1000)),
+                )
+                first_run = (cur.rowcount == 1)
+        if not first_run:
+            return
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE brief_preferences
+                       SET channels = 'sms,email'
+                       WHERE COALESCE(channels, '') <> 'sms,email'""",
+                )
+                changed = cur.rowcount
+        print(f"[channels-migration] set {changed} subscriber(s) to sms+email", flush=True)
+    except Exception as e:
+        print(f"[channels-migration] failed: {e}", flush=True)
+
+
 def init_db() -> None:
     """Create tables on first boot. Idempotent — safe to call every start.
 
@@ -2786,6 +2830,12 @@ def init_db() -> None:
         _backfill_crew_user_phone()
     except Exception as e:
         print(f"[crew-phone-backfill] failed: {e}", flush=True)
+    # One-shot: move every existing subscriber to text + email delivery
+    # (July 2026). Guarded by wv_one_shot_migrations; see the function.
+    try:
+        _migrate_channels_to_both()
+    except Exception as e:
+        print(f"[channels-migration] failed: {e}", flush=True)
 
 
 def _backfill_crew_user_phone() -> None:
@@ -16322,9 +16372,14 @@ def _match_user_by_phone(phone: str) -> tuple[int | None, int | None]:
                        WHERE u.phone = %s AND u.is_active = TRUE
                          AND EXISTS (
                            SELECT 1 FROM user_roles ur
-                            WHERE ur.user_id = u.id AND ur.role = 'subscriber'
+                            WHERE ur.user_id = u.id
+                              AND ur.role IN ('subscriber', 'crew')
                          )
-                       ORDER BY u.id DESC
+                       ORDER BY (EXISTS (
+                           SELECT 1 FROM user_roles ur2
+                            WHERE ur2.user_id = u.id
+                              AND ur2.role = 'subscriber')) DESC,
+                         u.id DESC
                        LIMIT 1""",
                     (normalized,),
                 )
@@ -16502,6 +16557,7 @@ def replies_sms_inbound():
         # member's home coordinates, we also drop a pin on the Crew map —
         # the map reads crew_reports, which the check-in table never fed,
         # which is why texted-in replies never showed up there. (June 2026)
+        _crew_ack = False
         if matched_user_id is not None:
             try:
                 with db() as conn:
@@ -16510,7 +16566,9 @@ def replies_sms_inbound():
                             """SELECT u.timezone, u.name,
                                       u.crew_home_lat, u.crew_home_lng,
                                       EXISTS (SELECT 1 FROM user_roles ur
-                                              WHERE ur.user_id = u.id AND ur.role = 'crew') AS is_crew
+                                              WHERE ur.user_id = u.id AND ur.role = 'crew') AS is_crew,
+                                      EXISTS (SELECT 1 FROM user_roles ur3
+                                              WHERE ur3.user_id = u.id AND ur3.role = 'subscriber') AS is_subscriber
                                FROM users u WHERE u.id = %s""",
                             (matched_user_id,),
                         )
@@ -16535,6 +16593,12 @@ def replies_sms_inbound():
                             )
                     print(f"[crew-checkin] recorded via SMS user={matched_user_id} "
                           f"date={date_key} condition={condition}", flush=True)
+                    # Ack crew-only senders so the check-in visibly worked.
+                    # Subscribers (even ones who are also Crew) stay silent:
+                    # their reply is a message to their Met, not a check-in,
+                    # and a robot "logged!" there would be confusing.
+                    if not urow.get("is_subscriber"):
+                        _crew_ack = True
 
                     # Put it on the Crew map when we recognized a condition
                     # and have home coordinates to place it.
@@ -16578,6 +16642,12 @@ def replies_sms_inbound():
                 print(f"[reply-route] pro thread routing failed: {e}", flush=True)
 
         # Twilio expects TwiML (or 200 OK with empty body works fine)
+        if _crew_ack:
+            _ack = ("Got it, your conditions report is logged. Thanks for "
+                    "being our eyes on the ground!")
+            return (f"<?xml version='1.0' encoding='UTF-8'?><Response>"
+                    f"<Message>{escape_xml(_ack)}</Message></Response>",
+                    200, {"Content-Type": "text/xml"})
         return ('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
                 200, {"Content-Type": "application/xml"})
     except Exception as e:
@@ -36756,12 +36826,13 @@ def sms_inbound_router():
                            JOIN user_roles ur ON ur.user_id = u.id
                            WHERE u.phone IN (%s, %s)
                              AND u.is_active = TRUE
-                             AND ur.role IN ('admin', 'met', 'subscriber')
+                             AND ur.role IN ('admin', 'met', 'subscriber', 'crew')
                            ORDER BY CASE ur.role
                              WHEN 'admin'      THEN 1
                              WHEN 'met'        THEN 2
                              WHEN 'subscriber' THEN 3
-                             ELSE 4
+                             WHEN 'crew'       THEN 4
+                             ELSE 5
                            END
                            LIMIT 1""",
                         (from_phone, normalized),
@@ -36781,8 +36852,11 @@ def sms_inbound_router():
         # Hand off to Rosie. We invoke the existing function directly —
         # it reads request.form so the call works as-is.
         return rosie_sms_inbound()
-    elif sender_role == "subscriber":
+    elif sender_role in ("subscriber", "crew"):
         # Hand off to reply capture. Same trick — reads request.form.
+        # Crew members route here too (July 2026): the reply handler
+        # already detects the crew role and records their check-in and
+        # map report, so a text back to the daily conditions nudge counts.
         return replies_sms_inbound()
     else:
         # Unknown number. Be polite, don't be silent.
@@ -43437,7 +43511,12 @@ def _fire_pro_brief_draft(draft_id: int, final_body: str | None,
             if sub and sub.get("phone"):
                 _img = (draft.get("image_url") or "").strip()
                 _media = [_img] if _img.startswith("http") else None
-                send_sms(sub["phone"], (final_body or "")[:480], media_url=_media)
+                _sms_body = (final_body or "")
+                if len(_sms_body) > 480:
+                    # Don't cut mid-sentence into silence: point at the
+                    # email, which always carries the full brief (July 2026).
+                    _sms_body = _sms_body[:440].rstrip() + "\u2026 (full brief in your email)"
+                send_sms(sub["phone"], _sms_body, media_url=_media)
         except Exception as e:
             print(f"[scheduled-fire] pro_brief SMS failed: {e}", flush=True)
         return True, None
