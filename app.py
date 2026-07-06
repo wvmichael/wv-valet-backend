@@ -206,6 +206,19 @@ TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER", "")  # Twilio number w
 #     deploys still work (Rosie just shares the main number).
 ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
+# Dedicated Valet Crew line (July 2026). Set this env var ONLY once the
+# second Twilio number is A2P-approved. When set: crew conditions nudges
+# are SENT from this number, and anything texted TO it is treated as a
+# conditions check-in regardless of the sender's other roles. When unset,
+# everything runs single-number exactly as before.
+TWILIO_CREW_NUMBER = os.environ.get("TWILIO_CREW_NUMBER", "")
+
+
+def _phone_last10(raw: str) -> str:
+    """Last 10 digits of a phone in any format, or '' if too short."""
+    digits = "".join(c for c in (raw or "") if c.isdigit())
+    return digits[-10:] if len(digits) >= 10 else ""
+
 # The on-duty meteorologist's phone, in E.164 format (+15555550101).
 # When you have multiple, swap this for a routing function.
 METEOROLOGIST_PHONE = os.environ.get("METEOROLOGIST_PHONE", "")
@@ -4119,8 +4132,11 @@ def send_sms_from(to: str, body: str, from_number: str) -> bool:
     requested. This is a TEMPORARY override — when Rosie's number is
     approved, remove the next 3 lines to re-enable per-number routing.
     """
-    # TEMP override (May 22, 2026) — Rosie's number not yet A2P-approved
-    if TWILIO_FROM_NUMBER:
+    # TEMP override (May 22, 2026; narrowed July 2026): Rosie's number is
+    # still not A2P-approved, so HER sends go out on the main number. Other
+    # dedicated lines (e.g. the Valet Crew number) pass through untouched:
+    # by convention those env vars are only set once the number is approved.
+    if TWILIO_FROM_NUMBER and from_number and from_number == ROSIE_TWILIO_NUMBER:
         from_number = TWILIO_FROM_NUMBER
 
     sender = from_number or TWILIO_FROM_NUMBER
@@ -16438,6 +16454,77 @@ def _match_user_by_email(email: str) -> tuple[int | None, int | None]:
     return None, None
 
 
+def _record_crew_checkin_from_sms(matched_user_id: int, body: str) -> tuple[bool, bool]:
+    """Record an inbound text as a Crew daily check-in (and, when the
+    condition is recognized and home coordinates exist, a Crew map
+    report). Returns (is_crew, is_subscriber) for the matched user so
+    callers can decide about acks and Met notifications. Raises nothing:
+    failures are logged and reported as (False, False) at worst for the
+    lookup, or flags-with-logged-error for the writes.
+    """
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.timezone, u.name,
+                          u.crew_home_lat, u.crew_home_lng,
+                          EXISTS (SELECT 1 FROM user_roles ur
+                                  WHERE ur.user_id = u.id AND ur.role = 'crew') AS is_crew,
+                          EXISTS (SELECT 1 FROM user_roles ur3
+                                  WHERE ur3.user_id = u.id AND ur3.role = 'subscriber') AS is_subscriber
+                   FROM users u WHERE u.id = %s""",
+                (matched_user_id,),
+            )
+            urow = cur.fetchone() or {}
+    is_crew = bool(urow.get("is_crew"))
+    is_subscriber = bool(urow.get("is_subscriber"))
+    if not is_crew:
+        return is_crew, is_subscriber
+    condition = _parse_crew_condition(body)
+    user_tz = urow.get("timezone") or "America/Indianapolis"
+    date_key = _local_date_key(user_tz)
+    # Store the recognized condition if we found one, else a short
+    # snippet of what they actually said.
+    checkin_label = condition or ((body or "").strip()[:40] or "reported")
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO crew_checkins
+                     (user_id, date_key, conditions, notes, checked_in_at)
+                   VALUES (%s, %s, %s, %s, %s)
+                   ON CONFLICT (user_id, date_key) DO UPDATE
+                     SET conditions = EXCLUDED.conditions,
+                         checked_in_at = EXCLUDED.checked_in_at""",
+                (matched_user_id, date_key, checkin_label, None, now_ms),
+            )
+    print(f"[crew-checkin] recorded via SMS user={matched_user_id} "
+          f"date={date_key} condition={condition}", flush=True)
+    # Put it on the Crew map when we recognized a condition and have
+    # home coordinates to place it.
+    lat = urow.get("crew_home_lat")
+    lng = urow.get("crew_home_lng")
+    if condition and lat is not None and lng is not None:
+        report_type = _CREW_CONDITION_TO_REPORT.get(condition, "other")
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO crew_reports
+                             (user_id, user_name, report_type,
+                              latitude, longitude, notes, image_url,
+                              verified_count, is_hidden, created_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, NULL, 0, FALSE, %s)""",
+                        (matched_user_id, urow.get("name") or "",
+                         report_type, float(lat), float(lng),
+                         (body or "").strip()[:500] or None, now_ms),
+                    )
+            print(f"[crew-report] mapped reply user={matched_user_id} "
+                  f"type={report_type}", flush=True)
+        except Exception as e:
+            print(f"[crew-report] map insert failed: {e!r}", flush=True)
+    return is_crew, is_subscriber
+
+
 def _notify_met_of_reply(reply_id: int, channel: str, from_addr: str,
                           body: str, matched_user_id: int | None,
                           primary_met_id: int | None) -> None:
@@ -16611,71 +16698,16 @@ def replies_sms_inbound():
         # the map reads crew_reports, which the check-in table never fed,
         # which is why texted-in replies never showed up there. (June 2026)
         _crew_ack = False
-        if matched_user_id is not None:
+        if matched_user_id is not None and not TWILIO_CREW_NUMBER:
+            # Single-number mode: the main line doubles as the Crew line,
+            # so a Crew member's text also records their daily check-in.
+            # Once the dedicated Crew number is live (TWILIO_CREW_NUMBER
+            # set), check-ins happen ONLY on that line and a text here is
+            # purely a message to the Met.
             try:
-                with db() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            """SELECT u.timezone, u.name,
-                                      u.crew_home_lat, u.crew_home_lng,
-                                      EXISTS (SELECT 1 FROM user_roles ur
-                                              WHERE ur.user_id = u.id AND ur.role = 'crew') AS is_crew,
-                                      EXISTS (SELECT 1 FROM user_roles ur3
-                                              WHERE ur3.user_id = u.id AND ur3.role = 'subscriber') AS is_subscriber
-                               FROM users u WHERE u.id = %s""",
-                            (matched_user_id,),
-                        )
-                        urow = cur.fetchone() or {}
-                if urow.get("is_crew"):
-                    condition = _parse_crew_condition(body)
-                    user_tz = urow.get("timezone") or "America/Indianapolis"
-                    date_key = _local_date_key(user_tz)
-                    # Store the recognized condition if we found one, else a
-                    # short snippet of what they actually said.
-                    checkin_label = condition or ((body or "").strip()[:40] or "reported")
-                    with db() as conn:
-                        with conn.cursor() as cur:
-                            cur.execute(
-                                """INSERT INTO crew_checkins
-                                     (user_id, date_key, conditions, notes, checked_in_at)
-                                   VALUES (%s, %s, %s, %s, %s)
-                                   ON CONFLICT (user_id, date_key) DO UPDATE
-                                     SET conditions = EXCLUDED.conditions,
-                                         checked_in_at = EXCLUDED.checked_in_at""",
-                                (matched_user_id, date_key, checkin_label, None, now_ms),
-                            )
-                    print(f"[crew-checkin] recorded via SMS user={matched_user_id} "
-                          f"date={date_key} condition={condition}", flush=True)
-                    # Ack crew-only senders so the check-in visibly worked.
-                    # Subscribers (even ones who are also Crew) stay silent:
-                    # their reply is a message to their Met, not a check-in,
-                    # and a robot "logged!" there would be confusing.
-                    if not urow.get("is_subscriber"):
-                        _crew_ack = True
-
-                    # Put it on the Crew map when we recognized a condition
-                    # and have home coordinates to place it.
-                    lat = urow.get("crew_home_lat")
-                    lng = urow.get("crew_home_lng")
-                    if condition and lat is not None and lng is not None:
-                        report_type = _CREW_CONDITION_TO_REPORT.get(condition, "other")
-                        try:
-                            with db() as conn:
-                                with conn.cursor() as cur:
-                                    cur.execute(
-                                        """INSERT INTO crew_reports
-                                             (user_id, user_name, report_type,
-                                              latitude, longitude, notes, image_url,
-                                              verified_count, is_hidden, created_at)
-                                           VALUES (%s, %s, %s, %s, %s, %s, NULL, 0, FALSE, %s)""",
-                                        (matched_user_id, urow.get("name") or "",
-                                         report_type, float(lat), float(lng),
-                                         (body or "").strip()[:500] or None, now_ms),
-                                    )
-                            print(f"[crew-report] mapped reply user={matched_user_id} "
-                                  f"type={report_type}", flush=True)
-                        except Exception as e:
-                            print(f"[crew-report] map insert failed: {e!r}", flush=True)
+                _is_crew, _is_sub = _record_crew_checkin_from_sms(matched_user_id, body)
+                if _is_crew and not _is_sub:
+                    _crew_ack = True
             except Exception as e:
                 print(f"[crew-checkin] SMS check-in/report failed: {e!r}", flush=True)
 
@@ -23989,7 +24021,10 @@ def _crew_daily_checkin_nudge() -> None:
             continue
         msg = pool[(day_number + r["id"]) % len(pool)]
         try:
-            send_sms(r["phone"], msg)
+            if TWILIO_CREW_NUMBER:
+                send_sms_from(r["phone"], msg, TWILIO_CREW_NUMBER)
+            else:
+                send_sms(r["phone"], msg)
         except Exception as e:
             print(f"[crew-nudge] send failed for user {r['id']}: {e!r}", flush=True)
 
@@ -36849,6 +36884,34 @@ def rosie_history():
 # than buy a second number, route at the application layer.
 # ─────────────────────────────────────────────────────────────
 
+def _crew_line_inbound(from_phone: str, body: str):
+    """Inbound SMS on the dedicated Valet Crew number. The destination
+    number IS the context: this is a conditions check-in, full stop,
+    no matter what other roles the sender holds. Always acks, so the
+    Crew member knows their report landed."""
+    matched_user_id, _met = _match_user_by_phone(from_phone)
+
+    def _twiml(msg):
+        return (f"<?xml version='1.0' encoding='UTF-8'?><Response>"
+                f"<Message>{escape_xml(msg)}</Message></Response>",
+                200, {"Content-Type": "text/xml"})
+
+    if matched_user_id is None:
+        return _twiml("Thanks for texting the WeatherValet Crew line. We didn't "
+                      "recognize this number. Please text from the phone on your "
+                      "Crew profile, or email hello@weathervalet.ai.")
+    try:
+        is_crew, _is_sub = _record_crew_checkin_from_sms(matched_user_id, body)
+    except Exception as e:
+        print(f"[crew-line] record failed: {e!r}", flush=True)
+        is_crew = False
+    if is_crew:
+        return _twiml("Got it, your conditions report is logged. Thanks for "
+                      "being our eyes on the ground!")
+    return _twiml("This is the WeatherValet Crew line for conditions reports. "
+                  "To message your Meteorologist, reply to their usual number.")
+
+
 @app.route("/api/v1/sms-inbound-router", methods=["OPTIONS"])
 def _sms_inbound_router_preflight():
     return ("", 204)
@@ -36875,6 +36938,15 @@ def sms_inbound_router():
     if not body:
         return ("<?xml version='1.0' encoding='UTF-8'?><Response/>",
                 200, {"Content-Type": "text/xml"})
+
+    # Dedicated Valet Crew line (July 2026): if this text was sent TO the
+    # Crew number, it's a conditions check-in regardless of the sender's
+    # roles. The destination number is the context; that's the whole point
+    # of having a second number.
+    to_phone = (request.form.get("To") or "").strip()
+    if TWILIO_CREW_NUMBER and _phone_last10(to_phone) == _phone_last10(TWILIO_CREW_NUMBER):
+        print(f"[sms-router] crew line from={from_phone} body_len={len(body)}", flush=True)
+        return _crew_line_inbound(from_phone, body)
 
     # Look up the sender's role(s). One query, returns highest-privilege role.
     # Met/admin take priority over subscriber if the same person has both
