@@ -665,6 +665,11 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS timezone TEXT NOT NULL DEFAULT 'Ameri
 -- "assigned Met" concept, just "whoever covered today gets today's pay").
 ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_commission_cents INTEGER NOT NULL DEFAULT 0;
 
+-- Discounted / carryover marker (July 2026): TRUE for subscribers paying
+-- below list price (e.g. Kansas carryovers migrated at legacy rates).
+-- Set by admin; powers the Command Center totals board.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS is_discounted BOOLEAN NOT NULL DEFAULT FALSE;
+
 -- Phase 10 Met tips: track which Met completed each verification + a
 -- customer-facing token for the review/tip page (separate from Met's
 -- claim_token so we can give customers a URL that doesn't expose
@@ -1552,6 +1557,21 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS welcome_sent_at BIGINT;
 -- migration already ran; init_db skips it forever after. This is how we
 -- run a one-time UPDATE without re-forcing it on every deploy (which
 -- would silently revert settings users changed in between).
+-- One-composer send history (July 2026): one row per composer send.
+CREATE TABLE IF NOT EXISTS met_messages (
+    id              BIGSERIAL PRIMARY KEY,
+    met_user_id     BIGINT NOT NULL,
+    kind            TEXT NOT NULL,
+    audience_mode   TEXT NOT NULL,
+    title           TEXT,
+    body            TEXT NOT NULL,
+    image_url       TEXT,
+    recipient_count INT NOT NULL DEFAULT 0,
+    created_at      BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_met_messages_met
+    ON met_messages(met_user_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS wv_one_shot_migrations (
     mig_key     TEXT PRIMARY KEY,
     applied_at  BIGINT NOT NULL
@@ -21427,6 +21447,29 @@ def _send_brief_email(email: str, subject: str, body_text: str,
         return False
 
 
+def _channels_note() -> tuple[str, str]:
+    """Self-expiring settings note (July 2026). Every subscriber was moved
+    to text+email delivery on July 6; this note rides along on brief
+    emails through July 14 so people know why, see that email carries the
+    full brief and images, and know where to change it. Returns
+    (html, text), both empty once the window closes."""
+    try:
+        if datetime.now(tz=timezone.utc) >= datetime(2026, 7, 15, tzinfo=timezone.utc):
+            return "", ""
+    except Exception:
+        return "", ""
+    html = ("<div style='margin-top:14px;padding:10px 12px;background:#F4F7FF;"
+            "border:1px solid #D5DEF5;border-radius:8px;font-size:12.5px;"
+            "color:#3B4658;'>New: your brief now arrives by text and email. "
+            "Email carries the full brief and any images. Prefer it differently? "
+            "Adjust your delivery anytime in your settings at "
+            "<a href='https://weathervalet.ai'>weathervalet.ai</a>.</div>")
+    text = ("\n\nNew: your brief now arrives by text and email. Email carries "
+            "the full brief and any images. Adjust your delivery anytime in "
+            "your settings at weathervalet.ai.")
+    return html, text
+
+
 def _render_pro_brief_email_html(
     verdict: str,
     verdict_label: str,
@@ -21542,6 +21585,9 @@ def _render_pro_brief_email_html(
 </div>
 </body>
 </html>"""
+    _note_html, _ = _channels_note()
+    if _note_html:
+        html = html.replace("</div>\n</div>", _note_html + "</div>\n</div>", 1) if "</div>\n</div>" in html else (html + _note_html)
     return html
 
 
@@ -22104,7 +22150,7 @@ def _process_pending_briefs_inner() -> None:
                         c.get("loc_address") or "")
                     subject = f"Your WeatherValet brief, {smart_label}"
                     reply_to = _get_subscriber_reply_to_email(c["user_id"])
-                    ok = _send_brief_email(c["email"], subject, full_body, reply_to=reply_to)
+                    ok = _send_brief_email(c["email"], subject, full_body + _channels_note()[1], reply_to=reply_to)
                     if ok:
                         channels_used.append("email")
                         any_success = True
@@ -23565,7 +23611,7 @@ def _fetch_active_nws_alerts() -> list:
 
 
 def _find_pro_subscribers_in_polygon(geom: dict) -> list:
-    """Find Pro-tier subscribers whose primary saved_location is inside
+    """Find ALL subscribers (any tier, July 2026) whose primary saved_location is inside
     the alert polygon. Returns list of dicts with user info needed for
     later notification (id, name, email, phone, location), plus the
     subscriber's assigned primary Met (id, name, phone) so the pager can
@@ -23596,7 +23642,9 @@ def _find_pro_subscribers_in_polygon(geom: dict) -> list:
                    LEFT JOIN users bm
                      ON bm.id = cov.backup_met_id
                    WHERE u.is_active = TRUE
-                     AND u.subscription_tier IN ('pro_single','pro_multi','pro_enterprise')
+                     -- July 2026: severe weather does not check tiers.
+                     -- Every subscriber in the warning area gets the alert,
+                     -- Pro and Hobbyist alike (Michael + Met decision).
                      AND EXISTS (
                        SELECT 1 FROM user_roles ur
                         WHERE ur.user_id = u.id AND ur.role = 'subscriber'
@@ -23627,7 +23675,7 @@ def _find_pro_subscribers_in_polygon(geom: dict) -> list:
 
 
 def _find_pro_subscribers_by_county(alert: dict) -> list:
-    """Find Pro-tier subscribers whose saved location falls in a county-based
+    """Find ALL subscribers (any tier, July 2026) whose saved location falls in a county-based
     (geometry-less) alert, e.g. a Severe Thunderstorm Watch. Watches identify
     their area by county, not a polygon, so we match the alert's areaDesc
     ("County, ST; County, ST") against each subscriber's county + state.
@@ -23663,7 +23711,9 @@ def _find_pro_subscribers_by_county(alert: dict) -> list:
                    LEFT JOIN users bm
                      ON bm.id = cov.backup_met_id
                    WHERE u.is_active = TRUE
-                     AND u.subscription_tier IN ('pro_single','pro_multi','pro_enterprise')
+                     -- July 2026: severe weather does not check tiers.
+                     -- Every subscriber in the warning area gets the alert,
+                     -- Pro and Hobbyist alike (Michael + Met decision).
                      AND EXISTS (
                        SELECT 1 FROM user_roles ur
                         WHERE ur.user_id = u.id AND ur.role = 'subscriber'
@@ -31834,7 +31884,7 @@ def _autosend_pro_brief_draft(draft_id: int) -> tuple[bool, str]:
             ]
             email_body = "\n".join(body_lines)
             try:
-                if _send_brief_email(row["sub_email"], subject, email_body,
+                if _send_brief_email(row["sub_email"], subject, email_body + _channels_note()[1],
                                      html=False, reply_to=reply_to):
                     channels_used.append("email")
                     any_success = True
@@ -44411,6 +44461,155 @@ def trial_survey_submit(token):
     return jsonify({"ok": True, "followup": followup})
 
 
+@app.route("/api/v1/admin/today-boards", methods=["OPTIONS"])
+def _admin_today_boards_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/today-boards")
+def admin_today_boards():
+    """The Command Center Today tab's two boards in one call:
+    1. The totals board: subscriber counts by tier and payment status
+       (free trial / starter month / full pay / discounted).
+    2. The trial conversion board: every active trial with its clock,
+       survey status, and whether they've messaged their Met.
+    """
+    user = _get_current_user()
+    if user is None or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    now_ms = int(time.time() * 1000)
+
+    # ── Board 1: totals ──
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.subscription_tier, u.trial_status,
+                          u.trial_ends_at, u.is_discounted,
+                          a.starter_used, a.signed_up_at
+                   FROM users u
+                   JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'subscriber'
+                   LEFT JOIN sales_attributions a ON a.user_id = u.id
+                   WHERE u.is_active = TRUE""",
+            )
+            rows = cur.fetchall()
+    tiers = ["hobbyist", "pro_single", "pro_multi"]
+    statuses = ["trial", "starter", "full", "discounted"]
+    grid = {t: {st: 0 for st in statuses} for t in tiers}
+    other = 0
+    for r in rows:
+        tier = (r.get("subscription_tier") or "").strip()
+        if tier not in grid:
+            other += 1
+            continue
+        if r.get("trial_status") == "active":
+            st = "trial"
+        elif r.get("is_discounted"):
+            st = "discounted"
+        elif r.get("starter_used") and r.get("signed_up_at") and                 (now_ms - r["signed_up_at"]) < 35 * 86400000:
+            st = "starter"
+        else:
+            st = "full"
+        grid[tier][st] += 1
+    totals = {
+        "tiers": [{
+            "tier": t,
+            "label": {"hobbyist": "Hobbyist", "pro_single": "Pro Single",
+                      "pro_multi": "Pro Multi"}[t],
+            **grid[t],
+            "total": sum(grid[t].values()),
+        } for t in tiers],
+        "columns": {st: sum(grid[t][st] for t in tiers) for st in statuses},
+        "grand_total": sum(sum(grid[t].values()) for t in tiers),
+        "untiered": other,
+    }
+
+    # ── Board 2: active trials ──
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.name, u.email, u.trial_business_name,
+                          u.subscription_tier, u.trial_started_at, u.trial_ends_at,
+                          (SELECT t.q_messaged_met FROM trial_surveys t
+                            WHERE t.user_id = u.id AND t.submitted_at IS NOT NULL
+                            ORDER BY t.submitted_at DESC LIMIT 1) AS survey_messaged,
+                          (SELECT COUNT(*) FROM trial_surveys t2
+                            WHERE t2.user_id = u.id AND t2.submitted_at IS NOT NULL) AS survey_done,
+                          EXISTS (SELECT 1 FROM brief_replies br
+                                  WHERE br.matched_user_id = u.id) AS has_replied,
+                          (SELECT a2.rep_slug FROM sales_attributions a2
+                            WHERE a2.user_id = u.id) AS rep_slug,
+                          (SELECT m.name FROM subscriber_coverage sc
+                             JOIN users m ON m.id = sc.primary_met_id
+                            WHERE sc.user_id = u.id) AS met_name
+                   FROM users u
+                   WHERE u.is_active = TRUE AND u.trial_status = 'active'
+                   ORDER BY u.trial_ends_at ASC NULLS LAST""",
+            )
+            trows = cur.fetchall()
+    trials = []
+    for r in trows:
+        ends = r.get("trial_ends_at")
+        days_left = max(0, int(round((ends - now_ms) / 86400000))) if ends else None
+        messaged = bool(r.get("has_replied")) or (r.get("survey_messaged") == "yes")
+        trials.append({
+            "display": r.get("trial_business_name") or r.get("name") or r.get("email"),
+            "tier": r.get("subscription_tier") or "",
+            "days_left": days_left,
+            "survey_done": bool(r.get("survey_done")),
+            "messaged_met": messaged,
+            "rep": (r.get("rep_slug") or "") if (r.get("rep_slug") or "") != "organic" else "",
+            "met": ((r.get("met_name") or "").split(" ") or [""])[0],
+        })
+    return jsonify({"ok": True, "totals": totals, "trials": trials})
+
+
+@app.route("/api/v1/admin/channels-status", methods=["OPTIONS"])
+def _admin_channels_status_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/channels-status")
+def admin_channels_status():
+    """Plain-English check that the July 6 both-channels switch ran,
+    readable by opening this URL in a signed-in browser. Built because
+    Render's dashboard is blocked on Michael's work network."""
+    user = _get_current_user()
+    if user is None or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden",
+                        "message": "Sign in at weathervalet.ai as an admin first, then open this link again."}), 403
+    ran_at = None
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT applied_at FROM wv_one_shot_migrations WHERE mig_key = %s",
+                        ("brief-channels-both-202607",))
+            r = cur.fetchone()
+            ran_at = r["applied_at"] if r else None
+            cur.execute(
+                """SELECT COALESCE(bp.channels, 'sms,email') AS ch, COUNT(*) AS n
+                   FROM users u
+                   JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'subscriber'
+                   LEFT JOIN brief_preferences bp ON bp.user_id = u.id
+                   WHERE u.is_active = TRUE
+                   GROUP BY 1 ORDER BY 2 DESC""",
+            )
+            rows = cur.fetchall()
+    total = sum(r["n"] for r in rows)
+    on_both = sum(r["n"] for r in rows if r["ch"] == "sms,email")
+    if ran_at:
+        when = datetime.fromtimestamp(ran_at / 1000, tz=ZoneInfo("America/New_York")).strftime("%B %d at %I:%M %p ET")
+        msg = (f"Yes, the switch ran on {when}. {on_both} of {total} active subscribers "
+               f"now get both text and email.")
+        if on_both < total:
+            msg += (f" The other {total - on_both} changed their own settings since, "
+                    "which is allowed and stays respected.")
+    else:
+        msg = ("The switch has NOT run yet. Deploy the latest app.py and check "
+               "this link again a few minutes later.")
+    return jsonify({"ok": True, "migration_ran": bool(ran_at), "message": msg,
+                    "subscribers_total": total, "on_both_channels": on_both,
+                    "breakdown": [{"channels": r["ch"], "count": r["n"]} for r in rows]})
+
+
 @app.route("/api/v1/admin/trial-survey/results", methods=["OPTIONS"])
 def _trial_survey_results_preflight():
     return ("", 204)
@@ -44459,6 +44658,222 @@ def met_trial_survey_results():
             "missing": r.get("q_missing") or "",
         })
     return jsonify({"ok": True, "results": out})
+
+
+# ════════════════════════════════════════════════════════════════════
+# The One Composer (July 2026) — one form for every Met message
+# ════════════════════════════════════════════════════════════════════
+# Built from the Mets' own feedback: one place to write, an explicit
+# audience picker, and an always-visible line saying exactly who a
+# message reaches. Delivery follows each subscriber's channel settings
+# (Chris's Option B). Pro recipients also get the message posted into
+# their Messages thread so replies land as a conversation.
+
+_MSG_KIND_LABELS = {
+    "update": "Weather update",
+    "nowcast": "Nowcast",
+    "question": "Quick question",
+    "announcement": "Announcement",
+}
+
+
+def _composer_roster(me_id: int, is_admin: bool) -> list:
+    """Every subscriber this Met can message: their primary people, or
+    everyone for admins. Returns display name, tier, and channels."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.name, u.email, u.trial_business_name,
+                          u.subscription_tier,
+                          COALESCE(bp.channels, 'sms,email') AS channels,
+                          u.phone
+                   FROM users u
+                   JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'subscriber'
+                   LEFT JOIN brief_preferences bp ON bp.user_id = u.id
+                   LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
+                   WHERE u.is_active = TRUE
+                     AND (%s OR sc.primary_met_id = %s)
+                   ORDER BY u.subscription_tier, u.name""",
+                (is_admin, me_id),
+            )
+            rows = cur.fetchall()
+    out = []
+    for r in rows:
+        tier = (r.get("subscription_tier") or "").strip()
+        out.append({
+            "id": r["id"],
+            "display": r.get("trial_business_name") or r.get("name") or r.get("email"),
+            "tier": tier,
+            "is_pro": tier.startswith("pro"),
+            "channels": r.get("channels") or "sms,email",
+            "has_phone": bool((r.get("phone") or "").strip()),
+        })
+    return out
+
+
+@app.route("/api/v1/met/messages/roster", methods=["OPTIONS"])
+def _met_msg_roster_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/messages/roster")
+def met_messages_roster():
+    user = _get_current_user()
+    roles = (user.get("roles") or []) if user else []
+    if user is None or not ("met" in roles or "admin" in roles):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    roster = _composer_roster(user["id"], "admin" in roles)
+    return jsonify({"ok": True, "roster": roster})
+
+
+@app.route("/api/v1/met/messages/send", methods=["OPTIONS"])
+def _met_msg_send_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/met/messages/send")
+def met_messages_send():
+    """Send one message to a picked audience, honoring each subscriber's
+    channel settings. Records one met_messages row for history."""
+    user = _get_current_user()
+    roles = (user.get("roles") or []) if user else []
+    if user is None or not ("met" in roles or "admin" in roles):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    me_id = user["id"]
+    actor_first = ((user.get("name") or "").strip().split(" ") or ["your Meteorologist"])[0]
+    data = request.get_json(silent=True) or {}
+
+    kind = (data.get("kind") or "update").strip().lower()
+    if kind not in _MSG_KIND_LABELS:
+        kind = "update"
+    kind_label = _MSG_KIND_LABELS[kind]
+    mode = (data.get("audience_mode") or "").strip().lower()
+    if mode not in ("all", "pros", "hobbyists", "selected"):
+        return jsonify({"ok": False, "error": "invalid-audience",
+                        "message": "Pick who this goes to."}), 400
+    title = (data.get("title") or "").strip()[:160]
+    body = (data.get("body") or "").strip()[:4000]
+    if not body:
+        return jsonify({"ok": False, "error": "empty-body",
+                        "message": "Write the message first."}), 400
+    image_url = (data.get("image_url") or "").strip()[:500]
+    if not image_url.startswith("http"):
+        image_url = ""
+    sel_ids = set()
+    if mode == "selected":
+        for x in (data.get("user_ids") or []):
+            try:
+                sel_ids.add(int(x))
+            except (TypeError, ValueError):
+                continue
+        if not sel_ids:
+            return jsonify({"ok": False, "error": "empty-selection",
+                            "message": "Choose at least one subscriber."}), 400
+
+    roster = _composer_roster(me_id, "admin" in roles)
+    if mode == "pros":
+        targets = [r for r in roster if r["is_pro"]]
+    elif mode == "hobbyists":
+        targets = [r for r in roster if not r["is_pro"]]
+    elif mode == "selected":
+        targets = [r for r in roster if r["id"] in sel_ids]
+    else:
+        targets = roster
+    targets = targets[:500]
+    if not targets:
+        return jsonify({"ok": False, "error": "no-audience",
+                        "message": "That audience is empty."}), 400
+
+    # Build the message once.
+    sms_head = f"{kind_label} from {actor_first}, WeatherValet:"
+    thread_body = (f"{title}: {body}" if title else body)[:4000]
+    subject = title or f"{kind_label} from {actor_first}, your Meteorologist"
+    img_html = (f"<img src='{image_url}' alt='' style='max-width:100%;"
+                f"border-radius:8px;margin:10px 0;'>" if image_url else "")
+    body_html = (
+        "<div style='font-family:Arial,sans-serif;max-width:560px;'>"
+        f"<div style='font-size:11px;font-weight:700;text-transform:uppercase;"
+        f"letter-spacing:0.06em;color:#2E4FB8;margin-bottom:6px;'>{_html_escape(kind_label)}</div>"
+        + (f"<h2 style='margin:0 0 10px;font-size:19px;color:#0F1216;'>{_html_escape(title)}</h2>" if title else "")
+        + f"<p style='font-size:15px;line-height:1.6;color:#1A1D24;white-space:pre-wrap;margin:0 0 10px;'>{_html_escape(body)}</p>"
+        + img_html +
+        f"<p style='font-size:13px;color:#4B5563;margin:10px 0 0;'>Reply to this message "
+        f"anytime, {_html_escape(actor_first)} reads every one. WeatherValet</p></div>"
+    )
+    email_text = (f"{kind_label}\n\n" + (f"{title}\n\n" if title else "") + body
+                  + f"\n\nReply anytime, {actor_first} reads every one. WeatherValet")
+
+    sent_sms = sent_email = threaded = 0
+    skipped = []
+    for t in targets:
+        chans = (t.get("channels") or "sms,email").lower()
+        did_any = False
+        try:
+            if "sms" in chans and t.get("has_phone"):
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT phone, email FROM users WHERE id = %s", (t["id"],))
+                        urow = cur.fetchone() or {}
+                phone = (urow.get("phone") or "").strip()
+                if phone:
+                    sms_body = f"{sms_head}\n" + (f"{title}\n" if title else "") + body
+                    if len(sms_body) > 480:
+                        tail = ("\u2026 (full message in your email)"
+                                if "email" in chans else "\u2026")
+                        sms_body = sms_body[:440].rstrip() + tail
+                    _media = [image_url] if image_url else None
+                    if send_sms(phone, sms_body, media_url=_media):
+                        sent_sms += 1
+                        did_any = True
+            if "email" in chans:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT email FROM users WHERE id = %s", (t["id"],))
+                        erow = cur.fetchone() or {}
+                to_email = (erow.get("email") or "").strip()
+                if to_email:
+                    _send_user_email(to_email, subject, body_html, email_text)
+                    sent_email += 1
+                    did_any = True
+            if t.get("is_pro"):
+                try:
+                    _post_to_pro_thread(
+                        subscriber_user_id=t["id"],
+                        body=f"[{kind_label}] {thread_body}",
+                        sender_role="met",
+                        sender_user_id=me_id,
+                        sender_name=user.get("name") or actor_first,
+                    )
+                    threaded += 1
+                except Exception as e:
+                    print(f"[composer] thread post failed for {t['id']}: {e!r}", flush=True)
+        except Exception as e:
+            print(f"[composer] send failed for {t['id']}: {e!r}", flush=True)
+        if not did_any:
+            skipped.append({"id": t["id"], "display": t["display"],
+                            "reason": "No reachable channel on file."})
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO met_messages
+                         (met_user_id, kind, audience_mode, title, body,
+                          image_url, recipient_count, created_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (me_id, kind, mode, title or None, body,
+                     image_url or None, len(targets) - len(skipped),
+                     int(time.time() * 1000)),
+                )
+    except Exception as e:
+        print(f"[composer] history insert failed: {e!r}", flush=True)
+
+    reached = len(targets) - len(skipped)
+    pro_n = sum(1 for t in targets if t["is_pro"])
+    return jsonify({"ok": True, "reached": reached, "pro": pro_n,
+                    "hobbyist": len(targets) - pro_n,
+                    "sms": sent_sms, "email": sent_email,
+                    "threaded": threaded, "skipped": skipped})
 
 
 @app.get("/api/v1/admin/trial-survey/results")
