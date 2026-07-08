@@ -206,6 +206,11 @@ TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER", "")  # Twilio number w
 #     deploys still work (Rosie just shares the main number).
 ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
+# Backend build identity (July 2026). Bumped with every shipped app.py so
+# the Command Center's version light can prove what's actually deployed.
+BACKEND_BUILD = "0702-8"
+_BOOT_TS = time.time()
+
 # Dedicated Valet Crew line (July 2026). Set this env var ONLY once the
 # second Twilio number is A2P-approved. When set: crew conditions nudges
 # are SENT from this number, and anything texted TO it is treated as a
@@ -44461,6 +44466,15 @@ def trial_survey_submit(token):
     return jsonify({"ok": True, "followup": followup})
 
 
+@app.get("/api/v1/version")
+def api_version():
+    """What's actually running. Public and tiny: the Command Center's
+    version light compares this against the frontend's build tag."""
+    up = int(time.time() - _BOOT_TS)
+    return jsonify({"ok": True, "build": BACKEND_BUILD,
+                    "uptime_seconds": up})
+
+
 @app.route("/api/v1/admin/today-boards", methods=["OPTIONS"])
 def _admin_today_boards_preflight():
     return ("", 204)
@@ -44560,7 +44574,60 @@ def admin_today_boards():
             "rep": (r.get("rep_slug") or "") if (r.get("rep_slug") or "") != "organic" else "",
             "met": ((r.get("met_name") or "").split(" ") or [""])[0],
         })
-    return jsonify({"ok": True, "totals": totals, "trials": trials})
+    # ── Board 3: needs attention (July 2026) ──
+    # Everything currently wrong that needs a human, gathered in one place
+    # so problems stop waiting to be stumbled on.
+    attention = []
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.name, u.email, u.trial_business_name
+                   FROM users u
+                   JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'subscriber'
+                   WHERE u.is_active = TRUE
+                     AND COALESCE(u.subscription_tier, '') = ''
+                   LIMIT 12""",
+            )
+            no_tier = cur.fetchall()
+            cur.execute(
+                """SELECT u.name, u.email, u.trial_business_name
+                   FROM users u
+                   JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'subscriber'
+                   LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
+                   WHERE u.is_active = TRUE
+                     AND sc.primary_met_id IS NULL
+                   LIMIT 12""",
+            )
+            no_met = cur.fetchall()
+            cur.execute(
+                """SELECT plan_text, created_at FROM verification_requests
+                   WHERE status = 'paid' AND created_at < %s
+                   ORDER BY created_at ASC LIMIT 12""",
+                (int(time.time()) - 1800,),
+            )
+            stale = cur.fetchall()
+
+    def _names(rows):
+        return [(r.get("trial_business_name") or r.get("name") or r.get("email") or "?")
+                for r in rows]
+    if no_tier:
+        attention.append({
+            "key": "no-tier", "count": len(no_tier),
+            "label": "subscriber(s) with no tier set: they are invisible to the brief pipeline",
+            "items": _names(no_tier)})
+    if no_met:
+        attention.append({
+            "key": "no-met", "count": len(no_met),
+            "label": "subscriber(s) with no primary Meteorologist: nobody owns them",
+            "items": _names(no_met)})
+    if stale:
+        attention.append({
+            "key": "stale-review", "count": len(stale),
+            "label": "paid $19 review(s) unclaimed past the 30-minute promise",
+            "items": [(r.get("plan_text") or "")[:60] for r in stale]})
+
+    return jsonify({"ok": True, "totals": totals, "trials": trials,
+                    "attention": attention})
 
 
 @app.route("/api/v1/admin/channels-status", methods=["OPTIONS"])
