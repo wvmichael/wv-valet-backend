@@ -208,7 +208,7 @@ ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-13"
+BACKEND_BUILD = "0702-14"
 _BOOT_TS = time.time()
 
 # Dedicated Valet Crew line (July 2026). Set this env var ONLY once the
