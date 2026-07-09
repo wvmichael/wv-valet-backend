@@ -208,7 +208,7 @@ ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-12"
+BACKEND_BUILD = "0702-13"
 _BOOT_TS = time.time()
 
 # Dedicated Valet Crew line (July 2026). Set this env var ONLY once the
@@ -1563,7 +1563,11 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS welcome_sent_at BIGINT;
 -- run a one-time UPDATE without re-forcing it on every deploy (which
 -- would silently revert settings users changed in between).
 -- One-composer send history (July 2026): one row per composer send.
-CREATE TABLE IF NOT EXISTS met_messages (
+-- Named met_composer_messages because a met_messages table already
+-- exists (the verification follow-up log). Reusing that name made the
+-- schema script throw on every boot: my index referenced columns the
+-- older table does not have. Same lesson as the endpoint collision.
+CREATE TABLE IF NOT EXISTS met_composer_messages (
     id              BIGSERIAL PRIMARY KEY,
     met_user_id     BIGINT NOT NULL,
     kind            TEXT NOT NULL,
@@ -1574,8 +1578,8 @@ CREATE TABLE IF NOT EXISTS met_messages (
     recipient_count INT NOT NULL DEFAULT 0,
     created_at      BIGINT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_met_messages_met
-    ON met_messages(met_user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_met_composer_messages_met
+    ON met_composer_messages(met_user_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS wv_one_shot_migrations (
     mig_key     TEXT PRIMARY KEY,
@@ -45096,7 +45100,7 @@ def met_composer_send():
         with db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """INSERT INTO met_messages
+                    """INSERT INTO met_composer_messages
                          (met_user_id, kind, audience_mode, title, body,
                           image_url, recipient_count, created_at)
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
