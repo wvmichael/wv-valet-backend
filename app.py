@@ -208,7 +208,7 @@ ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-11"
+BACKEND_BUILD = "0702-12"
 _BOOT_TS = time.time()
 
 # Dedicated Valet Crew line (July 2026). Set this env var ONLY once the
@@ -10639,6 +10639,10 @@ def _store_media_bytes(raw: bytes, filename: str, uploaded_by):
     try:
         import io
         from PIL import Image
+        # Memory guard (July 2026): refuse decompression bombs. A small
+        # file can decode into gigabytes; 40M pixels is far beyond any
+        # legitimate forecast graphic and keeps us under the 512MB plan.
+        Image.MAX_IMAGE_PIXELS = 40_000_000
         img = Image.open(io.BytesIO(raw))
         img.load()
         if img.width > 1400:
@@ -10779,6 +10783,10 @@ def media_upload():
     try:
         import io
         from PIL import Image
+        # Memory guard (July 2026): refuse decompression bombs. A small
+        # file can decode into gigabytes; 40M pixels is far beyond any
+        # legitimate forecast graphic and keeps us under the 512MB plan.
+        Image.MAX_IMAGE_PIXELS = 40_000_000
         img = Image.open(io.BytesIO(raw))
         img.load()
         if img.width > 1400:
