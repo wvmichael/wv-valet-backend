@@ -208,7 +208,7 @@ ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-14"
+BACKEND_BUILD = "0702-18"
 _BOOT_TS = time.time()
 
 # Dedicated Valet Crew line (July 2026). Set this env var ONLY once the
@@ -2770,6 +2770,51 @@ def db():
         conn.close()
 
 
+def _crew_line_intro_once() -> None:
+    """Runs exactly once, on the first boot where TWILIO_CREW_NUMBER is
+    set: texts every active Crew member from the new line to introduce
+    it, announce photo reports, state the featuring-with-credit policy,
+    and offer the PRIVATE opt-out. Guarded by wv_one_shot_migrations so
+    later boots never repeat it."""
+    if not TWILIO_CREW_NUMBER:
+        return
+    mig_key = "crew-line-intro-202607"
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO wv_one_shot_migrations (mig_key, applied_at)
+                   VALUES (%s, %s) ON CONFLICT (mig_key) DO NOTHING""",
+                (mig_key, int(time.time() * 1000)),
+            )
+            first_run = (cur.rowcount == 1)
+    if not first_run:
+        return
+    intro = ("Valet Crew update! This is our new dedicated Crew line. Your "
+             "daily check-in texts now come from this number. Big one: you "
+             "can text PHOTOS here and they land straight on the Crew map. "
+             "Standout shots may be featured, with your first-name credit, "
+             "on WeatherValet's channels, social media, and live streams. "
+             "Prefer to stay off public channels? Reply PRIVATE and your "
+             "photos stay map-only. Thanks for being our eyes on the ground!")
+    sent = 0
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.phone FROM users u
+                   JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'crew'
+                   WHERE u.is_active = TRUE
+                     AND COALESCE(u.phone, '') <> ''""",
+            )
+            rows = cur.fetchall()
+    for r in rows:
+        try:
+            if send_sms_from(r["phone"], intro, TWILIO_CREW_NUMBER):
+                sent += 1
+        except Exception as e:
+            print(f"[crew-line-intro] send failed: {e!r}", flush=True)
+    print(f"[crew-line-intro] introduced the Crew line to {sent} member(s)", flush=True)
+
+
 def _migrate_channels_to_both() -> None:
     """One-shot (July 2026): set every existing subscriber's brief delivery
     to BOTH text and email. Texts truncate; email carries the full brief
@@ -2878,6 +2923,13 @@ def init_db() -> None:
         _migrate_channels_to_both()
     except Exception as e:
         print(f"[channels-migration] failed: {e}", flush=True)
+    # One-shot: the first boot where the dedicated Crew number exists,
+    # introduce it to every active Crew member FROM that number, so the
+    # new sender arrives with context instead of confusion (July 2026).
+    try:
+        _crew_line_intro_once()
+    except Exception as e:
+        print(f"[crew-line-intro] failed: {e}", flush=True)
 
 
 def _backfill_crew_user_phone() -> None:
@@ -16616,7 +16668,41 @@ def _match_user_by_email(email: str) -> tuple[int | None, int | None]:
     return None, None
 
 
-def _record_crew_checkin_from_sms(matched_user_id: int, body: str) -> tuple[bool, bool]:
+def _match_any_active_user_by_phone(phone: str) -> int | None:
+    """The dedicated Crew line's matcher (July 2026): on that line, ANY
+    known person is a valid conditions reporter, Crew, subscriber, Met,
+    or admin. Prefers a crew-role match (they have home coordinates for
+    the map), then subscriber, then anyone. Last-10-digit comparison."""
+    normalized = _normalize_phone(phone)
+    digits = "".join(c for c in (normalized or "") if c.isdigit())
+    last10 = digits[-10:] if len(digits) >= 10 else None
+    if not last10:
+        return None
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT u.id FROM users u
+                       WHERE RIGHT(regexp_replace(COALESCE(u.phone, ''),
+                                                  '\\D', '', 'g'), 10) = %s
+                         AND u.is_active = TRUE
+                       ORDER BY
+                         (EXISTS (SELECT 1 FROM user_roles ur WHERE ur.user_id = u.id AND ur.role = 'crew')) DESC,
+                         (EXISTS (SELECT 1 FROM user_roles ur WHERE ur.user_id = u.id AND ur.role = 'subscriber')) DESC,
+                         u.id DESC
+                       LIMIT 1""",
+                    (last10,),
+                )
+                row = cur.fetchone()
+        return row["id"] if row else None
+    except Exception as e:
+        print(f"[crew-line] broad match failed: {e!r}", flush=True)
+        return None
+
+
+def _record_crew_checkin_from_sms(matched_user_id: int, body: str,
+                                  force: bool = False,
+                                  image_url: str | None = None) -> tuple[bool, bool]:
     """Record an inbound text as a Crew daily check-in (and, when the
     condition is recognized and home coordinates exist, a Crew map
     report). Returns (is_crew, is_subscriber) for the matched user so
@@ -16640,7 +16726,7 @@ def _record_crew_checkin_from_sms(matched_user_id: int, body: str) -> tuple[bool
             urow = cur.fetchone() or {}
     is_crew = bool(urow.get("is_crew"))
     is_subscriber = bool(urow.get("is_subscriber"))
-    if not is_crew:
+    if not is_crew and not force:
         return is_crew, is_subscriber
     condition = _parse_crew_condition(body)
     user_tz = urow.get("timezone") or "America/Indianapolis"
@@ -16661,12 +16747,13 @@ def _record_crew_checkin_from_sms(matched_user_id: int, body: str) -> tuple[bool
             )
     print(f"[crew-checkin] recorded via SMS user={matched_user_id} "
           f"date={date_key} condition={condition}", flush=True)
-    # Put it on the Crew map when we recognized a condition and have
-    # home coordinates to place it.
+    # Put it on the Crew map when we have coordinates AND either a
+    # recognized condition or a photo (July 2026: a picture is a report
+    # all by itself, even when the text is just "look at this").
     lat = urow.get("crew_home_lat")
     lng = urow.get("crew_home_lng")
-    if condition and lat is not None and lng is not None:
-        report_type = _CREW_CONDITION_TO_REPORT.get(condition, "other")
+    if (condition or image_url) and lat is not None and lng is not None:
+        report_type = _CREW_CONDITION_TO_REPORT.get(condition, "other") if condition else "other"
         try:
             with db() as conn:
                 with conn.cursor() as cur:
@@ -16675,10 +16762,11 @@ def _record_crew_checkin_from_sms(matched_user_id: int, body: str) -> tuple[bool
                              (user_id, user_name, report_type,
                               latitude, longitude, notes, image_url,
                               verified_count, is_hidden, created_at)
-                           VALUES (%s, %s, %s, %s, %s, %s, NULL, 0, FALSE, %s)""",
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, 0, FALSE, %s)""",
                         (matched_user_id, urow.get("name") or "",
                          report_type, float(lat), float(lng),
-                         (body or "").strip()[:500] or None, now_ms),
+                         (body or "").strip()[:500] or None,
+                         image_url, now_ms),
                     )
             print(f"[crew-report] mapped reply user={matched_user_id} "
                   f"type={report_type}", flush=True)
@@ -26186,7 +26274,9 @@ def _send_crew_welcome_email(email: str, magic_link_url: str,
         ("Reply to your daily check-in.",
          "Each day we will message you to ask what the weather looks like where "
          "you are. Just reply with what you see (clear, cloudy, rain, storm, and "
-         "so on). Every reply keeps your streak going and puts you on the Crew map."),
+         "so on). Every reply keeps your streak going and puts you on the Crew map. "
+         "Standout photos may be featured, with your first-name credit, on our "
+         "channels, social media, and live streams."),
         ("Report it when weather hits.",
          "When you see something worth flagging (storms, hail, high wind, "
          "flooding), send a quick report. Your eyes on the ground help our "
@@ -37082,12 +37172,46 @@ def rosie_history():
 # than buy a second number, route at the application layer.
 # ─────────────────────────────────────────────────────────────
 
+def _ingest_inbound_mms_image(uploaded_by) -> str | None:
+    """Pull the first attached image off an inbound Twilio message and
+    store it on our own /media/ host (July 2026). Returns the hosted URL
+    or None. Twilio's MediaUrl0 is fetchable without auth by default."""
+    try:
+        num = int(request.form.get("NumMedia") or 0)
+    except (TypeError, ValueError):
+        num = 0
+    if num < 1:
+        return None
+    murl = (request.form.get("MediaUrl0") or "").strip()
+    ctype = (request.form.get("MediaContentType0") or "").lower()
+    if not murl or not ctype.startswith("image/"):
+        return None
+    try:
+        import urllib.request
+        req = urllib.request.Request(murl, headers={"User-Agent": "WeatherValet crew line"})
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            raw = resp.read(8 * 1024 * 1024 + 1)
+        if len(raw) > 8 * 1024 * 1024:
+            print("[crew-line] MMS image too large, skipping", flush=True)
+            return None
+        ok, result = _store_media_bytes(raw, "crew-mms", uploaded_by)
+        if not ok:
+            print(f"[crew-line] MMS store failed: {result}", flush=True)
+            return None
+        print(f"[crew-line] MMS photo hosted -> {result}", flush=True)
+        return result
+    except Exception as e:
+        print(f"[crew-line] MMS fetch failed: {e!r}", flush=True)
+        return None
+
+
 def _crew_line_inbound(from_phone: str, body: str):
-    """Inbound SMS on the dedicated Valet Crew number. The destination
-    number IS the context: this is a conditions check-in, full stop,
-    no matter what other roles the sender holds. Always acks, so the
-    Crew member knows their report landed."""
-    matched_user_id, _met = _match_user_by_phone(from_phone)
+    """Inbound SMS/MMS on the dedicated Valet Crew number. The destination
+    number IS the context: this is a conditions report, full stop, and on
+    THIS line everyone we know counts, Crew, subscribers, Mets, admins
+    (July 2026: Michael's "ALL can use it" rule). Photos become map pins.
+    Always acks, so the sender knows their report landed."""
+    matched_user_id = _match_any_active_user_by_phone(from_phone)
 
     def _twiml(msg):
         return (f"<?xml version='1.0' encoding='UTF-8'?><Response>"
@@ -37097,17 +37221,23 @@ def _crew_line_inbound(from_phone: str, body: str):
     if matched_user_id is None:
         return _twiml("Thanks for texting the WeatherValet Crew line. We didn't "
                       "recognize this number. Please text from the phone on your "
-                      "Crew profile, or email hello@weathervalet.ai.")
+                      "WeatherValet profile, or email hello@weathervalet.ai.")
+    image_url = _ingest_inbound_mms_image(matched_user_id)
     try:
-        is_crew, _is_sub = _record_crew_checkin_from_sms(matched_user_id, body)
+        _record_crew_checkin_from_sms(matched_user_id, body,
+                                      force=True, image_url=image_url)
+        recorded = True
     except Exception as e:
         print(f"[crew-line] record failed: {e!r}", flush=True)
-        is_crew = False
-    if is_crew:
-        return _twiml("Got it, your conditions report is logged. Thanks for "
-                      "being our eyes on the ground!")
-    return _twiml("This is the WeatherValet Crew line for conditions reports. "
-                  "To message your Meteorologist, reply to their usual number.")
+        recorded = False
+    if not recorded:
+        return _twiml("Something hiccuped on our end saving that. Please try "
+                      "again in a minute, your report matters to us.")
+    if image_url:
+        return _twiml("Got it, photo and all! Your conditions report is on the "
+                      "map. Thanks for being our eyes on the ground!")
+    return _twiml("Got it, your conditions report is logged. Thanks for "
+                  "being our eyes on the ground!")
 
 
 @app.route("/api/v1/sms-inbound-router", methods=["OPTIONS"])
@@ -44244,6 +44374,26 @@ def _current_sales_rep():
                     ((user.get("email") or "").strip(),),
                 )
                 rep = cur.fetchone()
+                if rep is None and "admin" in (user.get("roles") or []):
+                    # Admins may view the portal as any rep (July 2026):
+                    # ?as=slug picks one, defaulting to the first active rep
+                    # alphabetically, so the boss sees what the team sees.
+                    as_slug = ""
+                    try:
+                        as_slug = (request.args.get("as") or "").strip().lower()
+                    except Exception:
+                        pass
+                    cur.execute(
+                        """SELECT id, slug, name, email, phone FROM sales_reps
+                           WHERE is_active = TRUE
+                           ORDER BY (slug = %s) DESC, slug ASC
+                           LIMIT 1""",
+                        (as_slug,),
+                    )
+                    rep = cur.fetchone()
+                    if rep is not None:
+                        rep = dict(rep)
+                        rep["_admin_view"] = True
         return user, rep
     except Exception as e:
         print(f"[sales-portal] rep lookup failed: {e!r}", flush=True)
@@ -44262,7 +44412,18 @@ def sales_me():
         return jsonify({"ok": False, "error": "not-signed-in"}), 401
     if rep is None:
         return jsonify({"ok": False, "error": "not-a-rep"}), 403
-    return jsonify({"ok": True, "rep": {"slug": rep["slug"], "name": rep["name"] or rep["slug"]}})
+    out = {"ok": True, "rep": {"slug": rep["slug"], "name": rep["name"] or rep["slug"]}}
+    if rep.get("_admin_view"):
+        out["admin_view"] = True
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT slug, name FROM sales_reps
+                       WHERE is_active = TRUE ORDER BY slug ASC""",
+                )
+                out["reps"] = [{"slug": r["slug"], "name": r["name"] or r["slug"]}
+                               for r in cur.fetchall()]
+    return jsonify(out)
 
 
 @app.route("/api/v1/sales/pipeline", methods=["OPTIONS"])
