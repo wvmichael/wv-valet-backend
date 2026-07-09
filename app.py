@@ -208,7 +208,7 @@ ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-10"
+BACKEND_BUILD = "0702-11"
 _BOOT_TS = time.time()
 
 # Dedicated Valet Crew line (July 2026). Set this env var ONLY once the
@@ -10615,6 +10615,130 @@ def _ensure_media_table():
                        created_at  BIGINT NOT NULL
                    )"""
             )
+
+
+def _sniff_image_bytes(b: bytes):
+    """PNG/JPG/GIF by file signature. Returns (mime, ext) or (None, None)."""
+    if b[:8] == b"\x89PNG\r\n\x1a\n":
+        return ("image/png", "png")
+    if b[:3] == b"\xff\xd8\xff":
+        return ("image/jpeg", "jpg")
+    if b[:6] in (b"GIF87a", b"GIF89a"):
+        return ("image/gif", "gif")
+    return (None, None)
+
+
+def _store_media_bytes(raw: bytes, filename: str, uploaded_by):
+    """The storage core behind /api/v1/media/upload, callable from anywhere.
+    Optimizes with Pillow when available, stores in uploaded_media, and
+    returns (True, public_url) or (False, reason)."""
+    mime, ext = _sniff_image_bytes(raw)
+    if not mime:
+        return False, "not-an-image"
+    data = raw
+    try:
+        import io
+        from PIL import Image
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+        if img.width > 1400:
+            ratio = 1400 / float(img.width)
+            img = img.resize((1400, max(1, int(img.height * ratio))))
+        out = io.BytesIO()
+        if mime == "image/png" or img.mode in ("RGBA", "LA", "P"):
+            img.save(out, format="PNG", optimize=True)
+            mime, ext = "image/png", "png"
+        else:
+            img.convert("RGB").save(out, format="JPEG", quality=82, optimize=True)
+            mime, ext = "image/jpeg", "jpg"
+        data = out.getvalue()
+    except Exception:
+        data = raw
+    if len(data) > 5 * 1024 * 1024:
+        return False, "too-large"
+    token = secrets.token_urlsafe(18)
+    _ensure_media_table()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO uploaded_media
+                       (token, mime_type, bytes, byte_size, filename, uploaded_by, created_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                (token, mime, psycopg2.Binary(data), len(data),
+                 (filename or "")[:200], uploaded_by, int(time.time() * 1000)),
+            )
+    try:
+        base = request.host_url.rstrip("/")
+    except Exception:
+        base = "https://api.weathervalet.ai"
+    return True, base + "/media/" + token + "." + ext
+
+
+# Hosts whose links get silently re-hosted onto our own domain before any
+# send (July 2026). Google Drive links in picture texts are a known
+# carrier-filtering trigger (Twilio error 30007), and shared-drive images
+# can expire or require sign-in. A fixed allowlist (rather than "mirror
+# everything") avoids turning this into an open server-side fetch.
+_MIRROR_HOSTS = (
+    "drive.google.com", "docs.google.com", "drive.usercontent.google.com",
+    "lh3.googleusercontent.com", "lh4.googleusercontent.com",
+    "lh5.googleusercontent.com", "lh6.googleusercontent.com",
+    "photos.google.com", "dropbox.com", "www.dropbox.com",
+    "dl.dropboxusercontent.com",
+)
+
+
+def _normalize_share_link(url: str) -> str:
+    """Turn common share-page links into direct-download links."""
+    import re as _re
+    m = _re.search(r"drive\.google\.com/file/d/([\w-]+)", url)
+    if m:
+        return "https://drive.google.com/uc?export=download&id=" + m.group(1)
+    m = _re.search(r"drive\.google\.com/open\?id=([\w-]+)", url)
+    if m:
+        return "https://drive.google.com/uc?export=download&id=" + m.group(1)
+    if "dropbox.com" in url and "dl=0" in url:
+        return url.replace("dl=0", "dl=1")
+    return url
+
+
+def _mirror_external_image(url: str, uploaded_by) -> str | None:
+    """If the URL points at a risky share host (Google Drive etc.),
+    download the image and re-host it at weathervalet's own /media/ URL.
+    Returns the URL to use: our new URL on success, the original when the
+    host isn't on the mirror list or is already ours, or None when the
+    mirror was needed but failed (callers keep the original and we log)."""
+    u = (url or "").strip()
+    if not u.lower().startswith(("http://", "https://")):
+        return u or None
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(u).hostname or "").lower()
+    except Exception:
+        return u
+    if host.endswith("weathervalet.ai"):
+        return u
+    if host not in _MIRROR_HOSTS:
+        return u
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            _normalize_share_link(u),
+            headers={"User-Agent": "Mozilla/5.0 (WeatherValet image mirror)"})
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            raw = resp.read(8 * 1024 * 1024 + 1)
+        if len(raw) > 8 * 1024 * 1024:
+            print(f"[img-mirror] too large, keeping original: {u[:90]}", flush=True)
+            return None
+        ok, result = _store_media_bytes(raw, "mirrored-image", uploaded_by)
+        if not ok:
+            print(f"[img-mirror] store failed ({result}): {u[:90]}", flush=True)
+            return None
+        print(f"[img-mirror] re-hosted {host} image -> {result}", flush=True)
+        return result
+    except Exception as e:
+        print(f"[img-mirror] fetch failed ({e!r}): {u[:90]}", flush=True)
+        return None
 
 
 @app.route("/api/v1/media/upload", methods=["OPTIONS"])
@@ -31165,6 +31289,10 @@ def met_pro_bulk_schedule():
     image_url = (data.get("image_url") or "").strip()[:500]
     if not image_url.startswith("http"):
         image_url = ""
+    if image_url:
+        # Google Drive / Dropbox links get re-hosted on our own domain
+        # before anything sends (carrier-filter protection, July 2026).
+        image_url = _mirror_external_image(image_url, user["id"]) or image_url
 
     # mode: "schedule" (next morning, default) or "send_now" (immediately)
     mode = (data.get("mode") or "schedule").strip().lower()
@@ -33834,6 +33962,8 @@ def met_pro_brief_compose_update():
     snippet = (data.get("snippet") or "").strip()
     body_text = (data.get("body") or "").strip()
     image_url = (data.get("image_url") or "").strip()
+    if image_url.startswith("http"):
+        image_url = _mirror_external_image(image_url, user["id"]) or image_url
     if not snippet and not body_text:
         return jsonify({"ok": False, "error": "empty-update",
                         "message": "Provide a snippet or body."}), 400
@@ -44826,9 +44956,12 @@ def _met_msg_send_preflight():
 
 
 @app.post("/api/v1/met/messages/send")
-def met_messages_send():
+def met_composer_send():
     """Send one message to a picked audience, honoring each subscriber's
-    channel settings. Records one met_messages row for history."""
+    channel settings. Records one met_messages row for history.
+    (Named met_composer_send because met_messages_send already exists as
+    an older endpoint; duplicate Flask view names crash the boot, which
+    is exactly what happened between builds 0702-2 and 0702-10.)"""
     user = _get_current_user()
     roles = (user.get("roles") or []) if user else []
     if user is None or not ("met" in roles or "admin" in roles):
@@ -44853,6 +44986,10 @@ def met_messages_send():
     image_url = (data.get("image_url") or "").strip()[:500]
     if not image_url.startswith("http"):
         image_url = ""
+    if image_url:
+        # Google Drive / Dropbox links get re-hosted on our own domain
+        # before anything sends (carrier-filter protection, July 2026).
+        image_url = _mirror_external_image(image_url, user["id"]) or image_url
     sel_ids = set()
     if mode == "selected":
         for x in (data.get("user_ids") or []):
