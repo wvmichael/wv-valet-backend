@@ -208,7 +208,7 @@ ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-8"
+BACKEND_BUILD = "0702-10"
 _BOOT_TS = time.time()
 
 # Dedicated Valet Crew line (July 2026). Set this env var ONLY once the
@@ -12471,6 +12471,7 @@ def _serialize_user_for_admin(row):
     return {
         "id": f"u_{row['id']}",
         "user_id": row["id"],
+        "is_discounted": bool(row.get("is_discounted")),
         "name": row.get("name") or "",
         "email": row["email"],
         "phone": row.get("phone") or "",
@@ -12516,7 +12517,7 @@ def admin_list_users():
         cur = conn.cursor()
         cur.execute("""
             SELECT u.id, u.email, u.name, u.phone, u.created_at, u.last_login_at, u.is_active,
-                   u.subscription_tier,
+                   u.subscription_tier, u.is_discounted,
                    u.trial_business_name AS business_name,
                    pmm.primary_user_id AS account_owner_id,
                    u.welcome_sent_at,
@@ -44473,6 +44474,32 @@ def api_version():
     up = int(time.time() - _BOOT_TS)
     return jsonify({"ok": True, "build": BACKEND_BUILD,
                     "uptime_seconds": up})
+
+
+@app.route("/api/v1/admin/users/<int:user_id>/discounted", methods=["OPTIONS"])
+def _admin_user_discounted_preflight(user_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/users/<int:user_id>/discounted")
+def admin_user_set_discounted(user_id):
+    """Flag or unflag a subscriber as paying below list price (Kansas
+    carryovers etc.). Powers the Discounted column on the totals board."""
+    user = _get_current_user()
+    if user is None or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    value = bool(data.get("value"))
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET is_discounted = %s WHERE id = %s RETURNING id",
+                (value, user_id),
+            )
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    return jsonify({"ok": True, "is_discounted": value})
 
 
 @app.route("/api/v1/admin/today-boards", methods=["OPTIONS"])
