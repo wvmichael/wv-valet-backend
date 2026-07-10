@@ -208,7 +208,7 @@ ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-26"
+BACKEND_BUILD = "0702-27"
 _BOOT_TS = time.time()
 
 # Dedicated Valet Crew line (July 2026). Set this env var ONLY once the
@@ -44609,6 +44609,37 @@ def _current_sales_rep():
     except Exception as e:
         print(f"[sales-portal] rep lookup failed: {e!r}", flush=True)
         return user, None
+
+
+@app.route("/api/v1/admin/sales/reps/<slug>/email", methods=["OPTIONS"])
+def _admin_sales_rep_email_preflight(slug):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/sales/reps/<slug>/email")
+def admin_sales_rep_set_email(slug):
+    """Change a rep's sign-in email (July 2026). The portal matches reps
+    by email, and the magic link auto-creates the user account on first
+    sign-in, so this one field IS the login change."""
+    user = _get_current_user()
+    if user is None or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    if not is_valid_email(email):
+        return jsonify({"ok": False, "error": "invalid-email"}), 400
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE sales_reps SET email = %s, updated_at = %s
+                   WHERE slug = %s RETURNING slug""",
+                (email, int(time.time() * 1000), slug.strip().lower()),
+            )
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "no-such-rep"}), 404
+    print(f"[rep-email] {slug} -> {email}", flush=True)
+    return jsonify({"ok": True, "email": email})
 
 
 @app.route("/api/v1/sales/roster", methods=["OPTIONS"])
