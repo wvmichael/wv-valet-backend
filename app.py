@@ -208,7 +208,7 @@ ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-19"
+BACKEND_BUILD = "0702-20"
 _BOOT_TS = time.time()
 
 # Dedicated Valet Crew line (July 2026). Set this env var ONLY once the
@@ -24128,33 +24128,33 @@ def _notify_crew_in_severe_alert(alert: dict) -> None:
 # Sent from the toll-free number, so a reply lands in the inbound webhook
 # (rosie_sms_inbound) and checks them in.
 _CREW_DAILY_NUDGE_MESSAGES = [
-    "Good morning! What does it look like outside right now? Reply clear, cloudy, rain, or storm to check-in.",
-    "This is a friendly reminder to check-in with us today.",
-    "Our Mets needs your help. What does it look like at your location?",
-    "Take a look outside. Is it clear, cloudy, raining, or storming?",
-    "Daily update: What does it look like outside at your location?",
-    "Weather check! What are conditions like at your location right now?",
+    "Good morning! What does it look like outside right now? Reply clear, cloudy, rain, or storm, or send a photo of your sky.",
+    "Check-in time! A quick word (clear, cloudy, rain, storm) or a photo puts you on the Crew map today.",
+    "Our Meteorologists need your eyes. What does it look like at your location? Photos welcome!",
+    "Take a look outside. Is it clear, cloudy, raining, or storming? Snap a photo if the sky is doing something interesting.",
+    "Daily update: what does it look like outside at your location? A photo says it best.",
+    "Weather check! What are conditions like right now? Reply with a word or a picture.",
     "Help us monitor conditions in your area. What does the weather look like outside?",
     "Take a quick glance outside and let us know what you see: clear, cloudy, rain, or storm.",
-    "We'd love an update from your location. What are current conditions outside?",
+    "We'd love an update from your location. What are current conditions outside? Photos land straight on the Crew map.",
     "Ground truth matters. What does the sky look like where you are right now?",
-    "Can you help us out with a quick weather observation? Reply clear, cloudy, rain, or storm.",
-    "What's happening outside your window? Let us know with a quick weather check-in.",
+    "Can you help us out with a quick observation? Reply clear, cloudy, rain, or storm, or just send a photo.",
+    "What's happening outside your window? A word or a photo checks you in for today.",
     "Conditions can change quickly. What does the weather look like at your location right now?",
-    "Weather observation request: Is it clear, cloudy, raining, or storming where you are?",
-    "Today's weather check-in: What are you seeing outside at your location?",
-    "Help improve our weather awareness. What does it look like outside right now?",
-    "Quick weather survey: Are conditions clear, cloudy, rainy, or stormy in your area?",
-    "Your observation helps us stay informed. What are conditions like outside?",
-    "What does the sky have in store today? Reply clear, cloudy, rain, or storm.",
+    "Weather observation request: is it clear, cloudy, raining, or storming where you are?",
+    "Today's check-in: what are you seeing outside? Bonus points for a great sky photo.",
+    "Help improve our weather picture. What does it look like outside right now?",
+    "Quick check: are conditions clear, cloudy, rainy, or stormy in your area?",
+    "Your observation helps everyone in your region. What are conditions like outside?",
+    "What does the sky have in store today? Reply clear, cloudy, rain, or storm, or show us with a photo.",
     "We're checking conditions across the region. What does it look like where you are?",
-    "Step outside or look out a window. What weather conditions are you seeing right now?",
+    "Step outside or look out a window. What are you seeing right now? Photos welcome.",
     "A quick update from you goes a long way. What's the weather doing at your location?",
-    "Current conditions check: Clear, cloudy, rain, or storm?",
+    "Current conditions check: clear, cloudy, rain, or storm? A photo works too.",
     "Take 5 seconds to help us out. What does the weather look like where you are?",
-    "Valet Crew, we need your eyes on the sky. What's it looking like at your location?",
-    "Valet Crew! Crew check-in: What are current conditions where you are?",
-    "Help us build a real-time weather picture. What does it look like outside right now?",
+    "Valet Crew, we need your eyes on the sky. What's it looking like at your location? Send a photo if it's a good one.",
+    "Crew check-in: what are current conditions where you are?",
+    "Help us build a real-time weather picture. A word or a photo does it.",
     "Your local observation helps everyone. What conditions are you seeing at your location?",
     "Be our weather spotter for the day. Is it clear, cloudy, raining, or storming where you are?",
 ]
