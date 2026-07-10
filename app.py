@@ -208,7 +208,7 @@ ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-24"
+BACKEND_BUILD = "0702-25"
 _BOOT_TS = time.time()
 
 # Dedicated Valet Crew line (July 2026). Set this env var ONLY once the
@@ -674,6 +674,10 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_commission_cents INTEGER NOT NU
 -- below list price (e.g. Kansas carryovers migrated at legacy rates).
 -- Set by admin; powers the Command Center totals board.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS is_discounted BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Met recognition (July 2026): a personal thanks sent from the Crew line.
+ALTER TABLE crew_reports ADD COLUMN IF NOT EXISTS thanked_at BIGINT;
+ALTER TABLE crew_reports ADD COLUMN IF NOT EXISTS thanked_by_name TEXT;
 
 -- Phase 10 Met tips: track which Met completed each verification + a
 -- customer-facing token for the review/tip page (separate from Met's
@@ -27828,6 +27832,66 @@ def crew_reports_submit():
     return jsonify({"ok": True, "report_id": new_id, "recognition": recognition})
 
 
+@app.route("/api/v1/met/crew-reports/<int:report_id>/thank", methods=["OPTIONS"])
+def _met_crew_report_thank_preflight(report_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/met/crew-reports/<int:report_id>/thank")
+def met_crew_report_thank(report_id):
+    """A Meteorologist (or admin) sends a personal thanks to the Crew
+    member behind a report (July 2026). Sends FROM the dedicated Crew
+    line so the recognition arrives on the same number they report to.
+    One personal sentence from a real Meteorologist beats any token."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-signed-in"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "not-a-met"}), 403
+    data = request.get_json(silent=True) or {}
+    message = (data.get("message") or "").strip()[:300]
+    if not message:
+        return jsonify({"ok": False, "error": "empty-message"}), 400
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT r.id, r.user_name, u.phone
+                   FROM crew_reports r
+                   JOIN users u ON u.id = r.user_id
+                   WHERE r.id = %s""",
+                (report_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    if not (row.get("phone") or "").strip():
+        return jsonify({"ok": False, "error": "no-phone"}), 400
+    sender_name = ((user.get("name") or "").split(" ") or ["Your Meteorologist"])[0]
+    from_number = TWILIO_CREW_NUMBER or None
+    try:
+        if from_number:
+            sent = send_sms_from(row["phone"], message, from_number)
+        else:
+            sent = send_sms(row["phone"], message)
+    except Exception as e:
+        print(f"[met-thank] send failed: {e!r}", flush=True)
+        sent = False
+    if not sent:
+        return jsonify({"ok": False, "error": "send-failed"}), 502
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE crew_reports
+                   SET thanked_at = %s, thanked_by_name = %s
+                   WHERE id = %s""",
+                (now_ms, sender_name, report_id),
+            )
+    print(f"[met-thank] {sender_name} thanked report={report_id}", flush=True)
+    return jsonify({"ok": True, "thanked_by_name": sender_name})
+
+
 @app.route("/api/v1/crew/reports/<int:report_id>", methods=["OPTIONS"])
 def _crew_report_get_preflight(report_id):
     return ("", 204)
@@ -27845,7 +27909,8 @@ def crew_report_get(report_id):
                 """SELECT id, user_id, user_name, report_type,
                           latitude, longitude, notes, image_url,
                           verified_count, created_at,
-                          cited_at, cited_by_name
+                          cited_at, cited_by_name,
+                          thanked_at, thanked_by_name
                    FROM crew_reports
                    WHERE id = %s AND is_hidden = FALSE""",
                 (report_id,),
