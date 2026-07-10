@@ -208,7 +208,7 @@ ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-23"
+BACKEND_BUILD = "0702-24"
 _BOOT_TS = time.time()
 
 # Dedicated Valet Crew line (July 2026). Set this env var ONLY once the
@@ -27826,6 +27826,34 @@ def crew_reports_submit():
     except Exception as e:
         print(f"[crew-alert] hook failed: {e!r}", flush=True)
     return jsonify({"ok": True, "report_id": new_id, "recognition": recognition})
+
+
+@app.route("/api/v1/crew/reports/<int:report_id>", methods=["OPTIONS"])
+def _crew_report_get_preflight(report_id):
+    return ("", 204)
+
+
+@app.get("/api/v1/crew/reports/<int:report_id>")
+def crew_report_get(report_id):
+    """Fetch one Crew report by id (July 2026). Exists so the Detail view
+    can self-heal: any surface can show a pin, and if the pin's report
+    isn't in the frontend cache, the Detail view fetches it here instead
+    of showing "Report not found." Same visibility rules as the list."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, user_id, user_name, report_type,
+                          latitude, longitude, notes, image_url,
+                          verified_count, created_at,
+                          cited_at, cited_by_name
+                   FROM crew_reports
+                   WHERE id = %s AND is_hidden = FALSE""",
+                (report_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    return jsonify({"ok": True, "report": dict(row)})
 
 
 @app.route("/api/v1/crew/reports/<int:report_id>/verify", methods=["OPTIONS"])
