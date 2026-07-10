@@ -208,7 +208,7 @@ ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-18"
+BACKEND_BUILD = "0702-19"
 _BOOT_TS = time.time()
 
 # Dedicated Valet Crew line (July 2026). Set this env var ONLY once the
@@ -16752,6 +16752,25 @@ def _record_crew_checkin_from_sms(matched_user_id: int, body: str,
     # all by itself, even when the text is just "look at this").
     lat = urow.get("crew_home_lat")
     lng = urow.get("crew_home_lng")
+    if lat is None or lng is None:
+        # No crew home base (Mets, admins, subscribers using the Crew
+        # line): fall back to their primary saved location so everyone
+        # who reports lands on the map (July 2026, "ALL can use it").
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT lat, lng FROM saved_locations
+                           WHERE user_id = %s
+                           ORDER BY is_primary DESC, id ASC LIMIT 1""",
+                        (matched_user_id,),
+                    )
+                    locrow = cur.fetchone()
+            if locrow:
+                lat = locrow.get("lat")
+                lng = locrow.get("lng")
+        except Exception as e:
+            print(f"[crew-report] location fallback failed: {e!r}", flush=True)
     if (condition or image_url) and lat is not None and lng is not None:
         report_type = _CREW_CONDITION_TO_REPORT.get(condition, "other") if condition else "other"
         try:
