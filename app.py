@@ -208,7 +208,7 @@ ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-20"
+BACKEND_BUILD = "0702-21"
 _BOOT_TS = time.time()
 
 # Dedicated Valet Crew line (July 2026). Set this env var ONLY once the
@@ -1562,6 +1562,16 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS welcome_sent_at BIGINT;
 -- migration already ran; init_db skips it forever after. This is how we
 -- run a one-time UPDATE without re-forcing it on every deploy (which
 -- would silently revert settings users changed in between).
+-- Crew report alert throttle (July 2026): one row per alert text sent
+-- to a Met, so "no more than 3 an hour" is enforceable per Met.
+CREATE TABLE IF NOT EXISTS crew_alert_log (
+    id           BIGSERIAL PRIMARY KEY,
+    met_user_id  BIGINT NOT NULL,
+    sent_at      BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_crew_alert_log_met
+    ON crew_alert_log(met_user_id, sent_at DESC);
+
 -- One-composer send history (July 2026): one row per composer send.
 -- Named met_composer_messages because a met_messages table already
 -- exists (the verification follow-up log). Reusing that name made the
@@ -16789,6 +16799,12 @@ def _record_crew_checkin_from_sms(matched_user_id: int, body: str,
                     )
             print(f"[crew-report] mapped reply user={matched_user_id} "
                   f"type={report_type}", flush=True)
+            try:
+                _alert_mets_for_crew_report(report_type, lat, lng,
+                                            urow.get("name") or "",
+                                            body, bool(image_url))
+            except Exception as e:
+                print(f"[crew-alert] hook failed: {e!r}", flush=True)
         except Exception as e:
             print(f"[crew-report] map insert failed: {e!r}", flush=True)
     return is_crew, is_subscriber
@@ -27803,6 +27819,12 @@ def crew_reports_submit():
     except Exception as e:
         print(f"[crew-report-submit] recognition calc failed: {e!r}", flush=True)
 
+    try:
+        _alert_mets_for_crew_report(report_type, lat, lng,
+                                    (user.get('name') or ''),
+                                    notes, bool(image_url))
+    except Exception as e:
+        print(f"[crew-alert] hook failed: {e!r}", flush=True)
     return jsonify({"ok": True, "report_id": new_id, "recognition": recognition})
 
 
@@ -37190,6 +37212,83 @@ def rosie_history():
 # Rationale: we have one toll-free number, two use cases. Rather
 # than buy a second number, route at the application layer.
 # ─────────────────────────────────────────────────────────────
+
+_CREW_ALERTS_PER_HOUR = 3
+
+
+def _region_label_for_coords(lat, lng) -> str:
+    """Coarse coordinates-to-territory mapping (July 2026). Two regions
+    exist today, split cleanly by longitude; replace with real county/NWS
+    zone lookup when that standardization lands."""
+    try:
+        return "Kansas Region" if float(lng) < -90.0 else "Indiana Region"
+    except (TypeError, ValueError):
+        return "Indiana Region"
+
+
+def _alert_mets_for_crew_report(report_type: str, lat, lng,
+                                reporter_name: str, notes: str,
+                                has_photo: bool) -> None:
+    """Text the territory Met(s) about a fresh crew report, throttled to
+    _CREW_ALERTS_PER_HOUR per Met per rolling hour (Michael, July 2026:
+    "I don't want 45 texts to the Met in 3 mins"). Suppressed reports
+    still pin the map; the text is just the tap on the shoulder. Sends
+    from the MAIN number so a Met's reply flows to the normal inbound
+    path instead of logging a bogus crew check-in."""
+    region = _region_label_for_coords(lat, lng)
+    now_ms = int(time.time() * 1000)
+    hour_ago = now_ms - 3600 * 1000
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT DISTINCT u.id, u.name, u.phone
+                       FROM met_territories t
+                       JOIN users u ON u.id = t.met_user_id
+                       WHERE t.region_label = %s
+                         AND u.is_active = TRUE
+                         AND COALESCE(u.phone, '') <> ''""",
+                    (region,),
+                )
+                mets = cur.fetchall()
+    except Exception as e:
+        print(f"[crew-alert] met lookup failed: {e!r}", flush=True)
+        return
+    if not mets:
+        print(f"[crew-alert] no Mets for {region}, report unalerted", flush=True)
+        return
+    photo_bit = " (with photo)" if has_photo else ""
+    note_bit = f' "{(notes or "").strip()[:80]}"' if (notes or "").strip() else ""
+    msg = (f"Valet Crew: {reporter_name or 'a Crew member'} reports "
+           f"{report_type}{photo_bit} in your region.{note_bit} "
+           f"See the Crew map for the pin.")
+    for m in mets:
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT COUNT(*) AS n FROM crew_alert_log
+                           WHERE met_user_id = %s AND sent_at > %s""",
+                        (m["id"], hour_ago),
+                    )
+                    n = int(cur.fetchone()["n"])
+            if n >= _CREW_ALERTS_PER_HOUR:
+                print(f"[crew-alert] throttled for met={m['id']} "
+                      f"({n} in last hour)", flush=True)
+                continue
+            if send_sms(m["phone"], msg):
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """INSERT INTO crew_alert_log (met_user_id, sent_at)
+                               VALUES (%s, %s)""",
+                            (m["id"], now_ms),
+                        )
+                print(f"[crew-alert] sent to met={m['id']} for {report_type}",
+                      flush=True)
+        except Exception as e:
+            print(f"[crew-alert] send failed for met={m['id']}: {e!r}", flush=True)
+
 
 def _ingest_inbound_mms_image(uploaded_by) -> str | None:
     """Pull the first attached image off an inbound Twilio message and
