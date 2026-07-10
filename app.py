@@ -208,7 +208,20 @@ ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-28"
+BACKEND_BUILD = "0702-30"
+
+
+def _epoch_ms(ts):
+    """Normalize an epoch that might be seconds OR milliseconds to ms
+    (July 2026). This codebase stores both: users.trial_ends_at and
+    friends are SECONDS (now_ts()), most newer tables are ms. Mixing
+    them made every trial read "0 days left" and silently killed the
+    day-25 rep heads-up texts. Values below 10^12 are seconds until
+    the year 33658, which is a safe bet."""
+    if not ts:
+        return 0
+    ts = int(ts)
+    return ts * 1000 if ts < 10 ** 12 else ts
 _BOOT_TS = time.time()
 
 # Dedicated Valet Crew line (July 2026). Set this env var ONLY once the
@@ -7548,7 +7561,10 @@ def _process_rep_trial_nudges() -> None:
         return
     _REP_NUDGE_LAST_RUN = now_s
     now_ms = int(now_s * 1000)
-    window_ms = 5 * 86400000
+    # trial_ends_at is stored in SECONDS; compare in seconds (July 2026:
+    # comparing it against milliseconds meant this job never fired).
+    now_secs = int(now_s)
+    window_secs = 5 * 86400
     try:
         with db() as conn:
             with conn.cursor() as cur:
@@ -7565,12 +7581,12 @@ def _process_rep_trial_nudges() -> None:
                          AND u.trial_ends_at > %s
                          AND u.trial_ends_at <= %s
                          AND n.user_id IS NULL""",
-                    (now_ms, now_ms + window_ms),
+                    (now_secs, now_secs + window_secs),
                 )
                 due = cur.fetchall()
         for row in due:
             who = row.get("trial_business_name") or row.get("name") or row.get("email")
-            days_left = max(1, int(round((row["trial_ends_at"] - now_ms) / 86400000)))
+            days_left = max(1, int(round((_epoch_ms(row["trial_ends_at"]) - now_ms) / 86400000)))
             day_word = "day" if days_left == 1 else "days"
             first = _rep_first_name(row["rep_slug"])
             sms_body = (f"WeatherValet heads-up: {who}'s free trial ends in "
@@ -7771,6 +7787,36 @@ def boone_trial_signup():
                        WHERE id = %s""",
                     (name or None, phone or None, cohort, category, now, ends, business, user_id),
                 )
+
+            # Store the city they just told us (July 2026). This field was
+            # parsed and then silently dropped for the entire Boone launch;
+            # subscribers were telling us where they are all along. Geocode
+            # it (state chosen by cohort) and save as their primary
+            # location. Non-blocking: a bad geocode never breaks signup.
+            if city:
+                try:
+                    state = "Kansas" if "ks" in ((cohort or "") + (category or "")).lower() else "Indiana"
+                    geo_query = f"{city}, {state}"
+                    geo = _geocode_address(geo_query)
+                    if geo and _geocode_looks_confident(geo_query, geo):
+                        with db() as conn2:
+                            with conn2.cursor() as cur2:
+                                cur2.execute(
+                                    """INSERT INTO saved_locations
+                                         (user_id, label, address_text, lat, lng,
+                                          county, is_primary, created_at, updated_at)
+                                       VALUES (%s, %s, %s, %s, %s, %s, TRUE, %s, %s)""",
+                                    (user_id, city[:80], geo_query,
+                                     geo["lat"], geo["lng"],
+                                     geo.get("county"), now * 1000, now * 1000),
+                                )
+                        print(f"[trial-signup] located {city} -> "
+                              f"{geo['lat']:.3f},{geo['lng']:.3f}", flush=True)
+                    else:
+                        print(f"[trial-signup] geocode unconfident for {geo_query}, "
+                              f"skipping location", flush=True)
+                except Exception as e:
+                    print(f"[trial-signup] location store failed: {e!r}", flush=True)
 
             # Auto-assign the region's Meteorologist as this subscriber's
             # primary Met (June 2026). Signups previously landed with no Met,
@@ -44670,7 +44716,10 @@ def sales_roster():
                           sr.name AS rep_name,
                           (SELECT m.name FROM subscriber_coverage sc
                              JOIN users m ON m.id = sc.primary_met_id
-                            WHERE sc.user_id = u.id) AS met_name
+                            WHERE sc.user_id = u.id) AS met_name,
+                          (SELECT t.region_label FROM subscriber_coverage sc2
+                             JOIN met_territories t ON t.met_user_id = sc2.primary_met_id
+                            WHERE sc2.user_id = u.id LIMIT 1) AS region_label
                    FROM users u
                    JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'subscriber'
                    LEFT JOIN sales_attributions a ON a.user_id = u.id
@@ -44704,14 +44753,14 @@ def sales_roster():
     accounts = []
     for r in rows:
         if r.get("trial_status") == "active":
-            ends = r.get("trial_ends_at")
+            ends = _epoch_ms(r.get("trial_ends_at"))
             days = max(0, int(round((ends - now_ms) / 86400000))) if ends else None
             status = "trial"
         else:
             days = None
             if r.get("is_discounted"):
                 status = "discounted"
-            elif r.get("starter_used") and r.get("signed_up_at") and                     (now_ms - r["signed_up_at"]) < 35 * 86400000:
+            elif r.get("starter_used") and r.get("signed_up_at") and                     (now_ms - _epoch_ms(r["signed_up_at"])) < 35 * 86400000:
                 status = "starter"
             else:
                 status = "paying"
@@ -44728,6 +44777,7 @@ def sales_roster():
             "rep_name": r.get("rep_name") or "",
             "members": members.get(r["id"], []),
             "locations": locs.get(r["id"], []),
+            "region": r.get("region_label") or "",
         })
     out = {"ok": True, "accounts": accounts, "can_assign": is_admin}
     if is_admin:
@@ -45223,7 +45273,7 @@ def admin_today_boards():
             st = "trial"
         elif r.get("is_discounted"):
             st = "discounted"
-        elif r.get("starter_used") and r.get("signed_up_at") and                 (now_ms - r["signed_up_at"]) < 35 * 86400000:
+        elif r.get("starter_used") and r.get("signed_up_at") and                 (now_ms - _epoch_ms(r["signed_up_at"])) < 35 * 86400000:
             st = "starter"
         else:
             st = "full"
@@ -45266,7 +45316,7 @@ def admin_today_boards():
             trows = cur.fetchall()
     trials = []
     for r in trows:
-        ends = r.get("trial_ends_at")
+        ends = _epoch_ms(r.get("trial_ends_at"))
         days_left = max(0, int(round((ends - now_ms) / 86400000))) if ends else None
         messaged = bool(r.get("has_replied")) or (r.get("survey_messaged") == "yes")
         trials.append({
