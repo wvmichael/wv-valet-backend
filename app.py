@@ -208,7 +208,7 @@ ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-25"
+BACKEND_BUILD = "0702-26"
 _BOOT_TS = time.time()
 
 # Dedicated Valet Crew line (July 2026). Set this env var ONLY once the
@@ -44609,6 +44609,138 @@ def _current_sales_rep():
     except Exception as e:
         print(f"[sales-portal] rep lookup failed: {e!r}", flush=True)
         return user, None
+
+
+@app.route("/api/v1/sales/roster", methods=["OPTIONS"])
+def _sales_roster_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/sales/roster")
+def sales_roster():
+    """The full subscriber board (July 2026): every account with its
+    team members, locations, tier, status, lead Met, and salesperson.
+    Visible to admins AND sales reps (transparency by design, per
+    Michael); the rep-assignment action itself stays admin-only."""
+    user, rep = _current_sales_rep()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-signed-in"}), 401
+    is_admin = "admin" in (user.get("roles") or [])
+    if rep is None and not is_admin:
+        return jsonify({"ok": False, "error": "not-a-rep"}), 403
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.name, u.email, u.trial_business_name,
+                          u.subscription_tier, u.trial_status, u.trial_ends_at,
+                          u.is_discounted,
+                          a.rep_slug, a.starter_used, a.signed_up_at,
+                          sr.name AS rep_name,
+                          (SELECT m.name FROM subscriber_coverage sc
+                             JOIN users m ON m.id = sc.primary_met_id
+                            WHERE sc.user_id = u.id) AS met_name
+                   FROM users u
+                   JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'subscriber'
+                   LEFT JOIN sales_attributions a ON a.user_id = u.id
+                   LEFT JOIN sales_reps sr ON sr.slug = a.rep_slug
+                   WHERE u.is_active = TRUE
+                     AND NOT EXISTS (SELECT 1 FROM pro_multi_memberships pm
+                                     WHERE pm.member_user_id = u.id
+                                       AND pm.status = 'active')
+                   ORDER BY u.created_at DESC""",
+            )
+            rows = cur.fetchall()
+            cur.execute(
+                """SELECT pm.primary_user_id, mu.name
+                   FROM pro_multi_memberships pm
+                   JOIN users mu ON mu.id = pm.member_user_id
+                   WHERE pm.status = 'active'""",
+            )
+            member_rows = cur.fetchall()
+            cur.execute(
+                """SELECT user_id, COALESCE(NULLIF(label, ''), address_text) AS place
+                   FROM saved_locations ORDER BY is_primary DESC, id ASC""",
+            )
+            loc_rows = cur.fetchall()
+    members = {}
+    for m in member_rows:
+        members.setdefault(m["primary_user_id"], []).append(m["name"] or "")
+    locs = {}
+    for l in loc_rows:
+        if l.get("place"):
+            locs.setdefault(l["user_id"], []).append(l["place"])
+    accounts = []
+    for r in rows:
+        if r.get("trial_status") == "active":
+            ends = r.get("trial_ends_at")
+            days = max(0, int(round((ends - now_ms) / 86400000))) if ends else None
+            status = "trial"
+        else:
+            days = None
+            if r.get("is_discounted"):
+                status = "discounted"
+            elif r.get("starter_used") and r.get("signed_up_at") and                     (now_ms - r["signed_up_at"]) < 35 * 86400000:
+                status = "starter"
+            else:
+                status = "paying"
+        rep_slug = (r.get("rep_slug") or "")
+        accounts.append({
+            "user_id": r["id"],
+            "display": r.get("trial_business_name") or r.get("name") or r.get("email"),
+            "email": r.get("email") or "",
+            "tier": r.get("subscription_tier") or "",
+            "status": status,
+            "days_left": days,
+            "met": ((r.get("met_name") or "").split(" ") or [""])[0],
+            "rep_slug": "" if rep_slug == "organic" else rep_slug,
+            "rep_name": r.get("rep_name") or "",
+            "members": members.get(r["id"], []),
+            "locations": locs.get(r["id"], []),
+        })
+    out = {"ok": True, "accounts": accounts, "can_assign": is_admin}
+    if is_admin:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT slug, name FROM sales_reps
+                               WHERE is_active = TRUE ORDER BY slug""")
+                out["reps"] = [{"slug": x["slug"], "name": x["name"] or x["slug"]}
+                               for x in cur.fetchall()]
+    return jsonify(out)
+
+
+@app.route("/api/v1/admin/users/<int:user_id>/rep", methods=["OPTIONS"])
+def _admin_user_rep_preflight(user_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/users/<int:user_id>/rep")
+def admin_user_set_rep(user_id):
+    """Assign or reassign a subscriber's salesperson (July 2026). Upserts
+    sales_attributions; empty rep means house account. Keeps the original
+    signed_up_at so the 6-month commission window never resets."""
+    user = _get_current_user()
+    if user is None or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    rep_slug = (data.get("rep") or "").strip().lower() or None
+    if rep_slug:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM sales_reps WHERE slug = %s AND is_active = TRUE",
+                            (rep_slug,))
+                if not cur.fetchone():
+                    return jsonify({"ok": False, "error": "no-such-rep"}), 400
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO sales_attributions (user_id, rep_slug, signed_up_at)
+                   VALUES (%s, %s, %s)
+                   ON CONFLICT (user_id) DO UPDATE SET rep_slug = EXCLUDED.rep_slug""",
+                (user_id, rep_slug, int(time.time() * 1000)),
+            )
+    print(f"[rep-assign] user={user_id} -> rep={rep_slug or 'house'}", flush=True)
+    return jsonify({"ok": True, "rep_slug": rep_slug or ""})
 
 
 @app.route("/api/v1/sales/me", methods=["OPTIONS"])
