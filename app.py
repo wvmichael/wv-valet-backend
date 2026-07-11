@@ -208,7 +208,7 @@ ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-31"
+BACKEND_BUILD = "0702-32"
 
 
 def _epoch_ms(ts):
@@ -26976,8 +26976,8 @@ def me_crew_stats():
     user = _get_current_user()
     if user is None:
         return jsonify({"ok": False, "error": "not-authenticated"}), 401
-    if not _is_crew_member(user):
-        return jsonify({"ok": False, "error": "not-crew"}), 403
+    # July 2026: the Crew line accepts check-ins from ANY known person
+    # (Mets, admins, subscribers), so anyone may read their own streak.
 
     user_id = user["id"]
     streak = _compute_streak(user_id)
@@ -37444,8 +37444,16 @@ def _ingest_inbound_mms_image(uploaded_by) -> str | None:
     if not murl or not ctype.startswith("image/"):
         return None
     try:
-        import urllib.request
-        req = urllib.request.Request(murl, headers={"User-Agent": "WeatherValet crew line"})
+        import urllib.request, base64
+        headers = {"User-Agent": "WeatherValet crew line"}
+        # Twilio enforces HTTP basic auth on media URLs for newer accounts
+        # (July 2026): without credentials the fetch 401s silently and
+        # every texted photo vanishes. Auth with the same creds we send with.
+        if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+            tok = base64.b64encode(
+                f"{TWILIO_ACCOUNT_SID}:{TWILIO_AUTH_TOKEN}".encode()).decode()
+            headers["Authorization"] = "Basic " + tok
+        req = urllib.request.Request(murl, headers=headers)
         with urllib.request.urlopen(req, timeout=12) as resp:
             raw = resp.read(8 * 1024 * 1024 + 1)
         if len(raw) > 8 * 1024 * 1024:
