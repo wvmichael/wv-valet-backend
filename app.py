@@ -208,7 +208,7 @@ ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-32"
+BACKEND_BUILD = "0702-33"
 
 
 def _epoch_ms(ts):
@@ -44719,7 +44719,7 @@ def sales_roster():
             cur.execute(
                 """SELECT u.id, u.name, u.email, u.trial_business_name,
                           u.subscription_tier, u.trial_status, u.trial_ends_at,
-                          u.is_discounted,
+                          u.is_discounted, u.stripe_customer_id,
                           a.rep_slug, a.starter_used, a.signed_up_at,
                           sr.name AS rep_name,
                           (SELECT m.name FROM subscriber_coverage sc
@@ -44770,8 +44770,16 @@ def sales_roster():
                 status = "discounted"
             elif r.get("starter_used") and r.get("signed_up_at") and                     (now_ms - _epoch_ms(r["signed_up_at"])) < 35 * 86400000:
                 status = "starter"
-            else:
+            elif r.get("stripe_customer_id"):
+                # Real payment evidence: they went through checkout.
                 status = "paying"
+            elif r.get("trial_status") == "expired":
+                status = "trial_ended"
+            else:
+                # Tier without billing evidence: courtesy account (July
+                # 2026: gov partners and internal accounts wore a false
+                # "Paying" badge on the board).
+                status = "comped"
         rep_slug = (r.get("rep_slug") or "")
         accounts.append({
             "user_id": r["id"],
@@ -45260,7 +45268,7 @@ def admin_today_boards():
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT u.id, u.subscription_tier, u.trial_status,
-                          u.trial_ends_at, u.is_discounted,
+                          u.trial_ends_at, u.is_discounted, u.stripe_customer_id,
                           a.starter_used, a.signed_up_at
                    FROM users u
                    JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'subscriber'
@@ -45269,7 +45277,7 @@ def admin_today_boards():
             )
             rows = cur.fetchall()
     tiers = ["hobbyist", "pro_single", "pro_multi"]
-    statuses = ["trial", "starter", "full", "discounted"]
+    statuses = ["trial", "starter", "full", "comped", "discounted"]
     grid = {t: {st: 0 for st in statuses} for t in tiers}
     other = 0
     for r in rows:
@@ -45283,6 +45291,8 @@ def admin_today_boards():
             st = "discounted"
         elif r.get("starter_used") and r.get("signed_up_at") and                 (now_ms - _epoch_ms(r["signed_up_at"])) < 35 * 86400000:
             st = "starter"
+        elif not r.get("stripe_customer_id"):
+            st = "comped"
         else:
             st = "full"
         grid[tier][st] += 1
