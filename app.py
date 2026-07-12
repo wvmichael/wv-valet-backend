@@ -208,7 +208,7 @@ ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-35"
+BACKEND_BUILD = "0702-37"
 
 
 def _epoch_ms(ts):
@@ -25297,9 +25297,16 @@ def _find_crew_for_mission(polygon_geojson: Optional[str]) -> list:
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT u.id, u.name, u.email, u.phone,
-                          u.crew_home_lat, u.crew_home_lng, u.crew_home_label
+                          COALESCE(u.crew_home_lat, sl.lat) AS crew_home_lat,
+                          COALESCE(u.crew_home_lng, sl.lng) AS crew_home_lng,
+                          u.crew_home_label
                    FROM users u
                    JOIN user_roles ur ON ur.user_id = u.id
+                   LEFT JOIN LATERAL (
+                       SELECT lat, lng FROM saved_locations s
+                       WHERE s.user_id = u.id
+                       ORDER BY s.is_primary DESC, s.id ASC LIMIT 1
+                   ) sl ON TRUE
                    WHERE ur.role = 'crew'
                      AND u.is_active = TRUE
                      AND u.crew_active = TRUE
@@ -25313,8 +25320,11 @@ def _find_crew_for_mission(polygon_geojson: Optional[str]) -> list:
 
     matching = []
     for c in all_crew:
+        # July 2026: coordinates fall back to the member's primary saved
+        # location (same rule as map pins), so admins and Mets using the
+        # Crew line are targetable too. Only the truly location-less skip.
         if c["crew_home_lat"] is None or c["crew_home_lng"] is None:
-            continue  # Crew member hasn't set location, can't target them
+            continue
         if _point_in_polygon_geojson(c["crew_home_lat"], c["crew_home_lng"], polygon_geojson):
             matching.append(c)
     return matching
@@ -25361,7 +25371,13 @@ def _dispatch_mission_sms(mission_id: int, prompt: str, polygon_geojson: Optiona
         delivery_status = "stubbed"
         twilio_sid = None
         try:
-            ok = send_sms(c["phone"], sms_body)
+            # July 2026: send from the dedicated Crew line when it exists.
+            # Replies to a mission ARE crew reports; on the main number
+            # a photo reply vanished into the subscriber/Met path.
+            if TWILIO_CREW_NUMBER:
+                ok = send_sms_from(c["phone"], sms_body, TWILIO_CREW_NUMBER)
+            else:
+                ok = send_sms(c["phone"], sms_body)
             delivery_status = "sent" if ok else "failed"
         except Exception as e:
             print(f"[mission-sms] send failed crew_id={c['id']}: {e}", flush=True)
@@ -33065,7 +33081,28 @@ def met_mission_audience_count():
         print(f"[mission-audience-count] error: {e}", flush=True)
         return jsonify({"ok": False, "error": "lookup-failed"}), 500
 
-    return jsonify({"ok": True, "count": len(crew)})
+    # Name the crew no selection can reach (July 2026): members without
+    # home coordinates are invisible to map targeting, which made this
+    # count silently disagree with the People tab's crew list.
+    unplaced = []
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT u.id, u.name FROM users u
+                       JOIN user_roles ur ON ur.user_id = u.id
+                       WHERE ur.role = 'crew'
+                         AND u.is_active = TRUE
+                         AND u.crew_active = TRUE
+                         AND (u.crew_home_lat IS NULL OR u.crew_home_lng IS NULL)
+                       ORDER BY u.name""",
+                )
+                unplaced = [{"user_id": x["id"], "name": x.get("name") or ""}
+                            for x in cur.fetchall()]
+    except Exception as e:
+        print(f"[mission-audience-count] unplaced lookup failed: {e!r}", flush=True)
+
+    return jsonify({"ok": True, "count": len(crew), "unplaced": unplaced})
 
 
 @app.get("/api/v1/met/crew-locations")
@@ -33113,7 +33150,28 @@ def met_crew_locations():
             "lng": float(r["crew_home_lng"]),
             "label": r.get("crew_home_label") or "",
         })
-    return jsonify({"ok": True, "count": len(out), "crew": out})
+    # Also name the crew this selector CANNOT see (July 2026): members
+    # with no home coordinates never appear in a map selection, which
+    # made mission counts silently disagree with the People tab.
+    unplaced = []
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT u.id, u.name FROM users u
+                       JOIN user_roles ur ON ur.user_id = u.id
+                       WHERE ur.role = 'crew'
+                         AND u.is_active = TRUE
+                         AND u.crew_active = TRUE
+                         AND (u.crew_home_lat IS NULL OR u.crew_home_lng IS NULL)
+                       ORDER BY u.name""",
+                )
+                unplaced = [{"user_id": x["id"], "name": x.get("name") or ""}
+                            for x in cur.fetchall()]
+    except Exception as e:
+        print(f"[crew-locations] unplaced lookup failed: {e!r}", flush=True)
+    return jsonify({"ok": True, "count": len(out), "crew": out,
+                    "unplaced": unplaced})
 
 
 @app.get("/api/v1/met/map-default-center")
