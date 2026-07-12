@@ -208,7 +208,7 @@ ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-34"
+BACKEND_BUILD = "0702-35"
 
 
 def _epoch_ms(ts):
@@ -26022,6 +26022,23 @@ def _crew_apply_preflight():
     return ("", 204)
 
 
+def _crew_apply_location_desc(geo, state, zip_code) -> str:
+    """Human-readable place line for the crew-application email (July
+    2026: 'Gaston County' alone identifies nothing; there are Gaston
+    Counties in more than one state). Prefers the geocoded city+state,
+    falls back to whatever the form gave us."""
+    bits = []
+    if geo:
+        place = ", ".join(p for p in [geo.get("name"), geo.get("admin1")] if p)
+        if place:
+            bits.append(place)
+    if not bits and state:
+        bits.append(state)
+    if zip_code:
+        bits.append(f"zip {zip_code}")
+    return " · ".join(bits) if bits else "(no location given)"
+
+
 @app.post("/api/v1/crew/apply")
 def crew_apply_submit():
     """Submit a Crew application. Public — no auth required.
@@ -26058,6 +26075,7 @@ def crew_apply_submit():
     phone = normalize_phone(phone_raw) if phone_raw else None
     county = (data.get("county") or "").strip() or None
     state = (data.get("state") or "").strip() or None
+    geo = None  # bound even when no zip/county arrives (July 2026)
     zip_code = (data.get("zip") or "").strip() or None
     # Keep only a clean 5-digit US zip; ignore anything else.
     if zip_code:
@@ -26237,6 +26255,7 @@ def crew_apply_submit():
                 f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Handle</td><td>{_html_escape(handle or "(none)")}</td></tr>'
                 f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Phone</td><td>{_html_escape(phone or "(none)")}</td></tr>'
                 f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">County</td><td>{_html_escape(county or "(none)")}</td></tr>'
+                f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Location</td><td>{_html_escape(_crew_apply_location_desc(geo, state, zip_code))}</td></tr>'
                 f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Interests</td><td>{_html_escape(mission_interests or "(none)")}</td></tr>'
                 f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Hours</td><td>{_html_escape(hours)}</td></tr>'
                 f'<tr><td style="padding:4px 12px 4px 0;color:#6E7682;">Notify</td><td>{_html_escape(notify)}</td></tr>'
