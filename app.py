@@ -208,7 +208,7 @@ ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-37"
+BACKEND_BUILD = "0702-38"
 
 
 def _epoch_ms(ts):
@@ -658,6 +658,30 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS team_cap_override INTEGER;
 --         behalf with timestamp). Twilio accepts both as long as
 --         each is documented.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS operational_sms_consent_at BIGINT;
+
+-- July 2026: sales rep business-trial intakes. Reps gather the onboarding
+-- answers on the phone; the SYSTEM creates the account only after the
+-- prospect texts YES (their own consent record). Reps never touch accounts.
+CREATE TABLE IF NOT EXISTS business_trial_intakes (
+    id BIGSERIAL PRIMARY KEY,
+    created_at BIGINT NOT NULL,
+    rep_slug TEXT,
+    business TEXT NOT NULL,
+    contact_name TEXT,
+    phone TEXT NOT NULL,
+    phone_last10 TEXT NOT NULL,
+    email TEXT NOT NULL,
+    city TEXT,
+    industry TEXT,
+    profile_json TEXT,
+    notes TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    consent_sms_sent_at BIGINT,
+    activated_at BIGINT,
+    declined_at BIGINT,
+    user_id BIGINT
+);
+CREATE INDEX IF NOT EXISTS idx_bti_phone10 ON business_trial_intakes (phone_last10);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS operational_sms_consent_ip TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS operational_sms_consent_source TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS operational_sms_consent_recorded_by INTEGER;
@@ -7429,6 +7453,259 @@ TRIAL_REGION_MET = {
     "boone":  "timmy@weathervalet.com",
     "kansas": "sramek@weathervalet.com",
 }
+
+
+@app.route("/api/v1/sales/business-trial-intake", methods=["OPTIONS"])
+def sales_bti_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/sales/business-trial-intake")
+def sales_business_trial_intake():
+    """A rep (or admin) submits a phone-gathered business trial intake.
+    Creates a pending row and texts the prospect a YES-to-start consent
+    message from the main number. No account exists until they reply YES;
+    reps have no access to subscriber accounts (July 2026, by design)."""
+    user, rep = _current_sales_rep()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    is_admin = "admin" in (user.get("roles") or [])
+    if rep is None and not is_admin:
+        return jsonify({"ok": False, "error": "not-a-rep"}), 403
+    data = request.get_json(silent=True) or {}
+    business = (data.get("business") or "").strip()[:200]
+    contact = (data.get("contact_name") or "").strip()[:120]
+    phone = (data.get("phone") or "").strip()[:30]
+    email = (data.get("email") or "").strip().lower()[:200]
+    city = (data.get("city") or "").strip()[:80]
+    industry = (data.get("industry") or "").strip()[:200]
+    notes = (data.get("notes") or "").strip()[:2000]
+    if not business or not phone or not email or "@" not in email:
+        return jsonify({"ok": False, "error": "missing-fields"}), 400
+    p10 = _phone_last10(phone)
+    if not p10 or len(p10) < 10:
+        return jsonify({"ok": False, "error": "bad-phone"}), 400
+    profile = {
+        "industry": industry,
+        "client_decisions": data.get("client_decisions") or [],
+        "watched_thresholds": data.get("watched_thresholds") or [],
+        "worst_event_history": (data.get("worst_event_history") or "")[:2000],
+        "operation_detail": data.get("operation_detail") or {},
+        "contact_protocol": data.get("contact_protocol") or {},
+    }
+    now = now_ts()
+    rep_slug = (rep or {}).get("slug") if rep else "admin"
+    consent_msg = (
+        f"{contact or 'Hi'}, {(rep or {}).get('name') or 'our team'} with WeatherValet "
+        f"set up your free 30-day trial for {business}. Reply YES and your first "
+        f"morning forecast from a real local Meteorologist arrives tomorrow. "
+        f"Reply STOP to opt out."
+    )
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id FROM business_trial_intakes
+                        WHERE phone_last10=%s AND status='pending'""",
+                    (p10,),
+                )
+                row = cur.fetchone()
+                if row:
+                    cur.execute(
+                        """UPDATE business_trial_intakes
+                              SET business=%s, contact_name=%s, email=%s, city=%s,
+                                  industry=%s, profile_json=%s, notes=%s,
+                                  rep_slug=%s, consent_sms_sent_at=%s
+                            WHERE id=%s""",
+                        (business, contact, email, city, industry,
+                         json.dumps(profile), notes, rep_slug, now * 1000, row["id"]),
+                    )
+                    intake_id = row["id"]
+                    resent = True
+                else:
+                    cur.execute(
+                        """INSERT INTO business_trial_intakes
+                               (created_at, rep_slug, business, contact_name, phone,
+                                phone_last10, email, city, industry, profile_json,
+                                notes, status, consent_sms_sent_at)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending',%s)
+                           RETURNING id""",
+                        (now * 1000, rep_slug, business, contact, phone, p10, email,
+                         city, industry, json.dumps(profile), notes, now * 1000),
+                    )
+                    intake_id = cur.fetchone()["id"]
+                    resent = False
+    except Exception as e:
+        print(f"[bti] intake save failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "save-failed"}), 500
+    try:
+        sent = send_sms(phone, consent_msg)
+    except Exception as e:
+        print(f"[bti] consent sms failed intake={intake_id}: {e!r}", flush=True)
+        sent = False
+    print(f"[bti] intake {intake_id} by {rep_slug} for {business} "
+          f"consent_sms={'sent' if sent else 'FAILED'} resent={resent}", flush=True)
+    return jsonify({"ok": True, "intake_id": intake_id, "consent_sms_sent": bool(sent),
+                    "resent": resent})
+
+
+@app.get("/api/v1/sales/business-trial-intakes")
+def sales_business_trial_intakes_list():
+    """A rep sees their own intakes; admins see all."""
+    user, rep = _current_sales_rep()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    is_admin = "admin" in (user.get("roles") or [])
+    if rep is None and not is_admin:
+        return jsonify({"ok": False, "error": "not-a-rep"}), 403
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                if is_admin:
+                    cur.execute(
+                        """SELECT id, created_at, rep_slug, business, contact_name,
+                                  phone, city, status, activated_at
+                             FROM business_trial_intakes
+                            ORDER BY created_at DESC LIMIT 200""")
+                else:
+                    cur.execute(
+                        """SELECT id, created_at, rep_slug, business, contact_name,
+                                  phone, city, status, activated_at
+                             FROM business_trial_intakes
+                            WHERE rep_slug=%s
+                            ORDER BY created_at DESC LIMIT 200""",
+                        (rep["slug"],),
+                    )
+                rows = cur.fetchall()
+    except Exception as e:
+        print(f"[bti] list failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "list-failed"}), 500
+    return jsonify({"ok": True, "intakes": [dict(r) for r in rows]})
+
+
+def _activate_business_intake(intake) -> bool:
+    """The prospect texted YES: create their trial account exactly the way
+    /api/v1/boone/trial-signup would (July 2026, mirrors that handler:
+    tier + trial stamps, geocoded primary location, region Met assignment,
+    rep attribution), then apply the rep-gathered operational profile via
+    _apply_operational_profile, stamp SMS consent, and send the welcome
+    receipt email. Returns True on success."""
+    now = now_ts()
+    email = intake["email"]
+    business = intake.get("business") or ""
+    name = intake.get("contact_name") or ""
+    phone = intake.get("phone") or ""
+    city = intake.get("city") or ""
+    industry = intake.get("industry") or ""
+    cohort = "boone"
+    try:
+        profile = json.loads(intake.get("profile_json") or "{}")
+    except Exception:
+        profile = {}
+    ends = now + BOONE_TRIAL_DAYS * 24 * 60 * 60
+    try:
+        with db() as conn:
+            user_id = _get_or_create_user(email, conn)
+            _grant_subscriber_role(user_id, conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE users
+                          SET subscription_tier = 'pro_single',
+                              name = COALESCE(NULLIF(name, ''), %s),
+                              phone = COALESCE(NULLIF(phone, ''), %s),
+                              trial_cohort = %s,
+                              trial_category = %s,
+                              trial_started_at = %s,
+                              trial_ends_at = %s,
+                              trial_status = 'active',
+                              trial_business_name = %s,
+                              operational_sms_consent_at = %s
+                        WHERE id = %s""",
+                    (name or None, phone or None, cohort, industry or "business",
+                     now, ends, business, now * 1000, user_id),
+                )
+            if city:
+                try:
+                    geo_query = f"{city}, Indiana"
+                    geo = _geocode_address(geo_query)
+                    if geo and _geocode_looks_confident(geo_query, geo):
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """INSERT INTO saved_locations
+                                     (user_id, label, address_text, lat, lng,
+                                      county, is_primary, created_at, updated_at)
+                                   VALUES (%s,%s,%s,%s,%s,%s,TRUE,%s,%s)""",
+                                (user_id, city[:80], geo_query, geo["lat"], geo["lng"],
+                                 geo.get("county"), now * 1000, now * 1000),
+                            )
+                except Exception as e:
+                    print(f"[bti-activate] location store failed: {e!r}", flush=True)
+            met_email = TRIAL_REGION_MET.get(cohort)
+            if met_email:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT id FROM users WHERE LOWER(email)=LOWER(%s)", (met_email,))
+                    met_row = cur.fetchone()
+                    if met_row:
+                        cur.execute(
+                            """INSERT INTO subscriber_coverage (user_id, primary_met_id, updated_at)
+                               VALUES (%s,%s,%s)
+                               ON CONFLICT (user_id) DO UPDATE
+                               SET primary_met_id = EXCLUDED.primary_met_id,
+                                   updated_at = EXCLUDED.updated_at
+                               WHERE subscriber_coverage.primary_met_id IS NULL""",
+                            (user_id, met_row["id"], int(time.time() * 1000)),
+                        )
+            rep_slug = (intake.get("rep_slug") or "").strip() or None
+            if rep_slug and rep_slug != "admin":
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """INSERT INTO sales_attributions
+                                   (user_id, rep_slug, signed_up_at, starter_used, locked)
+                               VALUES (%s,%s,%s,FALSE,TRUE)
+                               ON CONFLICT (user_id) DO NOTHING""",
+                            (user_id, rep_slug, now),
+                        )
+                except Exception as e:
+                    print(f"[bti-activate] attribution failed: {e!r}", flush=True)
+    except Exception as e:
+        print(f"[bti-activate] account creation failed intake={intake['id']}: {e!r}", flush=True)
+        return False
+    try:
+        result = _apply_operational_profile(user_id, profile)
+        print(f"[bti-activate] profile applied user={user_id}: {result}", flush=True)
+    except Exception as e:
+        print(f"[bti-activate] profile apply failed: {e!r}", flush=True)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE business_trial_intakes
+                          SET status='active', activated_at=%s, user_id=%s
+                        WHERE id=%s""",
+                    (now * 1000, user_id, intake["id"]),
+                )
+    except Exception as e:
+        print(f"[bti-activate] status update failed: {e!r}", flush=True)
+    try:
+        _send_brief_email(
+            email,
+            "Welcome to WeatherValet, you're all set",
+            f"<div style=\"font-family:Segoe UI,Roboto,sans-serif;max-width:560px;margin:24px auto;padding:0 16px;color:#0E1116;\">"
+            f"<h2 style=\"font-size:18px;margin:0 0 14px;\">You're all set, {_html_escape(name or business)}</h2>"
+            f"<p>Your free 30-day WeatherValet trial for <b>{_html_escape(business)}</b> is active. "
+            f"Everything was set up for you from your conversation with our team, there's nothing you need to do. "
+            f"Your first morning forecast from a real local Meteorologist arrives tomorrow by text.</p>"
+            f"<p>Want to review or adjust what we watch for? Visit "
+            f"<a href=\"https://api.weathervalet.ai/wv_onboarding.html\">your weather profile</a> anytime, "
+            f"or simply reply to any of our texts and we'll adjust it for you.</p>"
+            f"<p style=\"color:#6E7682;font-size:13px;\">No credit card on file. The trial simply ends unless you choose to continue.</p>"
+            f"</div>",
+            html=True,
+        )
+    except Exception as e:
+        print(f"[bti-activate] welcome email failed: {e!r}", flush=True)
+    return True
 
 
 def _send_rep_message(rep_slug: str, sms_body: str, subject: str,
@@ -18148,14 +18425,12 @@ def me_operational_profile_preflight():
     return ("", 204)
 
 
-@app.post("/api/v1/me/operational-profile")
-def me_operational_profile_save():
-    user = _get_current_user()
-    if not user:
-        return jsonify({"ok": False, "error": "not-authenticated"}), 401
-    data = request.get_json(silent=True) or {}
+def _apply_operational_profile(user_id: int, data: dict) -> dict:
+    """Write a subscriber's operational profile (coverage context +
+    watched thresholds). Shared by the onboarding page endpoint and
+    the sales rep intake activation (July 2026), so a rep-gathered
+    profile lands identically to a self-service one."""
     now_ms = int(time.time() * 1000)
-
     # ── 1. Structured context onto subscriber_coverage ──
     industry = (data.get("industry") or "").strip()[:200]
     decisions = data.get("client_decisions") or []
@@ -18183,7 +18458,7 @@ def me_operational_profile_save():
     try:
         with db() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT user_id FROM subscriber_coverage WHERE user_id=%s", (user["id"],))
+                cur.execute("SELECT user_id FROM subscriber_coverage WHERE user_id=%s", (user_id,))
                 if cur.fetchone():
                     cur.execute(
                         """UPDATE subscriber_coverage
@@ -18193,7 +18468,7 @@ def me_operational_profile_save():
                                   additional_context = COALESCE(NULLIF(%s,''), additional_context),
                                   updated_at = %s
                             WHERE user_id = %s""",
-                        (industry, decisions_txt, peak_txt, additional_ctx, now_ms, user["id"]),
+                        (industry, decisions_txt, peak_txt, additional_ctx, now_ms, user_id),
                     )
                 else:
                     cur.execute(
@@ -18201,10 +18476,10 @@ def me_operational_profile_save():
                                (user_id, business_role, weather_decisions, peak_need_times,
                                 additional_context, updated_at)
                            VALUES (%s,%s,%s,%s,%s,%s)""",
-                        (user["id"], industry, decisions_txt, peak_txt, additional_ctx, now_ms),
+                        (user_id, industry, decisions_txt, peak_txt, additional_ctx, now_ms),
                     )
     except Exception as e:
-        print(f"[operational-profile] context save failed for user {user['id']}: {e}", flush=True)
+        print(f"[operational-profile] context save failed for user {user_id}: {e}", flush=True)
         # Non-fatal: still try to save thresholds below.
 
     # ── 2. Watched thresholds -> threshold_alerts (dedup by content) ──
@@ -18241,7 +18516,7 @@ def me_operational_profile_save():
                         """SELECT id FROM threshold_alerts
                             WHERE user_id=%s AND metric=%s AND comparator=%s
                               AND threshold_value=%s AND units=%s""",
-                        (user["id"], metric, comp, tv, units),
+                        (user_id, metric, comp, tv, units),
                     )
                     if cur.fetchone():
                         continue
@@ -18250,15 +18525,27 @@ def me_operational_profile_save():
                                (user_id, metric, comparator, threshold_value, units,
                                 channels, enabled, created_at, updated_at)
                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                        (user["id"], metric, comp, tv, units, "sms,email", True, now_ms, now_ms),
+                        (user_id, metric, comp, tv, units, "sms,email", True, now_ms, now_ms),
                     )
                     created += 1
     except Exception as e:
-        print(f"[operational-profile] threshold save failed for user {user['id']}: {e}", flush=True)
-        return jsonify({"ok": False, "error": "threshold-save-failed"}), 500
+        print(f"[operational-profile] threshold save failed for user {user_id}: {e}", flush=True)
+        return {"ok": False, "error": "threshold-save-failed"}
 
-    return jsonify({"ok": True, "thresholds_created": created, "skipped": skipped,
-                    "severe_watched": severe_watched})
+    return {"ok": True, "thresholds_created": created, "skipped": skipped,
+            "severe_watched": severe_watched}
+
+
+@app.post("/api/v1/me/operational-profile")
+def me_operational_profile_save():
+    user = _get_current_user()
+    if not user:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    data = request.get_json(silent=True) or {}
+    result = _apply_operational_profile(user["id"], data)
+    if not result.get("ok"):
+        return jsonify(result), 500
+    return jsonify(result)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -37617,6 +37904,50 @@ def sms_inbound_router():
     if TWILIO_CREW_NUMBER and _phone_last10(to_phone) == _phone_last10(TWILIO_CREW_NUMBER):
         print(f"[sms-router] crew line from={from_phone} body_len={len(body)}", flush=True)
         return _crew_line_inbound(from_phone, body)
+
+    # ── Business-trial consent (July 2026): a pending intake's prospect
+    # texting YES on the main line IS their signup. Checked before user
+    # matching because no account exists yet.
+    if body.strip().upper().rstrip("!.") in ("YES", "Y"):
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT * FROM business_trial_intakes
+                            WHERE phone_last10=%s AND status='pending'
+                            ORDER BY created_at DESC LIMIT 1""",
+                        (_phone_last10(from_phone),),
+                    )
+                    intake = cur.fetchone()
+        except Exception as e:
+            print(f"[sms-router] intake lookup failed: {e!r}", flush=True)
+            intake = None
+        if intake:
+            ok = _activate_business_intake(intake)
+            if ok:
+                try:
+                    send_sms(from_phone,
+                             "You're in! Your first WeatherValet morning forecast "
+                             "arrives tomorrow morning. Questions anytime? Just "
+                             "reply here and a real Meteorologist will answer.")
+                except Exception:
+                    pass
+                print(f"[sms-router] intake {intake['id']} activated via YES", flush=True)
+            return ("", 204)
+
+    if body.strip().upper() in ("STOP", "NO") :
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """UPDATE business_trial_intakes
+                              SET status='declined', declined_at=%s
+                            WHERE phone_last10=%s AND status='pending'""",
+                        (int(time.time() * 1000), _phone_last10(from_phone)),
+                    )
+        except Exception:
+            pass
+        # fall through: existing STOP handling / user matching continues
 
     # Look up the sender's role(s). One query, returns highest-privilege role.
     # Met/admin take priority over subscriber if the same person has both
