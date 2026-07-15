@@ -208,7 +208,7 @@ ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-39"
+BACKEND_BUILD = "0702-40"
 
 
 def _epoch_ms(ts):
@@ -7638,6 +7638,13 @@ def _activate_business_intake(intake) -> bool:
                                 (user_id, city[:80], geo_query, geo["lat"], geo["lng"],
                                  geo.get("county"), now * 1000, now * 1000),
                             )
+                            cur.execute(
+                                """UPDATE users SET timezone = %s
+                                    WHERE id = %s
+                                      AND (timezone IS NULL OR timezone = ''
+                                           OR timezone = 'America/Indiana/Indianapolis')""",
+                                (_approx_us_tz_from_lng(geo["lng"]), user_id),
+                            )
                 except Exception as e:
                     print(f"[bti-activate] location store failed: {e!r}", flush=True)
             met_email = TRIAL_REGION_MET.get(cohort)
@@ -8085,7 +8092,11 @@ def boone_trial_signup():
             # location. Non-blocking: a bad geocode never breaks signup.
             if city:
                 try:
-                    state = "Kansas" if "ks" in ((cohort or "") + (category or "")).lower() else "Indiana"
+                    # July 2026 fix: the Kansas cohort is spelled "kansas",
+                    # which does NOT contain "ks" - every Kansas signup was
+                    # geocoded as "<city>, Indiana" and dropped or mis-pinned.
+                    combined = ((cohort or "") + " " + (category or "")).lower()
+                    state = "Kansas" if ("kansas" in combined or "ks" in combined.split()) else "Indiana"
                     geo_query = f"{city}, {state}"
                     geo = _geocode_address(geo_query)
                     if geo and _geocode_looks_confident(geo_query, geo):
@@ -8099,6 +8110,13 @@ def boone_trial_signup():
                                     (user_id, city[:80], geo_query,
                                      geo["lat"], geo["lng"],
                                      geo.get("county"), now * 1000, now * 1000),
+                                )
+                                cur2.execute(
+                                    """UPDATE users SET timezone = %s
+                                        WHERE id = %s
+                                          AND (timezone IS NULL OR timezone = ''
+                                               OR timezone = 'America/Indiana/Indianapolis')""",
+                                    (_approx_us_tz_from_lng(geo["lng"]), user_id),
                                 )
                         print(f"[trial-signup] located {city} -> "
                               f"{geo['lat']:.3f},{geo['lng']:.3f}", flush=True)
@@ -13484,6 +13502,16 @@ def admin_user_set_location(user_id: int):
     try:
         with db() as conn:
             with conn.cursor() as cur:
+                # July 2026: setting a location also heals a missing
+                # timezone, so a Kansas subscriber repaired via Edit
+                # Location gets Central-time briefs the very next morning.
+                cur.execute(
+                    """UPDATE users SET timezone = %s
+                        WHERE id = %s
+                          AND (timezone IS NULL OR timezone = ''
+                               OR timezone = 'America/Indiana/Indianapolis')""",
+                    (_approx_us_tz_from_lng(lng), user_id),
+                )
                 # Look for existing primary location for this user.
                 cur.execute(
                     """SELECT id FROM saved_locations
@@ -24583,7 +24611,9 @@ def _approx_us_tz_from_lng(lng):
         return "America/Indiana/Indianapolis"
     if x >= -87.5:
         return "America/New_York"
-    if x >= -101.0:
+    if x >= -102.0:
+        # July 2026: edge moved from -101 to -102 so western Kansas
+        # (Colby is -101.05) lands in Central, where it actually lives.
         return "America/Chicago"
     if x >= -114.5:
         return "America/Denver"
