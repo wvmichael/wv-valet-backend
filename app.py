@@ -208,7 +208,7 @@ ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-38"
+BACKEND_BUILD = "0702-39"
 
 
 def _epoch_ms(ts):
@@ -7687,6 +7687,19 @@ def _activate_business_intake(intake) -> bool:
                 )
     except Exception as e:
         print(f"[bti-activate] status update failed: {e!r}", flush=True)
+    try:
+        _send_team_notification(
+            subject=f"New Boone trial (rep intake): {business}",
+            html_body=(f"<p><b>{_html_escape(business)}</b> ({_html_escape(name or 'no contact name')}, "
+                       f"{_html_escape(email)}, {_html_escape(phone)}) accepted the trial by texting YES. "
+                       f"Rep: {_html_escape(intake.get('rep_slug') or 'unknown')}. City: {_html_escape(city or 'not given')}. "
+                       f"Their operational profile was applied from the rep's intake."),
+            text_body=(f"{business} ({email}) accepted the trial by texting YES. "
+                       f"Rep: {intake.get('rep_slug')}. City: {city or 'not given'}."),
+            extra_recipients=[TRIAL_REGION_MET.get("boone")],
+        )
+    except Exception as e:
+        print(f"[bti-activate] team notification failed: {e!r}", flush=True)
     try:
         _send_brief_email(
             email,
