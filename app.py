@@ -208,7 +208,7 @@ ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-41"
+BACKEND_BUILD = "0702-43"
 
 
 def _epoch_ms(ts):
@@ -694,6 +694,37 @@ CREATE TABLE IF NOT EXISTS onboarding_acks (
     name_snapshot TEXT,
     UNIQUE (user_id, slug, version)
 );
+-- July 2026: Watch Cards. The dated layer of a subscriber's Watch Card:
+-- weather-sensitive events (pours, events, weddings, games) the Mets
+-- watch for. watch_updates logs every "we're watching" text a Met sends,
+-- which is the company's promise-kept metric.
+CREATE TABLE IF NOT EXISTS watch_events (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    title TEXT NOT NULL,
+    day_key TEXT NOT NULL,
+    start_hhmm TEXT,
+    end_hhmm TEXT,
+    location_label TEXT,
+    notes TEXT,
+    source TEXT NOT NULL DEFAULT 'portal',
+    created_by BIGINT,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_watch_events_user_day ON watch_events (user_id, day_key);
+CREATE INDEX IF NOT EXISTS idx_watch_events_day ON watch_events (day_key);
+
+CREATE TABLE IF NOT EXISTS watch_updates (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    met_id BIGINT NOT NULL,
+    body TEXT NOT NULL,
+    event_id BIGINT,
+    sent_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_watch_updates_user ON watch_updates (user_id, sent_at);
+
 CREATE TABLE IF NOT EXISTS onboarding_forms (
     id BIGSERIAL PRIMARY KEY,
     user_id BIGINT NOT NULL,
@@ -7473,6 +7504,414 @@ TRIAL_REGION_MET = {
     "boone":  "timmy@weathervalet.com",
     "kansas": "sramek@weathervalet.com",
 }
+
+
+# ════════════════════════════════════════════════════════════════════
+# Watch Cards (July 2026): the dated layer of a subscriber's Watch Card.
+# Subscribers add events in their account (or by telling their Met, who
+# adds them from the Day Board). Mets see a Today board, send watch
+# updates that are logged, get a morning digest, and subscribers get a
+# Sunday-evening "what's your week look like?" prompt.
+# ════════════════════════════════════════════════════════════════════
+
+def _watch_event_row(r) -> dict:
+    return {"id": r["id"], "user_id": r["user_id"], "title": r["title"],
+            "day_key": r["day_key"], "start_hhmm": r.get("start_hhmm"),
+            "end_hhmm": r.get("end_hhmm"), "location_label": r.get("location_label"),
+            "notes": r.get("notes"), "source": r.get("source"), "status": r.get("status")}
+
+
+def _valid_day_key(k: str) -> bool:
+    try:
+        from datetime import date
+        y, m, d = k.split("-")
+        date(int(y), int(m), int(d))
+        return True
+    except Exception:
+        return False
+
+
+@app.route("/api/v1/me/watch-events", methods=["OPTIONS"])
+def me_watch_events_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/watch-events")
+def me_watch_events_list():
+    user = _get_current_user()
+    if not user:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT * FROM watch_events
+                        WHERE user_id=%s AND status='active'
+                          AND day_key >= to_char(now() - interval '1 day', 'YYYY-MM-DD')
+                        ORDER BY day_key, start_hhmm NULLS LAST""",
+                    (user["id"],),
+                )
+                rows = cur.fetchall()
+    except Exception as e:
+        print(f"[watch] list failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "list-failed"}), 500
+    return jsonify({"ok": True, "events": [_watch_event_row(r) for r in rows]})
+
+
+@app.post("/api/v1/me/watch-events")
+def me_watch_events_add():
+    user = _get_current_user()
+    if not user:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    d = request.get_json(silent=True) or {}
+    title = (d.get("title") or "").strip()[:200]
+    day_key = (d.get("day_key") or "").strip()
+    if not title or not _valid_day_key(day_key):
+        return jsonify({"ok": False, "error": "missing-fields"}), 400
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO watch_events
+                           (user_id, title, day_key, start_hhmm, end_hhmm,
+                            location_label, notes, source, created_by, created_at)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,'portal',%s,%s)
+                       RETURNING *""",
+                    (user["id"], title, day_key,
+                     (d.get("start_hhmm") or "").strip()[:5] or None,
+                     (d.get("end_hhmm") or "").strip()[:5] or None,
+                     (d.get("location_label") or "").strip()[:200] or None,
+                     (d.get("notes") or "").strip()[:1000] or None,
+                     user["id"], int(time.time() * 1000)),
+                )
+                row = cur.fetchone()
+    except Exception as e:
+        print(f"[watch] add failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "save-failed"}), 500
+    return jsonify({"ok": True, "event": _watch_event_row(row)})
+
+
+@app.route("/api/v1/me/watch-events/<int:event_id>", methods=["OPTIONS"])
+def me_watch_event_del_preflight(event_id):
+    return ("", 204)
+
+
+@app.delete("/api/v1/me/watch-events/<int:event_id>")
+def me_watch_events_delete(event_id):
+    user = _get_current_user()
+    if not user:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE watch_events SET status='cancelled'
+                        WHERE id=%s AND user_id=%s""",
+                    (event_id, user["id"]),
+                )
+                n = cur.rowcount
+    except Exception as e:
+        print(f"[watch] delete failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "delete-failed"}), 500
+    return jsonify({"ok": bool(n)})
+
+
+def _met_subscriber_ids(met_id: int) -> list:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT sc.user_id FROM subscriber_coverage sc
+                    JOIN users u ON u.id = sc.user_id
+                   WHERE sc.primary_met_id = %s AND u.is_active = TRUE""",
+                (met_id,),
+            )
+            return [r["user_id"] for r in cur.fetchall()]
+
+
+@app.route("/api/v1/met/day-board", methods=["OPTIONS"])
+def met_day_board_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/day-board")
+def met_day_board():
+    """The Met's Today board: every watch event in the next 48 hours for
+    their subscribers, with the subscriber's standing thresholds and a
+    log of the last watch update sent. Admins see all Mets' boards."""
+    user = _get_current_user()
+    if not user:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "met-only"}), 403
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                if "admin" in roles and "met" not in roles:
+                    cur.execute("SELECT user_id FROM subscriber_coverage WHERE primary_met_id IS NOT NULL")
+                    sub_ids = [r["user_id"] for r in cur.fetchall()]
+                else:
+                    sub_ids = _met_subscriber_ids(user["id"])
+                if not sub_ids:
+                    return jsonify({"ok": True, "cards": []})
+                cur.execute(
+                    """SELECT we.*, u.name AS sub_name, u.phone AS sub_phone,
+                              u.timezone AS sub_tz, u.trial_business_name
+                         FROM watch_events we
+                         JOIN users u ON u.id = we.user_id
+                        WHERE we.user_id = ANY(%s) AND we.status='active'
+                          AND we.day_key >= to_char(now() - interval '1 day', 'YYYY-MM-DD')
+                          AND we.day_key <= to_char(now() + interval '2 days', 'YYYY-MM-DD')
+                        ORDER BY we.day_key, we.start_hhmm NULLS LAST""",
+                    (sub_ids,),
+                )
+                events = cur.fetchall()
+                cur.execute(
+                    """SELECT user_id, metric, comparator, threshold_value
+                         FROM threshold_alerts WHERE user_id = ANY(%s)""",
+                    (sub_ids,),
+                )
+                thr = {}
+                for t in cur.fetchall():
+                    thr.setdefault(t["user_id"], []).append(
+                        f"{t['metric']} {t['comparator']} {t['threshold_value']}")
+                cur.execute(
+                    """SELECT DISTINCT ON (user_id) user_id, body, sent_at
+                         FROM watch_updates WHERE user_id = ANY(%s)
+                        ORDER BY user_id, sent_at DESC""",
+                    (sub_ids,),
+                )
+                last = {r["user_id"]: {"body": r["body"], "sent_at": r["sent_at"]}
+                        for r in cur.fetchall()}
+    except Exception as e:
+        print(f"[day-board] failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "load-failed"}), 500
+    cards = []
+    for e in events:
+        cards.append({
+            "event": _watch_event_row(e),
+            "subscriber": {"user_id": e["user_id"],
+                           "name": e.get("trial_business_name") or e.get("sub_name") or "",
+                           "phone": e.get("sub_phone") or ""},
+            "thresholds": thr.get(e["user_id"], []),
+            "last_update": last.get(e["user_id"]),
+        })
+    return jsonify({"ok": True, "cards": cards})
+
+
+@app.route("/api/v1/met/watch-events", methods=["OPTIONS"])
+def met_watch_events_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/met/watch-events")
+def met_watch_events_add():
+    """A Met adds an event to one of their subscribers' Watch Cards,
+    typically transcribing something the subscriber texted."""
+    user = _get_current_user()
+    if not user:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "met-only"}), 403
+    d = request.get_json(silent=True) or {}
+    sub_id = d.get("user_id")
+    title = (d.get("title") or "").strip()[:200]
+    day_key = (d.get("day_key") or "").strip()
+    if not sub_id or not title or not _valid_day_key(day_key):
+        return jsonify({"ok": False, "error": "missing-fields"}), 400
+    if "admin" not in roles and int(sub_id) not in _met_subscriber_ids(user["id"]):
+        return jsonify({"ok": False, "error": "not-your-subscriber"}), 403
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO watch_events
+                           (user_id, title, day_key, start_hhmm, end_hhmm,
+                            location_label, notes, source, created_by, created_at)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,'met',%s,%s)
+                       RETURNING *""",
+                    (int(sub_id), title, day_key,
+                     (d.get("start_hhmm") or "").strip()[:5] or None,
+                     (d.get("end_hhmm") or "").strip()[:5] or None,
+                     (d.get("location_label") or "").strip()[:200] or None,
+                     (d.get("notes") or "").strip()[:1000] or None,
+                     user["id"], int(time.time() * 1000)),
+                )
+                row = cur.fetchone()
+    except Exception as e:
+        print(f"[watch] met add failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "save-failed"}), 500
+    return jsonify({"ok": True, "event": _watch_event_row(row)})
+
+
+@app.route("/api/v1/met/watch-update", methods=["OPTIONS"])
+def met_watch_update_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/met/watch-update")
+def met_watch_update():
+    """A Met sends a watch update text to a subscriber. Sent from the
+    main number so replies flow into the normal subscriber<->Met path,
+    and logged in watch_updates: the promise-kept metric."""
+    user = _get_current_user()
+    if not user:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "met-only"}), 403
+    d = request.get_json(silent=True) or {}
+    sub_id = d.get("user_id")
+    body = (d.get("body") or "").strip()[:800]
+    if not sub_id or not body:
+        return jsonify({"ok": False, "error": "missing-fields"}), 400
+    if "admin" not in roles and int(sub_id) not in _met_subscriber_ids(user["id"]):
+        return jsonify({"ok": False, "error": "not-your-subscriber"}), 403
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT phone, name FROM users WHERE id=%s", (int(sub_id),))
+                sub = cur.fetchone()
+    except Exception:
+        sub = None
+    if not sub or not sub.get("phone"):
+        return jsonify({"ok": False, "error": "no-phone"}), 400
+    ok = False
+    try:
+        ok = send_sms(sub["phone"], body)
+    except Exception as e:
+        print(f"[watch-update] send failed: {e!r}", flush=True)
+    if ok:
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO watch_updates (user_id, met_id, body, event_id, sent_at)
+                           VALUES (%s,%s,%s,%s,%s)""",
+                        (int(sub_id), user["id"], body, d.get("event_id"),
+                         int(time.time() * 1000)),
+                    )
+        except Exception as e:
+            print(f"[watch-update] log failed: {e!r}", flush=True)
+    return jsonify({"ok": bool(ok)})
+
+
+def _watch_weekly_prompt() -> None:
+    """Sunday around 6 PM local: ask each active subscriber what their
+    week looks like, so the dated layer of their Watch Card stays alive.
+    One prompt per subscriber per week."""
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import datetime
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT u.id, u.phone, u.timezone, u.name FROM users u
+                        JOIN user_roles ur ON ur.user_id = u.id AND ur.role='subscriber'
+                       WHERE u.is_active = TRUE AND u.phone IS NOT NULL AND u.phone <> ''""")
+                subs = cur.fetchall()
+        for s in subs:
+            tz_name = s.get("timezone") or "America/Indiana/Indianapolis"
+            try:
+                now_local = datetime.now(ZoneInfo(tz_name))
+            except Exception:
+                now_local = datetime.now(ZoneInfo("America/Indiana/Indianapolis"))
+            if now_local.weekday() != 6 or now_local.hour != 18:
+                continue
+            week_key = now_local.strftime("%G-W%V")
+            guard = f"watch-prompt-{s['id']}-{week_key}"
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """INSERT INTO wv_one_shot_migrations (mig_key, applied_at)
+                               VALUES (%s,%s) ON CONFLICT (mig_key) DO NOTHING""",
+                            (guard, int(time.time() * 1000)),
+                        )
+                        if cur.rowcount == 0:
+                            continue
+            except Exception:
+                continue
+            try:
+                send_sms(s["phone"],
+                         "It's WeatherValet! What does your week look like? Reply with any "
+                         "outdoor plans, jobs, or events (day and time) and your Meteorologist "
+                         "will watch the weather for them.")
+            except Exception as e:
+                print(f"[watch-prompt] send failed user={s['id']}: {e!r}", flush=True)
+    except Exception as e:
+        print(f"[watch-prompt] job failed: {e!r}", flush=True)
+
+
+def _met_day_digest() -> None:
+    """Each morning around 6:30 local, text each Met their day's watch
+    cards so the system does the remembering."""
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import datetime
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT u.id, u.phone, u.timezone, u.name FROM users u
+                        JOIN user_roles ur ON ur.user_id = u.id AND ur.role='met'
+                       WHERE u.is_active = TRUE AND u.phone IS NOT NULL AND u.phone <> ''""")
+                mets = cur.fetchall()
+        for m in mets:
+            tz_name = m.get("timezone") or "America/Indiana/Indianapolis"
+            try:
+                now_local = datetime.now(ZoneInfo(tz_name))
+            except Exception:
+                now_local = datetime.now(ZoneInfo("America/Indiana/Indianapolis"))
+            if now_local.hour != 6 or now_local.minute >= 40 or now_local.minute < 20:
+                continue
+            day_key = now_local.strftime("%Y-%m-%d")
+            guard = f"met-digest-{m['id']}-{day_key}"
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """INSERT INTO wv_one_shot_migrations (mig_key, applied_at)
+                               VALUES (%s,%s) ON CONFLICT (mig_key) DO NOTHING""",
+                            (guard, int(time.time() * 1000)),
+                        )
+                        if cur.rowcount == 0:
+                            continue
+            except Exception:
+                continue
+            sub_ids = _met_subscriber_ids(m["id"])
+            if not sub_ids:
+                continue
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """SELECT we.title, we.start_hhmm, u.name, u.trial_business_name
+                                 FROM watch_events we JOIN users u ON u.id = we.user_id
+                                WHERE we.user_id = ANY(%s) AND we.status='active'
+                                  AND we.day_key = %s
+                                ORDER BY we.start_hhmm NULLS LAST LIMIT 12""",
+                            (sub_ids, day_key),
+                        )
+                        evs = cur.fetchall()
+            except Exception:
+                evs = []
+            if not evs:
+                continue
+            lines = [f"- {(e.get('trial_business_name') or e.get('name') or 'Subscriber')}: "
+                     f"{e['title']}" + (f" at {e['start_hhmm']}" if e.get('start_hhmm') else "")
+                     for e in evs]
+            msg = ("WeatherValet Day Board: you have "
+                   f"{len(evs)} watch item{'s' if len(evs) != 1 else ''} today.\n"
+                   + "\n".join(lines)
+                   + "\nFull board: weathervalet.ai (Met portal, Today tab)")
+            try:
+                send_sms(m["phone"], msg)
+                print(f"[met-digest] sent to met={m['id']} items={len(evs)}", flush=True)
+            except Exception as e:
+                print(f"[met-digest] send failed met={m['id']}: {e!r}", flush=True)
+    except Exception as e:
+        print(f"[met-digest] job failed: {e!r}", flush=True)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -23770,6 +24209,16 @@ def _brief_scheduler_loop() -> None:
             _process_rain_alerts()
         except Exception as e:
             print(f"[rain-alert] tick failed: {e!r}", flush=True)
+
+        try:
+            _watch_weekly_prompt()
+        except Exception as e:
+            print(f"[watch-prompt] tick failed: {e!r}", flush=True)
+
+        try:
+            _met_day_digest()
+        except Exception as e:
+            print(f"[met-digest] tick failed: {e!r}", flush=True)
 
         try:
             _process_threshold_alerts()
