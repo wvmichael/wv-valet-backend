@@ -208,7 +208,7 @@ ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-43"
+BACKEND_BUILD = "0702-44"
 
 
 def _epoch_ms(ts):
@@ -7504,6 +7504,231 @@ TRIAL_REGION_MET = {
     "boone":  "timmy@weathervalet.com",
     "kansas": "sramek@weathervalet.com",
 }
+
+
+# ════════════════════════════════════════════════════════════════════
+# Brief flip (July 2026, Michael's design): the detailed forecast moves
+# to the EVENING (tomorrow's outlook, written at a humane hour), and the
+# morning brief becomes truly brief: one line and the temps, auto-derived
+# from the evening send plus fresh numbers. If no evening forecast went
+# out, the classic full-AI morning pregen runs untouched as the fallback.
+# ════════════════════════════════════════════════════════════════════
+
+def _pregen_evening_forecasts() -> None:
+    """Mid-afternoon (15:00-16:59 subscriber local, once per day), create
+    tomorrow's detailed evening forecast draft for each Pro subscriber
+    with a location. Appears in the same Forecasts queue; the Met edits
+    and sends it in the evening."""
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import datetime
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT u.id AS user_id, u.subscription_tier AS tier,
+                              u.timezone, COALESCE(bp.channels, 'sms,email') AS channels,
+                              loc.label AS loc_label, loc.address_text AS loc_address,
+                              loc.lat AS loc_lat, loc.lng AS loc_lng
+                         FROM users u
+                         JOIN user_roles ur ON ur.user_id = u.id AND ur.role='subscriber'
+                         JOIN saved_locations loc ON loc.user_id = u.id AND loc.is_primary = TRUE
+                         LEFT JOIN brief_preferences bp ON bp.user_id = u.id
+                        WHERE u.is_active = TRUE
+                          AND u.subscription_tier IN ('pro_single','pro_multi','pro_enterprise')""")
+                subs = cur.fetchall()
+    except Exception as e:
+        print(f"[eve-pregen] roster load failed: {e!r}", flush=True)
+        return
+    for c in subs:
+        tz_name = c.get("timezone") or "America/Indiana/Indianapolis"
+        try:
+            local_now = datetime.now(ZoneInfo(tz_name))
+        except Exception:
+            local_now = datetime.now(ZoneInfo("America/Indiana/Indianapolis"))
+        if local_now.hour not in (15, 16):
+            continue
+        day_key = local_now.strftime("%Y-%m-%d")
+        guard = f"eve-pregen-{c['user_id']}-{day_key}"
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO wv_one_shot_migrations (mig_key, applied_at)
+                           VALUES (%s,%s) ON CONFLICT (mig_key) DO NOTHING""",
+                        (guard, int(time.time() * 1000)),
+                    )
+                    if cur.rowcount == 0:
+                        continue
+        except Exception:
+            continue
+        try:
+            location_label = c["loc_label"] or c["loc_address"] or "your location"
+            forecast = _fetch_forecast(float(c["loc_lat"]), float(c["loc_lng"]), day_offset=1)
+            ai_verdict, ai_snippet, ai_body = _generate_ai_brief(
+                location_label, forecast or {}, address=c.get("loc_address") or "")
+            if ai_verdict == "suppress":
+                continue
+            ai_body = f"Tomorrow's outlook for {location_label}:\n\n" + ai_body
+            ai_snippet = "Tomorrow: " + ai_snippet
+            end_dt = local_now.replace(hour=20, minute=0, second=0, microsecond=0)
+            window_end_ms = int(end_dt.timestamp() * 1000)
+            now_ms = int(time.time() * 1000)
+            preds = _extract_predicted_values_from_forecast(forecast)
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT id FROM pro_brief_drafts
+                            WHERE user_id=%s AND brief_type='evening'
+                              AND created_at >= %s
+                              AND status IN ('pending-review','claimed','sent')
+                            LIMIT 1""",
+                        (c["user_id"], now_ms - 12 * 3600 * 1000),
+                    )
+                    if cur.fetchone():
+                        continue
+                    cur.execute(
+                        """INSERT INTO pro_brief_drafts
+                           (user_id, brief_type, created_at, window_end_at, status,
+                            user_tier, location_label, location_lat, location_lng,
+                            channels, ai_verdict, ai_snippet, ai_body,
+                            met_verdict, met_snippet, met_body,
+                            predicted_high_f, predicted_low_f,
+                            predicted_precip_in, predicted_max_wind_mph)
+                           VALUES (%s, 'evening', %s, %s, 'pending-review',
+                                   %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                   %s, %s, %s, %s)""",
+                        (c["user_id"], now_ms, window_end_ms,
+                         c["tier"], location_label,
+                         float(c["loc_lat"]), float(c["loc_lng"]),
+                         c.get("channels") or "",
+                         ai_verdict, ai_snippet, ai_body,
+                         ai_verdict, ai_snippet, ai_body,
+                         preds.get("predicted_high_f"), preds.get("predicted_low_f"),
+                         preds.get("predicted_precip_in"), preds.get("predicted_max_wind_mph")),
+                    )
+            print(f"[eve-pregen] evening draft created user={c['user_id']}", flush=True)
+        except Exception as e:
+            print(f"[eve-pregen] failed user={c['user_id']}: {e!r}", flush=True)
+
+
+def _derive_morning_shorts() -> None:
+    """Early morning (04:40-05:04 local), for each subscriber whose
+    EVENING forecast was actually sent, pre-seed today's morning draft as
+    the short: conditions one-liner plus temps, from fresh numbers. The
+    classic morning pregen sees the existing draft and skips, and the
+    normal morning autosend machinery sends it. What, not why."""
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import datetime
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT DISTINCT ON (d.user_id)
+                              d.user_id, d.met_verdict, d.ai_verdict,
+                              u.timezone, u.subscription_tier AS tier,
+                              COALESCE(bp.channels, 'sms,email') AS channels,
+                              loc.label AS loc_label, loc.address_text AS loc_address,
+                              loc.lat AS loc_lat, loc.lng AS loc_lng,
+                              COALESCE(bp.morning_window_end, '08:00') AS morning_window_end
+                         FROM pro_brief_drafts d
+                         JOIN users u ON u.id = d.user_id
+                         JOIN saved_locations loc ON loc.user_id = u.id AND loc.is_primary = TRUE
+                         LEFT JOIN brief_preferences bp ON bp.user_id = u.id
+                        WHERE d.brief_type='evening' AND d.status='sent'
+                          AND d.created_at >= %s AND u.is_active = TRUE
+                        ORDER BY d.user_id, d.created_at DESC""",
+                    (int(time.time() * 1000) - 20 * 3600 * 1000,),
+                )
+                rows = cur.fetchall()
+    except Exception as e:
+        print(f"[morning-derive] load failed: {e!r}", flush=True)
+        return
+    for c in rows:
+        tz_name = c.get("timezone") or "America/Indiana/Indianapolis"
+        try:
+            local_now = datetime.now(ZoneInfo(tz_name))
+        except Exception:
+            local_now = datetime.now(ZoneInfo("America/Indiana/Indianapolis"))
+        if not (local_now.hour == 4 and local_now.minute >= 40) and not (local_now.hour == 5 and local_now.minute < 5):
+            continue
+        day_key = local_now.strftime("%Y-%m-%d")
+        guard = f"morning-derive-{c['user_id']}-{day_key}"
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO wv_one_shot_migrations (mig_key, applied_at)
+                           VALUES (%s,%s) ON CONFLICT (mig_key) DO NOTHING""",
+                        (guard, int(time.time() * 1000)),
+                    )
+                    if cur.rowcount == 0:
+                        continue
+        except Exception:
+            continue
+        try:
+            forecast = _fetch_forecast(float(c["loc_lat"]), float(c["loc_lng"])) or {}
+            daily = forecast.get("daily") or {}
+            high = (daily.get("temperature_2m_max") or [None])[0]
+            low = (daily.get("temperature_2m_min") or [None])[0]
+            code = (daily.get("weathercode") or [None])[0]
+            cond = _weather_code_label(code) if code is not None else ""
+            if high is None:
+                continue
+            label = c["loc_label"] or c["loc_address"] or "your location"
+            parts = []
+            if cond:
+                parts.append(cond + ".")
+            if low is not None:
+                parts.append(f"Morning around {round(low)}, afternoon high {round(high)}.")
+            else:
+                parts.append(f"High {round(high)} this afternoon.")
+            short = " ".join(parts)
+            verdict = c.get("met_verdict") or c.get("ai_verdict") or "clear"
+            try:
+                eh, em = int(c["morning_window_end"][:2]), int(c["morning_window_end"][3:5] or c["morning_window_end"][3:])
+                end_dt = local_now.replace(hour=eh, minute=em, second=0, microsecond=0)
+                if end_dt < local_now:
+                    end_dt = local_now
+                window_end_ms = int(end_dt.timestamp() * 1000)
+            except Exception:
+                window_end_ms = int(time.time() * 1000) + 4 * 3600 * 1000
+            now_ms = int(time.time() * 1000)
+            preds = _extract_predicted_values_from_forecast(forecast)
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT id FROM pro_brief_drafts
+                            WHERE user_id=%s AND brief_type='morning'
+                              AND created_at >= %s
+                              AND status IN ('pending-review','claimed','sent')
+                            LIMIT 1""",
+                        (c["user_id"], now_ms - 18 * 3600 * 1000),
+                    )
+                    if cur.fetchone():
+                        continue
+                    cur.execute(
+                        """INSERT INTO pro_brief_drafts
+                           (user_id, brief_type, created_at, window_end_at, status,
+                            user_tier, location_label, location_lat, location_lng,
+                            channels, ai_verdict, ai_snippet, ai_body,
+                            met_verdict, met_snippet, met_body,
+                            predicted_high_f, predicted_low_f,
+                            predicted_precip_in, predicted_max_wind_mph)
+                           VALUES (%s, 'morning', %s, %s, 'pending-review',
+                                   %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                   %s, %s, %s, %s)""",
+                        (c["user_id"], now_ms, window_end_ms,
+                         c["tier"], label,
+                         float(c["loc_lat"]), float(c["loc_lng"]),
+                         c.get("channels") or "",
+                         verdict, short, short,
+                         verdict, short, short,
+                         preds.get("predicted_high_f"), preds.get("predicted_low_f"),
+                         preds.get("predicted_precip_in"), preds.get("predicted_max_wind_mph")),
+                    )
+            print(f"[morning-derive] short seeded user={c['user_id']}", flush=True)
+        except Exception as e:
+            print(f"[morning-derive] failed user={c['user_id']}: {e!r}", flush=True)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -24211,6 +24436,16 @@ def _brief_scheduler_loop() -> None:
             print(f"[rain-alert] tick failed: {e!r}", flush=True)
 
         try:
+            _derive_morning_shorts()
+        except Exception as e:
+            print(f"[morning-derive] tick failed: {e!r}", flush=True)
+
+        try:
+            _pregen_evening_forecasts()
+        except Exception as e:
+            print(f"[eve-pregen] tick failed: {e!r}", flush=True)
+
+        try:
             _watch_weekly_prompt()
         except Exception as e:
             print(f"[watch-prompt] tick failed: {e!r}", flush=True)
@@ -32397,6 +32632,7 @@ def met_pro_briefs_list():
         drafts.append({
             "id": r["id"],
             "user_id": r["user_id"],
+            "brief_type": r.get("brief_type") or "morning",
             "subscriber_email": r["subscriber_email"],
             "subscriber_name": r.get("subscriber_name") or "",
             "subscriber_phone": r.get("subscriber_phone") or "",
