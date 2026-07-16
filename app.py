@@ -208,7 +208,7 @@ ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-40"
+BACKEND_BUILD = "0702-41"
 
 
 def _epoch_ms(ts):
@@ -682,6 +682,26 @@ CREATE TABLE IF NOT EXISTS business_trial_intakes (
     user_id BIGINT
 );
 CREATE INDEX IF NOT EXISTS idx_bti_phone10 ON business_trial_intakes (phone_last10);
+
+-- July 2026: Onboarding Hub. Versioned policy acknowledgments and native
+-- onboarding forms for Mets and sales reps. Crew keeps its simple intro.
+CREATE TABLE IF NOT EXISTS onboarding_acks (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    slug TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    acked_at BIGINT NOT NULL,
+    name_snapshot TEXT,
+    UNIQUE (user_id, slug, version)
+);
+CREATE TABLE IF NOT EXISTS onboarding_forms (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    form_slug TEXT NOT NULL,
+    data_json TEXT NOT NULL,
+    updated_at BIGINT NOT NULL,
+    UNIQUE (user_id, form_slug)
+);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS operational_sms_consent_ip TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS operational_sms_consent_source TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS operational_sms_consent_recorded_by INTEGER;
@@ -7453,6 +7473,321 @@ TRIAL_REGION_MET = {
     "boone":  "timmy@weathervalet.com",
     "kansas": "sramek@weathervalet.com",
 }
+
+
+# ════════════════════════════════════════════════════════════════════
+# Onboarding Hub (July 2026): versioned policies + native forms for
+# Mets and sales reps, with tracked acknowledgments. Policy text was
+# reviewed and approved by Michael on July 16, 2026. Editing any body
+# REQUIRES bumping that section's version so everyone re-acknowledges.
+# ════════════════════════════════════════════════════════════════════
+
+ONBOARDING_SECTIONS = [
+  {"slug": "mission", "order": 1, "type": "read", "version": 1,
+   "roles": ["met", "rep"], "title": "Mission, Vision, and Who We Are",
+   "body": [
+     {"p": "We help empower people to make informed decisions by communicating personalized, easy-to-understand weather information."},
+     {"p": "WeatherValet, offered by America's Weather Streaming Channel, LLC, is a personalized weather information service built on real Meteorologists, not just computer models. We provide individuals, businesses, and organizations with location-specific forecasts, daily updates, severe weather alerts, ongoing weather watching for business operations, and direct access to a Meteorologist. We deliver through text, email, our app, livestreams, radio, and social media. Accurate. Personalized. Accessible."},
+     {"p": "Everything in this onboarding exists to protect two things: our subscribers' trust and the company we are building together."},
+   ]},
+  {"slug": "contact_form", "order": 2, "type": "form", "form": "contact", "version": 1,
+   "roles": ["met", "rep"], "title": "Your Contact Information",
+   "body": [{"p": "So the company can reach you, pay you, and reach someone for you in an emergency."}]},
+  {"slug": "payroll_form", "order": 3, "type": "form", "form": "payroll", "version": 1,
+   "roles": ["met", "rep"], "title": "Payroll Information",
+   "body": [{"p": "Subscriber counts are gathered on the first day of each month; pay for those subscribers comes on the last day of the month. Do not enter bank account numbers here. If you choose direct deposit, Michael will collect those details securely."}]},
+  {"slug": "goals_form", "order": 4, "type": "form", "form": "goals", "version": 1,
+   "roles": ["met", "rep"], "title": "Goal Setting",
+   "body": [{"p": "Personal, professional, and company goals matter for our continued growth. Set overall goals for your tenure with WeatherValet."}]},
+  {"slug": "email_conduct", "order": 5, "type": "policy", "version": 1,
+   "roles": ["met", "rep"], "title": "Company Email Conduct",
+   "body": [
+     {"p": "Your company email address (@weathervalet.com or @americasweathersc.com) represents WeatherValet in every message."},
+     {"ul": ["Use company email for company business. Personal matters belong on personal accounts.",
+             "Write professionally, clearly, and respectfully. Assume any email could be read aloud in public someday.",
+             "Never share subscriber information, internal documents, business numbers, credentials, or anything marked internal outside the company without Michael's approval.",
+             "Never send passwords, bank details, or sensitive personal data by email, ours or anyone else's.",
+             "If you receive a legal notice, media inquiry, complaint, or anything that feels above your pay grade, do not reply. Forward it to Michael the same day.",
+             "Your mailbox remains company property. When your role ends, access ends."]},
+   ]},
+  {"slug": "company_social", "order": 6, "type": "policy", "version": 1,
+   "roles": ["met", "rep"], "title": "Company Social Media Conduct",
+   "body": [
+     {"p": "This covers posting on WeatherValet's official accounts (Facebook, X, TikTok, Instagram, YouTube)."},
+     {"ul": ["Post only content that is accurate, professional, and consistent with our mission. You are the company's voice when you post.",
+             "Weather information posted on company accounts must reflect your professional judgment. Never post sensationalized or exaggerated weather claims to chase engagement.",
+             "Follow the On-Air Content Policy for everything visual: company accounts display only content we own or have written permission to use.",
+             "Engage respectfully with everyone, including critics. Never argue with, mock, or pile onto anyone from a company account.",
+             "Never announce partnerships, pricing changes, legal matters, or company news unless Michael has approved the announcement.",
+             "If a post turns out to be wrong, correct it visibly and promptly. Deleting quietly damages trust; correcting openly builds it."]},
+   ]},
+  {"slug": "personal_social", "order": 7, "type": "policy", "version": 1,
+   "roles": ["met", "rep"], "title": "Personal Social Media Policy",
+   "body": [
+     {"p": "Your personal accounts are yours, and we want our Meteorologists and team members to have strong personal brands. These rules cover only where your personal presence touches WeatherValet."},
+     {"h": "You are welcome to:"},
+     {"ul": ["Identify yourself as a WeatherValet Meteorologist or team member, and share your pride in the work.",
+             "Share, repost, and link to WeatherValet's public content. That helps everyone.",
+             "Talk about weather generally, your craft, and your own original content that does not use company property."]},
+     {"h": "You may not:"},
+     {"ul": ["Post WeatherValet subscriber briefs, forecasts, graphics, maps, data, or internal tools on personal accounts. Subscriber-facing content is a paid product; giving it away on a personal page undercuts the company and your own paycheck.",
+             "Share anything about subscribers: names, locations, conversations, screenshots, or stories detailed enough to identify someone.",
+             "Share internal information: subscriber counts, revenue, pricing plans, legal matters, internal discussions, or unreleased features.",
+             "Speak for the company. Opinions on your page are yours; company announcements come from company accounts.",
+             "Post anything that would embarrass the company while identifying yourself as part of it. If your bio says WeatherValet, the public will not separate you from us."]},
+     {"p": "If a reporter or anyone else contacts you about company matters through a personal account, do not respond; forward it to Michael."},
+   ]},
+  {"slug": "on_air", "order": 8, "type": "policy", "version": 1,
+   "roles": ["met"], "title": "On-Air Content Policy",
+   "body": [
+     {"p": "Nothing appears on a WeatherValet stream, brief, post, or any company content unless it is ours or we hold written permission to use it."},
+     {"h": "\"Ours\" means exactly three things:"},
+     {"ul": ["Content we created: our own cameras, graphics, maps, charts, and recordings made by WeatherValet people for WeatherValet.",
+             "Valet Crew content: photos and videos submitted through the Crew line. Members grant permission at signup, and we credit them by first name.",
+             "Licensed sources: data and imagery from providers we have a written license or documented permission to use."]},
+     {"h": "Never on air, named so there is no ambiguity:"},
+     {"ul": ["Scrolling your own social media feeds on screen, even briefly",
+             "Any portion of someone else's storm video, no matter how short",
+             "Screenshots of other outlets' radar, graphics, maps, or broadcasts",
+             "Viral clips, memes, or images found through search",
+             "Music of any kind we have not licensed, including background music",
+             "Photos or video from anyone outside the Valet Crew pipeline, unless Michael has confirmed permission in writing"]},
+     {"p": "Brevity is not permission. Popularity is not permission. Credit is not permission. Fair use is a legal defense argued in court after you have already been sued; it is not our plan."},
+     {"p": "The escape valve: want to show something we do not own? Ask Michael first. We can often license it, get written permission, or simply describe it on air and tell viewers where to find it. Mentioning something is always legal; displaying it is not."},
+     {"p": "Before every stream, thirty seconds: look at every screen, tab, and source you are about to broadcast and ask, is everything here ours? Close anything that is not."},
+     {"p": "Why this exists: in 2026 the company faced a federal copyright lawsuit over roughly thirty seconds of third-party video shown during a livestream. It was resolved, but it consumed months of the company's attention during a critical growth period. Firms monitor streams specifically to find this kind of use, and one lapse can carry penalties large enough to end a company our size. Our own content is also our advantage: every crew photo and original graphic is something nobody else can show and nobody can sue us over."},
+   ]},
+  {"slug": "ip_confidentiality", "order": 9, "type": "policy", "version": 1,
+   "roles": ["met", "rep"], "title": "Company Property, Confidentiality, and Intellectual Property",
+   "body": [
+     {"p": "What we make here belongs to the company, and what we learn here stays here."},
+     {"ul": ["Everything created for WeatherValet is WeatherValet's property: forecasts, briefs, graphics, maps, templates, scripts, methods, software, subscriber and lead lists, crew content, and recordings. This is true whether you made it on company tools or your own.",
+             "Company property may not be used for personal projects, side work, another employer, or any purpose outside WeatherValet, during your time here or after it ends. Your skills and general knowledge go with you when you leave; our content, data, and subscriber relationships do not.",
+             "Confidential information includes subscriber and lead information, business metrics, pricing strategy, partnership discussions, legal matters, security details, and internal communications. Do not share it with anyone outside the company, and inside the company share it only with people who need it.",
+             "Confidentiality survives your departure from WeatherValet.",
+             "If you are ever unsure whether something is confidential or company property, treat it as both and ask Michael."]},
+   ]},
+  {"slug": "subscriber_data", "order": 10, "type": "policy", "version": 1,
+   "roles": ["met", "rep"], "title": "Subscriber Data and Control Center Conduct",
+   "body": [
+     {"p": "Subscribers trust us with their names, phone numbers, locations, and daily routines. That trust is the business."},
+     {"ul": ["Access subscriber information only to do your job for that subscriber. Curiosity is not a business purpose.",
+             "Never export, download, copy, screenshot, or share subscriber or lead lists outside company systems without Michael's approval.",
+             "Never share one subscriber's information with another subscriber or any outside party.",
+             "Communications with subscribers happen through company channels (the portal, company email, company lines), not personal phones or accounts, so the company can stand behind every interaction.",
+             "Report any suspected data exposure, lost device with company access, or account compromise to Michael immediately. Fast reporting is always the right call; delay is the only wrong one."]},
+   ]},
+  {"slug": "met_portal_usage", "order": 11, "type": "policy", "version": 1,
+   "roles": ["met"], "title": "Met Portal and App Usage",
+   "body": [
+     {"p": "The Met portal and WeatherValet app are how we serve subscribers, and everything in them is subscriber-facing or business-critical."},
+     {"ul": ["Provide accurate, timely forecasts and respond to subscriber questions thoughtfully and courteously. Every reply is the brand.",
+             "Keep your morning brief windows. If you cannot send on time, say so early so coverage can be arranged; the auto-send safety net is a backstop, not a plan.",
+             "Word weather guidance so subscribers make the call: we inform their decisions, we do not make them. Say \"conditions are deteriorating, here is what we see\" rather than \"it is safe\" or \"you are fine to proceed.\"",
+             "Keep your login to yourself. No shared accounts, no letting anyone else send as you.",
+             "Do not test, probe, or work around portal features in ways that touch real subscribers. Found a bug? Report it to Michael with the exact steps; that is genuinely valued here."]},
+   ]},
+  {"slug": "sales_conduct", "order": 12, "type": "policy", "version": 1,
+   "roles": ["rep"], "title": "Sales Conduct",
+   "body": [
+     {"p": "You sell trust, and the product has to be able to keep every promise you make."},
+     {"ul": ["Describe the service honestly: real local Meteorologists, morning forecasts for their locations, and weather watching for the thresholds they tell us about. Never promise we will guarantee safety, catch every storm, or accept liability for their decisions. Our words are \"we keep you updated so you can make the call.\"",
+             "Enter intake information exactly as the customer gave it. The answers you record become the profile a Meteorologist works from.",
+             "The customer's YES text is their consent, and it is sacred. Never text YES from a customer's phone yourself, never pressure someone to reply, and never submit an intake for someone who did not agree to receive it.",
+             "Quote only published pricing and offers. No invented discounts, no side deals.",
+             "You have no access to subscriber accounts, and that protects you: if a customer asks for an account change, tell them to reply to any WeatherValet text or contact Michael.",
+             "Everything in the Confidentiality policy applies doubly to lead lists and the pipeline board."]},
+   ]},
+]
+
+_ONBOARDING_FORM_FIELDS = {
+    "contact": ["phone", "personal_email", "mailing_address", "emergency_name", "emergency_phone"],
+    "payroll": ["legal_name", "mailing_address", "payment_preference", "note"],
+    "goals": ["personal", "professional", "company"],
+}
+
+
+def _onboarding_roles_for(user) -> set:
+    roles = set()
+    if "met" in (user.get("roles") or []):
+        roles.add("met")
+    try:
+        u2, rep = _current_sales_rep()
+        if rep is not None:
+            roles.add("rep")
+    except Exception:
+        pass
+    return roles
+
+
+def _onboarding_state_for(user_id: int, roles: set) -> dict:
+    sections = [x for x in ONBOARDING_SECTIONS if roles & set(x["roles"])]
+    acks, forms = {}, {}
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT slug, version FROM onboarding_acks WHERE user_id=%s", (user_id,))
+                for r in cur.fetchall():
+                    acks.setdefault(r["slug"], set()).add(r["version"])
+                cur.execute("SELECT form_slug, data_json FROM onboarding_forms WHERE user_id=%s", (user_id,))
+                for r in cur.fetchall():
+                    try:
+                        forms[r["form_slug"]] = json.loads(r["data_json"])
+                    except Exception:
+                        forms[r["form_slug"]] = {}
+    except Exception as e:
+        print(f"[onboarding] state load failed user={user_id}: {e!r}", flush=True)
+    out = []
+    done = 0
+    for x in sorted(sections, key=lambda s: s["order"]):
+        item = {k: x[k] for k in ("slug", "order", "type", "version", "title", "body")}
+        if x["type"] == "form":
+            item["form"] = x["form"]
+            item["fields"] = _ONBOARDING_FORM_FIELDS[x["form"]]
+            item["data"] = forms.get(x["form"]) or {}
+            item["complete"] = bool(item["data"])
+        else:
+            item["complete"] = x["version"] in acks.get(x["slug"], set())
+        if item["complete"]:
+            done += 1
+        out.append(item)
+    return {"items": out, "done": done, "total": len(out)}
+
+
+@app.route("/api/v1/me/onboarding", methods=["OPTIONS"])
+def me_onboarding_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/me/onboarding")
+def me_onboarding():
+    user = _get_current_user()
+    if not user:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = _onboarding_roles_for(user)
+    if not roles:
+        return jsonify({"ok": True, "applicable": False, "items": [], "done": 0, "total": 0})
+    state = _onboarding_state_for(user["id"], roles)
+    state.update({"ok": True, "applicable": True})
+    return jsonify(state)
+
+
+@app.route("/api/v1/me/onboarding/ack", methods=["OPTIONS"])
+def me_onboarding_ack_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/me/onboarding/ack")
+def me_onboarding_ack():
+    user = _get_current_user()
+    if not user:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = _onboarding_roles_for(user)
+    slug = ((request.get_json(silent=True) or {}).get("slug") or "").strip()
+    section = next((x for x in ONBOARDING_SECTIONS
+                    if x["slug"] == slug and roles & set(x["roles"])), None)
+    if not section or section["type"] == "form":
+        return jsonify({"ok": False, "error": "bad-slug"}), 400
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO onboarding_acks
+                           (user_id, slug, version, acked_at, name_snapshot)
+                       VALUES (%s,%s,%s,%s,%s)
+                       ON CONFLICT (user_id, slug, version) DO NOTHING""",
+                    (user["id"], slug, section["version"],
+                     int(time.time() * 1000), user.get("name") or user.get("email")),
+                )
+    except Exception as e:
+        print(f"[onboarding] ack failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "save-failed"}), 500
+    print(f"[onboarding] user={user['id']} acked {slug} v{section['version']}", flush=True)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/v1/me/onboarding/form", methods=["OPTIONS"])
+def me_onboarding_form_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/me/onboarding/form")
+def me_onboarding_form():
+    user = _get_current_user()
+    if not user:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if not _onboarding_roles_for(user):
+        return jsonify({"ok": False, "error": "not-applicable"}), 403
+    data = request.get_json(silent=True) or {}
+    form_slug = (data.get("form") or "").strip()
+    fields = _ONBOARDING_FORM_FIELDS.get(form_slug)
+    if not fields:
+        return jsonify({"ok": False, "error": "bad-form"}), 400
+    payload = {}
+    for f in fields:
+        v = (data.get(f) or "").strip()[:2000]
+        if v:
+            payload[f] = v
+    # Never store banking numbers, even if pasted into a note field.
+    joined = " ".join(payload.values())
+    digits_runs = [w for w in joined.replace("-", "").split() if w.isdigit() and len(w) >= 8]
+    if form_slug == "payroll" and digits_runs:
+        return jsonify({"ok": False,
+                        "error": "no-account-numbers",
+                        "message": "Please do not enter bank account or routing numbers here. Michael will collect direct deposit details securely."}), 400
+    if not payload:
+        return jsonify({"ok": False, "error": "empty"}), 400
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO onboarding_forms (user_id, form_slug, data_json, updated_at)
+                       VALUES (%s,%s,%s,%s)
+                       ON CONFLICT (user_id, form_slug) DO UPDATE
+                       SET data_json = EXCLUDED.data_json, updated_at = EXCLUDED.updated_at""",
+                    (user["id"], form_slug, json.dumps(payload), int(time.time() * 1000)),
+                )
+    except Exception as e:
+        print(f"[onboarding] form save failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "save-failed"}), 500
+    return jsonify({"ok": True})
+
+
+@app.get("/api/v1/admin/onboarding/grid")
+def admin_onboarding_grid():
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "admin-only"}), 403
+    people = []
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT u.id, u.name, u.email, 'met' AS kind FROM users u
+                       JOIN user_roles ur ON ur.user_id = u.id AND ur.role='met'
+                       WHERE u.is_active = TRUE""")
+                mets = cur.fetchall()
+                cur.execute(
+                    """SELECT u.id, u.name, u.email, 'rep' AS kind FROM users u
+                       JOIN sales_reps sr ON LOWER(sr.email) = LOWER(u.email)
+                       WHERE sr.is_active = TRUE AND u.is_active = TRUE""")
+                reps = cur.fetchall()
+    except Exception as e:
+        print(f"[onboarding] grid load failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "load-failed"}), 500
+    seen = {}
+    for r in list(mets) + list(reps):
+        e = seen.setdefault(r["id"], {"id": r["id"], "name": r.get("name") or r.get("email"),
+                                      "roles": set()})
+        e["roles"].add(r["kind"])
+    for e in seen.values():
+        state = _onboarding_state_for(e["id"], e["roles"])
+        people.append({"id": e["id"], "name": e["name"], "roles": sorted(e["roles"]),
+                       "done": state["done"], "total": state["total"],
+                       "items": [{"slug": i["slug"], "title": i["title"],
+                                  "complete": i["complete"]} for i in state["items"]]})
+    people.sort(key=lambda p: p["name"] or "")
+    return jsonify({"ok": True, "people": people})
 
 
 @app.route("/api/v1/sales/business-trial-intake", methods=["OPTIONS"])
