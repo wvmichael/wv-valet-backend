@@ -206,9 +206,21 @@ TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER", "")  # Twilio number w
 #     deploys still work (Rosie just shares the main number).
 ROSIE_TWILIO_NUMBER = os.environ.get("ROSIE_TWILIO_NUMBER", "")
 
+# July 16, 2026: missed/overdue brief ALERTING kill switch. The evening
+# forecast flip (build 0702-44) introduced drafts with evening windows,
+# which the missed-brief watchdog reads as missed morning briefs and
+# storms the team's phones. Alerting stays OFF until the watchdog is
+# taught the new rhythm. Re-enable by setting env ROSIE_MISSED_BRIEF_ALERTS=on
+# in Render. Note: this gates ALERT TEXTS only. Brief sending, the
+# autosend safety net, Rosie chat, and accuracy emails are unaffected.
+ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
+    os.environ.get("ROSIE_MISSED_BRIEF_ALERTS", "off").strip().lower()
+    in ("on", "true", "1", "yes")
+)
+
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-46"
+BACKEND_BUILD = "0702-47"
 
 
 def _epoch_ms(ts):
@@ -24728,6 +24740,8 @@ def _coverage_check_escalations() -> None:
     at once and page every overdue task twice. This was the cause of the
     duplicate overdue texts.
     """
+    if not ROSIE_MISSED_BRIEF_ALERTS_ENABLED:
+        return
     _LOCK_KEY = 91234574
     _lock_conn = _try_acquire_scheduler_lock(_LOCK_KEY)
     if _lock_conn is None:
@@ -24926,6 +24940,8 @@ def _check_missed_pro_briefs() -> None:
     Runs every 60s. Dedupes via a daily marker so we don't spam.
     A "missed" alert fires once: at 5 minutes past window end.
     """
+    if not ROSIE_MISSED_BRIEF_ALERTS_ENABLED:
+        return
     # We track which (user_id, local_date) combos we've already alerted
     # for, to avoid repeating. Use brief_history with a special
     # brief_type='missed_alert' marker so dedup persists across restarts.
