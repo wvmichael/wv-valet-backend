@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-53"
+BACKEND_BUILD = "0702-55"
 
 
 def _epoch_ms(ts):
@@ -14515,6 +14515,125 @@ def admin_user_set_password(user_id: int):
 #   - The brief grader's nws_station_cache auto-invalidates when
 #     lat/lng changes by >0.01° — so the next brief uses the right
 #     station too. No additional cleanup needed.
+
+@app.get("/api/v1/admin/people-directory")
+def admin_people_directory():
+    """One list, one row per human (July 18, 2026, Michael's spec).
+    Active people with roles, location, subscription, and setup alerts;
+    deactivated accounts stay hidden unless include_inactive=1."""
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "admin-only"}), 403
+    include_inactive = (request.args.get("include_inactive") or "") == "1"
+    now = now_ts()
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT u.id, u.name, u.email, u.phone, u.is_active,
+                              u.subscription_tier, u.trial_status, u.trial_ends_at,
+                              u.trial_business_name, u.timezone, u.created_at,
+                              u.crew_home_label,
+                              loc.label AS loc_label, loc.address_text AS loc_address,
+                              sc.primary_met_id, pm.name AS primary_met_name,
+                              sr.slug AS rep_slug_self,
+                              COALESCE(r.roles, '{}') AS roles
+                         FROM users u
+                         LEFT JOIN saved_locations loc
+                                ON loc.user_id = u.id AND loc.is_primary = TRUE
+                         LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
+                         LEFT JOIN users pm ON pm.id = sc.primary_met_id
+                         LEFT JOIN sales_reps sr
+                                ON LOWER(sr.email) = LOWER(u.email) AND sr.is_active = TRUE
+                         LEFT JOIN (
+                             SELECT user_id, array_agg(role) AS roles
+                               FROM user_roles GROUP BY user_id
+                         ) r ON r.user_id = u.id
+                        ORDER BY LOWER(COALESCE(NULLIF(u.name, ''), u.email))""")
+                rows = cur.fetchall()
+                cur.execute("SELECT slug, name FROM sales_reps WHERE is_active = TRUE ORDER BY name")
+                reps = [dict(x) for x in cur.fetchall()]
+    except Exception as e:
+        print(f"[directory] load failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "load-failed"}), 500
+    active, inactive = [], []
+    for r in rows:
+        roles = sorted(set(list(r.get("roles") or [])))
+        if r.get("rep_slug_self"):
+            roles.append("sales")
+        location = (r.get("loc_label") or r.get("loc_address")
+                    or r.get("crew_home_label") or "")
+        tier = r.get("subscription_tier") or ""
+        trial_days = None
+        if r.get("trial_status") == "active" and r.get("trial_ends_at"):
+            trial_days = max(0, int((r["trial_ends_at"] - now) // 86400))
+        alerts = []
+        needs_loc = any(x in roles for x in ("subscriber", "met", "crew"))
+        if needs_loc and not location:
+            alerts.append("No location")
+        if any(x in roles for x in ("subscriber", "crew")) and not (r.get("phone") or "").strip():
+            alerts.append("No phone")
+        if r.get("trial_status") == "active" and r.get("trial_ends_at") and r["trial_ends_at"] < now:
+            alerts.append("Trial expired")
+        ob = None
+        ob_roles = set(x for x in roles if x in ("met",)) | ({"rep"} if "sales" in roles else set())
+        if ob_roles:
+            try:
+                st = _onboarding_state_for(r["id"], ob_roles)
+                ob = {"done": st["done"], "total": st["total"]}
+                if st["done"] < st["total"]:
+                    alerts.append(f"Onboarding {st['done']}/{st['total']}")
+            except Exception:
+                pass
+        person = {
+            "id": r["id"], "name": r.get("name") or r.get("email"),
+            "email": r.get("email"), "phone": r.get("phone") or "",
+            "roles": roles, "location": location,
+            "business": r.get("trial_business_name") or "",
+            "tier": tier, "trial_status": r.get("trial_status") or "",
+            "trial_days_left": trial_days,
+            "timezone": r.get("timezone") or "",
+            "primary_met": r.get("primary_met_name") or "",
+            "created_at": r.get("created_at"),
+            "onboarding": ob, "alerts": alerts,
+        }
+        (active if r.get("is_active") else inactive).append(person)
+    out = {"ok": True, "people": active, "reps": reps,
+           "inactive_count": len(inactive)}
+    if include_inactive:
+        out["inactive"] = inactive
+    return jsonify(out)
+
+
+@app.route("/api/v1/admin/users/<int:user_id>/contact", methods=["OPTIONS"])
+def admin_user_contact_preflight(user_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/users/<int:user_id>/contact")
+def admin_user_set_contact(user_id):
+    """Admin sets a user's phone (July 2026: closes the 'no admin way to
+    set a phone' gap from the Sarah Howell onboarding)."""
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "admin-only"}), 403
+    d = request.get_json(silent=True) or {}
+    phone = (d.get("phone") or "").strip()[:30]
+    if not phone or len(_phone_last10(phone) or "") < 10:
+        return jsonify({"ok": False, "error": "bad-phone"}), 400
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE users SET phone=%s WHERE id=%s AND is_active=TRUE",
+                            (phone, user_id))
+                if cur.rowcount == 0:
+                    return jsonify({"ok": False, "error": "no-such-user"}), 404
+    except Exception as e:
+        print(f"[contact] phone set failed user={user_id}: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "save-failed"}), 500
+    print(f"[contact] admin={user.get('email')} set phone for user={user_id}", flush=True)
+    return jsonify({"ok": True})
+
 
 @app.route("/api/v1/admin/users/<int:user_id>/extend-trial", methods=["OPTIONS"])
 def admin_extend_trial_preflight(user_id):
