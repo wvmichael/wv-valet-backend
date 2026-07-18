@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-52"
+BACKEND_BUILD = "0702-53"
 
 
 def _epoch_ms(ts):
@@ -15327,6 +15327,8 @@ def admin_view_as_met(met_user_id):
                        LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
                        LEFT JOIN users pm ON pm.id = sc.primary_met_id
                        WHERE (d.status IN ('pending-review', 'claimed')
+                              AND (d.window_end_at IS NULL
+                                   OR d.window_end_at > (EXTRACT(EPOCH FROM now()) * 1000 - 6*3600*1000))
                               OR (d.status = 'sent' AND d.sent_at >= %s))
                          AND (
                            sc.primary_met_id = %s
@@ -32682,6 +32684,8 @@ def met_pro_briefs_list():
                        LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
                        LEFT JOIN users pm ON pm.id = sc.primary_met_id
                        WHERE (d.status IN ('pending-review', 'claimed')
+                              AND (d.window_end_at IS NULL
+                                   OR d.window_end_at > (EXTRACT(EPOCH FROM now()) * 1000 - 6*3600*1000))
                               OR (d.status = 'sent' AND d.sent_at >= %s))
                          -- Pro-tier only: never surface non-Pro (hobbyist)
                          -- drafts here, regardless of how they got created
@@ -32718,6 +32722,8 @@ def met_pro_briefs_list():
                        LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
                        LEFT JOIN users pm ON pm.id = sc.primary_met_id
                        WHERE (d.status IN ('pending-review', 'claimed')
+                              AND (d.window_end_at IS NULL
+                                   OR d.window_end_at > (EXTRACT(EPOCH FROM now()) * 1000 - 6*3600*1000))
                               OR (d.status = 'sent' AND d.sent_at >= %s))
                          -- Pro-tier only (May 31, 2026): hide non-Pro drafts
                          -- so hobbyist strays never appear in the Pro tab.
