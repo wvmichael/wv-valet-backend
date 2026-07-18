@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-49"
+BACKEND_BUILD = "0702-50"
 
 
 def _epoch_ms(ts):
@@ -4282,6 +4282,27 @@ def normalize_phone(raw: Optional[str]) -> Optional[str]:
     if raw.startswith("+") and len(digits) >= 10:
         return "+" + digits
     return None  # caller treats None as "invalid number, ask again"
+
+
+def _normalize_image_url(url: str) -> str:
+    """Convert Google Drive SHARE links (which are HTML pages, not
+    images) into direct-content links so previews render and MMS can
+    fetch them. July 2026, per Timmy's report. Non-Drive URLs pass
+    through untouched. Proper fix remains hosting images on our own
+    domain (queued: image hosting migration)."""
+    import re as _re
+    u = (url or "").strip()
+    if not u:
+        return u
+    m = _re.search(r"drive\.google\.com/file/d/([A-Za-z0-9_-]+)", u)
+    if not m:
+        m = _re.search(r"drive\.google\.com/open\?id=([A-Za-z0-9_-]+)", u)
+    if not m:
+        m = _re.search(r"drive\.google\.com/uc\?[^\s]*id=([A-Za-z0-9_-]+)", u)
+        if m:
+            return f"https://drive.google.com/uc?export=view&id={m.group(1)}"
+        return u
+    return f"https://drive.google.com/uc?export=view&id={m.group(1)}"
 
 
 def send_sms(to: str, body: str, media_url=None) -> bool:
@@ -29269,7 +29290,7 @@ def crew_reports_submit():
     notes = (data.get("notes") or "").strip()
     if len(notes) > 500:
         notes = notes[:500]
-    image_url = (data.get("image_url") or "").strip() or None
+    image_url = _normalize_image_url((data.get("image_url") or "").strip()) or None
     now_ms = int(time.time() * 1000)
 
     try:
@@ -30683,7 +30704,7 @@ def me_crew_mission_respond(mission_id: int):
     if len(response_text) > 1000:
         return jsonify({"ok": False, "error": "response-too-long",
                         "message": "Max 1000 characters."}), 400
-    image_url = (data.get("image_url") or "").strip() or None
+    image_url = _normalize_image_url((data.get("image_url") or "").strip()) or None
     now_ms = int(time.time() * 1000)
 
     # Verify mission exists and is still active
@@ -33060,7 +33081,7 @@ def met_pro_bulk_schedule():
     body = body[:4000]
     # Optional attached image (July 2026): full parity with the single-card
     # composer. Must be an uploaded http(s) URL; anything else is dropped.
-    image_url = (data.get("image_url") or "").strip()[:500]
+    image_url = _normalize_image_url((data.get("image_url") or "").strip()[:500])
     if not image_url.startswith("http"):
         image_url = ""
     if image_url:
@@ -35101,6 +35122,14 @@ def met_pro_brief_send(draft_id):
     # Resolve final content with backward compat
     final_verdict = (row["met_verdict"] or row["ai_verdict"] or "caution").strip()
     final_snippet = (row["met_snippet"] or row["ai_snippet"] or "").strip()
+    # July 2026 (Timmy): never lead an outgoing brief with AI-authored
+    # snippet text once the Met has written their own body. If the Met
+    # edited the body but left the snippet untouched, the lead becomes
+    # the opening of THEIR words, not the AI's headline.
+    _met_wrote_body = bool((row.get("met_body") or "").strip()) and \
+        (row.get("met_body") or "").strip() != (row.get("ai_body") or "").strip()
+    if _met_wrote_body and not (row.get("met_snippet") or "").strip():
+        final_snippet = (row.get("met_body") or "").strip()[:140]
     legacy_body = (row["met_body"] or row["ai_body"] or "").strip()
 
     # New structured sections — fall back to legacy body for older drafts
@@ -35290,6 +35319,7 @@ def met_pro_brief_send(draft_id):
                 # Legacy fallback
                 sms_text = (final_snippet or legacy_body[:140]) + f"\n\nFull: {web_url}\n- {met_name}"
             try:
+                image_url = _normalize_image_url(image_url)
                 _media = [image_url] if image_url.startswith("http") else None
                 if send_sms(row["sub_phone"], sms_text, media_url=_media):
                     channels_used.append("sms")
@@ -35777,7 +35807,7 @@ def met_pro_brief_compose_update():
         return jsonify({"ok": False, "error": "invalid-verdict"}), 400
     snippet = (data.get("snippet") or "").strip()
     body_text = (data.get("body") or "").strip()
-    image_url = (data.get("image_url") or "").strip()
+    image_url = _normalize_image_url((data.get("image_url") or "").strip())
     if image_url.startswith("http"):
         image_url = _mirror_external_image(image_url, user["id"]) or image_url
     if not snippet and not body_text:
@@ -47176,7 +47206,7 @@ def met_composer_send():
     if not body:
         return jsonify({"ok": False, "error": "empty-body",
                         "message": "Write the message first."}), 400
-    image_url = (data.get("image_url") or "").strip()[:500]
+    image_url = _normalize_image_url((data.get("image_url") or "").strip()[:500])
     if not image_url.startswith("http"):
         image_url = ""
     if image_url:
