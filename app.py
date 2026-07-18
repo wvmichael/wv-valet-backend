@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-55"
+BACKEND_BUILD = "0702-56"
 
 
 def _epoch_ms(ts):
@@ -5862,7 +5862,7 @@ def _roles_to_workspaces(roles: list) -> list:
             "url": "/meteorologist",
         },
         "admin": {
-            "label": "Admin",
+            "label": "Command Center",
             "url": "/admin/dashboard",
         },
     }
@@ -5874,6 +5874,12 @@ def _roles_to_workspaces(roles: list) -> list:
                 "label": workspace_map[role]["label"],
                 "url": workspace_map[role]["url"],
             })
+    # Sales portal access (July 18, 2026): admins always; plus anyone on
+    # the active sales_reps roster (matched by email upstream, so here we
+    # only handle the admin case; rep users reach /sales via their rep
+    # login flow and get the entry below when the caller passes email).
+    if "admin" in roles and not any(w["role"] == "sales" for w in workspaces):
+        workspaces.append({"role": "sales", "label": "Sales", "url": "/sales"})
     return workspaces
 
 
