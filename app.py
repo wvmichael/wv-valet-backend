@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-61"
+BACKEND_BUILD = "0702-62"
 
 
 def _epoch_ms(ts):
@@ -14758,6 +14758,17 @@ def admin_extend_trial(user_id):
                           SET trial_ends_at = %s, trial_status = 'active'
                         WHERE id = %s""",
                     (new_end, user_id),
+                )
+                # July 18: extending an EXPIRED trial must also restore the
+                # subscriber role the expiry job revoked, or the extension
+                # looks successful while every send stays off.
+                cur.execute(
+                    """INSERT INTO user_roles (user_id, role, granted_at)
+                       SELECT %s, 'subscriber', %s
+                        WHERE NOT EXISTS (
+                          SELECT 1 FROM user_roles
+                           WHERE user_id=%s AND role='subscriber')""",
+                    (user_id, int(now * 1000), user_id),
                 )
     except Exception as e:
         print(f"[extend-trial] failed user={user_id}: {e!r}", flush=True)
