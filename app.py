@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-60"
+BACKEND_BUILD = "0702-61"
 
 
 def _epoch_ms(ts):
@@ -7960,8 +7960,14 @@ def met_day_board():
     try:
         with db() as conn:
             with conn.cursor() as cur:
-                if "admin" in roles and "met" not in roles:
-                    cur.execute("SELECT user_id FROM subscriber_coverage WHERE primary_met_id IS NOT NULL")
+                if "admin" in roles:
+                    # July 18 fix: admins see EVERY active subscriber's
+                    # cards, even admins who also hold the met role, and
+                    # even subscribers with no assigned Met yet.
+                    cur.execute(
+                        """SELECT ur.user_id FROM user_roles ur
+                             JOIN users u ON u.id = ur.user_id
+                            WHERE ur.role='subscriber' AND u.is_active=TRUE""")
                     sub_ids = [r["user_id"] for r in cur.fetchall()]
                 else:
                     sub_ids = _met_subscriber_ids(user["id"])
