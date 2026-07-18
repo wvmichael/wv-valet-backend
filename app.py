@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-47"
+BACKEND_BUILD = "0702-48"
 
 
 def _epoch_ms(ts):
@@ -7751,6 +7751,48 @@ def _derive_morning_shorts() -> None:
 # Sunday-evening "what's your week look like?" prompt.
 # ════════════════════════════════════════════════════════════════════
 
+def _normalize_hhmm(text) -> str:
+    """Accept human time input ("6pm", "6:30 PM", "18:00", "6.30pm") and
+    return 24h "HH:MM", or empty string if unparseable. Storage stays
+    24h so text ordering sorts correctly; display is 12h."""
+    t = (text or "").strip().lower().replace(".", ":").replace(" ", "")
+    if not t:
+        return ""
+    ampm = ""
+    if t.endswith("am") or t.endswith("pm"):
+        ampm = t[-2:]
+        t = t[:-2]
+    if ":" in t:
+        parts = t.split(":")
+        try:
+            h, m = int(parts[0]), int(parts[1] or 0)
+        except Exception:
+            return ""
+    else:
+        try:
+            h, m = int(t), 0
+        except Exception:
+            return ""
+    if ampm == "pm" and h != 12:
+        h += 12
+    if ampm == "am" and h == 12:
+        h = 0
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        return ""
+    return f"{h:02d}:{m:02d}"
+
+
+def _fmt_hhmm_12(hhmm) -> str:
+    """Render stored 24h "HH:MM" as friendly 12-hour ("6 PM", "6:30 PM")."""
+    try:
+        h, m = int(hhmm[:2]), int(hhmm[3:5])
+    except Exception:
+        return hhmm or ""
+    suffix = "AM" if h < 12 else "PM"
+    h12 = h % 12 or 12
+    return f"{h12} {suffix}" if m == 0 else f"{h12}:{m:02d} {suffix}"
+
+
 def _watch_event_row(r) -> dict:
     return {"id": r["id"], "user_id": r["user_id"], "title": r["title"],
             "day_key": r["day_key"], "start_hhmm": r.get("start_hhmm"),
@@ -7815,8 +7857,8 @@ def me_watch_events_add():
                        VALUES (%s,%s,%s,%s,%s,%s,%s,'portal',%s,%s)
                        RETURNING *""",
                     (user["id"], title, day_key,
-                     (d.get("start_hhmm") or "").strip()[:5] or None,
-                     (d.get("end_hhmm") or "").strip()[:5] or None,
+                     _normalize_hhmm(d.get("start_hhmm")) or None,
+                     _normalize_hhmm(d.get("end_hhmm")) or None,
                      (d.get("location_label") or "").strip()[:200] or None,
                      (d.get("notes") or "").strip()[:1000] or None,
                      user["id"], int(time.time() * 1000)),
@@ -7969,8 +8011,8 @@ def met_watch_events_add():
                        VALUES (%s,%s,%s,%s,%s,%s,%s,'met',%s,%s)
                        RETURNING *""",
                     (int(sub_id), title, day_key,
-                     (d.get("start_hhmm") or "").strip()[:5] or None,
-                     (d.get("end_hhmm") or "").strip()[:5] or None,
+                     _normalize_hhmm(d.get("start_hhmm")) or None,
+                     _normalize_hhmm(d.get("end_hhmm")) or None,
                      (d.get("location_label") or "").strip()[:200] or None,
                      (d.get("notes") or "").strip()[:1000] or None,
                      user["id"], int(time.time() * 1000)),
@@ -8136,7 +8178,7 @@ def _met_day_digest() -> None:
             if not evs:
                 continue
             lines = [f"- {(e.get('trial_business_name') or e.get('name') or 'Subscriber')}: "
-                     f"{e['title']}" + (f" at {e['start_hhmm']}" if e.get('start_hhmm') else "")
+                     f"{e['title']}" + (f" at {_fmt_hhmm_12(e['start_hhmm'])}" if e.get('start_hhmm') else "")
                      for e in evs]
             msg = ("WeatherValet Day Board: you have "
                    f"{len(evs)} watch item{'s' if len(evs) != 1 else ''} today.\n"
