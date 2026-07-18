@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-48"
+BACKEND_BUILD = "0702-49"
 
 
 def _epoch_ms(ts):
@@ -14494,6 +14494,55 @@ def admin_user_set_password(user_id: int):
 #   - The brief grader's nws_station_cache auto-invalidates when
 #     lat/lng changes by >0.01° — so the next brief uses the right
 #     station too. No additional cleanup needed.
+
+@app.route("/api/v1/admin/users/<int:user_id>/extend-trial", methods=["OPTIONS"])
+def admin_extend_trial_preflight(user_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/users/<int:user_id>/extend-trial")
+def admin_extend_trial(user_id):
+    """Admin extends (or effectively comps) a trial. Adds N days to the
+    later of now or the current trial end, reactivates trial status, and
+    returns the new end date. A comp is just a very long extension
+    (e.g. 365) until a proper comp flag exists. July 2026."""
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "admin-only"}), 403
+    d = request.get_json(silent=True) or {}
+    try:
+        days = int(d.get("days"))
+    except Exception:
+        return jsonify({"ok": False, "error": "bad-days"}), 400
+    if not (1 <= days <= 3650):
+        return jsonify({"ok": False, "error": "days-out-of-range"}), 400
+    now = now_ts()
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT trial_ends_at, email FROM users WHERE id=%s AND is_active=TRUE",
+                    (user_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"ok": False, "error": "no-such-user"}), 404
+                base = row.get("trial_ends_at") or 0
+                new_end = max(base, now) + days * 24 * 60 * 60
+                cur.execute(
+                    """UPDATE users
+                          SET trial_ends_at = %s, trial_status = 'active'
+                        WHERE id = %s""",
+                    (new_end, user_id),
+                )
+    except Exception as e:
+        print(f"[extend-trial] failed user={user_id}: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "save-failed"}), 500
+    days_left = max(0, (new_end - now) // 86400)
+    print(f"[extend-trial] admin={user.get('email')} extended user={user_id} "
+          f"by {days}d, {days_left}d left", flush=True)
+    return jsonify({"ok": True, "days_left": int(days_left)})
+
 
 @app.route("/api/v1/admin/users/<int:user_id>/set-location", methods=["OPTIONS"])
 def _admin_user_set_location_preflight(user_id):
