@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-50"
+BACKEND_BUILD = "0702-51"
 
 
 def _epoch_ms(ts):
@@ -33084,6 +33084,11 @@ def met_pro_bulk_schedule():
     image_url = _normalize_image_url((data.get("image_url") or "").strip()[:500])
     if not image_url.startswith("http"):
         image_url = ""
+    # July 2026 (Chris): only change a draft's stored image when the Met
+    # actually touched the image controls this session. touched + empty
+    # means REMOVE (previously impossible: COALESCE kept old images
+    # forever); untouched means keep whatever the draft already has.
+    image_touched = bool(data.get("image_touched"))
     if image_url:
         # Google Drive / Dropbox links get re-hosted on our own domain
         # before anything sends (carrier-filter protection, July 2026).
@@ -33191,9 +33196,9 @@ def met_pro_bulk_schedule():
                         cur.execute(
                             """UPDATE pro_brief_drafts
                                SET met_verdict = %s, met_snippet = %s, met_body = %s,
-                                   image_url = COALESCE(NULLIF(%s, ''), image_url)
+                                   image_url = CASE WHEN %s THEN NULLIF(%s, '') ELSE image_url END
                                WHERE id = %s""",
-                            (verdict, snippet, body, image_url, draft_id),
+                            (verdict, snippet, body, image_touched, image_url, draft_id),
                         )
                     else:
                         cur.execute(
