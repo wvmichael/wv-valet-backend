@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-56"
+BACKEND_BUILD = "0702-57"
 
 
 def _epoch_ms(ts):
@@ -14521,6 +14521,71 @@ def admin_user_set_password(user_id: int):
 #   - The brief grader's nws_station_cache auto-invalidates when
 #     lat/lng changes by >0.01° — so the next brief uses the right
 #     station too. No additional cleanup needed.
+
+@app.route("/api/v1/admin/users/<int:member_id>/attach-to-account", methods=["OPTIONS"])
+def admin_attach_member_preflight(member_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/users/<int:member_id>/attach-to-account")
+def admin_attach_member(member_id):
+    """Admin attaches an existing user as a team member under a primary
+    account (July 18, 2026: the Sarah-under-Missy case). The member keeps
+    their own login, location, briefs, and Met; the membership links them
+    to the primary for team management and billing. Idempotent."""
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "admin-only"}), 403
+    d = request.get_json(silent=True) or {}
+    primary_email = (d.get("primary_email") or "").strip().lower()
+    if not primary_email:
+        return jsonify({"ok": False, "error": "no-primary-email"}), 400
+    now_ms = int(time.time() * 1000)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, subscription_tier, name FROM users WHERE LOWER(email)=LOWER(%s) AND is_active=TRUE",
+                            (primary_email,))
+                primary = cur.fetchone()
+                if not primary:
+                    return jsonify({"ok": False, "error": "primary-not-found",
+                                    "message": "No active account with that email."}), 404
+                if primary["id"] == member_id:
+                    return jsonify({"ok": False, "error": "self-attach"}), 400
+                cur.execute("SELECT id, email FROM users WHERE id=%s AND is_active=TRUE", (member_id,))
+                member = cur.fetchone()
+                if not member:
+                    return jsonify({"ok": False, "error": "member-not-found"}), 404
+                # Primary must be team-capable; admin intent is explicit,
+                # so a non-Pro primary gets upgraded to pro_multi.
+                if (primary.get("subscription_tier") or "") not in TEAM_ELIGIBLE_TIERS:
+                    cur.execute("UPDATE users SET subscription_tier='pro_multi' WHERE id=%s",
+                                (primary["id"],))
+                    print(f"[attach-member] primary {primary['id']} tier set to pro_multi by admin",
+                          flush=True)
+                cur.execute(
+                    """SELECT id, status FROM pro_multi_memberships
+                       WHERE primary_user_id=%s AND member_user_id=%s""",
+                    (primary["id"], member_id))
+                ex = cur.fetchone()
+                if ex:
+                    cur.execute(
+                        """UPDATE pro_multi_memberships
+                              SET status='active', accepted_at=COALESCE(accepted_at, %s)
+                            WHERE id=%s""", (now_ms, ex["id"]))
+                else:
+                    cur.execute(
+                        """INSERT INTO pro_multi_memberships
+                             (primary_user_id, member_user_id, status, invited_at, accepted_at)
+                           VALUES (%s, %s, 'active', %s, %s)""",
+                        (primary["id"], member_id, now_ms, now_ms))
+    except Exception as e:
+        print(f"[attach-member] failed member={member_id}: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "save-failed"}), 500
+    print(f"[attach-member] admin={user.get('email')} attached user={member_id} "
+          f"under primary={primary['id']}", flush=True)
+    return jsonify({"ok": True, "primary_name": primary.get("name") or primary_email})
+
 
 @app.get("/api/v1/admin/people-directory")
 def admin_people_directory():
