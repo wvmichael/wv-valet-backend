@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-59"
+BACKEND_BUILD = "0702-60"
 
 
 def _epoch_ms(ts):
@@ -5880,6 +5880,13 @@ def _roles_to_workspaces(roles: list) -> list:
     # login flow and get the entry below when the caller passes email).
     if "admin" in roles and not any(w["role"] == "sales" for w in workspaces):
         workspaces.append({"role": "sales", "label": "Sales", "url": "/sales"})
+    # Met View for admins (July 18, 2026): opens the Met portal, where the
+    # Today board's admin branch shows EVERY subscriber's watch cards
+    # company-wide, and the composer sends as the admin. Deliberately not
+    # tied to granting the met role (which would scope the board to the
+    # admin's own empty coverage instead).
+    if "admin" in roles and not any(w["role"] == "met" for w in workspaces):
+        workspaces.append({"role": "met", "label": "Met View", "url": "/meteorologist"})
     return workspaces
 
 
