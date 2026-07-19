@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-63"
+BACKEND_BUILD = "0702-64"
 
 
 def _epoch_ms(ts):
@@ -7657,6 +7657,33 @@ def _pregen_evening_forecasts() -> None:
             print(f"[eve-pregen] failed user={c['user_id']}: {e!r}", flush=True)
 
 
+def _dedupe_primary_locations_once() -> None:
+    """July 18, 2026 one-shot: some users accumulated multiple saved
+    locations flagged is_primary (intake + signup writers did not demote
+    first; both are fixed in this build). Keep the most recently updated
+    primary per user, demote the rest. Guarded so it runs once ever."""
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO wv_one_shot_migrations (mig_key, applied_at)
+                       VALUES ('dedupe-primary-loc-0718', %s)
+                       ON CONFLICT (mig_key) DO NOTHING""",
+                    (int(time.time() * 1000),))
+                if cur.rowcount == 0:
+                    return
+                cur.execute(
+                    """UPDATE saved_locations SET is_primary = FALSE
+                        WHERE is_primary = TRUE AND id NOT IN (
+                          SELECT DISTINCT ON (user_id) id FROM saved_locations
+                           WHERE is_primary = TRUE
+                           ORDER BY user_id, updated_at DESC NULLS LAST, id DESC)""")
+                print(f"[dedupe-primary] demoted {cur.rowcount} duplicate primaries",
+                      flush=True)
+    except Exception as e:
+        print(f"[dedupe-primary] failed: {e!r}", flush=True)
+
+
 def _derive_morning_shorts() -> None:
     """Early morning (04:40-05:04 local), for each subscriber whose
     EVENING forecast was actually sent, pre-seed today's morning draft as
@@ -8723,6 +8750,7 @@ def _activate_business_intake(intake) -> bool:
                     geo = _geocode_address(geo_query)
                     if geo and _geocode_looks_confident(geo_query, geo):
                         with conn.cursor() as cur:
+                            cur.execute("UPDATE saved_locations SET is_primary = FALSE WHERE user_id = %s AND is_primary = TRUE", (user_id,))
                             cur.execute(
                                 """INSERT INTO saved_locations
                                      (user_id, label, address_text, lat, lng,
@@ -9163,6 +9191,7 @@ def boone_trial_signup():
             # Grant real Pro Single access + stamp the trial.
             _grant_subscriber_role(user_id, conn)
             with conn.cursor() as cur:
+                cur.execute("UPDATE saved_locations SET is_primary = FALSE WHERE user_id = %s AND is_primary = TRUE", (user_id,))
                 cur.execute(
                     """UPDATE users
                        SET subscription_tier = 'pro_single',
@@ -14614,7 +14643,8 @@ def admin_people_directory():
         with db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """SELECT u.id, u.name, u.email, u.phone, u.is_active,
+                    """SELECT DISTINCT ON (u.id)
+                              u.id, u.name, u.email, u.phone, u.is_active,
                               u.subscription_tier, u.trial_status, u.trial_ends_at,
                               u.trial_business_name, u.timezone, u.created_at,
                               u.crew_home_label,
@@ -14633,8 +14663,9 @@ def admin_people_directory():
                              SELECT user_id, array_agg(role) AS roles
                                FROM user_roles GROUP BY user_id
                          ) r ON r.user_id = u.id
-                        ORDER BY LOWER(COALESCE(NULLIF(u.name, ''), u.email))""")
-                rows = cur.fetchall()
+                        ORDER BY u.id, loc.updated_at DESC NULLS LAST""")
+                rows = sorted(cur.fetchall(),
+                              key=lambda r: ((r.get("name") or r.get("email") or "").lower()))
                 cur.execute("SELECT slug, name FROM sales_reps WHERE is_active = TRUE ORDER BY name")
                 reps = [dict(x) for x in cur.fetchall()]
     except Exception as e:
@@ -24778,6 +24809,11 @@ def _brief_scheduler_loop() -> None:
             _process_rain_alerts()
         except Exception as e:
             print(f"[rain-alert] tick failed: {e!r}", flush=True)
+
+        try:
+            _dedupe_primary_locations_once()
+        except Exception as e:
+            print(f"[dedupe-primary] tick failed: {e!r}", flush=True)
 
         try:
             _derive_morning_shorts()
