@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-69"
+BACKEND_BUILD = "0702-70"
 
 
 def _epoch_ms(ts):
@@ -12373,8 +12373,18 @@ def media_upload():
                 if len(data) <= TARGET:
                     break
             mime, ext = "image/jpeg", "jpg"
-    except Exception:
-        data = raw  # Pillow unavailable or failed; the original bytes are fine
+        print(f"[media-upload] optimized {len(raw)//1024}KB -> {len(data)//1024}KB "
+              f"({mime})", flush=True)
+    except Exception as _pe:
+        data = raw
+        print(f"[media-upload] optimizer unavailable or failed ({_pe!r}); "
+              f"storing raw {len(raw)//1024}KB", flush=True)
+        if len(raw) > 4 * 1024 * 1024:
+            return jsonify({"ok": False, "error": "optimizer-missing",
+                            "message": "The server could not shrink this image "
+                                       "(image optimizer not installed). Admin: add "
+                                       "Pillow to requirements.txt and redeploy. For "
+                                       "now, export the graphic at a smaller size."}), 400
     if len(data) > 4 * 1024 * 1024:
         return jsonify({"ok": False, "error": "too-large",
                         "message": "That image could not be shrunk enough to send by "
