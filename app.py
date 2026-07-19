@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-70"
+BACKEND_BUILD = "0702-72"
 
 
 def _epoch_ms(ts):
@@ -2130,6 +2130,7 @@ ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS bottom_line TEXT;
 ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS weather_details TEXT;
 ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS whats_ahead TEXT;
 ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS image_url TEXT;
+ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS morning_override TEXT;
 -- Subscriber's chosen delivery time for sort-ordering in the Met queue.
 -- Snapshotted from brief_preferences at draft-generation time so that
 -- "earliest first" ordering matches what the subscriber expects, even
@@ -7702,7 +7703,8 @@ def _derive_morning_shorts() -> None:
                               COALESCE(bp.channels, 'sms,email') AS channels,
                               loc.label AS loc_label, loc.address_text AS loc_address,
                               loc.lat AS loc_lat, loc.lng AS loc_lng,
-                              COALESCE(bp.morning_window_end, '08:00') AS morning_window_end
+                              COALESCE(bp.morning_window_end, '08:00') AS morning_window_end,
+                              d.morning_override
                          FROM pro_brief_drafts d
                          JOIN users u ON u.id = d.user_id
                          JOIN saved_locations loc ON loc.user_id = u.id AND loc.is_primary = TRUE
@@ -7739,23 +7741,13 @@ def _derive_morning_shorts() -> None:
         except Exception:
             continue
         try:
-            forecast = _fetch_forecast(float(c["loc_lat"]), float(c["loc_lng"])) or {}
-            daily = forecast.get("daily") or {}
-            high = (daily.get("temperature_2m_max") or [None])[0]
-            low = (daily.get("temperature_2m_min") or [None])[0]
-            code = (daily.get("weathercode") or [None])[0]
-            cond = _weather_code_label(code) if code is not None else ""
-            if high is None:
+            # July 19 (Michael's rule): the morning recap is EXACTLY the
+            # text the Met approved or wrote at evening-send time. If no
+            # approved text exists, NO recap goes out. This job never
+            # composes subscriber-facing weather words on its own.
+            short = (c.get("morning_override") or "").strip()
+            if not short:
                 continue
-            label = c["loc_label"] or c["loc_address"] or "your location"
-            parts = []
-            if cond:
-                parts.append(cond + ".")
-            if low is not None:
-                parts.append(f"Morning around {round(low)}, afternoon high {round(high)}.")
-            else:
-                parts.append(f"High {round(high)} this afternoon.")
-            short = " ".join(parts)
             verdict = c.get("met_verdict") or c.get("ai_verdict") or "clear"
             try:
                 eh, em = int(c["morning_window_end"][:2]), int(c["morning_window_end"][3:5] or c["morning_window_end"][3:])
@@ -14666,6 +14658,37 @@ def admin_attach_member(member_id):
     print(f"[attach-member] admin={user.get('email')} attached user={member_id} "
           f"under primary={primary['id']}", flush=True)
     return jsonify({"ok": True, "primary_name": primary.get("name") or primary_email})
+
+
+@app.route("/api/v1/met/pro-briefs/<int:draft_id>/morning-override", methods=["OPTIONS"])
+def _morning_override_preflight(draft_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/met/pro-briefs/<int:draft_id>/morning-override")
+def met_morning_override(draft_id):
+    """Met rewrites tomorrow's automatic morning recap at evening-send
+    time (July 19, Michael's review-before-it-sends request). Stored on
+    the evening draft; the 4:45 AM derive job uses it verbatim."""
+    user = _get_current_user()
+    roles = (user.get("roles") or []) if user else []
+    if not user or ("met" not in roles and "admin" not in roles):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    d = request.get_json(silent=True) or {}
+    text = (d.get("text") or "").strip()[:400]
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE pro_brief_drafts SET morning_override = %s
+                        WHERE id = %s AND brief_type = 'evening'""",
+                    (text or None, draft_id))
+                if cur.rowcount == 0:
+                    return jsonify({"ok": False, "error": "not-found"}), 404
+    except Exception as e:
+        print(f"[morning-override] save failed draft={draft_id}: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "save-failed"}), 500
+    return jsonify({"ok": True})
 
 
 @app.get("/api/v1/admin/message-feed")
@@ -33994,6 +34017,7 @@ def _autosend_pro_brief_draft(draft_id: int) -> tuple[bool, str]:
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT d.*, u.email AS sub_email, u.phone AS sub_phone,
+                          loc.lat AS loc_lat, loc.lng AS loc_lng,
                           u.name AS sub_name,
                           loc.address_text AS location_address
                    FROM pro_brief_drafts d
@@ -35485,6 +35509,7 @@ def met_pro_brief_send(draft_id):
             cur.execute(
                 """SELECT d.*, u.email AS sub_email, u.phone AS sub_phone,
                           u.name AS sub_name,
+                          loc.lat AS loc_lat, loc.lng AS loc_lng,
                           loc.address_text AS location_address
                    FROM pro_brief_drafts d
                    JOIN users u ON u.id = d.user_id
@@ -36131,6 +36156,39 @@ def met_pro_brief_send(draft_id):
             print(f"[pro-brief-send] multi-send failed user={extra_user_id}: {e}", flush=True)
             multi_results.append({"user_id": extra_user_id, "ok": False, "error": "exception"})
 
+    # July 19 (Michael): after an EVENING send, show the Met tomorrow's
+    # automatic morning recap so they can approve or rewrite it tonight.
+    morning_preview = None
+    try:
+        if (row.get("brief_type") or "") == "evening":
+            _f = _fetch_forecast(float(row.get("loc_lat") or row.get("location_lat") or 0),
+                                 float(row.get("loc_lng") or row.get("location_lng") or 0)) or {}
+            _daily = _f.get("daily") or {}
+            _hi = (_daily.get("temperature_2m_max") or [None, None])[1]
+            _lo = (_daily.get("temperature_2m_min") or [None, None])[1]
+            _code = (_daily.get("weathercode") or [None, None])[1]
+            _parts = []
+            _cond = _weather_code_label(_code) if _code is not None else ""
+            if _cond:
+                _parts.append(_cond.rstrip(".") + ".")
+            if _hi is not None and _lo is not None:
+                _parts.append(f"Morning around {round(_lo)}, afternoon high {round(_hi)}.")
+            elif _hi is not None:
+                _parts.append(f"High {round(_hi)} this afternoon.")
+            if _parts:
+                morning_preview = " ".join(_parts)
+                # Freeze-on-approval (July 19, Michael's rule): what the
+                # Met sees NOW is exactly what sends tomorrow. No
+                # overnight rebuild, ever.
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """UPDATE pro_brief_drafts
+                                  SET morning_override = %s
+                                WHERE id = %s AND morning_override IS NULL""",
+                            (morning_preview, draft_id))
+    except Exception as _mp:
+        print(f"[morning-preview] failed draft={draft_id}: {_mp!r}", flush=True)
     return jsonify({
         "ok": True,
         "channels_used": channels_used,
@@ -36138,6 +36196,8 @@ def met_pro_brief_send(draft_id):
         "history_id": history_id,
         "multi_results": multi_results,
         "multi_count": len([r for r in multi_results if r.get("ok")]),
+        "morning_preview": morning_preview,
+        "draft_id": draft_id,
     })
 
 
