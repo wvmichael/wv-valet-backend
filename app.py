@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-72"
+BACKEND_BUILD = "0702-73"
 
 
 def _epoch_ms(ts):
@@ -18871,6 +18871,27 @@ def replies_sms_inbound():
                 )
             except Exception as e:
                 print(f"[reply-route] pro thread routing failed: {e}", flush=True)
+            # July 19: instant static acknowledgment so a subscriber who
+            # just shared their plans knows a human has them. Fixed copy
+            # only (Met-words rule), throttled to one ack per 6 hours.
+            try:
+                _bucket = int(time.time() // 21600)
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """INSERT INTO wv_one_shot_migrations
+                                 (mig_key, applied_at)
+                               VALUES (%s, %s)
+                               ON CONFLICT (mig_key) DO NOTHING""",
+                            (f"sms-ack-{matched_user_id}-{_bucket}",
+                             int(time.time() * 1000)))
+                        _fresh_ack = cur.rowcount > 0
+                if _fresh_ack:
+                    send_sms(from_phone,
+                             "Got it. Your Meteorologist has your message and "
+                             "will take it from here.")
+            except Exception as e:
+                print(f"[reply-ack] failed: {e!r}", flush=True)
 
         # Notify the Met (or admins) — but NOT for crew-only check-ins.
         # A crew member answering the morning conditions nudge gets the
@@ -39235,7 +39256,8 @@ def _rosie_run_turn(met_user_id, conversation_id, user_message, channel="web"):
             print(f"[rosie] API error: {result['error']}", flush=True)
             _rosie_audit(met_user_id, channel, "api_error", result["error"][:200],
                          tier=1, success=False)
-            return "I hit a snag reaching my brain. Try again in a sec.\n- Rosie"
+            return ("Rosie here. I could not process that one just now. "
+                    "Give me a minute and try again.")
 
         usage = result.get("usage", {})
         total_tokens += (usage.get("input_tokens", 0) + usage.get("output_tokens", 0))
@@ -39640,6 +39662,31 @@ def sms_inbound_router():
         flush=True,
     )
 
+    # July 19 fix (the founder's own 6 PM prompt reply hit Rosie): a
+    # Met or admin who ALSO holds the subscriber role is usually
+    # replying as a subscriber. Context beats rank. Starting the text
+    # with "Rosie" summons her explicitly for staff who want her.
+    sender_has_subscriber = False
+    if sender_role in ("met", "admin") and from_phone:
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT 1 FROM users u
+                             JOIN user_roles ur ON ur.user_id = u.id
+                            WHERE RIGHT(REGEXP_REPLACE(COALESCE(u.phone,''),
+                                        '[^0-9]', '', 'g'), 10) = %s
+                              AND ur.role = 'subscriber' AND u.is_active
+                            LIMIT 1""",
+                        (_phone_last10(from_phone),))
+                    sender_has_subscriber = cur.fetchone() is not None
+        except Exception as e:
+            print(f"[sms-router] dual-role check failed: {e!r}", flush=True)
+    _summons_rosie = body.strip().lower().startswith("rosie")
+    if sender_role in ("met", "admin") and sender_has_subscriber and not _summons_rosie:
+        print(f"[sms-router] dual-role sender routed to subscriber capture",
+              flush=True)
+        return replies_sms_inbound()
     if sender_role in ("met", "admin"):
         # Hand off to Rosie. We invoke the existing function directly —
         # it reads request.form so the call works as-is.
