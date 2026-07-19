@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-64"
+BACKEND_BUILD = "0702-65"
 
 
 def _epoch_ms(ts):
@@ -14627,6 +14627,63 @@ def admin_attach_member(member_id):
     print(f"[attach-member] admin={user.get('email')} attached user={member_id} "
           f"under primary={primary['id']}", flush=True)
     return jsonify({"ok": True, "primary_name": primary.get("name") or primary_email})
+
+
+@app.get("/api/v1/admin/message-feed")
+def admin_message_feed():
+    """One log of every Met-subscriber message across channels (July 19,
+    2026, Michael's ask): SMS relay sends, Watch Card updates, and portal
+    thread messages, newest first, searchable. Admin only."""
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "admin-only"}), 403
+    q = (request.args.get("q") or "").strip().lower()
+    try:
+        limit = min(300, max(20, int(request.args.get("limit") or 150)))
+    except Exception:
+        limit = 150
+    rows = []
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT m.sent_at AS at, 'sms' AS channel,
+                              mu.name AS met_name,
+                              COALESCE(NULLIF(m.customer_label,''), m.customer_phone, '') AS who,
+                              'met' AS sender_role, m.body
+                         FROM met_messages m
+                         LEFT JOIN users mu ON mu.id = m.met_user_id
+                        ORDER BY m.sent_at DESC LIMIT %s""", (limit,))
+                rows += [dict(r) for r in cur.fetchall()]
+                cur.execute(
+                    """SELECT w.sent_at AS at, 'watch' AS channel,
+                              mu.name AS met_name,
+                              COALESCE(NULLIF(su.trial_business_name,''), su.name, su.email) AS who,
+                              'met' AS sender_role, w.body
+                         FROM watch_updates w
+                         LEFT JOIN users mu ON mu.id = w.met_id
+                         LEFT JOIN users su ON su.id = w.user_id
+                        ORDER BY w.sent_at DESC LIMIT %s""", (limit,))
+                rows += [dict(r) for r in cur.fetchall()]
+                cur.execute(
+                    """SELECT pm.created_at AS at, 'portal' AS channel,
+                              CASE WHEN pm.sender_role='met' THEN pm.sender_name ELSE NULL END AS met_name,
+                              COALESCE(NULLIF(su.trial_business_name,''), su.name, su.email) AS who,
+                              pm.sender_role, pm.body
+                         FROM pro_thread_messages pm
+                         JOIN pro_threads pt ON pt.id = pm.thread_id
+                         LEFT JOIN users su ON su.id = pt.subscriber_user_id
+                        ORDER BY pm.created_at DESC LIMIT %s""", (limit,))
+                rows += [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print(f"[message-log] load failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "load-failed"}), 500
+    if q:
+        rows = [r for r in rows
+                if q in ((r.get("who") or "") + " " + (r.get("met_name") or "")
+                         + " " + (r.get("body") or "")).lower()]
+    rows.sort(key=lambda r: r.get("at") or 0, reverse=True)
+    return jsonify({"ok": True, "messages": rows[:limit]})
 
 
 @app.get("/api/v1/admin/people-directory")
