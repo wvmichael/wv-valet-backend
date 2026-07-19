@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-62"
+BACKEND_BUILD = "0702-63"
 
 
 def _epoch_ms(ts):
@@ -14645,8 +14645,12 @@ def admin_people_directory():
         roles = sorted(set(list(r.get("roles") or [])))
         if r.get("rep_slug_self"):
             roles.append("sales")
-        location = (r.get("loc_label") or r.get("loc_address")
-                    or r.get("crew_home_label") or "")
+        _lab = (r.get("loc_label") or "").strip()
+        _addr = (r.get("loc_address") or "").strip()
+        if _lab.lower() in ("home", "work", "office", "my location", "primary") and _addr:
+            location = _addr
+        else:
+            location = _lab or _addr or (r.get("crew_home_label") or "")
         tier = r.get("subscription_tier") or ""
         trial_days = None
         if r.get("trial_status") == "active" and r.get("trial_ends_at"):
