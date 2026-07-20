@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-73"
+BACKEND_BUILD = "0702-74"
 
 
 def _epoch_ms(ts):
@@ -18887,7 +18887,7 @@ def replies_sms_inbound():
                              int(time.time() * 1000)))
                         _fresh_ack = cur.rowcount > 0
                 if _fresh_ack:
-                    send_sms(from_phone,
+                    send_sms(from_addr,
                              "Got it. Your Meteorologist has your message and "
                              "will take it from here.")
             except Exception as e:
