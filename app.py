@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-74"
+BACKEND_BUILD = "0702-75"
 
 
 def _epoch_ms(ts):
@@ -2131,6 +2131,7 @@ ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS weather_details TEXT;
 ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS whats_ahead TEXT;
 ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS image_url TEXT;
 ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS morning_override TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_prior_tier TEXT;
 -- Subscriber's chosen delivery time for sort-ordering in the Met queue.
 -- Snapshotted from brief_preferences at draft-generation time so that
 -- "earliest first" ordering matches what the subscriber expects, even
@@ -14691,6 +14692,93 @@ def met_morning_override(draft_id):
     return jsonify({"ok": True})
 
 
+@app.route("/api/v1/admin/users/<int:user_id>/courtesy-pro-trial", methods=["OPTIONS"])
+def courtesy_trial_preflight(user_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/users/<int:user_id>/courtesy-pro-trial")
+def admin_courtesy_pro_trial(user_id):
+    """Give a PAYING lower-tier subscriber a Pro Single trial on top of
+    their plan (July 19, Chris's idea, John Rundel first). Their paid
+    tier is remembered; when the trial ends they revert, never lose
+    access. Also assigns a primary Met if they lack one."""
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "admin-only"}), 403
+    d = request.get_json(silent=True) or {}
+    try:
+        days = min(120, max(7, int(d.get("days") or 30)))
+    except Exception:
+        days = 30
+    now_s = int(time.time())
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT subscription_tier, trial_status FROM users
+                        WHERE id = %s AND is_active = TRUE""", (user_id,))
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"ok": False, "error": "not-found"}), 404
+                cur_tier = (row.get("subscription_tier") or "").strip()
+                if cur_tier.startswith("pro_"):
+                    return jsonify({"ok": False, "error": "already-pro",
+                                    "message": "Already on a Pro tier."}), 400
+                cur.execute(
+                    """UPDATE users
+                          SET trial_prior_tier = %s,
+                              subscription_tier = 'pro_single',
+                              trial_status = 'active',
+                              trial_ends_at = %s
+                        WHERE id = %s""",
+                    (cur_tier or "hobbyist", now_s + days * 86400, user_id))
+                # Primary Met if missing, using the region auto-assign.
+                cur.execute(
+                    """SELECT primary_met_id FROM subscriber_coverage
+                        WHERE user_id = %s""", (user_id,))
+                cov = cur.fetchone()
+                if not cov or not cov.get("primary_met_id"):
+                    met_id = None
+                    try:
+                        cur.execute(
+                            """SELECT COALESCE(address_text,'') || ' ' ||
+                                      COALESCE(label,'') AS loc
+                                 FROM saved_locations
+                                WHERE user_id = %s AND is_primary = TRUE
+                                LIMIT 1""", (user_id,))
+                        _loc = ((cur.fetchone() or {}).get("loc") or "").lower()
+                        _cohort = "kansas" if ("kansas" in _loc or " ks" in _loc
+                                               or _loc.endswith("ks")) else "boone"
+                        _met_email = TRIAL_REGION_MET.get(_cohort)
+                        if _met_email:
+                            cur.execute(
+                                "SELECT id FROM users WHERE LOWER(email)=LOWER(%s)",
+                                (_met_email,))
+                            _mr = cur.fetchone()
+                            met_id = _mr["id"] if _mr else None
+                    except Exception as _aa:
+                        print(f"[courtesy-trial] met auto-assign failed: {_aa!r}",
+                              flush=True)
+                    if met_id:
+                        cur.execute(
+                            """INSERT INTO subscriber_coverage
+                                 (user_id, primary_met_id, updated_at)
+                               VALUES (%s, %s, %s)
+                               ON CONFLICT (user_id) DO UPDATE
+                                 SET primary_met_id = EXCLUDED.primary_met_id,
+                                     updated_at = EXCLUDED.updated_at""",
+                            (user_id, met_id, int(time.time() * 1000)))
+    except Exception as e:
+        print(f"[courtesy-trial] failed user={user_id}: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "save-failed"}), 500
+    print(f"[courtesy-trial] admin={user.get('email')} gave user {user_id} "
+          f"pro_single for {days}d (reverts to {cur_tier or 'hobbyist'})",
+          flush=True)
+    return jsonify({"ok": True, "days": days,
+                    "reverts_to": cur_tier or "hobbyist"})
+
+
 @app.get("/api/v1/admin/message-feed")
 def admin_message_feed():
     """One log of every Met-subscriber message across channels (July 19,
@@ -24904,6 +24992,28 @@ def _process_expired_trials() -> None:
                         cur_row = cur.fetchone() or {}
                     if cur_row.get("trial_status") != "active":
                         continue  # converted or already expired — leave alone
+                    # July 19 (courtesy Pro trials for paying hobbyists,
+                    # e.g. John Rundel): if a prior paid tier is stored,
+                    # the trial ending means REVERT, never revoke. The
+                    # customer keeps everything they are paying for.
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT trial_prior_tier FROM users WHERE id = %s",
+                            (uid,))
+                        _pt = (cur.fetchone() or {}).get("trial_prior_tier")
+                    if _pt:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """UPDATE users
+                                      SET subscription_tier = %s,
+                                          trial_status = 'expired',
+                                          trial_prior_tier = NULL
+                                    WHERE id = %s""",
+                                (_pt, uid))
+                        print(f"[trial-expiry] courtesy trial ended for user "
+                              f"{uid}; reverted to {_pt}, access kept",
+                              flush=True)
+                        continue
                     _revoke_subscriber_role(uid, conn)
                     with conn.cursor() as cur:
                         cur.execute(
