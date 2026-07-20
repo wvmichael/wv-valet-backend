@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-76"
+BACKEND_BUILD = "0702-77"
 
 
 def _epoch_ms(ts):
@@ -23076,6 +23076,24 @@ def _generate_ai_brief(location_label: str, forecast: dict,
         verdict = "caution"
     else:
         verdict = "clear"
+
+    # July 19 (Michael + both Mets): template prose is GONE by default.
+    # It narrated raw model data in confident sentences, which read as
+    # "wrong AI" and cost the Mets deletion time. Drafts now open with a
+    # plain FACTS block; the forecast words are the Met's job. Set env
+    # AI_DRAFT_PROSE=on to restore the old sentences.
+    if os.environ.get("AI_DRAFT_PROSE", "off") != "on":
+        facts = [f"{place}: {conditions.lower()}. High {high_int}, low {low_int}."]
+        if precip and precip > 0:
+            facts.append(f'Model precip: {precip:.2f}" through the day.')
+        else:
+            facts.append("Model precip: none indicated.")
+        if wind:
+            facts.append(f"Wind gusts to {int(wind)} mph.")
+        if code in (95, 96, 99):
+            facts.append("Thunderstorm signal in the model.")
+        body = "\n".join(facts)
+        return (verdict, facts[0], body)
 
     # ── Compose the brief in complete sentences ──
     # No editorializing about what the subscriber should or shouldn't
