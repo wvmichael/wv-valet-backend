@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-78"
+BACKEND_BUILD = "0702-79"
 
 
 def _epoch_ms(ts):
@@ -2132,6 +2132,9 @@ ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS whats_ahead TEXT;
 ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS image_url TEXT;
 ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS morning_override TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_prior_tier TEXT;
+ALTER TABLE IF EXISTS uploaded_media ADD COLUMN IF NOT EXISTS is_brand_asset BOOLEAN DEFAULT FALSE;
+ALTER TABLE IF EXISTS uploaded_media ADD COLUMN IF NOT EXISTS asset_label TEXT;
+ALTER TABLE saved_locations ADD COLUMN IF NOT EXISTS plant_date TEXT;
 -- Subscriber's chosen delivery time for sort-ordering in the Met queue.
 -- Snapshotted from brief_preferences at draft-generation time so that
 -- "earliest first" ordering matches what the subscriber expects, even
@@ -14785,6 +14788,42 @@ def admin_courtesy_pro_trial(user_id):
                     "reverts_to": cur_tier or "hobbyist"})
 
 
+@app.get("/api/v1/met/field-rain/<int:sub_id>")
+def met_field_rain(sub_id):
+    """Rain totals per saved field for one subscriber (met/admin).
+    Numbers only; the Met writes the message around them."""
+    user = _get_current_user()
+    roles = (user.get("roles") or []) if user else []
+    if not user or ("met" not in roles and "admin" not in roles):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT label, address_text, lat, lng, plant_date, is_primary
+                         FROM saved_locations
+                        WHERE user_id = %s
+                        ORDER BY is_primary DESC, id""", (sub_id,))
+                rows = cur.fetchall()
+    except Exception as e:
+        print(f"[field-rain] load failed sub={sub_id}: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "load-failed"}), 500
+    fields = []
+    for r in rows[:12]:
+        if r.get("lat") is None or r.get("lng") is None:
+            continue
+        t = _field_rain_totals(float(r["lat"]), float(r["lng"]),
+                               r.get("plant_date") or "")
+        if not t:
+            continue
+        fields.append({"label": r.get("label") or r.get("address_text") or "Field", **t})
+    lines = [f'{f["label"]}: {f["last24"]:.2f}" last 24 hr, '
+             f'{f["last7"]:.2f}" last 7 days, '
+             f'{f["since_plant"]:.2f}" since {f["plant_date"][5:]}'
+             for f in fields]
+    return jsonify({"ok": True, "fields": fields, "summary": "\n".join(lines)})
+
+
 @app.get("/api/v1/brand-assets")
 def brand_assets_list():
     """Graphics library for the Met Portal (July 19, 2026). Admin uploads
@@ -22028,6 +22067,70 @@ def _shift_forecast_to_day(data: dict, offset: int) -> dict:
             if isinstance(v, list) and len(v) > shift:
                 hourly[k] = v[shift:]
     return data
+
+
+_RAIN_CACHE: dict = {}
+
+
+def _fetch_openmeteo_json(url: str) -> Optional[dict]:
+    """Tiny HTTP helper (separate so tests can monkeypatch it)."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "weathervalet/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[rain-fetch] failed: {e!r}", flush=True)
+        return None
+
+
+def _field_rain_totals(lat: float, lng: float, plant_date: str) -> Optional[dict]:
+    """Chris's three numbers for one field (July 2026): rain last 24
+    hours, last 7 days, and total since planting. Inches, labeled
+    estimates, cached per field per hour."""
+    import datetime as _dt
+    key = (round(lat, 3), round(lng, 3), plant_date, int(time.time() // 3600))
+    if key in _RAIN_CACHE:
+        return _RAIN_CACHE[key]
+    today = _dt.date.today()
+    try:
+        pd = _dt.date.fromisoformat((plant_date or "")[:10])
+    except Exception:
+        pd = _dt.date(today.year, 4, 15)
+    if pd > today:
+        pd = _dt.date(today.year, 4, 15)
+    recent = _fetch_openmeteo_json(
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat}&longitude={lng}"
+        "&daily=precipitation_sum&hourly=precipitation"
+        "&past_days=7&forecast_days=1"
+        "&precipitation_unit=inch&timezone=auto")
+    if not recent:
+        return None
+    hourly = recent.get("hourly") or {}
+    htimes = hourly.get("time") or []
+    hvals = hourly.get("precipitation") or []
+    now_iso = _dt.datetime.now().strftime("%Y-%m-%dT%H:00")
+    cutoff = (_dt.datetime.now() - _dt.timedelta(hours=24)).strftime("%Y-%m-%dT%H:00")
+    last24 = sum((v or 0) for t, v in zip(htimes, hvals) if cutoff <= t <= now_iso)
+    dvals = (recent.get("daily") or {}).get("precipitation_sum") or []
+    dtimes = (recent.get("daily") or {}).get("time") or []
+    last7 = sum((v or 0) for t, v in zip(dtimes, dvals) if t <= today.isoformat())
+    since_plant = last7
+    window_start = today - _dt.timedelta(days=7)
+    if pd < window_start:
+        arch = _fetch_openmeteo_json(
+            "https://archive-api.open-meteo.com/v1/archive"
+            f"?latitude={lat}&longitude={lng}"
+            f"&start_date={pd.isoformat()}"
+            f"&end_date={(window_start - _dt.timedelta(days=1)).isoformat()}"
+            "&daily=precipitation_sum&precipitation_unit=inch&timezone=auto")
+        if arch:
+            since_plant += sum((v or 0) for v in
+                               ((arch.get("daily") or {}).get("precipitation_sum") or []))
+    out = {"last24": round(last24, 2), "last7": round(last7, 2),
+           "since_plant": round(since_plant, 2), "plant_date": pd.isoformat()}
+    _RAIN_CACHE[key] = out
+    return out
 
 
 def _fetch_forecast(lat: float, lng: float, day_offset: int = 0) -> Optional[dict]:
