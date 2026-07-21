@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-81"
+BACKEND_BUILD = "0702-82"
 
 
 def _epoch_ms(ts):
@@ -14847,6 +14847,37 @@ def admin_add_field(user_id):
                     "plant_date": plant_date})
 
 
+@app.route("/api/v1/admin/users/<int:user_id>/fields/<int:loc_id>", methods=["OPTIONS"])
+def admin_del_field_preflight(user_id, loc_id):
+    return ("", 204)
+
+
+@app.delete("/api/v1/admin/users/<int:user_id>/fields/<int:loc_id>")
+def admin_del_field(user_id, loc_id):
+    """Remove a field (met for own subscribers, admin for anyone).
+    Primary locations are protected; only added fields can be removed."""
+    user = _get_current_user()
+    roles = (user.get("roles") or []) if user else []
+    if not user or ("admin" not in roles and "met" not in roles):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    if "admin" not in roles and user_id not in _met_subscriber_ids(user["id"]):
+        return jsonify({"ok": False, "error": "not-your-subscriber"}), 403
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """DELETE FROM saved_locations
+                        WHERE id = %s AND user_id = %s AND is_primary = FALSE""",
+                    (loc_id, user_id))
+                if cur.rowcount == 0:
+                    return jsonify({"ok": False, "error": "not-removable",
+                                    "message": "Primary location cannot be removed here."}), 400
+    except Exception as e:
+        print(f"[del-field] failed loc={loc_id}: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "save-failed"}), 500
+    return jsonify({"ok": True})
+
+
 @app.get("/api/v1/met/field-rain/<int:sub_id>")
 def met_field_rain(sub_id):
     """Rain totals per saved field for one subscriber (met/admin).
@@ -14859,7 +14890,7 @@ def met_field_rain(sub_id):
         with db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """SELECT label, address_text, lat, lng, plant_date, is_primary
+                    """SELECT id, label, address_text, lat, lng, plant_date, is_primary
                          FROM saved_locations
                         WHERE user_id = %s
                         ORDER BY is_primary DESC, id""", (sub_id,))
@@ -14875,10 +14906,11 @@ def met_field_rain(sub_id):
                                r.get("plant_date") or "")
         if not t:
             continue
-        fields.append({"label": r.get("label") or r.get("address_text") or "Field", **t})
+        fields.append({"id": r["id"], "is_primary": bool(r.get("is_primary")),
+                       "label": r.get("label") or r.get("address_text") or "Field", **t})
     lines = [f'{f["label"]}: {f["last24"]:.2f}" last 24 hr, '
              f'{f["last7"]:.2f}" last 7 days, '
-             f'{f["since_plant"]:.2f}" since {f["plant_date"][5:]}'
+             f'{f["since_plant"]:.2f}" and {f["gdd"]} GDD since {f["plant_date"][5:]}'
              for f in fields]
     return jsonify({"ok": True, "fields": fields, "summary": "\n".join(lines)})
 
@@ -22160,9 +22192,10 @@ def _field_rain_totals(lat: float, lng: float, plant_date: str) -> Optional[dict
     recent = _fetch_openmeteo_json(
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={lat}&longitude={lng}"
-        "&daily=precipitation_sum&hourly=precipitation"
+        "&daily=precipitation_sum,temperature_2m_max,temperature_2m_min"
+        "&hourly=precipitation"
         "&past_days=7&forecast_days=1"
-        "&precipitation_unit=inch&timezone=auto")
+        "&precipitation_unit=inch&temperature_unit=fahrenheit&timezone=auto")
     if not recent:
         return None
     hourly = recent.get("hourly") or {}
@@ -22176,18 +22209,35 @@ def _field_rain_totals(lat: float, lng: float, plant_date: str) -> Optional[dict
     last7 = sum((v or 0) for t, v in zip(dtimes, dvals) if t <= today.isoformat())
     since_plant = last7
     window_start = today - _dt.timedelta(days=7)
+    def _gdd_day(tmax, tmin):
+        # Corn/milo standard: base 50F, cap 86F, floor at base.
+        if tmax is None or tmin is None:
+            return 0.0
+        return max(0.0, (min(tmax, 86) + max(tmin, 50)) / 2.0 - 50.0)
+
+    _rd = recent.get("daily") or {}
+    gdd = sum(_gdd_day(mx, mn)
+              for t, mx, mn in zip(_rd.get("time") or [],
+                                   _rd.get("temperature_2m_max") or [],
+                                   _rd.get("temperature_2m_min") or [])
+              if t >= pd.isoformat() and t <= today.isoformat())
     if pd < window_start:
         arch = _fetch_openmeteo_json(
             "https://archive-api.open-meteo.com/v1/archive"
             f"?latitude={lat}&longitude={lng}"
             f"&start_date={pd.isoformat()}"
             f"&end_date={(window_start - _dt.timedelta(days=1)).isoformat()}"
-            "&daily=precipitation_sum&precipitation_unit=inch&timezone=auto")
+            "&daily=precipitation_sum,temperature_2m_max,temperature_2m_min"
+            "&precipitation_unit=inch&temperature_unit=fahrenheit&timezone=auto")
         if arch:
-            since_plant += sum((v or 0) for v in
-                               ((arch.get("daily") or {}).get("precipitation_sum") or []))
+            _ad = arch.get("daily") or {}
+            since_plant += sum((v or 0) for v in (_ad.get("precipitation_sum") or []))
+            gdd += sum(_gdd_day(mx, mn)
+                       for mx, mn in zip(_ad.get("temperature_2m_max") or [],
+                                         _ad.get("temperature_2m_min") or []))
     out = {"last24": round(last24, 2), "last7": round(last7, 2),
-           "since_plant": round(since_plant, 2), "plant_date": pd.isoformat()}
+           "since_plant": round(since_plant, 2), "gdd": int(round(gdd)),
+           "plant_date": pd.isoformat()}
     _RAIN_CACHE[key] = out
     return out
 
