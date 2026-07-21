@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-80"
+BACKEND_BUILD = "0702-81"
 
 
 def _epoch_ms(ts):
@@ -14800,8 +14800,13 @@ def admin_add_field(user_id):
     (Chris: farmers can just give coordinates), plus an optional plant
     date. Stored as a non-primary saved location."""
     user = _get_current_user()
-    if not user or "admin" not in (user.get("roles") or []):
-        return jsonify({"ok": False, "error": "admin-only"}), 403
+    roles = (user.get("roles") or []) if user else []
+    if not user or ("admin" not in roles and "met" not in roles):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    # July 21: Mets add fields for THEIR OWN subscribers (Chris entering
+    # John's milo plantings himself); admins for anyone.
+    if "admin" not in roles and user_id not in _met_subscriber_ids(user["id"]):
+        return jsonify({"ok": False, "error": "not-your-subscriber"}), 403
     d = request.get_json(silent=True) or {}
     label = (d.get("label") or "").strip()[:80]
     where = (d.get("where") or "").strip()
