@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-77"
+BACKEND_BUILD = "0702-78"
 
 
 def _epoch_ms(ts):
@@ -12154,7 +12154,9 @@ def _ensure_media_table():
                        filename    TEXT,
                        uploaded_by INTEGER,
                        created_at  BIGINT NOT NULL
-                   )"""
+                   ,
+                       is_brand_asset BOOLEAN DEFAULT FALSE,
+                       asset_label TEXT)"""
             )
 
 
@@ -12390,10 +12392,14 @@ def media_upload():
             with conn.cursor() as cur:
                 cur.execute(
                     """INSERT INTO uploaded_media
-                           (token, mime_type, bytes, byte_size, filename, uploaded_by, created_at)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                           (token, mime_type, bytes, byte_size, filename, uploaded_by,
+                            created_at, is_brand_asset, asset_label)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                     (token, mime, psycopg2.Binary(data), len(data),
-                     (f.filename or "")[:200], user.get("id"), int(time.time() * 1000)),
+                     (f.filename or "")[:200], user.get("id"), int(time.time() * 1000),
+                     bool(request.form.get("brand"))
+                         and "admin" in (user.get("roles") or []),
+                     (request.form.get("label") or "")[:120] or None),
                 )
     except Exception as e:
         return jsonify({"ok": False, "error": "server", "message": str(e)}), 500
@@ -14777,6 +14783,38 @@ def admin_courtesy_pro_trial(user_id):
           flush=True)
     return jsonify({"ok": True, "days": days,
                     "reverts_to": cur_tier or "hobbyist"})
+
+
+@app.get("/api/v1/brand-assets")
+def brand_assets_list():
+    """Graphics library for the Met Portal (July 19, 2026). Admin uploads
+    finished graphics/templates; Mets browse, download, copy links."""
+    user = _get_current_user()
+    roles = (user.get("roles") or []) if user else []
+    if not user or ("met" not in roles and "admin" not in roles):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT token, mime_type, asset_label, filename, created_at
+                         FROM uploaded_media
+                        WHERE is_brand_asset = TRUE
+                        ORDER BY created_at DESC LIMIT 200""")
+                rows = cur.fetchall()
+    except Exception as e:
+        print(f"[brand-assets] list failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "load-failed"}), 500
+    base = os.environ.get("PUBLIC_BASE_URL", "https://api.weathervalet.ai").rstrip("/")
+    out = []
+    for r in rows:
+        ext = "png" if "png" in (r["mime_type"] or "") else "jpg"
+        out.append({
+            "label": r.get("asset_label") or r.get("filename") or "Graphic",
+            "url": f"{base}/media/{r['token']}.{ext}",
+            "created_at": r["created_at"],
+        })
+    return jsonify({"ok": True, "assets": out})
 
 
 @app.get("/api/v1/admin/message-feed")
