@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-79"
+BACKEND_BUILD = "0702-80"
 
 
 def _epoch_ms(ts):
@@ -14786,6 +14786,60 @@ def admin_courtesy_pro_trial(user_id):
           flush=True)
     return jsonify({"ok": True, "days": days,
                     "reverts_to": cur_tier or "hobbyist"})
+
+
+@app.route("/api/v1/admin/users/<int:user_id>/fields", methods=["OPTIONS"])
+def admin_add_field_preflight(user_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/users/<int:user_id>/fields")
+def admin_add_field(user_id):
+    """Add a named field to a subscriber (July 2026: John Rundel's two
+    milo plantings). Accepts an address OR raw 'lat,lng' GIS coords
+    (Chris: farmers can just give coordinates), plus an optional plant
+    date. Stored as a non-primary saved location."""
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "admin-only"}), 403
+    d = request.get_json(silent=True) or {}
+    label = (d.get("label") or "").strip()[:80]
+    where = (d.get("where") or "").strip()
+    plant_date = (d.get("plant_date") or "").strip()[:10] or None
+    if not label or not where:
+        return jsonify({"ok": False, "error": "need-label-and-where"}), 400
+    lat = lng = None
+    addr = where
+    import re as _re
+    m = _re.match(r"^\s*(-?\d{1,2}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)\s*$", where)
+    if m:
+        lat, lng = float(m.group(1)), float(m.group(2))
+        addr = f"{lat:.5f}, {lng:.5f}"
+    else:
+        geo = _geocode_address(where)
+        if not geo:
+            return jsonify({"ok": False, "error": "geocode-failed",
+                            "message": "Could not find that place. Try 'lat,lng' coordinates."}), 400
+        lat, lng = geo.get("lat"), geo.get("lng")
+        addr = ", ".join([p for p in [geo.get("name"), geo.get("admin1")] if p]) or where
+    now_ms = int(time.time() * 1000)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO saved_locations
+                         (user_id, label, address_text, lat, lng, is_primary,
+                          plant_date, created_at, updated_at)
+                       VALUES (%s,%s,%s,%s,%s,FALSE,%s,%s,%s)""",
+                    (user_id, label, addr[:200], lat, lng, plant_date,
+                     now_ms, now_ms))
+    except Exception as e:
+        print(f"[add-field] failed user={user_id}: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "save-failed"}), 500
+    print(f"[add-field] admin={user.get('email')} added '{label}' for user "
+          f"{user_id} at {lat},{lng} plant={plant_date}", flush=True)
+    return jsonify({"ok": True, "label": label, "lat": lat, "lng": lng,
+                    "plant_date": plant_date})
 
 
 @app.get("/api/v1/met/field-rain/<int:sub_id>")
