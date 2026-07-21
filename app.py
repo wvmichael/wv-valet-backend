@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-82"
+BACKEND_BUILD = "0702-83"
 
 
 def _epoch_ms(ts):
@@ -14845,6 +14845,60 @@ def admin_add_field(user_id):
           f"{user_id} at {lat},{lng} plant={plant_date}", flush=True)
     return jsonify({"ok": True, "label": label, "lat": lat, "lng": lng,
                     "plant_date": plant_date})
+
+
+@app.get("/api/v1/met/my-messages")
+def met_my_messages():
+    """Everything the signed-in Met has sent, newest first (July 21,
+    Chris: could not find his sent messages). Unions the three send
+    tables scoped to this Met, with optional text search."""
+    user = _get_current_user()
+    roles = (user.get("roles") or []) if user else []
+    if not user or ("met" not in roles and "admin" not in roles):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    q = (request.args.get("q") or "").strip()[:80]
+    like = f"%{q}%" if q else None
+    mid = user["id"]
+    out = []
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT mm.sent_at AS at, mm.body,
+                              COALESCE(mm.customer_label, mm.customer_phone,
+                                       'subscriber') AS to_name
+                         FROM met_messages mm
+                        WHERE mm.met_user_id = %s
+                          AND (%s IS NULL OR mm.body ILIKE %s)
+                        ORDER BY mm.sent_at DESC LIMIT 120""",
+                    (mid, like, like))
+                out += [dict(r) for r in cur.fetchall()]
+                cur.execute(
+                    """SELECT wu.sent_at AS at, wu.body,
+                              COALESCE(u.name, u.email) AS to_name
+                         FROM watch_updates wu
+                         LEFT JOIN users u ON u.id = wu.user_id
+                        WHERE wu.met_id = %s
+                          AND (%s IS NULL OR wu.body ILIKE %s)
+                        ORDER BY wu.sent_at DESC LIMIT 120""",
+                    (mid, like, like))
+                out += [dict(r) for r in cur.fetchall()]
+                cur.execute(
+                    """SELECT pm.created_at AS at, pm.body,
+                              COALESCE(u.name, u.email) AS to_name
+                         FROM pro_thread_messages pm
+                         LEFT JOIN pro_threads pt ON pt.id = pm.thread_id
+                         LEFT JOIN users u ON u.id = pt.subscriber_user_id
+                        WHERE pm.sender_user_id = %s
+                          AND (%s IS NULL OR pm.body ILIKE %s)
+                        ORDER BY pm.created_at DESC LIMIT 120""",
+                    (mid, like, like))
+                out += [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print(f"[my-messages] failed met={mid}: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "load-failed"}), 500
+    out.sort(key=lambda r: (r.get("at") or 0), reverse=True)
+    return jsonify({"ok": True, "messages": out[:150]})
 
 
 @app.route("/api/v1/admin/users/<int:user_id>/fields/<int:loc_id>", methods=["OPTIONS"])
