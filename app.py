@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-86"
+BACKEND_BUILD = "0702-87"
 
 
 def _epoch_ms(ts):
@@ -14930,6 +14930,176 @@ def admin_del_field(user_id, loc_id):
         print(f"[del-field] failed loc={loc_id}: {e!r}", flush=True)
         return jsonify({"ok": False, "error": "save-failed"}), 500
     return jsonify({"ok": True})
+
+
+@app.route("/fields", methods=["GET", "POST"])
+def fields_page():
+    """Standalone Field Rain page (July 23, 2026). Server-rendered,
+    cache-proof, fully testable end to end. Mets see their own
+    subscribers; admins see everyone."""
+    user = _get_current_user()
+    roles = (user.get("roles") or []) if user else []
+    if not user or ("met" not in roles and "admin" not in roles):
+        return ("<h3 style='font-family:sans-serif'>Sign in at "
+                "<a href='https://weathervalet.ai'>weathervalet.ai</a> first, "
+                "then come back to this page.</h3>"), 403
+    is_admin = "admin" in roles
+    msg = ""
+    if request.method == "POST":
+        sub_id = int(request.form.get("sub") or 0)
+        if not is_admin and sub_id not in _met_subscriber_ids(user["id"]):
+            return ("forbidden", 403)
+        action = request.form.get("action") or "add"
+        if action == "del":
+            loc_id = int(request.form.get("loc") or 0)
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """DELETE FROM saved_locations
+                                WHERE id = %s AND user_id = %s AND is_primary = FALSE""",
+                            (loc_id, sub_id))
+                        msg = "Field removed." if cur.rowcount else "Could not remove that one."
+            except Exception as e:
+                print(f"[fields-page] del failed: {e!r}", flush=True)
+                msg = "Remove failed."
+        else:
+            label = (request.form.get("label") or "").strip()[:80]
+            where = (request.form.get("where") or "").strip()
+            plant = (request.form.get("plant") or "").strip()[:10] or None
+            if label and where:
+                import re as _re
+                m = _re.match(r"^\s*(-?\d{1,2}(?:\.\d+)?)\s*,?\s*(-?\d{1,3}(?:\.\d+)?)\s*$", where)
+                lat = lng = None
+                addr = where
+                if m:
+                    lat, lng = float(m.group(1)), float(m.group(2))
+                    if lng > 50:
+                        lng = -lng  # farmers write "101.36" meaning west; add the minus for them
+                    addr = f"{lat:.5f}, {lng:.5f}"
+                else:
+                    geo = _geocode_address(where)
+                    if geo:
+                        lat, lng = geo.get("lat"), geo.get("lng")
+                        addr = ", ".join([p for p in [geo.get("name"), geo.get("admin1")] if p]) or where
+                if lat is None:
+                    msg = "Could not find that place. Try coordinates like 39.57,-101.36."
+                else:
+                    now_ms = int(time.time() * 1000)
+                    try:
+                        with db() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    """INSERT INTO saved_locations
+                                         (user_id, label, address_text, lat, lng, is_primary,
+                                          plant_date, created_at, updated_at)
+                                       VALUES (%s,%s,%s,%s,%s,FALSE,%s,%s,%s)""",
+                                    (sub_id, label, addr[:200], lat, lng, plant, now_ms, now_ms))
+                        msg = f"Added {label}."
+                    except Exception as e:
+                        print(f"[fields-page] add failed: {e!r}", flush=True)
+                        msg = "Save failed."
+            else:
+                msg = "Need a field name and a place."
+        return redirect(f"/fields?sub={sub_id}&m={urllib.parse.quote(msg)}")
+
+    sel = request.args.get("sub")
+    msg = request.args.get("m") or ""
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                if is_admin:
+                    cur.execute(
+                        """SELECT DISTINCT u.id, COALESCE(u.name, u.email) AS nm
+                             FROM users u JOIN saved_locations sl ON sl.user_id = u.id
+                            WHERE u.is_active = TRUE ORDER BY nm LIMIT 300""")
+                else:
+                    ids = _met_subscriber_ids(user["id"]) or [0]
+                    cur.execute(
+                        """SELECT u.id, COALESCE(u.name, u.email) AS nm
+                             FROM users u WHERE u.id = ANY(%s) ORDER BY nm""", (ids,))
+                subs = cur.fetchall()
+    except Exception as e:
+        print(f"[fields-page] subs failed: {e!r}", flush=True)
+        subs = []
+    rows_html = ""
+    section = ""
+    if sel:
+        sel_i = int(sel)
+        if not is_admin and sel_i not in _met_subscriber_ids(user["id"]):
+            return ("forbidden", 403)
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT id, label, address_text, lat, lng, plant_date, is_primary
+                             FROM saved_locations WHERE user_id = %s
+                            ORDER BY is_primary DESC, id""", (sel_i,))
+                    locs = cur.fetchall()
+        except Exception:
+            locs = []
+        for r in locs[:12]:
+            if r.get("lat") is None:
+                continue
+            t = _field_rain_totals(float(r["lat"]), float(r["lng"]), r.get("plant_date") or "")
+            if not t:
+                rows_html += ("<tr><td>" + (r.get("label") or "Field")
+                              + "</td><td colspan=5>weather data unavailable right now</td><td></td></tr>")
+                continue
+            delbtn = ""
+            if not r.get("is_primary"):
+                delbtn = ("<form method=post style='display:inline' "
+                          "onsubmit=\"return confirm('Remove this field?')\">"
+                          f"<input type=hidden name=sub value={sel_i}>"
+                          "<input type=hidden name=action value=del>"
+                          f"<input type=hidden name=loc value={r['id']}>"
+                          "<button style='background:none;border:none;color:#c33;"
+                          "font-weight:bold;cursor:pointer'>&times;</button></form>")
+            rows_html += (f"<tr><td><b>{r.get('label') or 'Field'}</b></td>"
+                          f"<td>{t['last24']:.2f}\"</td><td>{t['last7']:.2f}\"</td>"
+                          f"<td>{t['since_plant']:.2f}\"</td><td>{t['gdd']}</td>"
+                          f"<td>{t['plant_date']}</td><td>{delbtn}</td></tr>")
+        if not rows_html:
+            rows_html = "<tr><td colspan=7 style=opacity:0.6>No fields yet. Add the first one below.</td></tr>"
+        section = (
+            "<table><tr><th>Field</th><th>24 hr</th><th>7 day</th><th>Since plant</th>"
+            "<th>GDD</th><th>Planted</th><th></th></tr>" + rows_html + "</table>"
+            "<h3>Add a field</h3>"
+            "<form method=post>"
+            f"<input type=hidden name=sub value={sel_i}>"
+            "<input name=label placeholder=\"field name (Milo early)\" required> "
+            "<input name=where placeholder=\"GPS 39.57,-101.36 or address\" required size=24> "
+            "<input name=plant type=date title=\"plant date\"> "
+            "<button class=primary>Add field</button></form>"
+            "<p style=\"opacity:0.6;font-size:13px\">Coordinates: north number first, then the west number. "
+            "Forget the minus sign on the west number? We add it for you.</p>")
+    opts = "".join(
+        f"<option value={r['id']}{' selected' if sel and int(sel)==r['id'] else ''}>{r['nm']}</option>"
+        for r in subs)
+    msg_html = f"<div class=msg>{msg}</div>" if msg else ""
+    html = ("<!doctype html><html><head><meta charset=utf-8>"
+            "<meta name=viewport content=\"width=device-width, initial-scale=1\">"
+            "<title>WeatherValet Field Rain</title>"
+            "<style>body{font-family:system-ui,sans-serif;background:#12151c;color:#e8ebf0;"
+            "max-width:760px;margin:24px auto;padding:0 14px}"
+            "table{border-collapse:collapse;width:100%;margin:14px 0}"
+            "td,th{border-bottom:1px solid #333;padding:8px 6px;text-align:left;font-size:14px}"
+            "input,select,button{padding:8px 10px;border-radius:6px;border:1px solid #445;"
+            "background:#1c212c;color:#fff;font-size:14px}"
+            "button.primary{background:#2E4FB8;border:none;font-weight:700;cursor:pointer}"
+            ".msg{background:#1d2a1d;border:1px solid #2f5;color:#bfa;padding:8px 12px;"
+            "border-radius:6px;margin:10px 0}</style></head><body>"
+            "<h2>Field Rain &amp; GDD</h2>"
+            "<p style=\"opacity:0.7\">Pick a subscriber. Fields show rain last 24 hr, last 7 days, "
+            "since planting, and GDD. Estimates from model data.</p>"
+            + msg_html +
+            "<form method=get><select name=sub onchange=\"this.form.submit()\">"
+            "<option value=\"\">Choose a subscriber...</option>" + opts + "</select> "
+            "<button class=primary>Show</button></form>"
+            + section + "</body></html>")
+    resp = app.make_response(html)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.get("/api/v1/met/field-rain/<int:sub_id>")
