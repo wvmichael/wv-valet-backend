@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WeatherValet Storm Timeline Editor</title>
+<style>
+:root{--blue:#19a8ff;--green:#42d36d;--yellow:#f2c62b;--orange:#f18b1b;--red:#e72e36;--purple:#8b3fb4}
+*{box-sizing:border-box}body{margin:0;background:#07101b;color:#fff;font-family:Inter,Arial,sans-serif}
+.app{display:grid;grid-template-columns:410px 1fr;min-height:100vh}.controls{background:#091523;border-right:1px solid #ffffff26;padding:18px;overflow:auto}
+h1{font-size:22px;margin:0 0 5px}.lead{margin:0 0 14px;color:#91a4bb;font-size:13px;line-height:1.45}
+.group{border-top:1px solid #ffffff18;margin-top:14px;padding-top:14px}label{display:block;margin:8px 0 5px;font-size:12px;font-weight:800;color:#c7d3e1}
+input,textarea,select,button{width:100%;padding:9px 10px;border-radius:9px;border:1px solid #ffffff26;background:#122034;color:#fff;font:inherit}
+textarea{min-height:72px;resize:vertical}.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:11px}
+button{background:#1579ff;font-weight:900;cursor:pointer}button.secondary{background:#17263a}button:disabled{opacity:.5;cursor:not-allowed}
+.stage-edit{padding:10px;background:#0d1b2d;border-radius:11px;margin:8px 0}.stage-edit strong{font-size:13px}
+.ai{padding:12px;border:1px solid #19a8ff61;border-radius:12px;background:linear-gradient(145deg,#0b1e34,#091321)}
+.ai-help,.note{font-size:11px;line-height:1.4;color:#91a6bf}.status{min-height:38px;padding:8px;margin-top:8px;border-radius:8px;background:#07111e;color:#a7c7e6;font-size:12px}
+.status.success{background:#0b2518;color:#baf5ce}.status.error{background:#2a1115;color:#ffc6c6}
+.stage-wrap{padding:24px;display:flex;justify-content:center;align-items:flex-start;overflow:auto}.shell{width:min(100%,1600px);aspect-ratio:16/9;position:relative}
+.canvas{position:absolute;inset:0;width:1600px;height:900px;transform-origin:top left;overflow:hidden;background:linear-gradient(120deg,#03101d,#0b1c2b 50%,#211516);box-shadow:0 25px 80px #0008}
+.bg{position:absolute;inset:0;background-size:cover;background-position:center;opacity:.46}.shade{position:absolute;inset:0;background:linear-gradient(90deg,#020812f2 0%,#020812a8 38%,#02081235 67%,#0208127c 100%),linear-gradient(0deg,#020812ef,transparent 34%)}
+.top{position:absolute;left:35px;right:35px;top:27px;display:flex;justify-content:space-between;align-items:flex-start;z-index:5}.logo{width:330px;max-height:90px;object-fit:contain;object-position:left top}
+.datebox{padding:12px 20px;border-radius:17px;background:#07111ecc;border:1px solid #ffffff45;text-align:center;min-width:215px}.datebox .dow{font-size:19px;font-weight:900;color:var(--blue)}.datebox .date{font-size:26px;font-weight:900;margin-top:4px}
+.hero{position:absolute;left:40px;top:151px;width:440px;z-index:5}.headline{font-size:78px;line-height:.91;font-weight:950;letter-spacing:-.05em;text-transform:uppercase;text-shadow:0 7px 23px #000b}.headline span{background:linear-gradient(180deg,#fff,#55b8ff 68%,#1579ef);-webkit-background-clip:text;background-clip:text;color:transparent}
+.kicker{font-size:25px;font-weight:950;color:var(--blue);text-transform:uppercase;margin-top:18px}.summary{margin-top:20px;padding-left:18px;border-left:5px solid var(--blue);font-size:23px;line-height:1.28}
+.timeline{position:absolute;left:510px;right:28px;top:170px;height:520px;display:grid;grid-template-columns:repeat(5,1fr);gap:11px;z-index:4}
+.phase{position:relative;border-radius:19px;border:1px solid #ffffff4a;background:linear-gradient(180deg,#11263ddb,#06101eef);padding:15px 13px;text-align:center;display:flex;flex-direction:column;align-items:center;box-shadow:inset 0 5px 0 var(--accent)}
+.phase .time{font-size:24px;font-weight:950}.phase .label{font-size:19px;color:var(--accent);font-weight:950;text-transform:uppercase;margin-top:6px}.phase .icon{font-size:74px;line-height:1.1;margin:16px 0 8px}.phase .desc{font-size:17px;line-height:1.18;font-weight:850;min-height:64px}
+.phase .details{width:100%;margin-top:auto;border-top:1px solid #ffffff36;padding-top:13px}.phase .details div{font-size:14px;margin:4px 0}.phase .impact{margin-top:10px;padding:7px 10px;border-radius:9px;background:var(--accent);color:#07111c;font-weight:950;font-size:14px}
+.arrow{position:absolute;right:-18px;top:50%;transform:translateY(-50%);font-size:28px;color:#fff;z-index:8}.phase:last-child .arrow{display:none}
+.footer{position:absolute;left:34px;right:34px;bottom:20px;height:165px;z-index:7;display:grid;grid-template-rows:82px 73px;gap:10px}
+.impactbar,.bottom{border:1px solid #ffffff45;border-radius:16px;background:#06101ee5;backdrop-filter:blur(10px);overflow:hidden}
+.impactbar{display:grid;grid-template-columns:230px 1fr}.impact-title{display:flex;align-items:center;justify-content:center;text-align:center;font-size:22px;font-weight:950}.impact-scale{display:grid;grid-template-columns:repeat(5,1fr)}.seg{display:flex;align-items:center;justify-content:center;text-align:center;font-weight:950;font-size:14px;line-height:1.1;color:#fff;text-shadow:0 1px 3px #000}.s1{background:#269e46}.s2{background:#c6a713}.s3{background:#d67512}.s4{background:#cb262e}.s5{background:#6f2e91}
+.bottom{display:grid;grid-template-columns:380px 1fr 270px;align-items:center}.ready{height:100%;display:flex;align-items:center;justify-content:center;gap:11px;font-size:24px;font-weight:950;color:#b9ffca}.updated{text-align:center;color:#d6e1ed;font-size:17px}.updated strong{display:block;color:#fff;font-size:31px;line-height:1}.site{text-align:center;border-left:1px solid #ffffff29;font-size:23px;color:var(--blue);font-weight:950}
+.editable[contenteditable=true]{outline:none}.editable[contenteditable=true]:focus{box-shadow:0 0 0 3px #19a8ff80;border-radius:5px}
+@media(max-width:1050px){.app{grid-template-columns:1fr}.controls{border-right:0;border-bottom:1px solid #ffffff26}}
+</style>
+</head>
+<body>
+<div class="app">
+<aside class="controls">
+<h1>Storm Timeline Editor</h1><p class="lead">Build a phase-by-phase storm evolution graphic. GPT can turn forecast guidance into five editable storm stages.</p>
+<div class="group">
+<label>Date</label><input id="dateInput" value="SUNDAY|MAY 18, 2025">
+<label>Headline</label><input id="headlineInput" value="STORM TIMELINE">
+<label>Kicker</label><input id="kickerInput" value="SUNDAY NIGHT INTO MONDAY">
+<label>Summary</label><textarea id="summaryInput">Storms develop west of Indiana, arrive during the evening, peak overnight, and gradually weaken toward morning.</textarea>
+<label>Updated Time</label><input id="updatedInput" value="7:00 AM">
+<label>Footer Alert</label><input id="readyInput" value="STAY WEATHER READY">
+</div>
+<div id="phaseControls" class="group"></div>
+<div class="group">
+<label>Cinematic Background</label><input id="backgroundUpload" type="file" accept="image/*">
+</div>
+<div class="group ai">
+<strong>✦ GPT Storm Timeline Builder</strong>
+<p class="ai-help">Paste the forecast discussion, briefing notes, or model summary. GPT returns five draft phases for meteorologist review.</p>
+<label>Forecast Guidance</label><textarea id="guidanceInput">Storms are expected to develop west of Indiana during the late afternoon. A line may enter western Indiana after 8 PM, reach central Indiana near midnight, then move east and weaken toward daybreak. Damaging winds and heavy rain are the main concerns.</textarea>
+<label>Instructions</label><textarea id="promptInput">Create five chronological storm phases. Use concise timing, a short phase name, weather emoji, plain-language description, location/progression, primary concern, impact label, and CSS hex accent color. Use only details supported by the supplied guidance. Return JSON only.</textarea>
+<label>Secure API Endpoint</label><input id="endpointInput" value="/api/storm-timeline">
+<p class="note">The API key stays on your server, never in this HTML.</p>
+<div class="actions"><button id="buildBtn" type="button">✦ Build Timeline</button><button id="exampleBtn" class="secondary" type="button">Load Example</button></div>
+<div id="status" class="status">Paste forecast guidance and click Build Timeline.</div>
+</div>
+<div class="actions"><button id="exportBtn" type="button">Export PNG</button><button id="resetBtn" class="secondary" type="button">Reset</button></div>
+</aside>
+
+<main class="stage-wrap"><div id="shell" class="shell"><section id="canvas" class="canvas">
+<div id="bg" class="bg"></div><div class="shade"></div>
+<div class="top"><img src="/graphics/assets/weathervalet-logo-white.png" class="logo" alt="WeatherValet"><div class="datebox"><div id="dow" class="dow editable" contenteditable="true">SUNDAY</div><div id="date" class="date editable" contenteditable="true">MAY 18, 2025</div></div></div>
+<div class="hero"><div id="headline" class="headline editable" contenteditable="true"><span>STORM</span><br>TIMELINE</div><div id="kicker" class="kicker editable" contenteditable="true">SUNDAY NIGHT INTO MONDAY</div><div id="summary" class="summary editable" contenteditable="true">Storms develop west of Indiana, arrive during the evening, peak overnight, and gradually weaken toward morning.</div></div>
+<div id="timeline" class="timeline"></div>
+<div class="footer">
+<div class="impactbar"><div class="impact-title">STORM IMPACT<br>PROGRESSION</div><div class="impact-scale"><div class="seg s1">LOW<br>Watching</div><div class="seg s2">ELEVATED<br>Developing</div><div class="seg s3">HIGH<br>Arriving</div><div class="seg s4">SEVERE<br>Peak Risk</div><div class="seg s5">LOWERING<br>Ending</div></div></div>
+<div class="bottom"><div class="ready">✓ <span id="ready" class="editable" contenteditable="true">STAY WEATHER READY</span></div><div class="updated">UPDATED<strong id="updated" class="editable" contenteditable="true">7:00 AM</strong></div><div class="site">weathervalet.ai</div></div>
+</div>
+</section></div></main>
+</div>
+
+<script src="/graphics/assets/html2canvas.min.js"></script>
+<script>
+const $=id=>document.getElementById(id),canvas=$('canvas'),shell=$('shell');
+function fit(){const s=shell.clientWidth/1600;canvas.style.transform=`scale(${s})`;shell.style.height=`${900*s}px`}addEventListener('resize',fit);fit();
+
+const phases=[
+ {time:'4–7 PM',label:'DEVELOPING',icon:'🌥️',desc:'Storms organize west of Indiana.',location:'Illinois / Western Indiana',concern:'Monitor Trends',impact:'ELEVATED',accent:'#f2c62b'},
+ {time:'7–10 PM',label:'ARRIVING',icon:'⛈️',desc:'Storms enter western Indiana.',location:'Terre Haute to Lafayette',concern:'Wind & Heavy Rain',impact:'HIGH',accent:'#f18b1b'},
+ {time:'10 PM–1 AM',label:'PEAK WINDOW',icon:'🌩️',desc:'Strongest storms move through central Indiana.',location:'Indianapolis Metro',concern:'Damaging Wind',impact:'SEVERE',accent:'#e72e36'},
+ {time:'1–4 AM',label:'MOVING EAST',icon:'🌧️',desc:'Storms shift toward eastern Indiana.',location:'Muncie to Richmond',concern:'Heavy Rain',impact:'HIGH',accent:'#8b3fb4'},
+ {time:'4–7 AM',label:'ENDING',icon:'🌦️',desc:'Showers taper and storms weaken.',location:'Eastern Indiana',concern:'Lingering Showers',impact:'LOWERING',accent:'#42d36d'}
+];
+
+function render(){
+ const c=$('phaseControls'),t=$('timeline');c.innerHTML='<strong>Storm Phases</strong>';t.innerHTML='';
+ phases.forEach((p,i)=>{
+  c.insertAdjacentHTML('beforeend',`<div class="stage-edit"><strong>Phase ${i+1}</strong>
+   <div class="row"><input data-i="${i}" data-k="time" value="${p.time}"><input data-i="${i}" data-k="label" value="${p.label}"></div>
+   <div class="row"><input data-i="${i}" data-k="icon" value="${p.icon}"><input data-i="${i}" data-k="impact" value="${p.impact}"></div>
+   <input data-i="${i}" data-k="desc" value="${p.desc}">
+   <input data-i="${i}" data-k="location" value="${p.location}">
+   <input data-i="${i}" data-k="concern" value="${p.concern}">
+   <label>Accent</label><input type="color" data-i="${i}" data-k="accent" value="${p.accent}">
+  </div>`);
+  t.insertAdjacentHTML('beforeend',`<article class="phase" style="--accent:${p.accent}">
+   <div class="time editable" contenteditable="true">${p.time}</div>
+   <div class="label editable" contenteditable="true">${p.label}</div>
+   <div class="icon editable" contenteditable="true">${p.icon}</div>
+   <div class="desc editable" contenteditable="true">${p.desc}</div>
+   <div class="details"><div class="editable" contenteditable="true">📍 ${p.location}</div><div class="editable" contenteditable="true">⚠ ${p.concern}</div></div>
+   <div class="impact editable" contenteditable="true">${p.impact}</div><div class="arrow">›</div>
+  </article>`);
+ });
+ c.querySelectorAll('input').forEach(el=>el.addEventListener('input',e=>{phases[+e.target.dataset.i][e.target.dataset.k]=e.target.value;render()}));
+}
+render();
+
+function bind(a,b,fn){$(a).addEventListener('input',e=>fn?fn(e.target.value):$(b).textContent=e.target.value)}
+bind('kickerInput','kicker');bind('summaryInput','summary');bind('updatedInput','updated');bind('readyInput','ready');
+bind('headlineInput','headline',v=>{const w=v.trim().split(/\s+/);$('headline').innerHTML=`<span>${w[0]||''}</span><br>${w.slice(1).join(' ')}`});
+$('dateInput').addEventListener('input',e=>{const[a,b]=e.target.value.split('|');$('dow').textContent=a||'';$('date').textContent=b||''});
+$('backgroundUpload').addEventListener('change',e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=()=>{$('bg').style.backgroundImage=`url("${r.result}")`};r.readAsDataURL(f)});
+
+function setStatus(m,t=''){const e=$('status');e.textContent=m;e.className='status'+(t?' '+t:'')}
+function normalize(p){const a=p.timeline||p.phases||p.data||p;if(!Array.isArray(a)||a.length<5)throw new Error('The response must contain five phases.');return a.slice(0,5)}
+$('buildBtn').addEventListener('click',async()=>{const endpoint=$('endpointInput').value.trim();if(!endpoint)return setStatus('Enter the secure API endpoint.','error');$('buildBtn').disabled=true;setStatus('Building storm timeline…','');try{const r=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({guidance:$('guidanceInput').value,prompt:$('promptInput').value,phases:5})});if(!r.ok)throw new Error(`${r.status}: ${(await r.text()).slice(0,180)}`);const result=normalize(await r.json());result.forEach((p,i)=>Object.assign(phases[i],p));render();setStatus('Timeline created. Review every phase before publishing.','success')}catch(e){setStatus(`Timeline build failed: ${e.message}`,'error')}finally{$('buildBtn').disabled=false}});
+$('exampleBtn').addEventListener('click',()=>{render();setStatus('Example timeline loaded.','success')});
+$('exportBtn').addEventListener('click',async()=>{const prior=canvas.style.transform;canvas.style.transform='none';const c=await html2canvas(canvas,{backgroundColor:null,scale:1,useCORS:true});const a=document.createElement('a');a.download='weathervalet-storm-timeline.png';a.href=c.toDataURL('image/png');a.click();canvas.style.transform=prior});
+$('resetBtn').addEventListener('click',()=>location.reload());
+</script>
+</body></html>

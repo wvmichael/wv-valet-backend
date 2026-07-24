@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WeatherValet Hourly Timeline Editor</title>
+<style>
+:root{
+  --blue:#18a8ff;
+  --green:#45de73;
+  --yellow:#f4c928;
+  --orange:#f28c1b;
+  --red:#e3262e;
+  --panel:#07121f;
+  --line:rgba(255,255,255,.22);
+}
+*{box-sizing:border-box}
+body{margin:0;background:#07101b;color:#fff;font-family:Inter,Arial,Helvetica,sans-serif}
+.app{display:grid;grid-template-columns:410px 1fr;min-height:100vh}
+.controls{padding:18px;background:#091523;border-right:1px solid var(--line);overflow:auto}
+h1{font-size:22px;margin:0 0 5px}
+.lead{font-size:13px;color:#94a7bd;line-height:1.45;margin:0 0 15px}
+.group{border-top:1px solid rgba(255,255,255,.1);padding-top:14px;margin-top:14px}
+label{display:block;font-size:12px;font-weight:800;color:#c8d4e2;margin:8px 0 5px}
+input,textarea,select,button{
+ width:100%;padding:9px 10px;border-radius:9px;border:1px solid rgba(255,255,255,.16);
+ background:#122034;color:#fff;font:inherit
+}
+textarea{min-height:72px;resize:vertical}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:11px}
+button{cursor:pointer;background:#1579ff;font-weight:900}
+button.secondary{background:#17263a}
+button:disabled{opacity:.5;cursor:not-allowed}
+.hour-edit{padding:10px;background:#0d1b2d;border-radius:11px;margin:8px 0}
+.hour-edit strong{font-size:13px}
+.ai-box{padding:12px;border:1px solid rgba(24,168,255,.38);border-radius:13px;background:linear-gradient(145deg,#0b1e34,#091321)}
+.ai-title{font-weight:900;margin-bottom:4px}
+.ai-help,.note{font-size:11px;line-height:1.4;color:#91a6bf}
+.status{min-height:38px;margin-top:8px;padding:8px;border-radius:8px;background:#07111e;color:#a8c7e7;font-size:12px}
+.status.success{background:#0b2518;color:#baf4cd}
+.status.error{background:#2a1115;color:#ffc7c7}
+.stage-wrap{padding:24px;display:flex;justify-content:center;align-items:flex-start;overflow:auto}
+.shell{width:min(100%,1600px);aspect-ratio:16/9;position:relative}
+.canvas{
+ position:absolute;inset:0;width:1600px;height:900px;transform-origin:top left;overflow:hidden;
+ background:
+ radial-gradient(circle at 75% 70%,rgba(255,162,49,.28),transparent 28%),
+ linear-gradient(120deg,#04101d,#0b1a2a 50%,#15131d);
+ box-shadow:0 25px 80px rgba(0,0,0,.48)
+}
+.bg{position:absolute;inset:0;background-size:cover;background-position:center;opacity:.47}
+.shade{position:absolute;inset:0;background:
+ linear-gradient(90deg,rgba(1,7,15,.95) 0%,rgba(1,7,15,.6) 35%,rgba(1,7,15,.19) 66%,rgba(1,7,15,.5) 100%),
+ linear-gradient(0deg,rgba(1,7,15,.94),transparent 34%)}
+.topbar{position:absolute;left:34px;right:34px;top:25px;display:flex;align-items:flex-start;justify-content:space-between;z-index:5}
+.logo{width:330px;max-height:92px;object-fit:contain;object-position:left top;filter:drop-shadow(0 4px 10px rgba(0,0,0,.5))}
+.location{padding:12px 17px;border-radius:17px;background:#07111ecc;border:1px solid rgba(255,255,255,.28);font-size:18px;font-weight:900;text-align:center}
+.location span{display:block;color:var(--blue);font-size:14px;margin-top:3px}
+.date-card{padding:12px 20px;border-radius:17px;background:#07111ecc;border:1px solid rgba(255,255,255,.3);text-align:center;min-width:210px}
+.date-card .dow{font-size:19px;font-weight:900;color:var(--blue)}
+.date-card .date{font-size:26px;font-weight:900;margin-top:4px}
+.hero{position:absolute;left:38px;top:155px;width:390px;z-index:5}
+.headline{font-size:73px;line-height:.92;font-weight:950;letter-spacing:-.05em;text-transform:uppercase;text-shadow:0 7px 24px rgba(0,0,0,.62)}
+.subhead{font-size:29px;line-height:1.12;color:var(--blue);font-weight:950;margin-top:20px;text-transform:uppercase}
+.summary{margin-top:22px;padding:17px 18px;border:1px solid rgba(255,255,255,.28);border-radius:15px;background:#07111ec7;font-size:21px;line-height:1.28}
+.timeline{position:absolute;left:450px;right:28px;top:205px;height:460px;display:grid;grid-template-columns:repeat(6,1fr);gap:10px;z-index:4}
+.hour-card{
+ position:relative;border:1px solid rgba(255,255,255,.32);border-radius:18px;
+ background:linear-gradient(180deg,rgba(15,29,45,.78),rgba(4,12,23,.9));
+ backdrop-filter:blur(10px);padding:13px 12px;text-align:center;display:flex;flex-direction:column;align-items:center;
+ box-shadow:inset 0 4px 0 var(--accent,var(--blue))
+}
+.time{font-size:27px;font-weight:950}
+.weather-icon{font-size:69px;line-height:1.1;margin:15px 0 5px}
+.temp{font-size:57px;font-weight:950;line-height:1;margin-top:8px}
+.rain{font-size:24px;font-weight:950;color:var(--blue);margin-top:9px}
+.wind{font-size:15px;font-weight:850;margin-top:9px}
+.desc{width:100%;margin-top:auto;padding-top:12px;border-top:1px solid rgba(255,255,255,.25);font-size:16px;line-height:1.14;font-weight:850;min-height:55px}
+.impact-wrap{position:absolute;left:34px;right:34px;bottom:112px;height:94px;z-index:6;border:1px solid rgba(255,255,255,.32);border-radius:16px;background:#06101ee4;padding:12px 20px}
+.impact-title{position:absolute;left:22px;top:17px;width:180px;text-align:center;font-size:21px;font-weight:950}
+.impact-title span{display:block;color:var(--blue)}
+.impact-bar{position:absolute;left:210px;right:24px;top:20px;height:55px;display:grid;grid-template-columns:1.15fr 1fr 1fr 1fr;border-radius:16px;overflow:hidden}
+.impact-seg{display:flex;align-items:center;justify-content:center;text-align:center;color:#fff;font-size:15px;font-weight:950;line-height:1.1;text-shadow:0 1px 3px #000}
+.low{background:linear-gradient(180deg,#35c557,#1a8d34)}.moderate{background:linear-gradient(180deg,#e3be23,#a97a0a)}.high{background:linear-gradient(180deg,#ef8b20,#c45609)}.very-high{background:linear-gradient(180deg,#e52c32,#9f0e16)}
+.marker{position:absolute;top:-12px;width:28px;height:28px;border-radius:50%;background:#fff;border:3px solid #d9e1eb;box-shadow:0 3px 9px #0008;left:65%;transform:translateX(-50%)}
+.footer{position:absolute;left:34px;right:34px;bottom:20px;height:76px;z-index:7;border:1px solid rgba(255,255,255,.33);border-radius:16px;background:#06101ee8;display:grid;grid-template-columns:360px 1fr 300px;align-items:center;overflow:hidden}
+.alert{height:100%;display:flex;align-items:center;justify-content:center;gap:12px;font-size:25px;font-weight:950;color:#b9ffca}
+.updated{text-align:center;font-size:17px;color:#d4dfeb}.updated strong{display:block;font-size:31px;color:#fff;line-height:1}
+.site{text-align:center;border-left:1px solid rgba(255,255,255,.22);font-size:23px;color:var(--blue);font-weight:950}
+.editable[contenteditable=true]{outline:none}
+.editable[contenteditable=true]:focus{box-shadow:0 0 0 3px rgba(24,168,255,.5);border-radius:5px}
+@media(max-width:1050px){.app{grid-template-columns:1fr}.controls{border-right:0;border-bottom:1px solid var(--line)}}
+</style>
+</head>
+<body>
+<div class="app">
+<aside class="controls">
+<h1>Hourly Timeline Editor</h1>
+<p class="lead">Create the hour-by-hour WeatherValet timeline, or paste forecast guidance and let GPT build a first draft for the meteorologist to review.</p>
+
+<div class="group">
+<label>Location</label><input id="locationInput" value="INDIANAPOLIS, IN">
+<label>Region</label><input id="regionInput" value="CENTRAL INDIANA">
+<label>Date</label><input id="dateInput" value="FRIDAY|MAY 16, 2025">
+<label>Headline</label><input id="headlineInput" value="HOURLY TIMELINE">
+<label>Subheadline</label><textarea id="subheadInput">WHAT TO EXPECT AND WHEN</textarea>
+<label>Summary</label><textarea id="summaryInput">Dry and pleasant this afternoon. Storms arrive this evening.</textarea>
+<label>Updated Time</label><input id="updatedInput" value="7:00 AM">
+<label>Footer Alert</label><input id="alertInput" value="STAY WEATHER AWARE">
+</div>
+
+<div id="hourControls" class="group"></div>
+
+<div class="group">
+<label>Impact Marker Position</label><input id="impactRange" type="range" min="0" max="100" value="65">
+<label>Cinematic Background</label><input id="backgroundUpload" type="file" accept="image/*">
+</div>
+
+<div class="group ai-box">
+<div class="ai-title">✦ GPT Timeline Builder</div>
+<div class="ai-help">Paste a forecast discussion, hourly forecast, or meteorologist notes. GPT returns six editable timeline periods. The meteorologist remains in control and must review every value.</div>
+<label>Forecast Guidance</label>
+<textarea id="guidanceInput">Dry through late afternoon with temperatures rising into the lower 80s. Scattered storms become possible after 8 PM, with periods of rain overnight. Winds southwest at 10 to 20 mph, shifting west toward morning.</textarea>
+<label>Instructions</label>
+<textarea id="timelinePrompt">Create six chronological forecast periods for an Indiana hourly weather timeline. Return concise time labels, weather icons as emoji, temperatures in Fahrenheit, precipitation chances, wind, and short descriptions. Do not invent precision that is not supported by the supplied forecast. Return JSON only.</textarea>
+<label>Secure API Endpoint</label><input id="timelineEndpoint" value="/api/weather-timeline">
+<div class="note">The API key stays on your server, never in this HTML.</div>
+<div class="actions"><button id="buildTimelineBtn" type="button">✦ Build Timeline</button><button id="loadExampleBtn" class="secondary" type="button">Load Example</button></div>
+<div id="timelineStatus" class="status">Paste forecast guidance and click Build Timeline.</div>
+</div>
+
+<div class="actions"><button id="exportBtn" type="button">Export PNG</button><button id="resetBtn" class="secondary" type="button">Reset</button></div>
+</aside>
+
+<main class="stage-wrap">
+<div id="shell" class="shell">
+<section id="canvas" class="canvas">
+<div id="bg" class="bg"></div><div class="shade"></div>
+
+<div class="topbar">
+<img src="/graphics/assets/weathervalet-logo-white.png" alt="WeatherValet" class="logo">
+<div class="location"><span id="location" class="editable" contenteditable="true">INDIANAPOLIS, IN</span><span id="region" class="editable" contenteditable="true">CENTRAL INDIANA</span></div>
+<div class="date-card"><div id="dow" class="dow editable" contenteditable="true">FRIDAY</div><div id="date" class="date editable" contenteditable="true">MAY 16, 2025</div></div>
+</div>
+
+<div class="hero">
+<div id="headline" class="headline editable" contenteditable="true">HOURLY<br>TIMELINE</div>
+<div id="subhead" class="subhead editable" contenteditable="true">WHAT TO EXPECT<br>AND WHEN</div>
+<div id="summary" class="summary editable" contenteditable="true">Dry and pleasant this afternoon. Storms arrive this evening.</div>
+</div>
+
+<div id="timeline" class="timeline"></div>
+
+<div class="impact-wrap">
+<div class="impact-title">WEATHER <span>IMPACT</span></div>
+<div class="impact-bar">
+<div class="impact-seg low">LOW IMPACT<br>Great Conditions</div>
+<div class="impact-seg moderate">MODERATE<br>Stay Aware</div>
+<div class="impact-seg high">HIGH<br>Storms Possible</div>
+<div class="impact-seg very-high">HIGH IMPACT<br>Heavy Rain / Storms</div>
+<div id="impactMarker" class="marker"></div>
+</div>
+</div>
+
+<div class="footer">
+<div class="alert">✓ <span id="alert" class="editable" contenteditable="true">STAY WEATHER AWARE</span></div>
+<div class="updated">UPDATED<strong id="updated" class="editable" contenteditable="true">7:00 AM</strong></div>
+<div class="site">weathervalet.ai</div>
+</div>
+</section>
+</div>
+</main>
+</div>
+
+<script src="/graphics/assets/html2canvas.min.js"></script>
+<script>
+const $=id=>document.getElementById(id),canvas=$('canvas'),shell=$('shell');
+function fit(){const s=shell.clientWidth/1600;canvas.style.transform=`scale(${s})`;shell.style.height=`${900*s}px`}
+addEventListener('resize',fit);fit();
+
+const hours=[
+ {time:'12 PM',icon:'🌤️',temp:'72°',rain:'0%',wind:'NW 5–10',desc:'Mostly Sunny',accent:'#43cf68'},
+ {time:'3 PM',icon:'🌤️',temp:'78°',rain:'10%',wind:'NW 8–12',desc:'Partly Cloudy',accent:'#f1c72b'},
+ {time:'6 PM',icon:'🌥️',temp:'81°',rain:'20%',wind:'SW 10–15',desc:'Clouds Increase',accent:'#f09a22'},
+ {time:'9 PM',icon:'⛈️',temp:'74°',rain:'60%',wind:'SW 15–20',desc:'Storms Arrive',accent:'#ef4949'},
+ {time:'12 AM',icon:'🌧️',temp:'68°',rain:'70%',wind:'SW 15–20',desc:'Periods of Rain',accent:'#ef4949'},
+ {time:'3 AM',icon:'🌧️',temp:'64°',rain:'30%',wind:'W 10–15',desc:'Showers Ending',accent:'#d8b72d'}
+];
+
+function renderHours(){
+ const controls=$('hourControls'),timeline=$('timeline');
+ controls.innerHTML='<strong>Timeline Periods</strong>';timeline.innerHTML='';
+ hours.forEach((h,i)=>{
+  controls.insertAdjacentHTML('beforeend',`<div class="hour-edit"><strong>Period ${i+1}</strong>
+   <div class="row"><input data-i="${i}" data-k="time" value="${h.time}"><input data-i="${i}" data-k="icon" value="${h.icon}"></div>
+   <div class="row"><input data-i="${i}" data-k="temp" value="${h.temp}"><input data-i="${i}" data-k="rain" value="${h.rain}"></div>
+   <input data-i="${i}" data-k="wind" value="${h.wind}">
+   <input data-i="${i}" data-k="desc" value="${h.desc}">
+   <label>Accent</label><input data-i="${i}" data-k="accent" type="color" value="${h.accent}">
+  </div>`);
+  timeline.insertAdjacentHTML('beforeend',`<article class="hour-card" style="--accent:${h.accent}">
+   <div class="time editable" contenteditable="true">${h.time}</div>
+   <div class="weather-icon editable" contenteditable="true">${h.icon}</div>
+   <div class="temp editable" contenteditable="true">${h.temp}</div>
+   <div class="rain editable" contenteditable="true">💧 ${h.rain}</div>
+   <div class="wind editable" contenteditable="true">〰 ${h.wind}</div>
+   <div class="desc editable" contenteditable="true">${h.desc}</div>
+  </article>`);
+ });
+ controls.querySelectorAll('input').forEach(el=>el.addEventListener('input',e=>{
+   hours[+e.target.dataset.i][e.target.dataset.k]=e.target.value;
+   renderHours();
+ }));
+}
+renderHours();
+
+function bind(a,b,fn){$(a).addEventListener('input',e=>fn?fn(e.target.value):$(b).textContent=e.target.value)}
+bind('locationInput','location');bind('regionInput','region');bind('updatedInput','updated');bind('alertInput','alert');
+bind('headlineInput','headline',v=>$('headline').innerHTML=v.trim().split(/\s+/).join('<br>'));
+bind('subheadInput','subhead',v=>$('subhead').innerHTML=v.replace(/\n/g,'<br>'));
+bind('summaryInput','summary');
+$('dateInput').addEventListener('input',e=>{const [a,b]=e.target.value.split('|');$('dow').textContent=a||'';$('date').textContent=b||''});
+$('impactRange').addEventListener('input',e=>$('impactMarker').style.left=`${e.target.value}%`);
+
+$('backgroundUpload').addEventListener('change',e=>{
+ const f=e.target.files[0];if(!f)return;const r=new FileReader();
+ r.onload=()=>{$('bg').style.backgroundImage=`url("${r.result}")`};r.readAsDataURL(f)
+});
+
+function status(msg,type=''){const el=$('timelineStatus');el.textContent=msg;el.className='status'+(type?' '+type:'')}
+function normalizeTimeline(payload){
+ const list=payload.timeline||payload.periods||payload.data||payload;
+ if(!Array.isArray(list)||list.length<6)throw new Error('The response must contain at least six timeline periods.');
+ return list.slice(0,6).map((p,i)=>({
+  time:String(p.time||hours[i].time),
+  icon:String(p.icon||hours[i].icon),
+  temp:String(p.temp||p.temperature||hours[i].temp),
+  rain:String(p.rain||p.precipitation||p.precip||hours[i].rain),
+  wind:String(p.wind||hours[i].wind),
+  desc:String(p.desc||p.description||hours[i].desc),
+  accent:String(p.accent||hours[i].accent)
+ }));
+}
+
+$('buildTimelineBtn').addEventListener('click',async()=>{
+ const endpoint=$('timelineEndpoint').value.trim();
+ if(!endpoint)return status('Enter the secure API endpoint.','error');
+ $('buildTimelineBtn').disabled=true;status('Building the timeline…','');
+ try{
+  const res=await fetch(endpoint,{
+   method:'POST',
+   headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({
+    guidance:$('guidanceInput').value,
+    prompt:$('timelinePrompt').value,
+    location:$('locationInput').value,
+    periods:6
+   })
+  });
+  if(!res.ok)throw new Error(`${res.status}: ${(await res.text()).slice(0,180)}`);
+  const result=normalizeTimeline(await res.json());
+  result.forEach((p,i)=>Object.assign(hours[i],p));
+  renderHours();
+  status('Timeline created. Review every period before publishing.','success');
+ }catch(error){console.error(error);status(`Timeline build failed: ${error.message}`,'error')}
+ finally{$('buildTimelineBtn').disabled=false}
+});
+
+$('loadExampleBtn').addEventListener('click',()=>{renderHours();status('Example timeline loaded.','success')});
+
+$('exportBtn').addEventListener('click',async()=>{
+ const prior=canvas.style.transform;canvas.style.transform='none';
+ const c=await html2canvas(canvas,{backgroundColor:null,scale:1,useCORS:true});
+ const a=document.createElement('a');a.download='weathervalet-hourly-timeline.png';a.href=c.toDataURL('image/png');a.click();
+ canvas.style.transform=prior
+});
+$('resetBtn').addEventListener('click',()=>location.reload());
+
+window.WeatherValetHourlyTimeline={
+ setData(data={}){
+  if(data.location){$('locationInput').value=data.location;$('locationInput').dispatchEvent(new Event('input'))}
+  if(data.region){$('regionInput').value=data.region;$('regionInput').dispatchEvent(new Event('input'))}
+  if(data.summary){$('summaryInput').value=data.summary;$('summaryInput').dispatchEvent(new Event('input'))}
+  if(Array.isArray(data.hours)){data.hours.slice(0,6).forEach((h,i)=>Object.assign(hours[i],h));renderHours()}
+  if(data.backgroundUrl)$('bg').style.backgroundImage=`url("${data.backgroundUrl}")`
+ }
+};
+</script>
+</body>
+</html>

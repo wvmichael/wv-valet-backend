@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WeatherValet Snow Forecast Editor</title>
+<style>
+:root{
+  --blue:#1da8ff;
+  --ice:#9edcff;
+  --purple:#bd51ff;
+  --panel:#07121f;
+  --line:rgba(255,255,255,.22);
+}
+*{box-sizing:border-box}
+body{margin:0;background:#07101a;color:#fff;font-family:Inter,Arial,Helvetica,sans-serif}
+.app{display:grid;grid-template-columns:420px 1fr;min-height:100vh}
+.controls{padding:18px;background:#091523;border-right:1px solid var(--line);overflow:auto}
+h1{font-size:22px;margin:0 0 5px}
+.lead{font-size:13px;line-height:1.45;color:#92a5bc;margin:0 0 14px}
+.group{border-top:1px solid rgba(255,255,255,.1);margin-top:14px;padding-top:14px}
+label{display:block;font-size:12px;font-weight:800;color:#c8d4e1;margin:8px 0 5px}
+input,textarea,select,button{
+ width:100%;padding:9px 10px;border-radius:9px;border:1px solid rgba(255,255,255,.16);
+ background:#122034;color:#fff;font:inherit
+}
+textarea{min-height:72px;resize:vertical}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:11px}
+button{background:#1579ff;font-weight:900;cursor:pointer}
+button.secondary{background:#17263a}
+button:disabled{opacity:.5;cursor:not-allowed}
+.ai-box{padding:12px;border:1px solid rgba(29,168,255,.38);border-radius:13px;background:linear-gradient(145deg,#0b1e34,#091321)}
+.ai-title{font-weight:900;margin-bottom:4px}
+.ai-help,.note{font-size:11px;line-height:1.4;color:#91a6bf}
+.status{min-height:38px;margin-top:8px;padding:8px;border-radius:8px;background:#07111e;color:#a8c7e7;font-size:12px}
+.status.success{background:#0b2518;color:#baf5ce}
+.status.error{background:#2a1115;color:#ffc7c7}
+.stage-wrap{padding:24px;display:flex;justify-content:center;align-items:flex-start;overflow:auto}
+.shell{width:min(100%,1600px);aspect-ratio:16/9;position:relative}
+.canvas{
+ position:absolute;inset:0;width:1600px;height:900px;transform-origin:top left;overflow:hidden;
+ background:
+ radial-gradient(circle at 70% 18%,rgba(65,100,255,.25),transparent 30%),
+ linear-gradient(120deg,#03101c,#0b1727 48%,#12101c);
+ box-shadow:0 25px 80px rgba(0,0,0,.48)
+}
+.bg{position:absolute;inset:0;background-size:cover;background-position:center;opacity:.44}
+.shade{position:absolute;inset:0;background:
+ linear-gradient(90deg,rgba(1,7,15,.95) 0%,rgba(1,7,15,.75) 33%,rgba(1,7,15,.18) 66%,rgba(1,7,15,.52) 100%),
+ linear-gradient(0deg,rgba(1,7,15,.95),transparent 35%)}
+.topbar{position:absolute;left:34px;right:34px;top:25px;z-index:7;display:flex;justify-content:space-between;align-items:flex-start}
+.logo{width:330px;max-height:90px;object-fit:contain;object-position:left top;filter:drop-shadow(0 4px 10px rgba(0,0,0,.5))}
+.date-card{padding:12px 20px;border-radius:17px;background:#07111ecc;border:1px solid rgba(255,255,255,.3);text-align:center;min-width:220px}
+.date-card .dow{font-size:18px;font-weight:900;color:var(--blue)}
+.date-card .date{font-size:25px;font-weight:900;margin-top:4px}
+.hero{position:absolute;left:38px;top:145px;width:460px;z-index:6}
+.headline{font-size:98px;line-height:.84;font-weight:950;letter-spacing:-.06em;text-transform:uppercase;text-shadow:0 7px 24px rgba(0,0,0,.68)}
+.headline .amount{color:#fff}
+.headline .snow{background:linear-gradient(180deg,#dff5ff,#57b6ff 70%,#1c78d7);-webkit-background-clip:text;background-clip:text;color:transparent}
+.period{display:inline-block;margin-top:18px;padding:9px 18px;border-radius:11px;border:1px solid rgba(189,81,255,.7);box-shadow:0 0 20px rgba(189,81,255,.25);font-size:23px;letter-spacing:.18em;font-weight:950}
+.summary{margin-top:24px;padding-left:18px;border-left:5px solid var(--blue);font-size:24px;line-height:1.28}
+.map-card{position:absolute;left:470px;right:325px;top:25px;height:700px;z-index:3;overflow:visible}
+.map-image{
+ position:absolute;inset:0;background-size:contain;background-repeat:no-repeat;background-position:center;
+ filter:drop-shadow(0 28px 18px rgba(0,0,0,.65)) drop-shadow(0 0 16px rgba(64,175,255,.62))
+}
+.map-glow{position:absolute;inset:4%;border-radius:30%;box-shadow:0 0 80px rgba(55,140,255,.28);pointer-events:none}
+.stats{position:absolute;right:28px;top:165px;width:270px;z-index:6;display:grid;gap:13px}
+.stat{min-height:138px;padding:15px;border-radius:18px;background:#06101ee3;border:1px solid rgba(255,255,255,.3);display:grid;grid-template-columns:72px 1fr;gap:12px;align-items:center;backdrop-filter:blur(10px)}
+.stat-icon{width:66px;height:66px;border-radius:50%;display:grid;place-items:center;font-size:34px;background:radial-gradient(circle at 35% 30%,#d9f3ff,#4ba9ed 60%,#13558f)}
+.stat .label{font-size:15px;font-weight:900;color:#d7e2ed}
+.stat .value{font-size:35px;font-weight:950;line-height:1;margin-top:4px}
+.stat .detail{font-size:14px;color:#c6d2df;margin-top:6px}
+.s-blue .value{color:var(--blue)}
+.s-purple .stat-icon{background:radial-gradient(circle at 35% 30%,#df83ff,#9226d4 60%,#501071)}
+.s-purple .value{color:var(--purple)}
+.meaning{position:absolute;left:34px;right:34px;bottom:115px;height:130px;z-index:7;display:grid;grid-template-columns:repeat(3,1fr);border:1px solid rgba(255,255,255,.3);border-radius:16px;background:#06101ee6;overflow:hidden}
+.meaning-card{padding:16px 18px;display:grid;grid-template-columns:78px 1fr;gap:13px;align-items:center}
+.meaning-card:not(:last-child){border-right:1px solid rgba(255,255,255,.2)}
+.mean-icon{width:72px;height:72px;border-radius:50%;display:grid;place-items:center;font-size:35px}
+.m1 .mean-icon{background:radial-gradient(circle at 35% 30%,#df83ff,#9226d4 60%,#501071)}
+.m2 .mean-icon{background:radial-gradient(circle at 35% 30%,#dff4ff,#55b6ff 60%,#155f9e)}
+.m3 .mean-icon{background:radial-gradient(circle at 35% 30%,#df83ff,#9226d4 60%,#501071)}
+.meaning-card .title{font-size:19px;font-weight:950}
+.meaning-card .desc{font-size:15px;line-height:1.2;margin-top:5px;color:#e0e8f0}
+.m1 .title,.m3 .title{color:var(--purple)}.m2 .title{color:var(--blue)}
+.sliderbar{position:absolute;left:34px;right:34px;bottom:20px;height:82px;z-index:8;border:1px solid rgba(255,255,255,.32);border-radius:16px;background:#06101ee9;display:grid;grid-template-columns:220px 1fr 240px;align-items:center;overflow:hidden}
+.slider-title{padding-left:18px;font-size:18px;font-weight:950}.slider-title span{display:block;font-size:13px;color:#b5c3d3;font-weight:700;margin-top:3px}
+.snow-options{display:grid;grid-template-columns:repeat(5,1fr);gap:0;padding:0 12px}
+.snow-option{padding:12px;text-align:center;border:1px solid rgba(255,255,255,.18);font-size:22px;font-weight:950;cursor:pointer;background:#0a1728}
+.snow-option:first-child{border-radius:12px 0 0 12px}.snow-option:last-child{border-radius:0 12px 12px 0}
+.snow-option.active{background:linear-gradient(180deg,#7b26c9,#411077);box-shadow:0 0 18px rgba(189,81,255,.55)}
+.confidence{text-align:center;border-left:1px solid rgba(255,255,255,.22);font-size:17px;color:#d6e1ed}.confidence strong{display:block;color:var(--blue);font-size:27px;line-height:1.1}
+.editable[contenteditable=true]{outline:none}
+.editable[contenteditable=true]:focus{box-shadow:0 0 0 3px rgba(29,168,255,.5);border-radius:5px}
+@media(max-width:1050px){.app{grid-template-columns:1fr}.controls{border-right:0;border-bottom:1px solid var(--line)}}
+</style>
+</head>
+<body>
+<div class="app">
+<aside class="controls">
+<h1>Snow Forecast Editor</h1>
+<p class="lead">Create a map-first snow forecast graphic with editable impacts, a snowfall headline slider, and GPT-assisted map and summary tools.</p>
+
+<div class="group">
+<label>Date</label><input id="dateInput" value="FRIDAY|MAY 16, 2025">
+<label>Headline Amount</label><input id="amountInput" value="6–10&quot;">
+<label>Headline Text</label><input id="headlineInput" value="SNOW POSSIBLE">
+<label>Forecast Period</label><input id="periodInput" value="NEXT 72 HOURS">
+<label>One-Sentence Summary</label><textarea id="summaryInput">Major winter storm late Saturday through Monday.</textarea>
+<label>Updated Time</label><input id="updatedInput" value="7:00 AM">
+</div>
+
+<div class="group">
+<div class="row"><div><label>Highest Snow</label><input id="highestInput" value="10&quot;"></div><div><label>Highest Detail</label><input id="highestDetailInput" value="Localized 10&quot;+ possible"></div></div>
+<div class="row"><div><label>Blowing Snow</label><input id="blowingInput" value="HIGH"></div><div><label>Blowing Detail</label><input id="blowingDetailInput" value="Strong gusts &amp; poor visibility"></div></div>
+<div class="row"><div><label>Travel Impact</label><input id="travelInput" value="SIGNIFICANT"></div><div><label>Travel Detail</label><input id="travelDetailInput" value="Dangerous travel likely at times"></div></div>
+<label>Confidence</label><input id="confidenceInput" value="HIGH">
+</div>
+
+<div class="group">
+<label>Morning Commute</label><input id="m1TitleInput" value="MORNING COMMUTE"><textarea id="m1DescInput">Monday morning commute will be slow and slick.</textarea>
+<label>Road Conditions</label><input id="m2TitleInput" value="ROAD CONDITIONS"><textarea id="m2DescInput">Snow-covered roads likely. Slick spots will develop.</textarea>
+<label>Snow Type</label><input id="m3TitleInput" value="SNOW TYPE"><textarea id="m3DescInput">Wet, heavy snow. Reduced visibility at times.</textarea>
+</div>
+
+<div class="group">
+<label>Cinematic Background</label><input id="backgroundUpload" type="file" accept="image/*">
+<label>Official Snowfall Map</label><input id="mapUpload" type="file" accept="image/*">
+
+<div class="ai-box">
+<div class="ai-title">✦ GPT Snow Map Editor</div>
+<div class="ai-help">Upload a real official snowfall map. GPT can crop and visually enhance it, but the meteorologist must compare the output with the original before publication.</div>
+<label>Map Source</label>
+<select id="mapType">
+<option value="wpc-snow">WPC Snow</option>
+<option value="nbm-snow">NBM Snow</option>
+<option value="hrrr-snow">HRRR Snow</option>
+<option value="kuchera">Kuchera Snow</option>
+<option value="storm-total">Storm Total Snow</option>
+</select>
+<label>Instructions</label>
+<textarea id="mapPrompt">Focus the official snowfall map on Indiana and nearby border counties. Preserve the exact Indiana boundary, snowfall contours, color bands, amounts, labels, city positions, county boundaries, legend values, and geographic placement. Do not redraw the state, invent geography, move contours, smooth data, change snowfall values, or add unsupported labels. Improve only presentation: isolate the real map, increase contrast, soften secondary county lines, add a subtle icy edge glow and depth, and place it on a transparent or dark WeatherValet-ready background.</textarea>
+<label>Secure API Endpoint</label><input id="mapEndpoint" value="/api/weather-map-enhance">
+<div class="note">The OpenAI API key stays on your server, never in this HTML.</div>
+<div class="actions"><button id="enhanceMapBtn" type="button">✦ Enhance Map</button><button id="originalMapBtn" class="secondary" type="button">Use Original</button></div>
+<div class="actions"><button id="enhancedMapBtn" class="secondary" type="button" disabled>Use Enhanced</button><button id="downloadMapBtn" class="secondary" type="button" disabled>Download Map</button></div>
+<div id="mapStatus" class="status">Upload an official snowfall map to begin.</div>
+</div>
+</div>
+
+<div class="group ai-box">
+<div class="ai-title">✦ GPT Snow Summary</div>
+<div class="ai-help">Paste forecast guidance. GPT drafts concise headline, impacts, confidence, and bottom callouts for review.</div>
+<label>Forecast Guidance</label>
+<textarea id="guidanceInput">A major winter storm may affect Indiana from late Saturday through Monday. The heaviest snow is expected from Indianapolis southward, with widespread 6 to 10 inches and localized amounts above 10 inches. Strong winds may produce blowing snow and poor visibility. Travel impacts could be significant, especially Monday morning. Confidence is high.</textarea>
+<label>Instructions</label>
+<textarea id="summaryPrompt">Create concise snow forecast graphic copy. Return a headline amount, headline text, forecast period, one-sentence summary, highest snow, blowing snow risk, travel impact, confidence, and three short bottom callouts. Use only details supported by the supplied guidance. Return JSON only.</textarea>
+<label>Secure API Endpoint</label><input id="summaryEndpoint" value="/api/snow-summary">
+<div class="actions"><button id="buildSummaryBtn" type="button">✦ Build Summary</button><button id="loadExampleBtn" class="secondary" type="button">Load Example</button></div>
+<div id="summaryStatus" class="status">Paste guidance and click Build Summary.</div>
+</div>
+
+<div class="actions"><button id="exportBtn" type="button">Export PNG</button><button id="resetBtn" class="secondary" type="button">Reset</button></div>
+</aside>
+
+<main class="stage-wrap">
+<div id="shell" class="shell">
+<section id="canvas" class="canvas">
+<div id="bg" class="bg"></div><div class="shade"></div>
+
+<div class="topbar">
+<img src="/graphics/assets/weathervalet-logo-white.png" class="logo" alt="WeatherValet">
+<div class="date-card"><div id="dow" class="dow editable" contenteditable="true">FRIDAY</div><div id="date" class="date editable" contenteditable="true">MAY 16, 2025</div></div>
+</div>
+
+<div class="hero">
+<div id="headline" class="headline"><span id="amount" class="amount editable" contenteditable="true">6–10"</span><br><span id="headlineText" class="snow editable" contenteditable="true">SNOW</span><br><span id="headlineBottom" class="editable" contenteditable="true">POSSIBLE</span></div>
+<div id="period" class="period editable" contenteditable="true">NEXT 72 HOURS</div>
+<div id="summary" class="summary editable" contenteditable="true">Major winter storm late Saturday through Monday.</div>
+</div>
+
+<div class="map-card">
+<div class="map-glow"></div>
+<div id="mapImage" class="map-image"></div>
+</div>
+
+<div class="stats">
+<div class="stat s-blue"><div class="stat-icon">❄️</div><div><div class="label">HIGHEST SNOW</div><div id="highest" class="value editable" contenteditable="true">10"</div><div id="highestDetail" class="detail editable" contenteditable="true">Localized 10"+ possible</div></div></div>
+<div class="stat s-blue"><div class="stat-icon">💨</div><div><div class="label">BLOWING SNOW</div><div id="blowing" class="value editable" contenteditable="true">HIGH</div><div id="blowingDetail" class="detail editable" contenteditable="true">Strong gusts & poor visibility</div></div></div>
+<div class="stat s-purple"><div class="stat-icon">⚠️</div><div><div class="label">TRAVEL IMPACT</div><div id="travel" class="value editable" contenteditable="true">SIGNIFICANT</div><div id="travelDetail" class="detail editable" contenteditable="true">Dangerous travel likely at times</div></div></div>
+</div>
+
+<div class="meaning">
+<div class="meaning-card m1"><div class="mean-icon">🚗</div><div><div id="m1Title" class="title editable" contenteditable="true">MORNING COMMUTE</div><div id="m1Desc" class="desc editable" contenteditable="true">Monday morning commute will be slow and slick.</div></div></div>
+<div class="meaning-card m2"><div class="mean-icon">🧂</div><div><div id="m2Title" class="title editable" contenteditable="true">ROAD CONDITIONS</div><div id="m2Desc" class="desc editable" contenteditable="true">Snow-covered roads likely. Slick spots will develop.</div></div></div>
+<div class="meaning-card m3"><div class="mean-icon">❄️</div><div><div id="m3Title" class="title editable" contenteditable="true">SNOW TYPE</div><div id="m3Desc" class="desc editable" contenteditable="true">Wet, heavy snow. Reduced visibility at times.</div></div></div>
+</div>
+
+<div class="sliderbar">
+<div class="slider-title">SNOW SLIDER<span>Adjust headline automatically</span></div>
+<div id="snowOptions" class="snow-options">
+<div class="snow-option" data-value="2&quot;">2"</div>
+<div class="snow-option" data-value="4&quot;">4"</div>
+<div class="snow-option active" data-value="6–10&quot;">6–10"</div>
+<div class="snow-option" data-value="8&quot;">8"</div>
+<div class="snow-option" data-value="12&quot;+">12"+</div>
+</div>
+<div class="confidence">CONFIDENCE<strong id="confidence" class="editable" contenteditable="true">HIGH</strong></div>
+</div>
+
+</section>
+</div>
+</main>
+</div>
+
+<script src="/graphics/assets/html2canvas.min.js"></script>
+<script>
+const $=id=>document.getElementById(id),canvas=$('canvas'),shell=$('shell');
+function fit(){const s=shell.clientWidth/1600;canvas.style.transform=`scale(${s})`;shell.style.height=`${900*s}px`}
+addEventListener('resize',fit);fit();
+
+function bind(a,b,fn){$(a).addEventListener('input',e=>fn?fn(e.target.value):$(b).textContent=e.target.value)}
+bind('amountInput','amount');
+bind('headlineInput','headlineText',v=>{
+ const words=v.trim().split(/\s+/);
+ $('headlineText').textContent=words[0]||'';
+ $('headlineBottom').textContent=words.slice(1).join(' ')||'';
+});
+bind('periodInput','period');bind('summaryInput','summary');bind('updatedInput','updated');
+bind('highestInput','highest');bind('highestDetailInput','highestDetail');
+bind('blowingInput','blowing');bind('blowingDetailInput','blowingDetail');
+bind('travelInput','travel');bind('travelDetailInput','travelDetail');
+bind('confidenceInput','confidence');
+bind('m1TitleInput','m1Title');bind('m1DescInput','m1Desc');
+bind('m2TitleInput','m2Title');bind('m2DescInput','m2Desc');
+bind('m3TitleInput','m3Title');bind('m3DescInput','m3Desc');
+
+$('dateInput').addEventListener('input',e=>{const[a,b]=e.target.value.split('|');$('dow').textContent=a||'';$('date').textContent=b||''});
+$('snowOptions').addEventListener('click',e=>{
+ const item=e.target.closest('.snow-option');if(!item)return;
+ document.querySelectorAll('.snow-option').forEach(x=>x.classList.remove('active'));
+ item.classList.add('active');
+ $('amountInput').value=item.dataset.value;$('amountInput').dispatchEvent(new Event('input'));
+});
+
+$('backgroundUpload').addEventListener('change',e=>{
+ const f=e.target.files[0];if(!f)return;const r=new FileReader();
+ r.onload=()=>{$('bg').style.backgroundImage=`url("${r.result}")`};r.readAsDataURL(f)
+});
+
+let originalMap='',enhancedMap='';
+$('mapUpload').addEventListener('change',e=>{
+ const f=e.target.files[0];if(!f)return;const r=new FileReader();
+ r.onload=()=>{
+  originalMap=r.result;enhancedMap='';
+  $('mapImage').style.backgroundImage=`url("${originalMap}")`;
+  $('enhancedMapBtn').disabled=true;$('downloadMapBtn').disabled=true;
+  setStatus('mapStatus','Official snowfall map loaded. Click Enhance Map.','')
+ };
+ r.readAsDataURL(f)
+});
+
+function setStatus(id,msg,type=''){const el=$(id);el.textContent=msg;el.className='status'+(type?' '+type:'')}
+function dataUrlBlob(u){const[m,d]=u.split(','),mime=(m.match(/data:(.*?);/)||[])[1]||'image/png',b=atob(d),a=new Uint8Array(b.length);for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return new Blob([a],{type:mime})}
+function returnedImage(p){if(p.image_url)return p.image_url;if(p.url)return p.url;if(p.image_base64)return `data:image/png;base64,${p.image_base64}`;if(p.b64_json)return `data:image/png;base64,${p.b64_json}`;if(p.data?.[0]?.b64_json)return `data:image/png;base64,${p.data[0].b64_json}`;if(p.data?.[0]?.url)return p.data[0].url;throw new Error('No image returned.')}
+
+$('enhanceMapBtn').addEventListener('click',async()=>{
+ if(!originalMap)return setStatus('mapStatus','Upload an official snowfall map first.','error');
+ const endpoint=$('mapEndpoint').value.trim();if(!endpoint)return setStatus('mapStatus','Enter the secure API endpoint.','error');
+ $('enhanceMapBtn').disabled=true;setStatus('mapStatus','Enhancing the official snowfall map…','');
+ try{
+  const form=new FormData();
+  form.append('image',dataUrlBlob(originalMap),'official-snowfall-map.png');
+  form.append('mapType',$('mapType').value);
+  form.append('prompt',$('mapPrompt').value);
+  form.append('focusState','Indiana');
+  form.append('preserveOfficialData','true');
+  const res=await fetch(endpoint,{method:'POST',body:form});
+  if(!res.ok)throw new Error(`${res.status}: ${(await res.text()).slice(0,180)}`);
+  enhancedMap=returnedImage(await res.json());
+  $('mapImage').style.backgroundImage=`url("${enhancedMap}")`;
+  $('enhancedMapBtn').disabled=false;$('downloadMapBtn').disabled=false;
+  setStatus('mapStatus','Enhanced map inserted. Compare it carefully with the official source.','success')
+ }catch(error){setStatus('mapStatus',`Map enhancement failed: ${error.message}`,'error')}
+ finally{$('enhanceMapBtn').disabled=false}
+});
+$('originalMapBtn').addEventListener('click',()=>{if(originalMap)$('mapImage').style.backgroundImage=`url("${originalMap}")`});
+$('enhancedMapBtn').addEventListener('click',()=>{if(enhancedMap)$('mapImage').style.backgroundImage=`url("${enhancedMap}")`});
+$('downloadMapBtn').addEventListener('click',()=>{if(!enhancedMap)return;const a=document.createElement('a');a.href=enhancedMap;a.download='weathervalet-snow-map.png';a.click()});
+
+function normalizeSummary(p){
+ const c=p.callouts||[];
+ if(c.length<3)throw new Error('Response must include three callouts.');
+ return p
+}
+$('buildSummaryBtn').addEventListener('click',async()=>{
+ const endpoint=$('summaryEndpoint').value.trim();
+ if(!endpoint)return setStatus('summaryStatus','Enter the secure API endpoint.','error');
+ $('buildSummaryBtn').disabled=true;setStatus('summaryStatus','Building snow summary…','');
+ try{
+  const res=await fetch(endpoint,{
+   method:'POST',
+   headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({guidance:$('guidanceInput').value,prompt:$('summaryPrompt').value})
+  });
+  if(!res.ok)throw new Error(`${res.status}: ${(await res.text()).slice(0,180)}`);
+  const p=normalizeSummary(await res.json());
+  const values={
+   amountInput:p.amount,headlineInput:p.headline,periodInput:p.period,summaryInput:p.summary,
+   highestInput:p.highestSnow,highestDetailInput:p.highestDetail,
+   blowingInput:p.blowingSnow,blowingDetailInput:p.blowingDetail,
+   travelInput:p.travelImpact,travelDetailInput:p.travelDetail,
+   confidenceInput:p.confidence,
+   m1TitleInput:p.callouts[0].title,m1DescInput:p.callouts[0].desc,
+   m2TitleInput:p.callouts[1].title,m2DescInput:p.callouts[1].desc,
+   m3TitleInput:p.callouts[2].title,m3DescInput:p.callouts[2].desc
+  };
+  Object.entries(values).forEach(([id,v])=>{if(v!==undefined){$(id).value=v;$(id).dispatchEvent(new Event('input'))}});
+  setStatus('summaryStatus','Summary created. Review all wording and values before publishing.','success')
+ }catch(error){setStatus('summaryStatus',`Summary failed: ${error.message}`,'error')}
+ finally{$('buildSummaryBtn').disabled=false}
+});
+$('loadExampleBtn').addEventListener('click',()=>setStatus('summaryStatus','Example values are already loaded.','success'));
+
+$('exportBtn').addEventListener('click',async()=>{
+ const prior=canvas.style.transform;canvas.style.transform='none';
+ const c=await html2canvas(canvas,{backgroundColor:null,scale:1,useCORS:true});
+ const a=document.createElement('a');a.download='weathervalet-snow-forecast.png';a.href=c.toDataURL('image/png');a.click();
+ canvas.style.transform=prior
+});
+$('resetBtn').addEventListener('click',()=>location.reload());
+</script>
+</body>
+</html>

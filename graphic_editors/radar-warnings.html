@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WeatherValet Radar & Warnings Editor</title>
+<style>
+:root{
+  --blue:#18a8ff;
+  --red:#ef3340;
+  --orange:#ff8a1c;
+  --yellow:#f4d82d;
+  --green:#36d568;
+  --purple:#b94bd3;
+  --panel:#07121f;
+  --line:rgba(255,255,255,.22);
+}
+*{box-sizing:border-box}
+body{margin:0;background:#07101a;color:#fff;font-family:Inter,Arial,Helvetica,sans-serif}
+.app{display:grid;grid-template-columns:420px 1fr;min-height:100vh}
+.controls{padding:18px;background:#091523;border-right:1px solid var(--line);overflow:auto}
+h1{font-size:22px;margin:0 0 5px}
+.lead{font-size:13px;line-height:1.45;color:#92a5bc;margin:0 0 14px}
+.group{border-top:1px solid rgba(255,255,255,.1);margin-top:14px;padding-top:14px}
+label{display:block;font-size:12px;font-weight:800;color:#c8d4e1;margin:8px 0 5px}
+input,textarea,select,button{
+ width:100%;padding:9px 10px;border-radius:9px;border:1px solid rgba(255,255,255,.16);
+ background:#122034;color:#fff;font:inherit
+}
+textarea{min-height:72px;resize:vertical}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:11px}
+button{background:#1579ff;font-weight:900;cursor:pointer}
+button.secondary{background:#17263a}
+button:disabled{opacity:.5;cursor:not-allowed}
+.alert-edit{padding:10px;border-radius:11px;background:#0d1b2d;margin:8px 0}
+.alert-edit strong{font-size:13px}
+.ai-box{padding:12px;border:1px solid rgba(24,168,255,.38);border-radius:13px;background:linear-gradient(145deg,#0b1e34,#091321)}
+.ai-title{font-weight:900;margin-bottom:4px}
+.ai-help,.note{font-size:11px;line-height:1.4;color:#91a6bf}
+.status{min-height:38px;margin-top:8px;padding:8px;border-radius:8px;background:#07111e;color:#a8c7e7;font-size:12px}
+.status.success{background:#0b2518;color:#baf5ce}
+.status.error{background:#2a1115;color:#ffc7c7}
+.stage-wrap{padding:24px;display:flex;justify-content:center;align-items:flex-start;overflow:auto}
+.shell{width:min(100%,1600px);aspect-ratio:16/9;position:relative}
+.canvas{
+ position:absolute;inset:0;width:1600px;height:900px;transform-origin:top left;overflow:hidden;
+ background:
+ radial-gradient(circle at 72% 18%,rgba(67,117,255,.25),transparent 29%),
+ linear-gradient(120deg,#03101c,#0a1828 48%,#171018);
+ box-shadow:0 25px 80px rgba(0,0,0,.48)
+}
+.bg{position:absolute;inset:0;background-size:cover;background-position:center;opacity:.4}
+.shade{position:absolute;inset:0;background:
+ linear-gradient(90deg,rgba(1,7,15,.95) 0%,rgba(1,7,15,.75) 33%,rgba(1,7,15,.18) 65%,rgba(1,7,15,.55) 100%),
+ linear-gradient(0deg,rgba(1,7,15,.95),transparent 34%)}
+.topbar{position:absolute;left:34px;right:34px;top:25px;z-index:7;display:flex;justify-content:space-between;align-items:flex-start}
+.logo{width:330px;max-height:90px;object-fit:contain;object-position:left top;filter:drop-shadow(0 4px 10px rgba(0,0,0,.5))}
+.date-card{padding:12px 20px;border-radius:17px;background:#07111ecc;border:1px solid rgba(255,255,255,.3);text-align:center;min-width:215px}
+.date-card .dow{font-size:18px;font-weight:900}.date-card .date{font-size:25px;font-weight:900;margin-top:4px}
+.hero{position:absolute;left:37px;top:146px;width:440px;z-index:6}
+.headline{font-size:76px;line-height:.9;font-weight:950;letter-spacing:-.055em;text-transform:uppercase;text-shadow:0 7px 24px rgba(0,0,0,.65)}
+.headline span{background:linear-gradient(180deg,#fff,#6cc0ff 68%,#197bf0);-webkit-background-clip:text;background-clip:text;color:transparent}
+.subline{margin-top:18px;font-size:21px;color:#d9e6f2;font-weight:850}
+.legend-card,.motion-card{
+ margin-top:20px;padding:16px;border-radius:16px;background:#07111eca;border:1px solid rgba(255,255,255,.28);backdrop-filter:blur(10px)
+}
+.legend-title{font-size:19px;font-weight:950;margin-bottom:9px}
+.legend-row{display:flex;align-items:center;gap:10px;font-size:15px;margin:8px 0}
+.swatch{width:29px;height:19px;border-radius:3px;border:3px solid currentColor;background:transparent}
+.motion-card .main{font-size:18px;font-weight:950}.motion-card .value{color:var(--blue);font-size:22px;font-weight:950;margin-top:4px}.motion-card .desc{font-size:16px;line-height:1.25;margin-top:8px}
+.map-card{position:absolute;left:510px;right:265px;top:105px;height:650px;z-index:3;border-radius:27px;overflow:hidden;border:1px solid rgba(255,255,255,.3);background:#243824;box-shadow:0 24px 58px rgba(0,0,0,.45)}
+.map-image{position:absolute;inset:0;background-size:cover;background-position:center}
+.map-overlay{position:absolute;inset:0;background:linear-gradient(180deg,rgba(0,0,0,.02),rgba(0,0,0,.3))}
+.radar-scale{position:absolute;left:110px;right:110px;top:14px;height:31px;border-radius:16px;background:#06101edb;border:1px solid rgba(255,255,255,.3);display:flex;align-items:center;gap:10px;padding:6px 14px;font-size:12px;font-weight:900}
+.radar-gradient{height:12px;flex:1;border-radius:8px;background:linear-gradient(90deg,#3b7a5e,#16863f,#50a92d,#e4d327,#ff9c20,#ff3425,#d11624,#9c2adc)}
+.map-label{position:absolute;left:17px;bottom:16px;padding:8px 11px;border-radius:9px;background:#07111ed9;border:1px solid rgba(255,255,255,.24);font-size:14px;font-weight:900}
+.alerts{position:absolute;right:26px;top:160px;width:220px;height:595px;z-index:6;padding:15px;border-radius:18px;background:#06101ee5;border:1px solid rgba(255,255,255,.32);backdrop-filter:blur(10px)}
+.alerts h3{font-size:19px;margin:0 0 8px;text-align:center}
+.alert-item{padding:12px 0;border-top:1px solid rgba(255,255,255,.18)}
+.alert-item:first-of-type{border-top:0}
+.alert-item .count{font-size:40px;font-weight:950;line-height:1}
+.alert-item .type{font-size:18px;font-weight:950;line-height:1.05;margin-top:3px}
+.alert-item .until{font-size:13px;color:#c9d5e1;margin-top:5px}
+.alert-item .areas{font-size:13px;line-height:1.25;margin-top:7px;color:#e6eef7}
+.hazards{position:absolute;left:34px;right:34px;bottom:106px;height:125px;z-index:7;border:1px solid rgba(255,255,255,.3);border-radius:16px;background:#06101ee6;display:grid;grid-template-columns:repeat(4,1fr);overflow:hidden}
+.hazard{padding:14px 15px;display:grid;grid-template-columns:64px 1fr;align-items:center;gap:11px}
+.hazard:not(:last-child){border-right:1px solid rgba(255,255,255,.2)}
+.hazard-icon{width:58px;height:58px;border-radius:50%;display:grid;place-items:center;background:radial-gradient(circle at 35% 30%,#4ac4ff,#1468d8 60%,#073b8a);font-size:29px}
+.hazard .title{font-size:17px;font-weight:950}.hazard .level{font-size:17px;color:var(--blue);font-weight:950}.hazard .desc{font-size:13px;line-height:1.2;margin-top:4px}
+.footer{position:absolute;left:34px;right:34px;bottom:20px;height:72px;z-index:8;border:1px solid rgba(255,255,255,.32);border-radius:16px;background:#06101ee9;display:grid;grid-template-columns:370px 1fr 280px;align-items:center;overflow:hidden}
+.ready{height:100%;display:flex;align-items:center;justify-content:center;gap:12px;color:#b9ffca;font-size:25px;font-weight:950}
+.live{text-align:center;font-size:18px;color:#d7e2ed}.live strong{display:block;color:var(--blue);font-size:27px;line-height:1}
+.site{text-align:center;border-left:1px solid rgba(255,255,255,.22);font-size:23px;color:var(--blue);font-weight:950}
+.editable[contenteditable=true]{outline:none}
+.editable[contenteditable=true]:focus{box-shadow:0 0 0 3px rgba(24,168,255,.5);border-radius:5px}
+@media(max-width:1050px){.app{grid-template-columns:1fr}.controls{border-right:0;border-bottom:1px solid var(--line)}}
+</style>
+</head>
+<body>
+<div class="app">
+<aside class="controls">
+<h1>Radar & Warnings Editor</h1>
+<p class="lead">Create an operational radar-and-alert graphic using an official radar screenshot or map, plus editable warning counts, counties, hazards, and storm motion.</p>
+
+<div class="group">
+<label>Date</label><input id="dateInput" value="FRIDAY|MAY 16, 2025">
+<label>Headline</label><input id="headlineInput" value="LIVE RADAR & WARNINGS">
+<label>Subline</label><input id="sublineInput" value="Real-Time Radar • Watches • Warnings • Storm Reports">
+<label>Storm Motion</label><input id="motionInput" value="WSW at 25 MPH">
+<label>Motion Description</label><textarea id="motionDescInput">Moving into Central Indiana through mid-morning.</textarea>
+<label>Updated Time</label><input id="updatedInput" value="7:00 AM">
+<label>Footer Alert</label><input id="readyInput" value="WEATHER READY!">
+</div>
+
+<div id="alertControls" class="group"></div>
+<div id="hazardControls" class="group"></div>
+
+<div class="group">
+<label>Cinematic Background</label><input id="backgroundUpload" type="file" accept="image/*">
+<label>Official Radar / Warning Map</label><input id="mapUpload" type="file" accept="image/*">
+
+<div class="ai-box">
+<div class="ai-title">✦ GPT Map Editor</div>
+<div class="ai-help">Upload the official radar or warning map. GPT can focus it on Indiana and apply the WeatherValet look. The meteorologist must verify that all official polygons, radar echoes, timestamps, colors, labels, and locations remain accurate.</div>
+<label>Map Type</label>
+<select id="mapType">
+<option value="radar-warnings">Radar & Warnings</option>
+<option value="radar">Radar Only</option>
+<option value="warnings">Warnings Only</option>
+<option value="watch">Watch Map</option>
+<option value="storm-reports">Storm Reports</option>
+</select>
+<label>Instructions</label>
+<textarea id="mapPrompt">Focus the official radar and warning map on Indiana and nearby border counties. Preserve all radar echoes, warning polygons, watch polygons, timestamps, colors, labels, geographic placement, county boundaries, storm tracks, and official data exactly. Do not invent, move, smooth, expand, shrink, or reinterpret weather data. Improve only presentation: premium dark terrain, crisp Indiana outline, clear county lines, strong contrast, subtle depth, and modern WeatherValet broadcast styling.</textarea>
+<label>Secure API Endpoint</label><input id="mapEndpoint" value="/api/weather-map-enhance">
+<div class="note">The OpenAI API key stays on your server, never in this HTML.</div>
+<div class="actions"><button id="enhanceMapBtn" type="button">✦ Enhance Map</button><button id="originalMapBtn" class="secondary" type="button">Use Original</button></div>
+<div class="actions"><button id="enhancedMapBtn" class="secondary" type="button" disabled>Use Enhanced</button><button id="downloadMapBtn" class="secondary" type="button" disabled>Download Map</button></div>
+<div id="mapStatus" class="status">Upload an official map to begin.</div>
+</div>
+</div>
+
+<div class="group ai-box">
+<div class="ai-title">✦ GPT Alert Summary</div>
+<div class="ai-help">Paste official warning text, alert summaries, or meteorologist notes. GPT drafts the warning counts, areas, storm motion, and hazard summaries for review.</div>
+<label>Official Alert Text / Notes</label>
+<textarea id="alertGuidance">Two tornado warnings are in effect for Henry and Rush Counties until 7:30 AM. Three severe thunderstorm warnings cover Hancock, Shelby, and Decatur Counties until 7:45 AM. One special weather statement covers southern Indiana until 8:15 AM. Main hazards are damaging winds up to 60 mph, quarter-size hail, heavy rain, and an elevated tornado risk west of I-65.</textarea>
+<label>Instructions</label>
+<textarea id="alertPrompt">Create three alert blocks and four concise hazard summaries. Use only information supported by the supplied official text. Do not add counties, times, hazards, or severity. Return JSON only.</textarea>
+<label>Secure API Endpoint</label><input id="alertEndpoint" value="/api/weather-alert-summary">
+<div class="actions"><button id="buildAlertsBtn" type="button">✦ Build Alert Summary</button><button id="loadExampleBtn" class="secondary" type="button">Load Example</button></div>
+<div id="alertStatus" class="status">Paste official alert text and click Build Alert Summary.</div>
+</div>
+
+<div class="actions"><button id="exportBtn" type="button">Export PNG</button><button id="resetBtn" class="secondary" type="button">Reset</button></div>
+</aside>
+
+<main class="stage-wrap">
+<div id="shell" class="shell">
+<section id="canvas" class="canvas">
+<div id="bg" class="bg"></div><div class="shade"></div>
+
+<div class="topbar">
+<img src="/graphics/assets/weathervalet-logo-white.png" class="logo" alt="WeatherValet">
+<div class="date-card"><div id="dow" class="dow editable" contenteditable="true">FRIDAY</div><div id="date" class="date editable" contenteditable="true">MAY 16, 2025</div></div>
+</div>
+
+<div class="hero">
+<div id="headline" class="headline editable" contenteditable="true"><span>LIVE RADAR</span><br>& WARNINGS</div>
+<div id="subline" class="subline editable" contenteditable="true">Real-Time Radar • Watches • Warnings • Storm Reports</div>
+
+<div class="legend-card">
+<div class="legend-title">LEGEND</div>
+<div class="legend-row" style="color:#ef3340"><span class="swatch"></span> Tornado Warning</div>
+<div class="legend-row" style="color:#ff8a1c"><span class="swatch"></span> Severe T-Storm Warning</div>
+<div class="legend-row" style="color:#f4d82d"><span class="swatch"></span> Special Weather Statement</div>
+<div class="legend-row" style="color:#36d568"><span class="swatch"></span> Flash Flood Warning</div>
+<div class="legend-row" style="color:#b94bd3"><span class="swatch"></span> Tornado Watch</div>
+</div>
+
+<div class="motion-card">
+<div class="main">STORM MOTION</div>
+<div id="motion" class="value editable" contenteditable="true">WSW at 25 MPH</div>
+<div id="motionDesc" class="desc editable" contenteditable="true">Moving into Central Indiana through mid-morning.</div>
+</div>
+</div>
+
+<div class="map-card">
+<div id="mapImage" class="map-image"></div>
+<div class="map-overlay"></div>
+<div class="radar-scale"><span>LIGHT</span><div class="radar-gradient"></div><span>HEAVY</span></div>
+<div class="map-label">OFFICIAL RADAR & WARNING MAP</div>
+</div>
+
+<div class="alerts">
+<h3>ACTIVE ALERTS</h3>
+<div id="alertsContainer"></div>
+</div>
+
+<div id="hazards" class="hazards"></div>
+
+<div class="footer">
+<div class="ready">✓ <span id="ready" class="editable" contenteditable="true">WEATHER READY!</span></div>
+<div class="live">UPDATED<strong id="updated" class="editable" contenteditable="true">7:00 AM</strong></div>
+<div class="site">weathervalet.ai</div>
+</div>
+</section>
+</div>
+</main>
+</div>
+
+<script src="/graphics/assets/html2canvas.min.js"></script>
+<script>
+const $=id=>document.getElementById(id),canvas=$('canvas'),shell=$('shell');
+function fit(){const s=shell.clientWidth/1600;canvas.style.transform=`scale(${s})`;shell.style.height=`${900*s}px`}
+addEventListener('resize',fit);fit();
+
+const alerts=[
+ {count:'2',type:'TORNADO WARNINGS',until:'Valid Until 7:30 AM',areas:'Henry County • Rush County',color:'#ef3340'},
+ {count:'3',type:'SEVERE T-STORM WARNINGS',until:'Valid Until 7:45 AM',areas:'Hancock County • Shelby County • Decatur County',color:'#ff8a1c'},
+ {count:'1',type:'SPECIAL WEATHER STATEMENT',until:'Valid Until 8:15 AM',areas:'Southern Indiana',color:'#f4d82d'}
+];
+
+const hazards=[
+ {icon:'🌪️',title:'TORNADO RISK',level:'ELEVATED',desc:'Greatest risk west of I-65 this morning.'},
+ {icon:'🧊',title:'LARGE HAIL',level:'POSSIBLE',desc:'Up to quarter size in stronger storms.'},
+ {icon:'💧',title:'HEAVY RAIN',level:'LIKELY',desc:'1–2 inches possible in heaviest downpours.'},
+ {icon:'💨',title:'WIND GUSTS',level:'UP TO 60 MPH',desc:'Damaging winds possible.'}
+];
+
+function renderAlerts(){
+ const c=$('alertControls'),out=$('alertsContainer');
+ c.innerHTML='<strong>Active Alert Blocks</strong>';out.innerHTML='';
+ alerts.forEach((a,i)=>{
+  c.insertAdjacentHTML('beforeend',`<div class="alert-edit"><strong>Alert ${i+1}</strong>
+   <div class="row"><input data-a="${i}" data-k="count" value="${a.count}"><input data-a="${i}" data-k="color" type="color" value="${a.color}"></div>
+   <input data-a="${i}" data-k="type" value="${a.type}">
+   <input data-a="${i}" data-k="until" value="${a.until}">
+   <textarea data-a="${i}" data-k="areas">${a.areas}</textarea>
+  </div>`);
+  out.insertAdjacentHTML('beforeend',`<div class="alert-item" style="color:${a.color}">
+   <div class="count editable" contenteditable="true">${a.count}</div>
+   <div class="type editable" contenteditable="true">${a.type}</div>
+   <div class="until editable" contenteditable="true">${a.until}</div>
+   <div class="areas editable" contenteditable="true">${a.areas}</div>
+  </div>`);
+ });
+ c.querySelectorAll('input,textarea').forEach(el=>el.addEventListener('input',e=>{alerts[+e.target.dataset.a][e.target.dataset.k]=e.target.value;renderAlerts()}));
+}
+renderAlerts();
+
+function renderHazards(){
+ const c=$('hazardControls'),out=$('hazards');
+ c.innerHTML='<strong>Hazard Summaries</strong>';out.innerHTML='';
+ hazards.forEach((h,i)=>{
+  c.insertAdjacentHTML('beforeend',`<div class="alert-edit"><strong>Hazard ${i+1}</strong>
+   <div class="row"><input data-h="${i}" data-k="icon" value="${h.icon}"><input data-h="${i}" data-k="level" value="${h.level}"></div>
+   <input data-h="${i}" data-k="title" value="${h.title}">
+   <textarea data-h="${i}" data-k="desc">${h.desc}</textarea>
+  </div>`);
+  out.insertAdjacentHTML('beforeend',`<div class="hazard">
+   <div class="hazard-icon editable" contenteditable="true">${h.icon}</div>
+   <div><div class="title editable" contenteditable="true">${h.title}</div><div class="level editable" contenteditable="true">${h.level}</div><div class="desc editable" contenteditable="true">${h.desc}</div></div>
+  </div>`);
+ });
+ c.querySelectorAll('input,textarea').forEach(el=>el.addEventListener('input',e=>{hazards[+e.target.dataset.h][e.target.dataset.k]=e.target.value;renderHazards()}));
+}
+renderHazards();
+
+function bind(a,b,fn){$(a).addEventListener('input',e=>fn?fn(e.target.value):$(b).textContent=e.target.value)}
+bind('sublineInput','subline');bind('motionInput','motion');bind('motionDescInput','motionDesc');bind('updatedInput','updated');bind('readyInput','ready');
+bind('headlineInput','headline',v=>{const parts=v.split('&');$('headline').innerHTML=`<span>${(parts[0]||'').trim()}</span>${parts[1]?'<br>& '+parts[1].trim():''}`});
+$('dateInput').addEventListener('input',e=>{const[a,b]=e.target.value.split('|');$('dow').textContent=a||'';$('date').textContent=b||''});
+
+$('backgroundUpload').addEventListener('change',e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=()=>{$('bg').style.backgroundImage=`url("${r.result}")`};r.readAsDataURL(f)});
+
+let originalMap='',enhancedMap='';
+$('mapUpload').addEventListener('change',e=>{
+ const f=e.target.files[0];if(!f)return;const r=new FileReader();
+ r.onload=()=>{originalMap=r.result;enhancedMap='';$('mapImage').style.backgroundImage=`url("${originalMap}")`;$('enhancedMapBtn').disabled=true;$('downloadMapBtn').disabled=true;setStatus('mapStatus','Official map loaded. Click Enhance Map.','')};
+ r.readAsDataURL(f)
+});
+
+function setStatus(id,msg,type=''){const el=$(id);el.textContent=msg;el.className='status'+(type?' '+type:'')}
+function dataUrlBlob(u){const[m,d]=u.split(','),mime=(m.match(/data:(.*?);/)||[])[1]||'image/png',b=atob(d),a=new Uint8Array(b.length);for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return new Blob([a],{type:mime})}
+function returnedImage(p){if(p.image_url)return p.image_url;if(p.url)return p.url;if(p.image_base64)return `data:image/png;base64,${p.image_base64}`;if(p.b64_json)return `data:image/png;base64,${p.b64_json}`;if(p.data?.[0]?.b64_json)return `data:image/png;base64,${p.data[0].b64_json}`;if(p.data?.[0]?.url)return p.data[0].url;throw new Error('No image returned.')}
+
+$('enhanceMapBtn').addEventListener('click',async()=>{
+ if(!originalMap)return setStatus('mapStatus','Upload an official map first.','error');
+ const endpoint=$('mapEndpoint').value.trim();if(!endpoint)return setStatus('mapStatus','Enter the secure API endpoint.','error');
+ $('enhanceMapBtn').disabled=true;setStatus('mapStatus','Enhancing the official map…','');
+ try{
+  const form=new FormData();form.append('image',dataUrlBlob(originalMap),'official-radar-map.png');form.append('mapType',$('mapType').value);form.append('prompt',$('mapPrompt').value);form.append('focusState','Indiana');form.append('preserveOfficialData','true');
+  const res=await fetch(endpoint,{method:'POST',body:form});if(!res.ok)throw new Error(`${res.status}: ${(await res.text()).slice(0,180)}`);
+  enhancedMap=returnedImage(await res.json());$('mapImage').style.backgroundImage=`url("${enhancedMap}")`;$('enhancedMapBtn').disabled=false;$('downloadMapBtn').disabled=false;setStatus('mapStatus','Enhanced map inserted. Compare it carefully with the official map.','success')
+ }catch(error){setStatus('mapStatus',`Map enhancement failed: ${error.message}`,'error')}
+ finally{$('enhanceMapBtn').disabled=false}
+});
+$('originalMapBtn').addEventListener('click',()=>{if(originalMap)$('mapImage').style.backgroundImage=`url("${originalMap}")`});
+$('enhancedMapBtn').addEventListener('click',()=>{if(enhancedMap)$('mapImage').style.backgroundImage=`url("${enhancedMap}")`});
+$('downloadMapBtn').addEventListener('click',()=>{if(!enhancedMap)return;const a=document.createElement('a');a.href=enhancedMap;a.download='weathervalet-radar-warnings-map.png';a.click()});
+
+function normalizeAlerts(p){
+ const a=p.alerts||[],h=p.hazards||[];
+ if(!Array.isArray(a)||a.length<3||!Array.isArray(h)||h.length<4)throw new Error('Response must contain three alerts and four hazards.');
+ return {alerts:a.slice(0,3),hazards:h.slice(0,4),motion:p.motion||'',motionDescription:p.motionDescription||''}
+}
+$('buildAlertsBtn').addEventListener('click',async()=>{
+ const endpoint=$('alertEndpoint').value.trim();if(!endpoint)return setStatus('alertStatus','Enter the secure API endpoint.','error');
+ $('buildAlertsBtn').disabled=true;setStatus('alertStatus','Building alert summary…','');
+ try{
+  const res=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({guidance:$('alertGuidance').value,prompt:$('alertPrompt').value})});
+  if(!res.ok)throw new Error(`${res.status}: ${(await res.text()).slice(0,180)}`);
+  const result=normalizeAlerts(await res.json());
+  result.alerts.forEach((a,i)=>Object.assign(alerts[i],a));result.hazards.forEach((h,i)=>Object.assign(hazards[i],h));
+  if(result.motion){$('motionInput').value=result.motion;$('motionInput').dispatchEvent(new Event('input'))}
+  if(result.motionDescription){$('motionDescInput').value=result.motionDescription;$('motionDescInput').dispatchEvent(new Event('input'))}
+  renderAlerts();renderHazards();setStatus('alertStatus','Alert summary created. Review every alert and hazard before publishing.','success')
+ }catch(error){setStatus('alertStatus',`Alert summary failed: ${error.message}`,'error')}
+ finally{$('buildAlertsBtn').disabled=false}
+});
+$('loadExampleBtn').addEventListener('click',()=>{renderAlerts();renderHazards();setStatus('alertStatus','Example alert summary loaded.','success')});
+
+$('exportBtn').addEventListener('click',async()=>{const prior=canvas.style.transform;canvas.style.transform='none';const c=await html2canvas(canvas,{backgroundColor:null,scale:1,useCORS:true});const a=document.createElement('a');a.download='weathervalet-radar-warnings.png';a.href=c.toDataURL('image/png');a.click();canvas.style.transform=prior});
+$('resetBtn').addEventListener('click',()=>location.reload());
+</script>
+</body>
+</html>

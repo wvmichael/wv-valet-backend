@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WeatherValet Tornado Potential Editor</title>
+<style>
+:root{--blue:#19a8ff;--green:#69c841;--yellow:#f1d126;--orange:#ef8519;--red:#df303b;--pink:#ef4fa0;--purple:#963dc0;--line:#ffffff2e}
+*{box-sizing:border-box}body{margin:0;background:#07101a;color:#fff;font-family:Inter,Arial,sans-serif}
+.app{display:grid;grid-template-columns:430px 1fr;min-height:100vh}.controls{padding:18px;background:#091523;border-right:1px solid var(--line);overflow:auto}
+h1{font-size:22px;margin:0 0 5px}.lead{font-size:13px;line-height:1.45;color:#92a5bc;margin:0 0 14px}
+.group{border-top:1px solid #ffffff18;margin-top:14px;padding-top:14px}label{display:block;font-size:12px;font-weight:800;color:#c8d4e1;margin:8px 0 5px}
+input,textarea,select,button{width:100%;padding:9px 10px;border-radius:9px;border:1px solid #ffffff26;background:#122034;color:#fff;font:inherit}
+textarea{min-height:72px;resize:vertical}.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:11px}
+button{background:#1579ff;font-weight:900;cursor:pointer}button.secondary{background:#17263a}button:disabled{opacity:.5;cursor:not-allowed}
+.sources{display:grid;gap:7px}.source-btn{display:flex;justify-content:space-between;align-items:center;background:#10243a;text-align:left}.source-btn small{display:block;color:#aab8c8;font-weight:500}
+.ai-box{padding:12px;border:1px solid #19a8ff61;border-radius:13px;background:linear-gradient(145deg,#0b1e34,#091321)}
+.ai-title{font-weight:900}.ai-help{font-size:11px;line-height:1.4;color:#91a6bf}
+.status{min-height:38px;margin-top:8px;padding:8px;border-radius:8px;background:#07111e;color:#a8c7e7;font-size:12px}.status.success{background:#0b2518;color:#baf5ce}.status.error{background:#2a1115;color:#ffc7c7}
+
+.stage-wrap{padding:24px;display:flex;justify-content:center;align-items:flex-start;overflow:auto}.shell{width:min(100%,1600px);aspect-ratio:16/9;position:relative}
+.canvas{position:absolute;inset:0;width:1600px;height:900px;transform-origin:top left;overflow:hidden;background:linear-gradient(120deg,#03101c,#0b1118 48%,#170b12);box-shadow:0 25px 80px #0008}
+.bg{position:absolute;inset:0;background-size:cover;background-position:center;opacity:.45}.shade{position:absolute;inset:0;background:linear-gradient(90deg,#01070ff2 0%,#01070fbd 34%,#01070f2b 67%,#01070f89 100%),linear-gradient(0deg,#01070ff2,transparent 35%)}
+.topbar{position:absolute;left:34px;right:34px;top:25px;z-index:7;display:flex;justify-content:space-between}.logo{width:330px;max-height:90px;object-fit:contain;object-position:left top}
+.updated-card{padding:12px 20px;border-radius:17px;background:#07111ecc;border:1px solid #ffffff4d;text-align:center;min-width:230px}.updated-card .label{font-size:14px;font-weight:900;color:#ff5b73}.updated-card .time{font-size:28px;font-weight:950}.updated-card .date{font-size:15px;color:#d4dfeb}
+
+.hero{position:absolute;left:34px;top:120px;width:430px;z-index:6}.headline{font-size:86px;line-height:.84;font-weight:950;letter-spacing:-.06em;text-transform:uppercase}.headline .tornado{background:linear-gradient(180deg,#ff8a8a,#e73d3d 60%,#9c111f);-webkit-background-clip:text;background-clip:text;color:transparent}
+.subline{font-size:28px;color:var(--yellow);font-weight:950;margin-top:18px;text-transform:uppercase;line-height:1.05}.summary{margin-top:22px;padding-left:18px;border-left:5px solid #ff4e6d;font-size:23px;line-height:1.3}
+
+.map-card{position:absolute;left:455px;right:340px;top:20px;height:690px;z-index:3}.map-image{position:absolute;inset:0;background-size:contain;background-repeat:no-repeat;background-position:center;filter:drop-shadow(0 28px 18px #000a) drop-shadow(0 0 18px #ff3d7280)}
+.stats{position:absolute;right:28px;top:145px;width:292px;z-index:6;display:grid;gap:13px}.stat{min-height:142px;padding:15px;border-radius:18px;background:#06101ee3;border:1px solid #ffffff4d;display:grid;grid-template-columns:72px 1fr;gap:12px;align-items:center}
+.stat-icon{width:66px;height:66px;border-radius:50%;display:grid;place-items:center;font-size:31px;background:radial-gradient(circle at 35% 30%,#ff9bd3,#d83e9a 60%,#761548)}
+.stat .label{font-size:15px;font-weight:900}.stat .value{font-size:31px;font-weight:950;color:var(--pink);margin-top:4px;line-height:1}.stat .detail{font-size:14px;line-height:1.25;color:#d0dbe6;margin-top:6px}
+.s-blue .stat-icon{background:radial-gradient(circle at 35% 30%,#9edaff,#3195e3 60%,#0c4f88)}.s-blue .value{color:var(--blue)}
+.s-yellow .stat-icon{background:radial-gradient(circle at 35% 30%,#fff27f,#d9b817 60%,#7e6500)}.s-yellow .value{color:var(--yellow)}
+.s-red .stat-icon{background:radial-gradient(circle at 35% 30%,#ff8f98,#dc3045 60%,#780d21)}.s-red .value{color:#ff5b73}
+
+.legend{position:absolute;left:475px;right:360px;bottom:165px;z-index:7;padding:12px;border-radius:16px;background:#06101ee3;border:1px solid #ffffff4d}
+.legend-title{text-align:center;font-size:16px;font-weight:900;margin-bottom:8px}.legend-bar{height:20px;border-radius:10px;background:linear-gradient(90deg,#4e9f30,#e1ca22,#ed8618,#d93032,#bd1755,#7a2ba0)}.legend-labels{display:flex;justify-content:space-between;font-size:12px;margin-top:6px}
+
+.impact-row{position:absolute;left:34px;right:34px;bottom:78px;height:122px;z-index:8;display:grid;grid-template-columns:repeat(4,1fr);border:1px solid #ffffff4d;border-radius:16px;background:#06101ee6;overflow:hidden}
+.impact{padding:15px;display:grid;grid-template-columns:64px 1fr;gap:10px;align-items:center}.impact:not(:last-child){border-right:1px solid #ffffff33}
+.icon{width:58px;height:58px;border-radius:50%;display:grid;place-items:center;font-size:29px;background:radial-gradient(circle at 35% 30%,#ff9bd3,#d83e9a 60%,#761548)}
+.impact .title{font-size:17px;font-weight:950;color:var(--pink)}.impact .desc{font-size:14px;line-height:1.2;margin-top:4px}
+.footer{position:absolute;left:34px;right:34px;bottom:14px;height:52px;z-index:9;border:1px solid #ffffff52;border-radius:14px;background:#06101ee9;display:grid;grid-template-columns:370px 1fr 280px;align-items:center}
+.ready{text-align:center;font-size:21px;font-weight:950;color:#ffc4d1}.site{text-align:center;font-size:23px;color:var(--blue);font-weight:950}.brand{text-align:center;border-left:1px solid #ffffff33;font-size:18px;font-weight:900}
+.editable[contenteditable=true]{outline:none}.editable[contenteditable=true]:focus{box-shadow:0 0 0 3px #19a8ff80;border-radius:5px}
+@media(max-width:1050px){.app{grid-template-columns:1fr}.controls{border-right:0;border-bottom:1px solid var(--line)}}
+</style>
+</head>
+<body>
+<div class="app">
+<aside class="controls">
+<h1>Tornado Potential Editor</h1>
+<p class="lead">Official-source tornado-risk workflow with GPT map enhancement, GPT summary drafting, editable impacts, and 1600×900 export.</p>
+
+<div class="group">
+<strong>Official Data Sources</strong>
+<div class="sources">
+<button class="source-btn" data-source="SPC Tornado Outlook">SPC Tornado Outlook <small>Storm Prediction Center</small></button>
+<button class="source-btn" data-source="NWS Watches & Warnings">NWS Watches & Warnings <small>National Weather Service</small></button>
+<button class="source-btn" data-source="HRRR Model">HRRR Model <small>High-Res Rapid Refresh</small></button>
+<button class="source-btn" data-source="NAM Model">NAM Model <small>North American Model</small></button>
+<button class="source-btn" data-source="GFS Model">GFS Model <small>Global Forecast System</small></button>
+<button class="source-btn" data-source="EURO Model">EURO Model <small>ECMWF Model</small></button>
+</div>
+<label>Selected Source</label><input id="sourceInput" value="SPC Tornado Outlook">
+</div>
+
+<div class="group">
+<label>Headline Top</label><input id="headlineTopInput" value="TORNADO">
+<label>Headline Bottom</label><input id="headlineBottomInput" value="POTENTIAL">
+<label>Subline</label><input id="sublineInput" value="SUNDAY NIGHT INTO MONDAY">
+<label>One-Sentence Summary</label><textarea id="summaryInput">The greatest tornado potential is expected across southern Indiana.</textarea>
+<label>Updated Time</label><input id="updatedInput" value="8:30 AM EDT">
+<label>Updated Date</label><input id="updatedDateInput" value="MAY 17, 2025">
+</div>
+
+<div class="group">
+<div class="row"><div><label>Highest Risk Area</label><input id="highestInput" value="SOUTH CENTRAL INDIANA"></div><div><label>Area Detail</label><input id="highestDetailInput" value="Bloomington to north of Columbus"></div></div>
+<div class="row"><div><label>Confidence</label><input id="confidenceInput" value="MODERATE"></div><div><label>Confidence Detail</label><input id="confidenceDetailInput" value="Guidance shows an increasing severe-weather signal."></div></div>
+<label>Timing</label><input id="timingInput" value="SUNDAY NIGHT INTO MONDAY">
+<label>Timing Detail</label><input id="timingDetailInput" value="Greatest threat from 8 PM Sunday to 4 AM Monday">
+<label>Biggest Concern</label><textarea id="concernInput">A few strong tornadoes are possible if storms become surface based.</textarea>
+</div>
+
+<div class="group">
+<label>Structural Damage</label><textarea id="impact1Input">Damage to homes, businesses, and other structures is possible.</textarea>
+<label>Travel</label><textarea id="impact2Input">Dangerous travel conditions and blocked roads are possible.</textarea>
+<label>Power</label><textarea id="impact3Input">Scattered to widespread power outages are possible.</textarea>
+<label>Other Hazards</label><textarea id="impact4Input">Large hail and heavy rain may accompany the strongest storms.</textarea>
+</div>
+
+<div class="group">
+<label>Cinematic Background</label><input id="backgroundUpload" type="file" accept="image/*">
+<label>Official Tornado-Risk Map</label><input id="mapUpload" type="file" accept="image/*">
+<div class="ai-box">
+<div class="ai-title">✦ Enhance for WeatherValet</div>
+<p class="ai-help">The official map remains the source of truth. GPT is used only for crop, isolation, and presentation enhancement.</p>
+<label>Instructions</label><textarea id="mapPrompt">Focus the official tornado-risk map on Indiana. Preserve the exact Indiana boundary, SPC probability contours, hatching, risk polygons, values, colors, labels, cities, counties, and legend. Do not redraw geography or alter data. Isolate the real map, soften secondary lines, increase contrast, add subtle dramatic depth, and return a WeatherValet-ready image.</textarea>
+<label>Secure API Endpoint</label><input id="mapEndpoint" value="/api/weather-map-enhance">
+<div class="actions"><button id="enhanceBtn">✦ Enhance Map</button><button id="originalBtn" class="secondary">Use Original</button></div>
+<div class="actions"><button id="enhancedBtn" class="secondary" disabled>Use Enhanced</button><button id="downloadMapBtn" class="secondary" disabled>Download Map</button></div>
+<div id="mapStatus" class="status">Choose a source and upload its official map.</div>
+</div>
+</div>
+
+<div class="group ai-box">
+<div class="ai-title">✦ GPT Tornado Summary</div>
+<p class="ai-help">Paste SPC discussion, NWS briefing text, or meteorologist notes. GPT drafts concise messaging for review.</p>
+<label>Forecast Guidance</label><textarea id="guidanceInput">A severe-weather setup may develop Sunday night into Monday. The greatest tornado threat may be across southern Indiana, where stronger instability and wind shear overlap. A few tornadoes are possible, and one or two could be strong. Confidence is moderate.</textarea>
+<label>Instructions</label><textarea id="summaryPrompt">Create concise tornado-potential graphic copy. Return headline lines, subline, summary, highest risk area, confidence, timing, biggest concern, and four short impacts. Use only details supported by the supplied guidance. Return JSON only.</textarea>
+<label>Secure API Endpoint</label><input id="summaryEndpoint" value="/api/tornado-summary">
+<div class="actions"><button id="buildSummaryBtn">✦ Build Summary</button><button id="loadExampleBtn" class="secondary">Load Example</button></div>
+<div id="summaryStatus" class="status">Paste guidance and click Build Summary.</div>
+</div>
+
+<div class="actions"><button id="exportBtn">Export PNG</button><button id="resetBtn" class="secondary">Reset</button></div>
+</aside>
+
+<main class="stage-wrap"><div id="shell" class="shell"><section id="canvas" class="canvas">
+<div id="bg" class="bg"></div><div class="shade"></div>
+<div class="topbar"><img src="/graphics/assets/weathervalet-logo-white.png" class="logo" alt="WeatherValet"><div class="updated-card"><div class="label">UPDATED</div><div id="updated" class="time editable" contenteditable="true">8:30 AM EDT</div><div id="updatedDate" class="date editable" contenteditable="true">MAY 17, 2025</div></div></div>
+
+<div class="hero">
+<div class="headline"><span id="headlineTop" class="tornado editable" contenteditable="true">TORNADO</span><br><span id="headlineBottom" class="editable" contenteditable="true">POTENTIAL</span></div>
+<div id="subline" class="subline editable" contenteditable="true">SUNDAY NIGHT INTO MONDAY</div>
+<div id="summary" class="summary editable" contenteditable="true">The greatest tornado potential is expected across southern Indiana.</div>
+</div>
+
+<div class="map-card"><div id="mapImage" class="map-image"></div></div>
+
+<div class="stats">
+<div class="stat"><div class="stat-icon">🌪️</div><div><div class="label">HIGHEST RISK AREA</div><div id="highest" class="value editable" contenteditable="true" style="font-size:25px">SOUTH CENTRAL INDIANA</div><div id="highestDetail" class="detail editable" contenteditable="true">Bloomington to north of Columbus</div></div></div>
+<div class="stat s-blue"><div class="stat-icon">🛡️</div><div><div class="label">CONFIDENCE</div><div id="confidence" class="value editable" contenteditable="true">MODERATE</div><div id="confidenceDetail" class="detail editable" contenteditable="true">Guidance shows an increasing severe-weather signal.</div></div></div>
+<div class="stat s-yellow"><div class="stat-icon">🕒</div><div><div class="label">TIMING</div><div id="timing" class="value editable" contenteditable="true" style="font-size:24px">SUNDAY NIGHT INTO MONDAY</div><div id="timingDetail" class="detail editable" contenteditable="true">Greatest threat from 8 PM Sunday to 4 AM Monday</div></div></div>
+<div class="stat s-red"><div class="stat-icon">⚠️</div><div><div class="label">BIGGEST CONCERN</div><div id="concern" class="detail editable" contenteditable="true" style="font-size:15px;line-height:1.3">A few strong tornadoes are possible if storms become surface based.</div></div></div>
+</div>
+
+<div class="legend"><div class="legend-title">TORNADO RISK LEVEL</div><div class="legend-bar"></div><div class="legend-labels"><span>MARGINAL</span><span>SLIGHT</span><span>ELEVATED</span><span>ENHANCED</span><span>MODERATE</span><span>HIGH</span></div></div>
+
+<div class="impact-row">
+<div class="impact"><div class="icon">🏠</div><div><div class="title">STRUCTURAL DAMAGE</div><div id="impact1" class="desc editable" contenteditable="true">Damage to homes, businesses, and other structures is possible.</div></div></div>
+<div class="impact"><div class="icon">🚗</div><div><div class="title">TRAVEL</div><div id="impact2" class="desc editable" contenteditable="true">Dangerous travel conditions and blocked roads are possible.</div></div></div>
+<div class="impact"><div class="icon">⚡</div><div><div class="title">POWER</div><div id="impact3" class="desc editable" contenteditable="true">Scattered to widespread power outages are possible.</div></div></div>
+<div class="impact"><div class="icon">🧊</div><div><div class="title">OTHER HAZARDS</div><div id="impact4" class="desc editable" contenteditable="true">Large hail and heavy rain may accompany the strongest storms.</div></div></div>
+</div>
+
+<div class="footer"><div class="ready">HAVE A PLAN. KNOW YOUR SAFE PLACE.</div><div class="site">weathervalet.ai</div><div class="brand">YOUR WEATHER. YOUR WAY.</div></div>
+</section></div></main>
+</div>
+
+<script src="/graphics/assets/html2canvas.min.js"></script>
+<script>
+const $=id=>document.getElementById(id),canvas=$('canvas'),shell=$('shell');
+function fit(){const s=shell.clientWidth/1600;canvas.style.transform=`scale(${s})`;shell.style.height=`${900*s}px`}addEventListener('resize',fit);fit();
+function bind(a,b){$(a).addEventListener('input',e=>$(b).textContent=e.target.value)}
+[
+['headlineTopInput','headlineTop'],['headlineBottomInput','headlineBottom'],['sublineInput','subline'],['summaryInput','summary'],
+['updatedInput','updated'],['updatedDateInput','updatedDate'],['highestInput','highest'],['highestDetailInput','highestDetail'],
+['confidenceInput','confidence'],['confidenceDetailInput','confidenceDetail'],['timingInput','timing'],['timingDetailInput','timingDetail'],
+['concernInput','concern'],['impact1Input','impact1'],['impact2Input','impact2'],['impact3Input','impact3'],['impact4Input','impact4']
+].forEach(x=>bind(...x));
+
+document.querySelectorAll('.source-btn').forEach(btn=>btn.addEventListener('click',()=>{
+ $('sourceInput').value=btn.dataset.source;
+ $('mapStatus').textContent=`Selected ${btn.dataset.source}. Upload the official map image.`;
+}));
+
+$('backgroundUpload').addEventListener('change',e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=()=>{$('bg').style.backgroundImage=`url("${r.result}")`};r.readAsDataURL(f)});
+
+let original='',enhanced='';
+$('mapUpload').addEventListener('change',e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=()=>{original=r.result;enhanced='';$('mapImage').style.backgroundImage=`url("${original}")`;$('enhancedBtn').disabled=true;$('downloadMapBtn').disabled=true;setStatus('Official map loaded. Click Enhance Map.','')};r.readAsDataURL(f)});
+function setStatus(m,t=''){const e=$('mapStatus');e.textContent=m;e.className='status'+(t?' '+t:'')}
+function blob(u){const[m,d]=u.split(','),mime=(m.match(/data:(.*?);/)||[])[1]||'image/png',b=atob(d),a=new Uint8Array(b.length);for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return new Blob([a],{type:mime})}
+function imageFrom(p){if(p.image_url)return p.image_url;if(p.url)return p.url;if(p.image_base64)return `data:image/png;base64,${p.image_base64}`;if(p.b64_json)return `data:image/png;base64,${p.b64_json}`;if(p.data?.[0]?.b64_json)return `data:image/png;base64,${p.data[0].b64_json}`;throw new Error('No image returned')}
+
+$('enhanceBtn').addEventListener('click',async()=>{if(!original)return setStatus('Upload an official map first.','error');$('enhanceBtn').disabled=true;setStatus('Enhancing the official map…','');try{const f=new FormData();f.append('image',blob(original),'official-tornado-map.png');f.append('mapType',$('sourceInput').value);f.append('prompt',$('mapPrompt').value);f.append('focusState','Indiana');f.append('preserveOfficialData','true');const r=await fetch($('mapEndpoint').value,{method:'POST',body:f});if(!r.ok)throw new Error(`${r.status}: ${(await r.text()).slice(0,160)}`);enhanced=imageFrom(await r.json());$('mapImage').style.backgroundImage=`url("${enhanced}")`;$('enhancedBtn').disabled=false;$('downloadMapBtn').disabled=false;setStatus('Enhanced map inserted. Verify it against the official map.','success')}catch(e){setStatus(`Enhancement failed: ${e.message}`,'error')}finally{$('enhanceBtn').disabled=false}});
+$('originalBtn').addEventListener('click',()=>{if(original)$('mapImage').style.backgroundImage=`url("${original}")`});
+$('enhancedBtn').addEventListener('click',()=>{if(enhanced)$('mapImage').style.backgroundImage=`url("${enhanced}")`});
+$('downloadMapBtn').addEventListener('click',()=>{if(!enhanced)return;const a=document.createElement('a');a.href=enhanced;a.download='weathervalet-tornado-map.png';a.click()});
+
+function normalize(p){if(!Array.isArray(p.impacts)||p.impacts.length<4)throw new Error('Response must include four impacts.');return p}
+$('buildSummaryBtn').addEventListener('click',async()=>{const endpoint=$('summaryEndpoint').value.trim();if(!endpoint)return;const status=$('summaryStatus');$('buildSummaryBtn').disabled=true;status.textContent='Building tornado summary…';status.className='status';try{const res=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({guidance:$('guidanceInput').value,prompt:$('summaryPrompt').value})});if(!res.ok)throw new Error(`${res.status}: ${(await res.text()).slice(0,160)}`);const p=normalize(await res.json());const values={headlineTopInput:p.headlineTop,headlineBottomInput:p.headlineBottom,sublineInput:p.subline,summaryInput:p.summary,highestInput:p.highestRiskArea,highestDetailInput:p.highestRiskDetail,confidenceInput:p.confidence,confidenceDetailInput:p.confidenceDetail,timingInput:p.timing,timingDetailInput:p.timingDetail,concernInput:p.biggestConcern,impact1Input:p.impacts[0].desc,impact2Input:p.impacts[1].desc,impact3Input:p.impacts[2].desc,impact4Input:p.impacts[3].desc};Object.entries(values).forEach(([id,v])=>{if(v!==undefined){$(id).value=v;$(id).dispatchEvent(new Event('input'))}});status.textContent='Tornado summary created. Review all values before publishing.';status.className='status success'}catch(e){status.textContent=`Summary failed: ${e.message}`;status.className='status error'}finally{$('buildSummaryBtn').disabled=false}});
+$('loadExampleBtn').addEventListener('click',()=>{const s=$('summaryStatus');s.textContent='Example values are already loaded.';s.className='status success'});
+$('exportBtn').addEventListener('click',async()=>{const t=canvas.style.transform;canvas.style.transform='none';const c=await html2canvas(canvas,{backgroundColor:null,scale:1,useCORS:true});const a=document.createElement('a');a.href=c.toDataURL('image/png');a.download='weathervalet-tornado-potential.png';a.click();canvas.style.transform=t});
+$('resetBtn').addEventListener('click',()=>location.reload());
+</script>
+</body>
+</html>
