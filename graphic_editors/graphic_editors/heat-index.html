@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WeatherValet Heat Index Editor</title>
+<style>
+:root{
+  --blue:#1aa8ff;
+  --yellow:#ffd338;
+  --orange:#ff8a1c;
+  --red:#eb3d2f;
+  --pink:#f24f9c;
+  --purple:#a84ada;
+  --line:rgba(255,255,255,.22);
+}
+*{box-sizing:border-box}
+body{margin:0;background:#07101a;color:#fff;font-family:Inter,Arial,Helvetica,sans-serif}
+.app{display:grid;grid-template-columns:430px 1fr;min-height:100vh}
+.controls{padding:18px;background:#091523;border-right:1px solid var(--line);overflow:auto}
+h1{font-size:22px;margin:0 0 5px}
+.lead{font-size:13px;line-height:1.45;color:#92a5bc;margin:0 0 14px}
+.group{border-top:1px solid rgba(255,255,255,.1);margin-top:14px;padding-top:14px}
+label{display:block;font-size:12px;font-weight:800;color:#c8d4e1;margin:8px 0 5px}
+input,textarea,select,button{
+  width:100%;padding:9px 10px;border-radius:9px;border:1px solid rgba(255,255,255,.16);
+  background:#122034;color:#fff;font:inherit
+}
+textarea{min-height:72px;resize:vertical}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:11px}
+button{background:#1579ff;font-weight:900;cursor:pointer}
+button.secondary{background:#17263a}
+button:disabled{opacity:.5;cursor:not-allowed}
+.sources{display:grid;gap:7px}
+.source-btn{display:flex;justify-content:space-between;align-items:center;background:#10243a;text-align:left}
+.source-btn small{display:block;color:#aab8c8;font-weight:500}
+.ai-box{padding:12px;border:1px solid rgba(26,168,255,.38);border-radius:13px;background:linear-gradient(145deg,#0b1e34,#091321)}
+.ai-title{font-weight:900}
+.ai-help,.note{font-size:11px;line-height:1.4;color:#91a6bf}
+.status{min-height:38px;margin-top:8px;padding:8px;border-radius:8px;background:#07111e;color:#a8c7e7;font-size:12px}
+.status.success{background:#0b2518;color:#baf5ce}
+.status.error{background:#2a1115;color:#ffc7c7}
+
+.stage-wrap{padding:24px;display:flex;justify-content:center;align-items:flex-start;overflow:auto}
+.shell{width:min(100%,1600px);aspect-ratio:16/9;position:relative}
+.canvas{
+  position:absolute;inset:0;width:1600px;height:900px;transform-origin:top left;overflow:hidden;
+  background:
+    radial-gradient(circle at 72% 20%,rgba(255,95,20,.28),transparent 30%),
+    linear-gradient(120deg,#03101c,#131017 48%,#2a100b);
+  box-shadow:0 25px 80px rgba(0,0,0,.48)
+}
+.bg{position:absolute;inset:0;background-size:cover;background-position:center;opacity:.46}
+.shade{position:absolute;inset:0;background:
+  linear-gradient(90deg,rgba(1,7,15,.95) 0%,rgba(1,7,15,.74) 34%,rgba(1,7,15,.16) 67%,rgba(1,7,15,.56) 100%),
+  linear-gradient(0deg,rgba(1,7,15,.95),transparent 35%)
+}
+.topbar{position:absolute;left:34px;right:34px;top:25px;z-index:7;display:flex;justify-content:space-between;align-items:flex-start}
+.logo{width:330px;max-height:90px;object-fit:contain;object-position:left top;filter:drop-shadow(0 4px 10px rgba(0,0,0,.5))}
+.updated-card{padding:12px 20px;border-radius:17px;background:#07111ecc;border:1px solid rgba(255,255,255,.3);text-align:center;min-width:230px}
+.updated-card .label{font-size:14px;font-weight:900;color:var(--orange)}
+.updated-card .time{font-size:28px;font-weight:950}
+.updated-card .date{font-size:15px;color:#d4dfeb}
+
+.hero{position:absolute;left:36px;top:120px;width:455px;z-index:6}
+.headline{font-size:91px;line-height:.84;font-weight:950;letter-spacing:-.06em;text-transform:uppercase;text-shadow:0 7px 24px rgba(0,0,0,.7)}
+.headline .heat{
+  background:linear-gradient(180deg,#ffe360,#ff9a1e 52%,#e8441d);
+  -webkit-background-clip:text;background-clip:text;color:transparent
+}
+.subline{font-size:27px;color:var(--yellow);font-weight:950;margin-top:20px;text-transform:uppercase;line-height:1.05}
+.summary{margin-top:24px;padding-left:18px;border-left:5px solid var(--orange);font-size:24px;line-height:1.28}
+
+.map-card{position:absolute;left:470px;right:340px;top:20px;height:690px;z-index:3}
+.map-image{
+  position:absolute;inset:0;background-size:contain;background-repeat:no-repeat;background-position:center;
+  filter:drop-shadow(0 28px 18px rgba(0,0,0,.65)) drop-shadow(0 0 18px rgba(255,108,35,.55))
+}
+.map-glow{position:absolute;inset:4%;border-radius:30%;box-shadow:0 0 90px rgba(255,97,34,.28);pointer-events:none}
+
+.stats{position:absolute;right:28px;top:145px;width:292px;z-index:6;display:grid;gap:13px}
+.stat{
+  min-height:142px;padding:15px;border-radius:18px;background:#06101ee3;border:1px solid rgba(255,255,255,.3);
+  display:grid;grid-template-columns:72px 1fr;gap:12px;align-items:center
+}
+.stat-icon{width:66px;height:66px;border-radius:50%;display:grid;place-items:center;font-size:32px;background:radial-gradient(circle at 35% 30%,#ff9a9a,#df3131 60%,#790d0d)}
+.stat .label{font-size:15px;font-weight:900}
+.stat .value{font-size:34px;font-weight:950;color:#ff7f55;margin-top:4px;line-height:1}
+.stat .detail{font-size:14px;line-height:1.25;color:#d0dbe6;margin-top:6px}
+.s-orange .stat-icon{background:radial-gradient(circle at 35% 30%,#ffd17b,#e78d16 60%,#804300)}
+.s-orange .value{color:var(--orange)}
+.s-pink .stat-icon{background:radial-gradient(circle at 35% 30%,#ff9bd0,#df3d96 60%,#7b154b)}
+.s-pink .value{color:var(--pink)}
+
+.legend{position:absolute;left:500px;right:360px;bottom:165px;z-index:7;padding:12px;border-radius:16px;background:#06101ee3;border:1px solid rgba(255,255,255,.3)}
+.legend-title{text-align:center;font-size:16px;font-weight:900;margin-bottom:8px}
+.legend-bar{height:20px;border-radius:10px;background:linear-gradient(90deg,#ffe34f,#ffb51d,#ff7d16,#ed3f27,#cf1446,#951487)}
+.legend-labels{display:flex;justify-content:space-between;font-size:12px;margin-top:6px}
+
+.impact-row{position:absolute;left:34px;right:34px;bottom:78px;height:122px;z-index:8;display:grid;grid-template-columns:repeat(4,1fr);border:1px solid rgba(255,255,255,.3);border-radius:16px;background:#06101ee6;overflow:hidden}
+.impact{padding:15px;display:grid;grid-template-columns:64px 1fr;gap:10px;align-items:center}
+.impact:not(:last-child){border-right:1px solid rgba(255,255,255,.2)}
+.icon{width:58px;height:58px;border-radius:50%;display:grid;place-items:center;font-size:29px;background:radial-gradient(circle at 35% 30%,#ffd77a,#ef9a15 60%,#8c4a00)}
+.impact .title{font-size:17px;font-weight:950;color:var(--orange)}
+.impact .desc{font-size:14px;line-height:1.2;margin-top:4px}
+.i3 .icon{background:radial-gradient(circle at 35% 30%,#ff8f98,#dc3045 60%,#780d21)}
+.i3 .title{color:#ff5b73}
+.i4 .icon{background:radial-gradient(circle at 35% 30%,#ff9bd3,#d63d97 60%,#711444)}
+.i4 .title{color:var(--pink)}
+
+.footer{position:absolute;left:34px;right:34px;bottom:14px;height:52px;z-index:9;border:1px solid rgba(255,255,255,.32);border-radius:14px;background:#06101ee9;display:grid;grid-template-columns:370px 1fr 280px;align-items:center}
+.ready{text-align:center;font-size:21px;font-weight:950;color:#ffd1b0}
+.site{text-align:center;font-size:23px;color:var(--blue);font-weight:950}
+.brand{text-align:center;border-left:1px solid rgba(255,255,255,.2);font-size:18px;font-weight:900}
+.editable[contenteditable=true]{outline:none}
+.editable[contenteditable=true]:focus{box-shadow:0 0 0 3px rgba(26,168,255,.5);border-radius:5px}
+@media(max-width:1050px){.app{grid-template-columns:1fr}.controls{border-right:0;border-bottom:1px solid var(--line)}}
+</style>
+<link rel="stylesheet" href="/graphics/assets/wv-fit.css"></head>
+<body>
+<div class="app">
+<aside class="controls">
+<h1>Heat Index Forecast Editor</h1>
+<p class="lead">Official-source heat workflow with GPT map enhancement, concise impacts, and 1600×900 export.</p>
+
+<div class="group">
+<strong>Official Data Sources</strong>
+<div class="sources">
+<button class="source-btn" data-source="NWS Heat Index Forecast">NWS Heat Index Forecast <small>National Weather Service</small></button>
+<button class="source-btn" data-source="WPC Heat Index">WPC Heat Index <small>Weather Prediction Center</small></button>
+<button class="source-btn" data-source="HRRR Model">HRRR Model <small>High-Res Rapid Refresh</small></button>
+<button class="source-btn" data-source="NAM Model">NAM Model <small>North American Model</small></button>
+<button class="source-btn" data-source="GFS Model">GFS Model <small>Global Forecast System</small></button>
+<button class="source-btn" data-source="EURO Model">EURO Model <small>ECMWF Model</small></button>
+</div>
+<label>Selected Source</label><input id="sourceInput" value="NWS Heat Index Forecast">
+</div>
+
+<div class="group">
+<label>Headline Top</label><input id="headlineTopInput" value="HEAT INDEX">
+<label>Headline Bottom</label><input id="headlineBottomInput" value="FORECAST">
+<label>Subline</label><input id="sublineInput" value="PEAK HEAT INDEX SATURDAY AFTERNOON">
+<label>One-Sentence Summary</label><textarea id="summaryInput">Dangerous heat is expected across much of Indiana Saturday afternoon.</textarea>
+<label>Updated Time</label><input id="updatedInput" value="8:30 AM EDT">
+<label>Updated Date</label><input id="updatedDateInput" value="MAY 17, 2025">
+</div>
+
+<div class="group">
+<div class="row"><div><label>Highest Heat Index</label><input id="highestInput" value="115°+"></div><div><label>Location</label><input id="highestLocationInput" value="Southern Indiana"></div></div>
+<div class="row"><div><label>Confidence</label><input id="confidenceInput" value="MODERATE"></div><div><label>Confidence Detail</label><input id="confidenceDetailInput" value="Model agreement is decent, but details may change."></div></div>
+<label>Timing</label><input id="timingInput" value="SATURDAY AFTERNOON">
+<label>Timing Detail</label><input id="timingDetailInput" value="2 PM – 7 PM">
+<label>Biggest Concern</label><textarea id="concernInput">Dangerous heat levels may lead to heat exhaustion or heat stroke if precautions are not taken.</textarea>
+</div>
+
+<div class="group">
+<label>Roads</label><textarea id="roadsInput">Hot pavement can cause soft spots and tire issues.</textarea>
+<label>Power</label><textarea id="powerInput">High demand on AC systems may stress the grid.</textarea>
+<label>Health</label><textarea id="healthInput">Heat exhaustion and heat stroke are possible.</textarea>
+<label>Hydration</label><textarea id="hydrationInput">Drink plenty of water. Avoid strenuous activity during peak heat.</textarea>
+</div>
+
+<div class="group">
+<label>Cinematic Background</label><input id="backgroundUpload" type="file" accept="image/*">
+<label>Official Heat Index Map</label><input id="mapUpload" type="file" accept="image/*">
+
+<div class="ai-box">
+<div class="ai-title">✦ Enhance for WeatherValet</div>
+<p class="ai-help">The official map remains the source of truth. GPT is used only for crop, isolation, and presentation enhancement.</p>
+<label>Instructions</label>
+<textarea id="mapPrompt">Focus the official heat index map on Indiana. Preserve the exact Indiana boundary, heat index contours, values, colors, labels, cities, counties, and legend. Do not redraw geography or alter data. Isolate the real map, soften secondary lines, increase contrast, add subtle fiery depth, and return a WeatherValet-ready image.</textarea>
+<label>Secure API Endpoint</label><input id="mapEndpoint" value="/api/weather-map-enhance">
+<div class="actions"><button id="enhanceBtn" type="button">✦ Enhance Map</button><button id="originalBtn" class="secondary" type="button">Use Original</button></div>
+<div class="actions"><button id="enhancedBtn" class="secondary" type="button" disabled>Use Enhanced</button><button id="downloadMapBtn" class="secondary" type="button" disabled>Download Map</button></div>
+<div id="mapStatus" class="status">Choose a source and upload its official map.</div>
+</div>
+</div>
+
+<div class="group ai-box">
+<div class="ai-title">✦ GPT Heat Summary</div>
+<p class="ai-help">Paste forecast guidance or meteorologist notes. GPT drafts the headline, timing, concern, and impacts for review.</p>
+<label>Forecast Guidance</label>
+<textarea id="guidanceInput">Dangerous heat is expected Saturday afternoon. Heat index values may reach 100 to 110 degrees across central Indiana and 110 to 115 or higher across southern Indiana. The greatest heat should occur from 2 PM to 7 PM. Confidence is moderate.</textarea>
+<label>Instructions</label>
+<textarea id="summaryPrompt">Create concise heat-index graphic copy. Return headline lines, one-sentence summary, highest heat index, location, confidence, timing, biggest concern, and four short impacts. Use only details supported by the supplied guidance. Return JSON only.</textarea>
+<label>Secure API Endpoint</label><input id="summaryEndpoint" value="/api/heat-index-summary">
+<div class="actions"><button id="buildSummaryBtn" type="button">✦ Build Summary</button><button id="loadExampleBtn" class="secondary" type="button">Load Example</button></div>
+<div id="summaryStatus" class="status">Paste guidance and click Build Summary.</div>
+</div>
+
+<div class="actions"><button id="exportBtn" type="button">Export PNG</button><button id="resetBtn" class="secondary" type="button">Reset</button></div>
+</aside>
+
+<main class="stage-wrap">
+<div id="shell" class="shell">
+<section id="canvas" class="canvas">
+<div id="bg" class="bg"></div><div class="shade"></div>
+
+<div class="topbar">
+<img src="/graphics/assets/weathervalet-logo-white.png" class="logo" alt="WeatherValet">
+<div class="updated-card"><div class="label">UPDATED</div><div id="updated" class="time editable" contenteditable="true">8:30 AM EDT</div><div id="updatedDate" class="date editable" contenteditable="true">MAY 17, 2025</div></div>
+</div>
+
+<div class="hero">
+<div class="headline"><span id="headlineTop" class="heat editable" contenteditable="true">HEAT INDEX</span><br><span id="headlineBottom" class="editable" contenteditable="true">FORECAST</span></div>
+<div id="subline" class="subline editable" contenteditable="true">PEAK HEAT INDEX SATURDAY AFTERNOON</div>
+<div id="summary" class="summary editable" contenteditable="true">Dangerous heat is expected across much of Indiana Saturday afternoon.</div>
+</div>
+
+<div class="map-card"><div class="map-glow"></div><div id="mapImage" class="map-image"></div></div>
+
+<div class="stats">
+<div class="stat"><div class="stat-icon">🌡️</div><div><div class="label">HIGHEST HEAT INDEX</div><div id="highest" class="value editable" contenteditable="true">115°+</div><div id="highestLocation" class="detail editable" contenteditable="true">Southern Indiana</div></div></div>
+<div class="stat s-orange"><div class="stat-icon">🛡️</div><div><div class="label">CONFIDENCE</div><div id="confidence" class="value editable" contenteditable="true">MODERATE</div><div id="confidenceDetail" class="detail editable" contenteditable="true">Model agreement is decent, but details may change.</div></div></div>
+<div class="stat s-orange"><div class="stat-icon">🕒</div><div><div class="label">TIMING</div><div id="timing" class="value editable" contenteditable="true" style="font-size:26px">SATURDAY AFTERNOON</div><div id="timingDetail" class="detail editable" contenteditable="true">2 PM – 7 PM</div></div></div>
+<div class="stat s-pink"><div class="stat-icon">⚠️</div><div><div class="label">BIGGEST CONCERN</div><div id="concern" class="detail editable" contenteditable="true" style="font-size:15px;line-height:1.3">Dangerous heat levels may lead to heat exhaustion or heat stroke if precautions are not taken.</div></div></div>
+</div>
+
+<div class="legend"><div class="legend-title">HEAT INDEX (FEELS-LIKE TEMPERATURE °F)</div><div class="legend-bar"></div><div class="legend-labels"><span>&lt;80°</span><span>80–90°</span><span>90–100°</span><span>100–105°</span><span>105–110°</span><span>110–115°</span><span>115°+</span></div></div>
+
+<div class="impact-row">
+<div class="impact"><div class="icon">🛣️</div><div><div class="title">ROADS</div><div id="roads" class="desc editable" contenteditable="true">Hot pavement can cause soft spots and tire issues.</div></div></div>
+<div class="impact"><div class="icon">⚡</div><div><div class="title">POWER</div><div id="power" class="desc editable" contenteditable="true">High demand on AC systems may stress the grid.</div></div></div>
+<div class="impact i3"><div class="icon">❤️</div><div><div class="title">HEALTH</div><div id="health" class="desc editable" contenteditable="true">Heat exhaustion and heat stroke are possible.</div></div></div>
+<div class="impact i4"><div class="icon">💧</div><div><div class="title">HYDRATION</div><div id="hydration" class="desc editable" contenteditable="true">Drink plenty of water. Avoid strenuous activity during peak heat.</div></div></div>
+</div>
+
+<div class="footer"><div class="ready">STAY INFORMED</div><div class="site">weathervalet.ai</div><div class="brand">YOUR WEATHER. YOUR WAY.</div></div>
+</section>
+</div>
+</main>
+</div>
+
+<script src="/graphics/assets/html2canvas.min.js"></script>
+<script>
+const $=id=>document.getElementById(id),canvas=$('canvas'),shell=$('shell');
+function fit(){const s=shell.clientWidth/1600;canvas.style.transform=`scale(${s})`;shell.style.height=`${900*s}px`}
+addEventListener('resize',fit);fit();
+
+function bind(a,b){$(a).addEventListener('input',e=>$(b).textContent=e.target.value)}
+bind('headlineTopInput','headlineTop');bind('headlineBottomInput','headlineBottom');bind('sublineInput','subline');bind('summaryInput','summary');
+bind('updatedInput','updated');bind('updatedDateInput','updatedDate');
+bind('highestInput','highest');bind('highestLocationInput','highestLocation');
+bind('confidenceInput','confidence');bind('confidenceDetailInput','confidenceDetail');
+bind('timingInput','timing');bind('timingDetailInput','timingDetail');bind('concernInput','concern');
+bind('roadsInput','roads');bind('powerInput','power');bind('healthInput','health');bind('hydrationInput','hydration');
+
+document.querySelectorAll('.source-btn').forEach(btn=>btn.addEventListener('click',()=>{
+  $('sourceInput').value=btn.dataset.source;
+  $('mapStatus').textContent=`Selected ${btn.dataset.source}. Upload the official map image.`;
+}));
+
+$('backgroundUpload').addEventListener('change',e=>{
+  const f=e.target.files[0];if(!f)return;
+  const r=new FileReader();
+  r.onload=()=>{$('bg').style.backgroundImage=`url("${r.result}")`};
+  r.readAsDataURL(f);
+});
+
+let original='',enhanced='';
+$('mapUpload').addEventListener('change',e=>{
+  const f=e.target.files[0];if(!f)return;
+  const r=new FileReader();
+  r.onload=()=>{
+    original=r.result;enhanced='';
+    $('mapImage').style.backgroundImage=`url("${original}")`;
+    $('enhancedBtn').disabled=true;$('downloadMapBtn').disabled=true;
+    setStatus('Official map loaded. Click Enhance Map.','');
+  };
+  r.readAsDataURL(f);
+});
+
+function setStatus(m,t=''){const e=$('mapStatus');e.textContent=m;e.className='status'+(t?' '+t:'')}
+function blob(u){const[m,d]=u.split(','),mime=(m.match(/data:(.*?);/)||[])[1]||'image/png',b=atob(d),a=new Uint8Array(b.length);for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return new Blob([a],{type:mime})}
+function imageFrom(p){if(p.image_url)return p.image_url;if(p.url)return p.url;if(p.image_base64)return `data:image/png;base64,${p.image_base64}`;if(p.b64_json)return `data:image/png;base64,${p.b64_json}`;if(p.data?.[0]?.b64_json)return `data:image/png;base64,${p.data[0].b64_json}`;throw new Error('No image returned')}
+
+$('enhanceBtn').addEventListener('click',async()=>{
+  if(!original)return setStatus('Upload an official map first.','error');
+  $('enhanceBtn').disabled=true;setStatus('Enhancing the official map…','');
+  try{
+    const f=new FormData();
+    f.append('image',blob(original),'official-heat-index-map.png');
+    f.append('mapType',$('sourceInput').value);
+    f.append('prompt',$('mapPrompt').value);
+    f.append('focusState','Indiana');
+    f.append('preserveOfficialData','true');
+    const r=await fetch($('mapEndpoint').value,{method:'POST',body:f});
+    if(!r.ok)throw new Error(`${r.status}: ${(await r.text()).slice(0,160)}`);
+    enhanced=imageFrom(await r.json());
+    $('mapImage').style.backgroundImage=`url("${enhanced}")`;
+    $('enhancedBtn').disabled=false;$('downloadMapBtn').disabled=false;
+    setStatus('Enhanced map inserted. Verify it against the official map.','success');
+  }catch(e){setStatus(`Enhancement failed: ${e.message}`,'error')}
+  finally{$('enhanceBtn').disabled=false}
+});
+$('originalBtn').addEventListener('click',()=>{if(original)$('mapImage').style.backgroundImage=`url("${original}")`});
+$('enhancedBtn').addEventListener('click',()=>{if(enhanced)$('mapImage').style.backgroundImage=`url("${enhanced}")`});
+$('downloadMapBtn').addEventListener('click',()=>{if(!enhanced)return;const a=document.createElement('a');a.href=enhanced;a.download='weathervalet-heat-index-map.png';a.click()});
+
+function normalizeSummary(p){
+  if(!Array.isArray(p.impacts)||p.impacts.length<4)throw new Error('Response must include four impacts.');
+  return p;
+}
+$('buildSummaryBtn').addEventListener('click',async()=>{
+  const endpoint=$('summaryEndpoint').value.trim();
+  if(!endpoint)return;
+  $('buildSummaryBtn').disabled=true;
+  const status=$('summaryStatus');status.textContent='Building heat summary…';status.className='status';
+  try{
+    const res=await fetch(endpoint,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({guidance:$('guidanceInput').value,prompt:$('summaryPrompt').value})
+    });
+    if(!res.ok)throw new Error(`${res.status}: ${(await res.text()).slice(0,160)}`);
+    const p=normalizeSummary(await res.json());
+    const values={
+      headlineTopInput:p.headlineTop,headlineBottomInput:p.headlineBottom,summaryInput:p.summary,
+      highestInput:p.highestHeatIndex,highestLocationInput:p.highestLocation,
+      confidenceInput:p.confidence,confidenceDetailInput:p.confidenceDetail,
+      timingInput:p.timing,timingDetailInput:p.timingDetail,concernInput:p.biggestConcern,
+      roadsInput:p.impacts[0].desc,powerInput:p.impacts[1].desc,healthInput:p.impacts[2].desc,hydrationInput:p.impacts[3].desc
+    };
+    Object.entries(values).forEach(([id,v])=>{if(v!==undefined){$(id).value=v;$(id).dispatchEvent(new Event('input'))}});
+    status.textContent='Heat summary created. Review all values before publishing.';status.className='status success';
+  }catch(e){status.textContent=`Summary failed: ${e.message}`;status.className='status error'}
+  finally{$('buildSummaryBtn').disabled=false}
+});
+$('loadExampleBtn').addEventListener('click',()=>{const s=$('summaryStatus');s.textContent='Example values are already loaded.';s.className='status success'});
+
+$('exportBtn').addEventListener('click',async()=>{
+  const t=canvas.style.transform;canvas.style.transform='none';
+  const c=await html2canvas(canvas,{backgroundColor:null,scale:1,useCORS:true});
+  const a=document.createElement('a');a.href=c.toDataURL('image/png');a.download='weathervalet-heat-index.png';a.click();
+  canvas.style.transform=t;
+});
+$('resetBtn').addEventListener('click',()=>location.reload());
+</script>
+<script src="/graphics/assets/wv-fit.js"></script></body>
+</html>

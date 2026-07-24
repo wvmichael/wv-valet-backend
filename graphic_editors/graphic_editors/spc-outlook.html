@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WeatherValet SPC Outlook Editor</title>
+<style>
+:root{
+  --blue:#19a8ff;
+  --green:#5bbd3b;
+  --yellow:#f1d42e;
+  --orange:#f28a1c;
+  --red:#e9353e;
+  --purple:#aa49cc;
+  --panel:#07121f;
+  --line:rgba(255,255,255,.22);
+}
+*{box-sizing:border-box}
+body{margin:0;background:#07101a;color:#fff;font-family:Inter,Arial,Helvetica,sans-serif}
+.app{display:grid;grid-template-columns:420px 1fr;min-height:100vh}
+.controls{padding:18px;background:#091523;border-right:1px solid var(--line);overflow:auto}
+h1{font-size:22px;margin:0 0 5px}
+.lead{font-size:13px;line-height:1.45;color:#92a5bc;margin:0 0 14px}
+.group{border-top:1px solid rgba(255,255,255,.1);margin-top:14px;padding-top:14px}
+label{display:block;font-size:12px;font-weight:800;color:#c8d4e1;margin:8px 0 5px}
+input,textarea,select,button{
+ width:100%;padding:9px 10px;border-radius:9px;border:1px solid rgba(255,255,255,.16);
+ background:#122034;color:#fff;font:inherit
+}
+textarea{min-height:72px;resize:vertical}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:11px}
+button{background:#1579ff;font-weight:900;cursor:pointer}
+button.secondary{background:#17263a}
+button:disabled{opacity:.5;cursor:not-allowed}
+.ai-box{padding:12px;border:1px solid rgba(25,168,255,.38);border-radius:13px;background:linear-gradient(145deg,#0b1e34,#091321)}
+.ai-title{font-weight:900;margin-bottom:4px}
+.ai-help,.note{font-size:11px;line-height:1.4;color:#91a6bf}
+.status{min-height:38px;margin-top:8px;padding:8px;border-radius:8px;background:#07111e;color:#a8c7e7;font-size:12px}
+.status.success{background:#0b2518;color:#baf5ce}
+.status.error{background:#2a1115;color:#ffc7c7}
+.stage-wrap{padding:24px;display:flex;justify-content:center;align-items:flex-start;overflow:auto}
+.shell{width:min(100%,1600px);aspect-ratio:16/9;position:relative}
+.canvas{
+ position:absolute;inset:0;width:1600px;height:900px;transform-origin:top left;overflow:hidden;
+ background:
+ radial-gradient(circle at 72% 18%,rgba(58,103,255,.23),transparent 30%),
+ linear-gradient(120deg,#03101c,#0a1828 48%,#161018);
+ box-shadow:0 25px 80px rgba(0,0,0,.48)
+}
+.bg{position:absolute;inset:0;background-size:cover;background-position:center;opacity:.44}
+.shade{position:absolute;inset:0;background:
+ linear-gradient(90deg,rgba(1,7,15,.95) 0%,rgba(1,7,15,.75) 33%,rgba(1,7,15,.18) 66%,rgba(1,7,15,.52) 100%),
+ linear-gradient(0deg,rgba(1,7,15,.95),transparent 35%)}
+.topbar{position:absolute;left:34px;right:34px;top:25px;z-index:7;display:flex;justify-content:space-between;align-items:flex-start}
+.logo{width:330px;max-height:90px;object-fit:contain;object-position:left top;filter:drop-shadow(0 4px 10px rgba(0,0,0,.5))}
+.date-card{padding:12px 20px;border-radius:17px;background:#07111ecc;border:1px solid rgba(255,255,255,.3);text-align:center;min-width:220px}
+.date-card .dow{font-size:18px;font-weight:900;color:#f3da3e}
+.date-card .date{font-size:25px;font-weight:900;margin-top:4px}
+.hero{position:absolute;left:38px;top:145px;width:460px;z-index:6}
+.headline{font-size:92px;line-height:.84;font-weight:950;letter-spacing:-.06em;text-transform:uppercase;text-shadow:0 7px 24px rgba(0,0,0,.68)}
+.headline .storm{background:linear-gradient(180deg,#fff,#ffd628 65%,#dd9a00);-webkit-background-clip:text;background-clip:text;color:transparent}
+.period{display:inline-block;margin-top:18px;padding:9px 18px;border-radius:11px;border:1px solid rgba(241,212,46,.75);box-shadow:0 0 20px rgba(241,212,46,.25);font-size:23px;letter-spacing:.12em;font-weight:950}
+.summary{margin-top:24px;padding-left:18px;border-left:5px solid #f1d42e;font-size:24px;line-height:1.28}
+.map-card{position:absolute;left:470px;right:340px;top:25px;height:680px;z-index:3;overflow:visible}
+.map-image{
+ position:absolute;inset:0;background-size:contain;background-repeat:no-repeat;background-position:center;
+ filter:drop-shadow(0 28px 18px rgba(0,0,0,.65)) drop-shadow(0 0 16px rgba(52,160,255,.48))
+}
+.map-glow{position:absolute;inset:4%;border-radius:30%;box-shadow:0 0 80px rgba(55,140,255,.25);pointer-events:none}
+.risk-panel{position:absolute;right:26px;top:155px;width:285px;z-index:6;padding:14px;border-radius:18px;background:#06101ee3;border:1px solid rgba(255,255,255,.3)}
+.risk-panel h3{text-align:center;margin:0 0 10px;font-size:19px}
+.risk-row{display:grid;grid-template-columns:52px 1fr;gap:10px;align-items:center;padding:9px 7px;border-radius:11px;margin:7px 0;border:1px solid rgba(255,255,255,.12)}
+.badge{width:46px;height:46px;border-radius:50%;display:grid;place-items:center;color:#07111c;font-size:24px;font-weight:950}
+.risk-row .name{font-size:18px;font-weight:950}
+.risk-row .detail{font-size:13px;line-height:1.15;color:#e0e8f1;margin-top:2px}
+.confidence-card{position:absolute;right:26px;top:635px;width:285px;z-index:6;padding:14px;border-radius:17px;background:#06101ee3;border:1px solid rgba(255,255,255,.3);display:grid;grid-template-columns:64px 1fr;gap:12px;align-items:center}
+.conf-icon{width:60px;height:60px;border-radius:50%;display:grid;place-items:center;font-size:31px;background:radial-gradient(circle at 35% 30%,#ffe872,#e2b300 60%,#806000)}
+.confidence-card .label{font-size:14px;font-weight:900}
+.confidence-card .value{font-size:28px;font-weight:950;color:#f4d82d;margin-top:3px}
+.confidence-card .detail{font-size:13px;color:#d2dde8;margin-top:4px}
+.threats{position:absolute;left:440px;right:340px;bottom:106px;height:124px;z-index:7;display:grid;grid-template-columns:repeat(4,1fr);border:1px solid rgba(255,255,255,.3);border-radius:16px;background:#06101ee6;overflow:hidden}
+.threat{padding:14px 13px;display:grid;grid-template-columns:58px 1fr;gap:10px;align-items:center}
+.threat:not(:last-child){border-right:1px solid rgba(255,255,255,.2)}
+.threat-icon{width:54px;height:54px;border-radius:50%;display:grid;place-items:center;font-size:27px;background:radial-gradient(circle at 35% 30%,#ff8c8c,#d92626 60%,#760b0b)}
+.threat .title{font-size:16px;font-weight:950}
+.threat .desc{font-size:13px;line-height:1.2;margin-top:4px}
+.footer{position:absolute;left:34px;right:34px;bottom:20px;height:72px;z-index:8;border:1px solid rgba(255,255,255,.32);border-radius:16px;background:#06101ee9;display:grid;grid-template-columns:390px 1fr 280px;align-items:center;overflow:hidden}
+.ready{height:100%;display:flex;align-items:center;justify-content:center;gap:12px;color:#b9ffca;font-size:24px;font-weight:950}
+.updated{text-align:center;font-size:17px;color:#d6e1ed}
+.updated strong{display:block;font-size:30px;color:#fff;line-height:1}
+.site{text-align:center;border-left:1px solid rgba(255,255,255,.22);font-size:23px;color:var(--blue);font-weight:950}
+.editable[contenteditable=true]{outline:none}
+.editable[contenteditable=true]:focus{box-shadow:0 0 0 3px rgba(25,168,255,.5);border-radius:5px}
+@media(max-width:1050px){.app{grid-template-columns:1fr}.controls{border-right:0;border-bottom:1px solid var(--line)}}
+</style>
+<link rel="stylesheet" href="/graphics/assets/wv-fit.css"></head>
+<body>
+<div class="app">
+<aside class="controls">
+<h1>SPC Outlook Editor</h1>
+<p class="lead">Create a focused severe-weather outlook from a real official SPC map, with concise risk messaging and GPT-assisted map and summary tools.</p>
+
+<div class="group">
+<label>Date</label><input id="dateInput" value="FRIDAY|MAY 16, 2025">
+<label>Headline Top</label><input id="headlineTopInput" value="SEVERE">
+<label>Headline Middle</label><input id="headlineMidInput" value="STORM">
+<label>Headline Bottom</label><input id="headlineBottomInput" value="OUTLOOK">
+<label>Forecast Period</label><input id="periodInput" value="SUNDAY NIGHT – MONDAY">
+<label>One-Sentence Summary</label><textarea id="summaryInput">Strong to severe storms are possible Sunday night into Monday.</textarea>
+<label>Updated Time</label><input id="updatedInput" value="7:00 AM">
+<label>Footer Alert</label><input id="readyInput" value="HAVE A PLAN">
+</div>
+
+<div class="group">
+<label>Forecast Confidence</label><input id="confidenceInput" value="MEDIUM–HIGH">
+<label>Confidence Detail</label><input id="confidenceDetailInput" value="Details may change">
+</div>
+
+<div class="group">
+<label>Main Threat 1</label><input id="t1TitleInput" value="TORNADOES"><textarea id="t1DescInput">A few strong tornadoes possible.</textarea>
+<label>Main Threat 2</label><input id="t2TitleInput" value="DAMAGING WIND"><textarea id="t2DescInput">Gusts up to 70+ mph possible.</textarea>
+<label>Main Threat 3</label><input id="t3TitleInput" value="LARGE HAIL"><textarea id="t3DescInput">Hail up to quarter size or larger.</textarea>
+<label>Main Threat 4</label><input id="t4TitleInput" value="HEAVY RAIN"><textarea id="t4DescInput">Localized flooding possible.</textarea>
+</div>
+
+<div class="group">
+<label>Cinematic Background</label><input id="backgroundUpload" type="file" accept="image/*">
+<label>Official SPC Outlook Map</label><input id="mapUpload" type="file" accept="image/*">
+
+<div class="ai-box">
+<div class="ai-title">✦ GPT SPC Map Editor</div>
+<div class="ai-help">Upload the official SPC map. GPT can crop and visually enhance it, but the meteorologist must compare the output with the original before publication.</div>
+<label>Outlook Type</label>
+<select id="mapType">
+<option value="categorical">Categorical Outlook</option>
+<option value="tornado">Tornado Probability</option>
+<option value="wind">Wind Probability</option>
+<option value="hail">Hail Probability</option>
+<option value="day2">Day 2 Outlook</option>
+<option value="day3">Day 3 Outlook</option>
+</select>
+<label>Instructions</label>
+<textarea id="mapPrompt">Focus the official SPC outlook map on Indiana and nearby border counties. Preserve the exact Indiana boundary, all official risk polygons, category colors, probability contours, hatching, labels, city positions, county boundaries, legend values, and geographic placement. Do not redraw the state, invent geography, move polygons, smooth boundaries, change categories, alter probabilities, or add unsupported labels. Improve only presentation: isolate the real map, increase contrast, soften secondary county lines, add subtle depth and a clean WeatherValet-ready background.</textarea>
+<label>Secure API Endpoint</label><input id="mapEndpoint" value="/api/weather-map-enhance">
+<div class="note">The OpenAI API key stays on your server, never in this HTML.</div>
+<div class="actions"><button id="enhanceMapBtn" type="button">✦ Enhance Map</button><button id="originalMapBtn" class="secondary" type="button">Use Original</button></div>
+<div class="actions"><button id="enhancedMapBtn" class="secondary" type="button" disabled>Use Enhanced</button><button id="downloadMapBtn" class="secondary" type="button" disabled>Download Map</button></div>
+<div id="mapStatus" class="status">Upload an official SPC map to begin.</div>
+</div>
+</div>
+
+<div class="group ai-box">
+<div class="ai-title">✦ GPT SPC Summary</div>
+<div class="ai-help">Paste the official SPC discussion or meteorologist notes. GPT drafts concise headline, confidence, and threat copy for review.</div>
+<label>Forecast Guidance</label>
+<textarea id="guidanceInput">A Slight to Enhanced Risk of severe storms may affect Indiana Sunday night into Monday. Damaging winds are the primary concern, with large hail and a few tornadoes also possible. Heavy rain may cause localized flooding. Confidence is medium to high, but exact placement and timing may change.</textarea>
+<label>Instructions</label>
+<textarea id="summaryPrompt">Create concise SPC outlook graphic copy. Return headline lines, forecast period, one-sentence summary, confidence, confidence detail, and four short threat summaries. Use only details supported by the supplied guidance. Return JSON only.</textarea>
+<label>Secure API Endpoint</label><input id="summaryEndpoint" value="/api/spc-summary">
+<div class="actions"><button id="buildSummaryBtn" type="button">✦ Build Summary</button><button id="loadExampleBtn" class="secondary" type="button">Load Example</button></div>
+<div id="summaryStatus" class="status">Paste guidance and click Build Summary.</div>
+</div>
+
+<div class="actions"><button id="exportBtn" type="button">Export PNG</button><button id="resetBtn" class="secondary" type="button">Reset</button></div>
+</aside>
+
+<main class="stage-wrap">
+<div id="shell" class="shell">
+<section id="canvas" class="canvas">
+<div id="bg" class="bg"></div><div class="shade"></div>
+
+<div class="topbar">
+<img src="/graphics/assets/weathervalet-logo-white.png" class="logo" alt="WeatherValet">
+<div class="date-card"><div id="dow" class="dow editable" contenteditable="true">FRIDAY</div><div id="date" class="date editable" contenteditable="true">MAY 16, 2025</div></div>
+</div>
+
+<div class="hero">
+<div class="headline"><span id="headlineTop" class="editable" contenteditable="true">SEVERE</span><br><span id="headlineMid" class="storm editable" contenteditable="true">STORM</span><br><span id="headlineBottom" class="editable" contenteditable="true">OUTLOOK</span></div>
+<div id="period" class="period editable" contenteditable="true">SUNDAY NIGHT – MONDAY</div>
+<div id="summary" class="summary editable" contenteditable="true">Strong to severe storms are possible Sunday night into Monday.</div>
+</div>
+
+<div class="map-card">
+<div class="map-glow"></div>
+<div id="mapImage" class="map-image"></div>
+</div>
+
+<div class="risk-panel">
+<h3>RISK LEVEL</h3>
+<div class="risk-row"><div class="badge" style="background:var(--green)">1</div><div><div class="name" style="color:var(--green)">MARGINAL</div><div class="detail">Isolated severe storms possible</div></div></div>
+<div class="risk-row"><div class="badge" style="background:var(--yellow)">2</div><div><div class="name" style="color:var(--yellow)">SLIGHT</div><div class="detail">Scattered severe storms possible</div></div></div>
+<div class="risk-row"><div class="badge" style="background:var(--orange)">3</div><div><div class="name" style="color:var(--orange)">ENHANCED</div><div class="detail">Numerous severe storms possible</div></div></div>
+<div class="risk-row"><div class="badge" style="background:var(--red)">4</div><div><div class="name" style="color:var(--red)">MODERATE</div><div class="detail">Widespread severe storms likely</div></div></div>
+<div class="risk-row"><div class="badge" style="background:var(--purple)">5</div><div><div class="name" style="color:var(--purple)">HIGH</div><div class="detail">Significant severe storms expected</div></div></div>
+</div>
+
+<div class="confidence-card">
+<div class="conf-icon">◎</div>
+<div><div class="label">FORECAST CONFIDENCE</div><div id="confidence" class="value editable" contenteditable="true">MEDIUM–HIGH</div><div id="confidenceDetail" class="detail editable" contenteditable="true">Details may change</div></div>
+</div>
+
+<div class="threats">
+<div class="threat"><div class="threat-icon">🌪️</div><div><div id="t1Title" class="title editable" contenteditable="true">TORNADOES</div><div id="t1Desc" class="desc editable" contenteditable="true">A few strong tornadoes possible.</div></div></div>
+<div class="threat"><div class="threat-icon" style="background:radial-gradient(circle at 35% 30%,#ffc86c,#f18814 60%,#8a4700)">💨</div><div><div id="t2Title" class="title editable" contenteditable="true">DAMAGING WIND</div><div id="t2Desc" class="desc editable" contenteditable="true">Gusts up to 70+ mph possible.</div></div></div>
+<div class="threat"><div class="threat-icon" style="background:radial-gradient(circle at 35% 30%,#ffe66a,#d5bd16 60%,#786600)">🧊</div><div><div id="t3Title" class="title editable" contenteditable="true">LARGE HAIL</div><div id="t3Desc" class="desc editable" contenteditable="true">Hail up to quarter size or larger.</div></div></div>
+<div class="threat"><div class="threat-icon" style="background:radial-gradient(circle at 35% 30%,#a8f58b,#47b93b 60%,#1b6817)">🌧️</div><div><div id="t4Title" class="title editable" contenteditable="true">HEAVY RAIN</div><div id="t4Desc" class="desc editable" contenteditable="true">Localized flooding possible.</div></div></div>
+</div>
+
+<div class="footer">
+<div class="ready">✓ <span id="ready" class="editable" contenteditable="true">HAVE A PLAN</span></div>
+<div class="updated">UPDATED<strong id="updated" class="editable" contenteditable="true">7:00 AM</strong></div>
+<div class="site">weathervalet.ai</div>
+</div>
+
+</section>
+</div>
+</main>
+</div>
+
+<script src="/graphics/assets/html2canvas.min.js"></script>
+<script>
+const $=id=>document.getElementById(id),canvas=$('canvas'),shell=$('shell');
+function fit(){const s=shell.clientWidth/1600;canvas.style.transform=`scale(${s})`;shell.style.height=`${900*s}px`}
+addEventListener('resize',fit);fit();
+
+function bind(a,b){$(a).addEventListener('input',e=>$(b).textContent=e.target.value)}
+bind('headlineTopInput','headlineTop');bind('headlineMidInput','headlineMid');bind('headlineBottomInput','headlineBottom');
+bind('periodInput','period');bind('summaryInput','summary');bind('updatedInput','updated');bind('readyInput','ready');
+bind('confidenceInput','confidence');bind('confidenceDetailInput','confidenceDetail');
+bind('t1TitleInput','t1Title');bind('t1DescInput','t1Desc');
+bind('t2TitleInput','t2Title');bind('t2DescInput','t2Desc');
+bind('t3TitleInput','t3Title');bind('t3DescInput','t3Desc');
+bind('t4TitleInput','t4Title');bind('t4DescInput','t4Desc');
+
+$('dateInput').addEventListener('input',e=>{const[a,b]=e.target.value.split('|');$('dow').textContent=a||'';$('date').textContent=b||''});
+
+$('backgroundUpload').addEventListener('change',e=>{
+ const f=e.target.files[0];if(!f)return;const r=new FileReader();
+ r.onload=()=>{$('bg').style.backgroundImage=`url("${r.result}")`};r.readAsDataURL(f)
+});
+
+let originalMap='',enhancedMap='';
+$('mapUpload').addEventListener('change',e=>{
+ const f=e.target.files[0];if(!f)return;const r=new FileReader();
+ r.onload=()=>{
+  originalMap=r.result;enhancedMap='';
+  $('mapImage').style.backgroundImage=`url("${originalMap}")`;
+  $('enhancedMapBtn').disabled=true;$('downloadMapBtn').disabled=true;
+  setStatus('mapStatus','Official SPC map loaded. Click Enhance Map.','')
+ };
+ r.readAsDataURL(f)
+});
+
+function setStatus(id,msg,type=''){const el=$(id);el.textContent=msg;el.className='status'+(type?' '+type:'')}
+function dataUrlBlob(u){const[m,d]=u.split(','),mime=(m.match(/data:(.*?);/)||[])[1]||'image/png',b=atob(d),a=new Uint8Array(b.length);for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return new Blob([a],{type:mime})}
+function returnedImage(p){if(p.image_url)return p.image_url;if(p.url)return p.url;if(p.image_base64)return `data:image/png;base64,${p.image_base64}`;if(p.b64_json)return `data:image/png;base64,${p.b64_json}`;if(p.data?.[0]?.b64_json)return `data:image/png;base64,${p.data[0].b64_json}`;if(p.data?.[0]?.url)return p.data[0].url;throw new Error('No image returned.')}
+
+$('enhanceMapBtn').addEventListener('click',async()=>{
+ if(!originalMap)return setStatus('mapStatus','Upload an official SPC map first.','error');
+ const endpoint=$('mapEndpoint').value.trim();if(!endpoint)return setStatus('mapStatus','Enter the secure API endpoint.','error');
+ $('enhanceMapBtn').disabled=true;setStatus('mapStatus','Enhancing the official SPC map…','');
+ try{
+  const form=new FormData();
+  form.append('image',dataUrlBlob(originalMap),'official-spc-map.png');
+  form.append('mapType',$('mapType').value);
+  form.append('prompt',$('mapPrompt').value);
+  form.append('focusState','Indiana');
+  form.append('preserveOfficialData','true');
+  const res=await fetch(endpoint,{method:'POST',body:form});
+  if(!res.ok)throw new Error(`${res.status}: ${(await res.text()).slice(0,180)}`);
+  enhancedMap=returnedImage(await res.json());
+  $('mapImage').style.backgroundImage=`url("${enhancedMap}")`;
+  $('enhancedMapBtn').disabled=false;$('downloadMapBtn').disabled=false;
+  setStatus('mapStatus','Enhanced map inserted. Compare it carefully with the official source.','success')
+ }catch(error){setStatus('mapStatus',`Map enhancement failed: ${error.message}`,'error')}
+ finally{$('enhanceMapBtn').disabled=false}
+});
+$('originalMapBtn').addEventListener('click',()=>{if(originalMap)$('mapImage').style.backgroundImage=`url("${originalMap}")`});
+$('enhancedMapBtn').addEventListener('click',()=>{if(enhancedMap)$('mapImage').style.backgroundImage=`url("${enhancedMap}")`});
+$('downloadMapBtn').addEventListener('click',()=>{if(!enhancedMap)return;const a=document.createElement('a');a.href=enhancedMap;a.download='weathervalet-spc-map.png';a.click()});
+
+function normalizeSummary(p){
+ if(!Array.isArray(p.threats)||p.threats.length<4)throw new Error('Response must include four threats.');
+ return p
+}
+$('buildSummaryBtn').addEventListener('click',async()=>{
+ const endpoint=$('summaryEndpoint').value.trim();
+ if(!endpoint)return setStatus('summaryStatus','Enter the secure API endpoint.','error');
+ $('buildSummaryBtn').disabled=true;setStatus('summaryStatus','Building SPC summary…','');
+ try{
+  const res=await fetch(endpoint,{
+   method:'POST',
+   headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({guidance:$('guidanceInput').value,prompt:$('summaryPrompt').value})
+  });
+  if(!res.ok)throw new Error(`${res.status}: ${(await res.text()).slice(0,180)}`);
+  const p=normalizeSummary(await res.json());
+  const values={
+   headlineTopInput:p.headlineTop,headlineMidInput:p.headlineMid,headlineBottomInput:p.headlineBottom,
+   periodInput:p.period,summaryInput:p.summary,
+   confidenceInput:p.confidence,confidenceDetailInput:p.confidenceDetail,
+   t1TitleInput:p.threats[0].title,t1DescInput:p.threats[0].desc,
+   t2TitleInput:p.threats[1].title,t2DescInput:p.threats[1].desc,
+   t3TitleInput:p.threats[2].title,t3DescInput:p.threats[2].desc,
+   t4TitleInput:p.threats[3].title,t4DescInput:p.threats[3].desc
+  };
+  Object.entries(values).forEach(([id,v])=>{if(v!==undefined){$(id).value=v;$(id).dispatchEvent(new Event('input'))}});
+  setStatus('summaryStatus','Summary created. Review all wording and values before publishing.','success')
+ }catch(error){setStatus('summaryStatus',`Summary failed: ${error.message}`,'error')}
+ finally{$('buildSummaryBtn').disabled=false}
+});
+$('loadExampleBtn').addEventListener('click',()=>setStatus('summaryStatus','Example values are already loaded.','success'));
+
+$('exportBtn').addEventListener('click',async()=>{
+ const prior=canvas.style.transform;canvas.style.transform='none';
+ const c=await html2canvas(canvas,{backgroundColor:null,scale:1,useCORS:true});
+ const a=document.createElement('a');a.download='weathervalet-spc-outlook.png';a.href=c.toDataURL('image/png');a.click();
+ canvas.style.transform=prior
+});
+$('resetBtn').addEventListener('click',()=>location.reload());
+</script>
+<script src="/graphics/assets/wv-fit.js"></script></body>
+</html>

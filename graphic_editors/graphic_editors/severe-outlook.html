@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WeatherValet Severe Outlook Editor</title>
+<style>
+:root{
+  --blue:#19a8ff;
+  --deep:#04101d;
+  --panel:#0a1728;
+  --line:rgba(255,255,255,.18);
+  --text:#fff;
+  --muted:#a9b7ca;
+  --risk:#f4d03f;
+}
+*{box-sizing:border-box}
+body{margin:0;font-family:Inter,Arial,Helvetica,sans-serif;background:#08111e;color:#fff}
+.app{display:grid;grid-template-columns:370px 1fr;min-height:100vh}
+.controls{background:#091524;border-right:1px solid var(--line);padding:18px;overflow:auto}
+.controls h1{margin:0 0 5px;font-size:22px}
+.controls p{margin:0 0 14px;color:#92a4ba;font-size:13px;line-height:1.45}
+.group{border-top:1px solid rgba(255,255,255,.1);margin-top:14px;padding-top:14px}
+label{display:block;margin:9px 0 5px;font-size:12px;font-weight:800;color:#c8d4e3}
+input,textarea,select,button{
+ width:100%;border:1px solid rgba(255,255,255,.16);border-radius:10px;
+ background:#111f33;color:white;padding:10px 11px;font:inherit
+}
+textarea{min-height:76px;resize:vertical}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+button{cursor:pointer;background:#1678ff;font-weight:900}
+button.secondary{background:#17253a}
+button:disabled{opacity:.5;cursor:not-allowed}
+.actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:14px}
+.ai-box{padding:12px;border:1px solid rgba(25,168,255,.38);border-radius:13px;background:linear-gradient(145deg,#0b1e34,#0a1423)}
+.ai-title{font-weight:900;margin-bottom:4px}
+.ai-help,.small{font-size:11px;line-height:1.4;color:#91a5bd}
+.ai-status{margin-top:9px;padding:9px;border-radius:9px;background:#07111e;font-size:12px;color:#a8c6e7;min-height:38px}
+.ai-status.success{background:#0c2418;color:#b9f6cf}
+.ai-status.error{background:#2a1115;color:#ffc5c5}
+.stage-wrap{padding:24px;display:flex;align-items:flex-start;justify-content:center;overflow:auto}
+.shell{width:min(100%,1600px);aspect-ratio:16/9;position:relative}
+.canvas{position:absolute;inset:0;width:1600px;height:900px;transform-origin:top left;overflow:hidden;
+ background:
+ radial-gradient(circle at 78% 18%,rgba(255,111,32,.36),transparent 30%),
+ linear-gradient(120deg,#020a14,#0a1828 45%,#1d1721 100%);
+ box-shadow:0 24px 80px rgba(0,0,0,.45)
+}
+.bg{position:absolute;inset:0;background-size:cover;background-position:center;opacity:.42}
+.vignette{position:absolute;inset:0;background:
+ linear-gradient(90deg,rgba(1,7,15,.96) 0%,rgba(1,7,15,.72) 38%,rgba(1,7,15,.16) 66%,rgba(1,7,15,.48) 100%),
+ linear-gradient(0deg,rgba(1,7,15,.95),transparent 31%)}
+.topbar{position:absolute;left:42px;right:42px;top:28px;z-index:5;display:flex;justify-content:space-between;align-items:flex-start}
+.logo{width:340px;max-height:94px;object-fit:contain;object-position:left top;filter:drop-shadow(0 4px 10px #0008)}
+.date-card{background:#08111fcc;border:1px solid #ffffff45;border-radius:19px;padding:12px 21px;min-width:220px;text-align:center;backdrop-filter:blur(10px)}
+.date-card .dow{font-size:19px;font-weight:900}.date-card .date{font-size:24px;font-weight:800;margin-top:4px}
+.hero{position:absolute;left:46px;top:158px;width:590px;z-index:5}
+.kicker{font-size:22px;font-weight:900;color:var(--risk);letter-spacing:.14em;text-transform:uppercase;margin-bottom:12px}
+.headline{font-size:86px;line-height:.91;font-weight:950;letter-spacing:-.055em;text-transform:uppercase;text-shadow:0 8px 26px #000b}
+.headline .accent{background:linear-gradient(180deg,#fff,#f6df76 55%,#e6a521);-webkit-background-clip:text;background-clip:text;color:transparent}
+.summary{margin-top:18px;border-left:5px solid var(--risk);padding-left:18px;font-size:25px;line-height:1.27;max-width:560px;text-shadow:0 2px 8px #000a}
+.map-card{position:absolute;right:250px;top:118px;width:700px;height:625px;border-radius:28px;overflow:hidden;z-index:3;border:1px solid #ffffff48;background:#26311f;box-shadow:0 24px 55px #0008}
+.map-img{position:absolute;inset:0;background-size:cover;background-position:center}
+.map-overlay{position:absolute;inset:0;background:linear-gradient(180deg,transparent,#03101b55)}
+.map-title{position:absolute;left:20px;top:18px;padding:8px 12px;border-radius:10px;background:#07111fce;border:1px solid #ffffff30;font-weight:900;font-size:16px;letter-spacing:.06em}
+.legend{position:absolute;left:18px;right:18px;bottom:18px;display:flex;gap:8px;padding:11px;border-radius:13px;background:#06101edb;border:1px solid #ffffff30}
+.legend-item{flex:1;text-align:center;padding:8px 5px;border-radius:8px;color:#07111c;font-weight:950;font-size:13px}
+.risk-rail{position:absolute;right:28px;top:220px;width:200px;z-index:5;display:grid;gap:12px}
+.risk-card{min-height:126px;padding:15px 12px;text-align:center;border-radius:18px;background:#06101ec9;border:1px solid #ffffff35;backdrop-filter:blur(10px)}
+.risk-card .label{font-size:13px;font-weight:900;color:#d8e4f0;text-transform:uppercase}
+.risk-card .value{font-size:31px;font-weight:950;line-height:1.05;margin:10px 0 5px}
+.risk-card .detail{font-size:14px;color:var(--blue);font-weight:900}
+.points{position:absolute;left:44px;bottom:96px;width:590px;height:146px;display:grid;grid-template-columns:repeat(3,1fr);z-index:5;background:#07111fc7;border:1px solid #ffffff36;border-radius:18px;overflow:hidden;backdrop-filter:blur(10px)}
+.point{padding:12px;text-align:center;display:flex;flex-direction:column;justify-content:center;position:relative}
+.point:not(:last-child)::after{content:"";position:absolute;right:0;top:22px;bottom:22px;width:1px;background:#ffffff30}
+.icon{font-size:30px;margin-bottom:7px}.main{font-size:18px;font-weight:950;text-transform:uppercase}.sub{font-size:16px;font-weight:900;color:var(--blue)}
+.footer{position:absolute;left:34px;right:34px;bottom:20px;height:66px;border:1px solid #ffffff48;border-radius:16px;background:#06101ee3;display:grid;grid-template-columns:360px 1fr 280px;align-items:center;overflow:hidden;z-index:6;backdrop-filter:blur(12px)}
+.impact{height:100%;display:flex;align-items:center;justify-content:center;gap:11px;background:linear-gradient(180deg,color-mix(in srgb,var(--risk) 90%,white),var(--risk));color:#07111c;font-weight:950;font-size:28px;text-transform:uppercase}
+.updated{text-align:center;color:#d7e2ee;font-size:17px}.updated strong{display:block;color:#fff;font-size:30px;line-height:1}
+.sponsor{height:100%;display:flex;align-items:center;justify-content:center;border-left:1px solid #ffffff25;padding:8px 14px}
+.sponsor img{max-width:100%;max-height:48px;object-fit:contain}.sponsor span{color:#9fb0c4;font-size:12px;font-weight:800;text-transform:uppercase}
+.editable[contenteditable=true]{outline:none}.editable[contenteditable=true]:focus{box-shadow:0 0 0 3px rgba(25,168,255,.5);border-radius:6px}
+@media(max-width:1000px){.app{grid-template-columns:1fr}.controls{border-right:0;border-bottom:1px solid var(--line)}}
+</style>
+<link rel="stylesheet" href="/graphics/assets/wv-fit.css"></head>
+<body>
+<div class="app">
+<aside class="controls">
+<h1>Severe Outlook Editor</h1>
+<p>Create a WeatherValet severe-weather story graphic, enhance an official SPC map with GPT, then export the final 1600×900 image.</p>
+
+<div class="group">
+<label>Headline</label><textarea id="headlineInput">SEVERE STORMS POSSIBLE</textarea>
+<label>Kicker</label><input id="kickerInput" value="SUNDAY NIGHT INTO MONDAY">
+<label>Summary</label><textarea id="summaryInput">A few strong to severe storms may move into Indiana overnight. Exact timing and placement remain uncertain.</textarea>
+<label>Date</label><input id="dateInput" value="SUNDAY|MAY 18, 2025">
+</div>
+
+<div class="group">
+<label>Risk Level</label>
+<select id="riskPreset">
+<option value="#4ade80|MARGINAL RISK">Marginal — Green</option>
+<option value="#f4d03f|SLIGHT RISK" selected>Slight — Yellow</option>
+<option value="#fb923c|ENHANCED RISK">Enhanced — Orange</option>
+<option value="#ef4444|MODERATE RISK">Moderate — Red</option>
+<option value="#d946ef|HIGH RISK">High — Magenta</option>
+</select>
+<label>Impact Label</label><input id="impactInput" value="SLIGHT RISK">
+</div>
+
+<div class="group">
+<div class="row"><div><label>Threat 1</label><input id="p1Main" value="DAMAGING WIND"></div><div><label>Detail</label><input id="p1Sub" value="Primary Threat"></div></div>
+<div class="row"><div><label>Threat 2</label><input id="p2Main" value="LARGE HAIL"></div><div><label>Detail</label><input id="p2Sub" value="Possible"></div></div>
+<div class="row"><div><label>Threat 3</label><input id="p3Main" value="TORNADO"></div><div><label>Detail</label><input id="p3Sub" value="Low Chance"></div></div>
+</div>
+
+<div class="group">
+<div class="row"><div><label>Timing</label><input id="timingInput" value="9 PM–4 AM"></div><div><label>Timing Detail</label><input id="timingDetail" value="WEST TO EAST"></div></div>
+<div class="row"><div><label>Coverage</label><input id="coverageInput" value="SCATTERED"></div><div><label>Coverage Detail</label><input id="coverageDetail" value="NOT EVERYONE"></div></div>
+<div class="row"><div><label>Confidence</label><input id="confidenceInput" value="MEDIUM"></div><div><label>Confidence Detail</label><input id="confidenceDetail" value="DETAILS MAY SHIFT"></div></div>
+<label>Updated Time</label><input id="updatedInput" value="7:00 AM">
+</div>
+
+<div class="group">
+<label>Cinematic Background</label><input id="backgroundUpload" type="file" accept="image/*">
+<label>Official SPC / Weather Map</label><input id="mapUpload" type="file" accept="image/*">
+
+<div class="ai-box">
+<div class="ai-title">✦ Enhance Map with GPT</div>
+<div class="ai-help">The official map is sent to your secure backend. GPT focuses it on Indiana and applies the WeatherValet look. The meteorologist must compare the result against the official source before publishing.</div>
+<label>Map Type</label>
+<select id="aiStyle">
+<option value="spc">SPC Convective Outlook</option>
+<option value="tornado">Tornado Probability</option>
+<option value="wind">Wind Probability</option>
+<option value="hail">Hail Probability</option>
+<option value="warnings">Watches / Warnings</option>
+<option value="radar">Radar</option>
+</select>
+<label>GPT Instructions</label>
+<textarea id="aiPrompt">Focus this official weather map on Indiana and nearby border counties. Preserve every official outlook boundary, category, hatch, label, color, percentage, and geographic placement exactly. Do not redraw, smooth, move, expand, shrink, or invent meteorological data. Improve only the presentation: premium dark terrain, crisp Indiana outline, subtle county lines, strong contrast, modern city labels, atmospheric depth, and a polished WeatherValet broadcast appearance. Keep all official risk colors recognizable.</textarea>
+<label>Secure API Endpoint</label><input id="aiEndpoint" value="/api/weather-map-enhance">
+<div class="small">Keep the OpenAI API key on your server, never in this HTML.</div>
+<div class="actions"><button id="enhanceBtn" type="button">✦ Enhance Map</button><button id="originalBtn" class="secondary" type="button">Use Original</button></div>
+<div class="actions"><button id="enhancedBtn" class="secondary" type="button" disabled>Use Enhanced</button><button id="downloadMapBtn" class="secondary" type="button" disabled>Download Map</button></div>
+<div id="aiStatus" class="ai-status">Upload an official map to begin.</div>
+</div>
+
+<label>Sponsor Logo</label><input id="sponsorUpload" type="file" accept="image/*">
+</div>
+
+<div class="actions"><button id="exportBtn" type="button">Export PNG</button><button id="resetBtn" class="secondary" type="button">Reset</button></div>
+</aside>
+
+<main class="stage-wrap">
+<div id="shell" class="shell">
+<section id="canvas" class="canvas">
+<div id="bg" class="bg"></div><div class="vignette"></div>
+<div class="topbar">
+<img src="/graphics/assets/weathervalet-logo-white.png" class="logo" alt="WeatherValet">
+<div class="date-card"><div id="dow" class="dow editable" contenteditable="true">SUNDAY</div><div id="date" class="date editable" contenteditable="true">MAY 18, 2025</div></div>
+</div>
+
+<div class="hero">
+<div id="kicker" class="kicker editable" contenteditable="true">SUNDAY NIGHT INTO MONDAY</div>
+<div id="headline" class="headline editable" contenteditable="true"><span class="accent">SEVERE STORMS</span><br>POSSIBLE</div>
+<div id="summary" class="summary editable" contenteditable="true">A few strong to severe storms may move into Indiana overnight. Exact timing and placement remain uncertain.</div>
+</div>
+
+<div class="map-card">
+<div id="mapImg" class="map-img"></div><div class="map-overlay"></div>
+<div class="map-title">SPC SEVERE OUTLOOK</div>
+<div class="legend">
+<div class="legend-item" style="background:#8ddf74">MRGL</div>
+<div class="legend-item" style="background:#f4e36a">SLGT</div>
+<div class="legend-item" style="background:#f3a04f">ENH</div>
+<div class="legend-item" style="background:#e76462;color:white">MDT</div>
+<div class="legend-item" style="background:#d05bd8;color:white">HIGH</div>
+</div>
+</div>
+
+<div class="risk-rail">
+<div class="risk-card"><div class="label">Timing</div><div id="timing" class="value editable" contenteditable="true">9 PM–4 AM</div><div id="timingD" class="detail editable" contenteditable="true">WEST TO EAST</div></div>
+<div class="risk-card"><div class="label">Coverage</div><div id="coverage" class="value editable" contenteditable="true">SCATTERED</div><div id="coverageD" class="detail editable" contenteditable="true">NOT EVERYONE</div></div>
+<div class="risk-card"><div class="label">Confidence</div><div id="confidence" class="value editable" contenteditable="true">MEDIUM</div><div id="confidenceD" class="detail editable" contenteditable="true">DETAILS MAY SHIFT</div></div>
+</div>
+
+<div class="points">
+<div class="point"><div class="icon">💨</div><div id="p1m" class="main editable" contenteditable="true">DAMAGING WIND</div><div id="p1s" class="sub editable" contenteditable="true">Primary Threat</div></div>
+<div class="point"><div class="icon">🧊</div><div id="p2m" class="main editable" contenteditable="true">LARGE HAIL</div><div id="p2s" class="sub editable" contenteditable="true">Possible</div></div>
+<div class="point"><div class="icon">🌪️</div><div id="p3m" class="main editable" contenteditable="true">TORNADO</div><div id="p3s" class="sub editable" contenteditable="true">Low Chance</div></div>
+</div>
+
+<div class="footer">
+<div id="impactBox" class="impact"><span>⚠</span><span id="impact" class="editable" contenteditable="true">SLIGHT RISK</span></div>
+<div class="updated">UPDATED<strong id="updated" class="editable" contenteditable="true">7:00 AM</strong></div>
+<div class="sponsor"><img id="sponsorImg" style="display:none" alt="Sponsor logo"><span id="sponsorText">Sponsored By</span></div>
+</div>
+</section>
+</div>
+</main>
+</div>
+
+<script src="/graphics/assets/html2canvas.min.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+const canvas=$('canvas'),shell=$('shell');
+function fit(){const s=shell.clientWidth/1600;canvas.style.transform=`scale(${s})`;shell.style.height=`${900*s}px`}
+addEventListener('resize',fit);fit();
+
+function bind(input,target,fn){$(input).addEventListener('input',e=>fn?fn(e.target.value):$(target).textContent=e.target.value)}
+bind('headlineInput','headline',v=>{const w=v.trim().split(/\s+/);if(w.length>2){$('headline').innerHTML=`<span class="accent">${w.slice(0,-1).join(' ')}</span><br>${w.at(-1)}`}else $('headline').innerHTML=`<span class="accent">${v}</span>`});
+bind('kickerInput','kicker');bind('summaryInput','summary');
+bind('p1Main','p1m');bind('p1Sub','p1s');bind('p2Main','p2m');bind('p2Sub','p2s');bind('p3Main','p3m');bind('p3Sub','p3s');
+bind('timingInput','timing');bind('timingDetail','timingD');bind('coverageInput','coverage');bind('coverageDetail','coverageD');bind('confidenceInput','confidence');bind('confidenceDetail','confidenceD');
+bind('impactInput','impact');bind('updatedInput','updated');
+$('dateInput').addEventListener('input',e=>{const [a,b]=e.target.value.split('|');$('dow').textContent=a||'';$('date').textContent=b||''});
+$('riskPreset').addEventListener('change',e=>{const [color,label]=e.target.value.split('|');document.documentElement.style.setProperty('--risk',color);$('impactInput').value=label;$('impact').textContent=label});
+
+function readFile(input,cb){input.addEventListener('change',e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=()=>cb(r.result);r.readAsDataURL(f)})}
+readFile($('backgroundUpload'),url=>$('bg').style.backgroundImage=`url("${url}")`);
+readFile($('sponsorUpload'),url=>{$('sponsorImg').src=url;$('sponsorImg').style.display='block';$('sponsorText').style.display='none'});
+
+let originalMap='',enhancedMap='';
+readFile($('mapUpload'),url=>{originalMap=url;enhancedMap='';$('mapImg').style.backgroundImage=`url("${url}")`;$('enhancedBtn').disabled=true;$('downloadMapBtn').disabled=true;status('Official map loaded. Click Enhance Map.','')});
+
+function status(msg,type=''){const el=$('aiStatus');el.textContent=msg;el.className='ai-status'+(type?' '+type:'')}
+function blobFromDataUrl(dataUrl){const [meta,data]=dataUrl.split(',');const mime=(meta.match(/data:(.*?);/)||[])[1]||'image/png';const bin=atob(data);const bytes=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)bytes[i]=bin.charCodeAt(i);return new Blob([bytes],{type:mime})}
+function returnedImage(p){if(p.image_url)return p.image_url;if(p.url)return p.url;if(p.image_base64)return `data:image/png;base64,${p.image_base64}`;if(p.b64_json)return `data:image/png;base64,${p.b64_json}`;if(p.data?.[0]?.b64_json)return `data:image/png;base64,${p.data[0].b64_json}`;if(p.data?.[0]?.url)return p.data[0].url;throw new Error('No returned image found.')}
+
+$('enhanceBtn').addEventListener('click',async()=>{
+ if(!originalMap){status('Upload an official map first.','error');return}
+ const endpoint=$('aiEndpoint').value.trim();if(!endpoint){status('Enter the secure API endpoint.','error');return}
+ $('enhanceBtn').disabled=true;status('Enhancing the map…','');
+ try{
+  const form=new FormData();form.append('image',blobFromDataUrl(originalMap),'official-map.png');form.append('mapType',$('aiStyle').value);form.append('prompt',$('aiPrompt').value);form.append('focusState','Indiana');form.append('preserveOfficialData','true');
+  const res=await fetch(endpoint,{method:'POST',body:form});if(!res.ok)throw new Error(`${res.status}: ${(await res.text()).slice(0,160)}`);
+  enhancedMap=returnedImage(await res.json());$('mapImg').style.backgroundImage=`url("${enhancedMap}")`;$('enhancedBtn').disabled=false;$('downloadMapBtn').disabled=false;status('Enhanced map inserted. Compare it carefully with the official source.','success')
+ }catch(err){console.error(err);status(`Enhancement failed: ${err.message}`,'error')}finally{$('enhanceBtn').disabled=false}
+});
+$('originalBtn').addEventListener('click',()=>{if(!originalMap)return status('No original map uploaded.','error');$('mapImg').style.backgroundImage=`url("${originalMap}")`;status('Using the original map.','')});
+$('enhancedBtn').addEventListener('click',()=>{if(!enhancedMap)return;$('mapImg').style.backgroundImage=`url("${enhancedMap}")`;status('Using the enhanced map.','success')});
+$('downloadMapBtn').addEventListener('click',()=>{if(!enhancedMap)return;const a=document.createElement('a');a.download='weathervalet-severe-map.png';a.href=enhancedMap;a.click()});
+$('exportBtn').addEventListener('click',async()=>{const prior=canvas.style.transform;canvas.style.transform='none';const c=await html2canvas(canvas,{backgroundColor:null,scale:1,useCORS:true});const a=document.createElement('a');a.download='weathervalet-severe-outlook.png';a.href=c.toDataURL('image/png');a.click();canvas.style.transform=prior});
+$('resetBtn').addEventListener('click',()=>location.reload());
+
+window.WeatherValetSevereOutlook={
+ setData(d={}){
+  const map={headline:'headlineInput',kicker:'kickerInput',summary:'summaryInput',date:'dateInput',impact:'impactInput',updated:'updatedInput',timing:'timingInput',timingDetail:'timingDetail',coverage:'coverageInput',coverageDetail:'coverageDetail',confidence:'confidenceInput',confidenceDetail:'confidenceDetail',p1Main:'p1Main',p1Sub:'p1Sub',p2Main:'p2Main',p2Sub:'p2Sub',p3Main:'p3Main',p3Sub:'p3Sub'};
+  Object.entries(map).forEach(([k,id])=>{if(d[k]!==undefined){$(id).value=d[k];$(id).dispatchEvent(new Event('input'))}});
+  if(d.backgroundUrl)$('bg').style.backgroundImage=`url("${d.backgroundUrl}")`;if(d.mapUrl){originalMap=d.mapUrl;$('mapImg').style.backgroundImage=`url("${d.mapUrl}")`};if(d.sponsorUrl){$('sponsorImg').src=d.sponsorUrl;$('sponsorImg').style.display='block';$('sponsorText').style.display='none'}
+ }
+};
+</script>
+<script src="/graphics/assets/wv-fit.js"></script></body>
+</html>

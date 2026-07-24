@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WeatherValet 5-Day Forecast Editor</title>
+<style>
+:root{--blue:#16a8ff;--green:#4ade80;--panel:#081523;--line:#ffffff2d}
+*{box-sizing:border-box}body{margin:0;background:#07101c;color:#fff;font-family:Inter,Arial,sans-serif}
+.app{display:grid;grid-template-columns:400px 1fr;min-height:100vh}.controls{padding:18px;background:#091524;border-right:1px solid var(--line);overflow:auto}
+h1{font-size:22px;margin:0 0 6px}.lead{font-size:13px;line-height:1.45;color:#91a4bb;margin:0 0 15px}
+.group{border-top:1px solid #ffffff18;margin-top:14px;padding-top:14px}label{display:block;font-size:12px;font-weight:800;color:#c7d3e1;margin:8px 0 5px}
+input,textarea,select,button{width:100%;padding:9px 10px;border-radius:9px;border:1px solid #ffffff26;background:#122034;color:#fff;font:inherit}
+textarea{min-height:68px;resize:vertical}.row{display:grid;grid-template-columns:1fr 1fr;gap:7px}.actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
+button{background:#1479ff;font-weight:900;cursor:pointer}button.secondary{background:#17263a}button:disabled{opacity:.5;cursor:not-allowed}
+.day-edit{padding:10px;border-radius:11px;background:#0d1b2d;margin:8px 0}.day-edit strong{font-size:13px}
+.ai{padding:12px;border:1px solid #16a8ff61;border-radius:12px;background:linear-gradient(145deg,#0b1e34,#0a1423)}
+.ai-help,.note{font-size:11px;color:#93a8c1;line-height:1.4}.status{margin-top:8px;padding:8px;border-radius:8px;background:#07111e;font-size:12px;color:#a9c7e7;min-height:36px}.status.error{background:#2a1115;color:#ffc6c6}.status.success{background:#0b2518;color:#baf5cf}
+.stage{padding:24px;display:flex;justify-content:center;align-items:flex-start;overflow:auto}.shell{width:min(100%,1600px);aspect-ratio:16/9;position:relative}
+.canvas{position:absolute;inset:0;width:1600px;height:900px;transform-origin:top left;overflow:hidden;background:linear-gradient(120deg,#04101d,#0a1e31 48%,#241a1b);box-shadow:0 25px 80px #0008}
+.bg{position:absolute;inset:0;background-size:cover;background-position:center;opacity:.45}.shade{position:absolute;inset:0;background:linear-gradient(180deg,#020a14a8,#020a1440 45%,#020a14e8)}
+.top{position:absolute;left:36px;right:36px;top:27px;display:flex;align-items:flex-start;justify-content:space-between;z-index:5}.logo{width:320px;max-height:90px;object-fit:contain;object-position:left top}
+.title{text-align:center;flex:1}.title h2{font-size:64px;letter-spacing:-.035em;margin:2px 0 0;text-shadow:0 6px 20px #000b}.title div{font-size:25px;color:var(--blue);font-weight:900;letter-spacing:.08em}
+.updated{min-width:190px;text-align:center;padding:12px 18px;border-radius:18px;background:#07111dcc;border:1px solid #ffffff45}.updated span{font-size:14px;color:var(--blue);font-weight:900}.updated strong{font-size:27px;display:block}.updated small{font-size:15px;font-weight:800}
+.days{position:absolute;left:30px;right:30px;top:150px;height:555px;display:grid;grid-template-columns:repeat(5,1fr);gap:12px;z-index:4}
+.day{border-radius:18px;border:1px solid #42a9ff8c;background:linear-gradient(180deg,#10283fda,#06101eea);backdrop-filter:blur(9px);padding:15px 17px;text-align:center;display:flex;flex-direction:column;align-items:center}
+.dow{font-size:31px;font-weight:950}.icon{font-size:78px;line-height:1.15;margin:12px 0}.desc{font-size:18px;font-weight:900;line-height:1.12;min-height:48px;text-transform:uppercase}.high{font-size:75px;font-weight:950;line-height:1;margin-top:20px}.low{font-size:42px;color:var(--blue);font-weight:950;margin-top:3px}
+.wind-label{margin-top:auto;padding-top:14px;border-top:1px solid #ffffff3b;width:100%;font-size:13px;font-weight:800}.wind{font-size:18px;font-weight:900;margin-top:3px}
+.footer{position:absolute;left:30px;right:30px;bottom:20px;height:150px;z-index:6;display:grid;grid-template-rows:82px 58px;gap:10px}
+.footer-main,.sponsor{border:1px solid #ffffff45;border-radius:15px;background:#06101ee7;backdrop-filter:blur(10px)}
+.footer-main{display:grid;grid-template-columns:330px 1fr 270px;align-items:center;overflow:hidden}.impact{height:100%;display:flex;align-items:center;justify-content:center;gap:11px;color:#06110c;background:linear-gradient(180deg,#6ef28d,#39d761);font-size:27px;font-weight:950}.story{padding:0 22px;font-size:18px;line-height:1.28;border-right:1px solid #ffffff29}.averages{text-align:center;font-weight:900;color:var(--blue);font-size:17px}.averages strong{color:#fff}
+.sponsor{display:flex;align-items:center;padding:8px 20px;justify-content:space-between}.sponsor img{max-height:38px;max-width:310px;object-fit:contain}.sponsor .url{font-size:23px;color:var(--blue);font-weight:900}
+.editable[contenteditable=true]{outline:none}.editable[contenteditable=true]:focus{box-shadow:0 0 0 3px #16a8ff80;border-radius:5px}
+@media(max-width:1050px){.app{grid-template-columns:1fr}.controls{border-right:0;border-bottom:1px solid var(--line)}}
+</style>
+<link rel="stylesheet" href="/graphics/assets/wv-fit.css"></head>
+<body>
+<div class="app">
+<aside class="controls">
+<h1>5-Day Forecast Editor</h1><p class="lead">Edit five daily forecast cards, enhance an optional map with GPT, and export a 1600×900 WeatherValet graphic.</p>
+<div class="group"><label>Region Subtitle</label><input id="regionInput" value="CENTRAL INDIANA"><label>Updated Time</label><input id="updatedInput" value="7:00 AM"><label>Date</label><input id="dateInput" value="FRIDAY|MAY 16, 2025"><label>Footer Story</label><textarea id="storyInput">Great stretch of weather through Saturday. Storm chances return Sunday into Monday.</textarea></div>
+<div id="dayControls" class="group"></div>
+<div class="group"><div class="row"><div><label>Average High</label><input id="avgHighInput" value="70°"></div><div><label>Average Low</label><input id="avgLowInput" value="48°"></div></div><label>Impact Label</label><input id="impactInput" value="LOW IMPACT"></div>
+<div class="group"><label>Cinematic Background</label><input id="backgroundUpload" type="file" accept="image/*"><label>Optional Official Map</label><input id="mapUpload" type="file" accept="image/*">
+<div class="ai"><strong>✦ GPT Map Editor</strong><p class="ai-help">Use this when you want a real radar, SPC, snow, or other official map incorporated into a forecast product.</p><label>Map Type</label><select id="mapType"><option>SPC Outlook</option><option>Radar</option><option>Snow Accumulation</option><option>Rainfall</option><option>Temperature</option><option>Warnings</option></select><label>Instructions</label><textarea id="promptInput">Focus the official weather map on Indiana. Preserve all official meteorological boundaries, colors, labels, contours, values and geographic placement exactly. Do not invent or move weather data. Apply a premium WeatherValet broadcast treatment with cinematic dark terrain, crisp Indiana outline, clean county boundaries, improved contrast and subtle depth.</textarea><label>Secure API Endpoint</label><input id="endpointInput" value="/api/weather-map-enhance"><p class="note">The API key stays on your server, never in this HTML.</p><div class="actions"><button id="enhanceBtn" type="button">Enhance Map</button><button id="originalBtn" class="secondary" type="button">Use Original</button></div><div class="actions"><button id="enhancedBtn" class="secondary" type="button" disabled>Use Enhanced</button><button id="downloadMapBtn" class="secondary" type="button" disabled>Download Map</button></div><div id="status" class="status">Upload a map to begin.</div></div>
+<label>Sponsor Logo</label><input id="sponsorUpload" type="file" accept="image/*"></div>
+<div class="actions"><button id="exportBtn" type="button">Export PNG</button><button id="resetBtn" class="secondary" type="button">Reset</button></div>
+</aside>
+<main class="stage"><div id="shell" class="shell"><section id="canvas" class="canvas"><div id="bg" class="bg"></div><div class="shade"></div>
+<div class="top"><img src="/graphics/assets/weathervalet-logo-white.png" class="logo" alt="WeatherValet"><div class="title"><h2>5-DAY FORECAST</h2><div id="region" class="editable" contenteditable="true">CENTRAL INDIANA</div></div><div class="updated"><span>UPDATED</span><strong id="updated" class="editable" contenteditable="true">7:00 AM</strong><small id="date" class="editable" contenteditable="true">FRIDAY<br>MAY 16, 2025</small></div></div>
+<div id="days" class="days"></div>
+<div class="footer"><div class="footer-main"><div class="impact">✓ <span id="impact" class="editable" contenteditable="true">LOW IMPACT</span></div><div id="story" class="story editable" contenteditable="true">Great stretch of weather through Saturday. Storm chances return Sunday into Monday.</div><div class="averages">AVERAGE HIGH: <strong id="avgHigh">70°</strong><br>AVERAGE LOW: <strong id="avgLow">48°</strong></div></div><div class="sponsor"><div><small>SPONSORED BY</small><br><img id="sponsorImg" style="display:none" alt="Sponsor logo"><span id="sponsorText">Sponsor Logo</span></div><div class="url">weathervalet.ai</div></div></div>
+</section></div></main></div>
+<script src="/graphics/assets/html2canvas.min.js"></script>
+<script>
+const $=id=>document.getElementById(id),canvas=$('canvas'),shell=$('shell');
+function fit(){const s=shell.clientWidth/1600;canvas.style.transform=`scale(${s})`;shell.style.height=`${900*s}px`}addEventListener('resize',fit);fit();
+const defaults=[
+ {dow:'FRI',icon:'🌤️',desc:'DRY & COOLER\\nPLEASANT DAY',high:'63°',low:'42°',wind:'NW 5–10'},
+ {dow:'SAT',icon:'🌞',desc:'WARMING UP\\nLOTS OF SUN',high:'72°',low:'48°',wind:'SW 8–15'},
+ {dow:'SUN',icon:'⛈️',desc:'STRAY STORM\\nLATE DAY',high:'78°',low:'58°',wind:'SW 10–18'},
+ {dow:'MON',icon:'🌩️',desc:'SCATTERED\\nSTORMS',high:'75°',low:'60°',wind:'SW 10–20'},
+ {dow:'TUE',icon:'🌤️',desc:'PARTLY CLOUDY\\nCOMFORTABLE',high:'70°',low:'50°',wind:'W 5–10'}
+];
+const controls=$('dayControls'),days=$('days');
+function render(){
+ controls.innerHTML='<strong>Daily Forecasts</strong>';days.innerHTML='';
+ defaults.forEach((d,i)=>{
+  controls.insertAdjacentHTML('beforeend',`<div class="day-edit"><strong>Day ${i+1}</strong><div class="row"><input data-i="${i}" data-k="dow" value="${d.dow}"><input data-i="${i}" data-k="icon" value="${d.icon}"></div><input data-i="${i}" data-k="desc" value="${d.desc.replace(/\n/g,' / ')}"><div class="row"><input data-i="${i}" data-k="high" value="${d.high}"><input data-i="${i}" data-k="low" value="${d.low}"></div><input data-i="${i}" data-k="wind" value="${d.wind}"></div>`);
+  days.insertAdjacentHTML('beforeend',`<article class="day"><div class="dow editable" contenteditable="true">${d.dow}</div><div class="icon editable" contenteditable="true">${d.icon}</div><div class="desc editable" contenteditable="true">${d.desc.replace(/\n/g,'<br>')}</div><div class="high editable" contenteditable="true">${d.high}</div><div class="low editable" contenteditable="true">${d.low}</div><div class="wind-label">WIND</div><div class="wind editable" contenteditable="true">${d.wind}</div></article>`);
+ });
+ controls.querySelectorAll('input').forEach(el=>el.addEventListener('input',e=>{const i=+e.target.dataset.i,k=e.target.dataset.k;defaults[i][k]=k==='desc'?e.target.value.replace(/\s*\/\s*/g,'\n'):e.target.value;render()}));
+}
+render();
+function bind(a,b){$(a).addEventListener('input',e=>$(b).textContent=e.target.value)}bind('regionInput','region');bind('updatedInput','updated');bind('storyInput','story');bind('avgHighInput','avgHigh');bind('avgLowInput','avgLow');bind('impactInput','impact');
+$('dateInput').addEventListener('input',e=>{const [a,b]=e.target.value.split('|');$('date').innerHTML=`${a||''}<br>${b||''}`});
+function readFile(input,cb){input.addEventListener('change',e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=()=>cb(r.result);r.readAsDataURL(f)})}
+readFile($('backgroundUpload'),u=>$('bg').style.backgroundImage=`url("${u}")`);readFile($('sponsorUpload'),u=>{$('sponsorImg').src=u;$('sponsorImg').style.display='inline-block';$('sponsorText').style.display='none'});
+let original='',enhanced='';readFile($('mapUpload'),u=>{original=u;enhanced='';$('bg').style.backgroundImage=`url("${u}")`;$('enhancedBtn').disabled=true;$('downloadMapBtn').disabled=true;setStatus('Official map loaded.','')});
+function setStatus(m,t=''){const e=$('status');e.textContent=m;e.className='status'+(t?' '+t:'')}function blob(u){const [m,d]=u.split(','),mime=(m.match(/data:(.*?);/)||[])[1]||'image/png',b=atob(d),a=new Uint8Array(b.length);for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return new Blob([a],{type:mime})}
+function imageFrom(p){if(p.image_url)return p.image_url;if(p.image_base64)return `data:image/png;base64,${p.image_base64}`;if(p.b64_json)return `data:image/png;base64,${p.b64_json}`;if(p.data?.[0]?.b64_json)return `data:image/png;base64,${p.data[0].b64_json}`;throw new Error('No image returned')}
+$('enhanceBtn').addEventListener('click',async()=>{if(!original)return setStatus('Upload an official map first.','error');$('enhanceBtn').disabled=true;setStatus('Enhancing map…','');try{const f=new FormData();f.append('image',blob(original),'official-map.png');f.append('mapType',$('mapType').value);f.append('prompt',$('promptInput').value);f.append('focusState','Indiana');f.append('preserveOfficialData','true');const r=await fetch($('endpointInput').value,{method:'POST',body:f});if(!r.ok)throw new Error(`${r.status}: ${(await r.text()).slice(0,150)}`);enhanced=imageFrom(await r.json());$('bg').style.backgroundImage=`url("${enhanced}")`;$('enhancedBtn').disabled=false;$('downloadMapBtn').disabled=false;setStatus('Enhanced map inserted. Verify it against the official map.','success')}catch(e){setStatus(`Enhancement failed: ${e.message}`,'error')}finally{$('enhanceBtn').disabled=false}});
+$('originalBtn').addEventListener('click',()=>{if(original)$('bg').style.backgroundImage=`url("${original}")`});$('enhancedBtn').addEventListener('click',()=>{if(enhanced)$('bg').style.backgroundImage=`url("${enhanced}")`});$('downloadMapBtn').addEventListener('click',()=>{if(!enhanced)return;const a=document.createElement('a');a.href=enhanced;a.download='weathervalet-enhanced-map.png';a.click()});
+$('exportBtn').addEventListener('click',async()=>{const t=canvas.style.transform;canvas.style.transform='none';const c=await html2canvas(canvas,{backgroundColor:null,scale:1,useCORS:true});const a=document.createElement('a');a.href=c.toDataURL('image/png');a.download='weathervalet-5-day-forecast.png';a.click();canvas.style.transform=t});$('resetBtn').addEventListener('click',()=>location.reload());
+</script>
+<script src="/graphics/assets/wv-fit.js"></script></body></html>

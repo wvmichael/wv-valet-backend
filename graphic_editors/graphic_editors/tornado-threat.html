@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WeatherValet Tornado Threat Editor</title>
+<style>
+:root{--red:#ef242d;--orange:#ff8b15;--yellow:#ffd21c}
+*{box-sizing:border-box}body{margin:0;background:#06101a;color:#fff;font-family:Arial,sans-serif}
+.app{display:grid;grid-template-columns:420px 1fr;min-height:100vh}.controls{padding:18px;background:#091522;overflow:auto}
+h1{margin:0 0 6px}.lead{font-size:13px;color:#98aabd}.group{border-top:1px solid #ffffff20;margin-top:14px;padding-top:14px}
+label{display:block;font-size:12px;font-weight:800;margin:8px 0 5px}input,textarea,button{width:100%;padding:9px;border-radius:8px;border:1px solid #ffffff25;background:#122034;color:#fff}
+textarea{min-height:68px}.actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:9px}button{background:#1579ff;font-weight:900}
+.stage{padding:20px}.shell{width:min(100%,1600px);aspect-ratio:16/9;position:relative}.canvas{position:absolute;width:1600px;height:900px;transform-origin:top left;overflow:hidden;background:linear-gradient(120deg,#07101a,#1b090b)}
+.bg{position:absolute;inset:0;background-size:cover;background-position:center;opacity:.55}.shade{position:absolute;inset:0;background:linear-gradient(90deg,#02070ff2,#02070fbd 38%,#02070f22 68%,#02070f88)}
+.logo{position:absolute;left:28px;top:18px;width:355px;max-height:90px;object-fit:contain;z-index:8}.updated,.source{position:absolute;top:20px;z-index:8;background:#08111ddd;border:1px solid #ffffff55;border-radius:14px;padding:11px 18px;text-align:center;font-weight:900}.updated{left:500px}.source{right:25px}
+.hero{position:absolute;left:25px;top:105px;width:520px;z-index:7}.headline{font-size:92px;line-height:.86;font-weight:950;letter-spacing:-5px}.headline span:last-child{color:var(--red)}
+.subline{display:inline-block;margin-top:15px;background:var(--red);padding:10px 24px;border-radius:10px;font-size:39px;font-weight:950}
+.takeaway{margin-top:16px;padding:18px 24px;border:2px solid var(--yellow);border-radius:20px;background:#08111ddd}.takeaway .small{font-size:29px;font-weight:900}.takeaway .big{font-size:60px;font-weight:950;color:var(--red)}.takeaway .bottom{font-size:23px;font-weight:800}
+.map{position:absolute;left:550px;right:38px;top:42px;height:590px;background-size:contain;background-position:center;background-repeat:no-repeat;z-index:4}
+.cards{position:absolute;left:34px;right:34px;bottom:112px;height:145px;display:grid;grid-template-columns:1fr 1fr 1.12fr;gap:14px;z-index:8}
+.card{border:2px solid;border-radius:22px;background:#07101de8;display:grid;grid-template-columns:95px 1fr;gap:15px;align-items:center;padding:18px}.card:nth-child(1){border-color:#a84cff}.card:nth-child(2){border-color:var(--orange)}.card:nth-child(3){border-color:var(--red)}
+.icon{font-size:50px;text-align:center}.title{font-size:26px;font-weight:950}.value{font-size:24px;font-weight:800;line-height:1.15;margin-top:6px}
+.action{position:absolute;left:34px;right:34px;bottom:28px;height:68px;border-radius:12px;background:var(--red);display:flex;align-items:center;justify-content:center;text-align:center;font-size:22px;font-weight:950;z-index:9}
+.site{position:absolute;bottom:2px;left:0;right:0;text-align:center}.ai{padding:12px;border:1px solid #19a8ff55;border-radius:12px;background:#0a1828}.status{font-size:12px;padding:8px;margin-top:8px;background:#07111e;border-radius:8px}
+</style>
+<link rel="stylesheet" href="/graphics/assets/wv-fit.css"></head>
+<body>
+<div class="app">
+<aside class="controls">
+<h1>Tornado Threat Editor</h1><p class="lead">One threat, one official map, three answers and one action bar.</p>
+<div class="group"><label>Headline Top</label><input id="ht" value="TORNADO"><label>Headline Bottom</label><input id="hb" value="THREAT"><label>Timeframe</label><input id="sl" value="SUNDAY AFTERNOON – EVENING"></div>
+<div class="group"><label>Main Takeaway</label><input id="pt" value="A FEW TORNADOES POSSIBLE"><label>Supporting Line</label><input id="st" value="STAY WEATHER AWARE. CONDITIONS CAN CHANGE."></div>
+<div class="group"><label>Where?</label><textarea id="wh">Greatest risk along and east of I-65.</textarea><label>When?</label><textarea id="wn">Sunday afternoon into Sunday evening.</textarea><label>Biggest Impact</label><textarea id="im">Tornadoes, large hail, damaging winds and dangerous storms.</textarea><label>Action Bar</label><input id="ac" value="KNOW YOUR SAFE PLACE • HAVE MULTIPLE WAYS TO RECEIVE WARNINGS • DON'T WAIT — TAKE ACTION"></div>
+<div class="group"><label>Storm Background</label><input id="bgup" type="file" accept="image/*"><label>Official SPC Tornado Map</label><input id="mapup" type="file" accept="image/*"></div>
+<div class="group ai"><strong>GPT Map Enhancement</strong><label>Endpoint</label><input id="mep" value="/api/weather-map-enhance"><label>Instructions</label><textarea id="mp">Preserve exact Indiana geography, SPC tornado probabilities, significant-tornado hatching, colors, labels, cities, counties and legend. Improve only crop, contrast and hierarchy.</textarea><div class="actions"><button id="enh">Enhance Map</button><button id="orig">Use Original</button></div><div id="ms" class="status">Upload an official map.</div></div>
+<div class="group ai"><strong>GPT Tornado Summary</strong><label>Guidance</label><textarea id="gd">A few tornadoes are possible along and east of I-65 Sunday afternoon into Sunday evening. Large hail and damaging winds are also possible. Conditions may change.</textarea><label>Endpoint</label><input id="sep" value="/api/tornado-threat-summary"><button id="sum">Build Copy</button><div id="ss" class="status">Paste guidance and build concise copy.</div></div>
+<div class="actions"><button id="exp">Export PNG</button><button onclick="location.reload()">Reset</button></div>
+</aside>
+<main class="stage"><div id="shell" class="shell"><section id="canvas" class="canvas">
+<div id="bg" class="bg"></div><div class="shade"></div><img src="/graphics/assets/weathervalet-logo-white.png" class="logo">
+<div class="updated">UPDATED<br>MAY 17, 2025 • 8:30 AM EDT</div><div class="source">OFFICIAL SOURCE<br>STORM PREDICTION CENTER</div>
+<div class="hero"><div class="headline"><span id="oht">TORNADO</span><br><span id="ohb">THREAT</span></div><div id="osl" class="subline">SUNDAY AFTERNOON – EVENING</div><div class="takeaway"><div class="small">MAIN TAKEAWAY</div><div id="opt" class="big">A FEW TORNADOES POSSIBLE</div><div id="ost" class="bottom">STAY WEATHER AWARE. CONDITIONS CAN CHANGE.</div></div></div>
+<div id="map" class="map"></div>
+<div class="cards"><div class="card"><div class="icon">📍</div><div><div class="title">WHERE?</div><div id="owh" class="value">Greatest risk along and east of I-65.</div></div></div><div class="card"><div class="icon">🕒</div><div><div class="title">WHEN?</div><div id="own" class="value">Sunday afternoon into Sunday evening.</div></div></div><div class="card"><div class="icon">⚠️</div><div><div class="title">BIGGEST IMPACT</div><div id="oim" class="value">Tornadoes, large hail, damaging winds and dangerous storms.</div></div></div></div>
+<div id="oac" class="action">KNOW YOUR SAFE PLACE • HAVE MULTIPLE WAYS TO RECEIVE WARNINGS • DON'T WAIT — TAKE ACTION</div><div class="site">weathervalet.ai</div>
+</section></div></main></div>
+<script src="/graphics/assets/html2canvas.min.js"></script>
+<script>
+const $=x=>document.getElementById(x),c=$('canvas'),s=$('shell');function fit(){let z=s.clientWidth/1600;c.style.transform=`scale(${z})`;s.style.height=`${900*z}px`}addEventListener('resize',fit);fit();
+[['ht','oht'],['hb','ohb'],['sl','osl'],['pt','opt'],['st','ost'],['wh','owh'],['wn','own'],['im','oim'],['ac','oac']].forEach(([a,b])=>$(a).oninput=e=>{$(b).textContent=e.target.value;fitHero()});
+function fitHero(){const hero=document.querySelector('.hero'),big=$('opt'),bot=$('ost');let bigSize=60,botSize=23;big.style.fontSize=bigSize+'px';bot.style.fontSize=botSize+'px';const limit=635;let guard=0;while(hero.offsetTop+hero.offsetHeight>limit&&bigSize>32&&guard<40){bigSize-=2;botSize=Math.max(15,botSize-1);big.style.fontSize=bigSize+'px';bot.style.fontSize=botSize+'px';guard++}}fitHero();
+$('bgup').onchange=e=>{let f=e.target.files[0];if(!f)return;let r=new FileReader();r.onload=()=>$('bg').style.backgroundImage=`url("${r.result}")`;r.readAsDataURL(f)}
+let original='';$('mapup').onchange=e=>{let f=e.target.files[0];if(!f)return;let r=new FileReader();r.onload=()=>{original=r.result;$('map').style.backgroundImage=`url("${original}")`;$('ms').textContent='Official map loaded.'};r.readAsDataURL(f)}
+$('orig').onclick=()=>{if(original)$('map').style.backgroundImage=`url("${original}")`}
+$('enh').onclick=async()=>{if(!original)return $('ms').textContent='Upload a map first.';let [h,d]=original.split(','),b=atob(d),a=new Uint8Array(b.length);for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);let fd=new FormData();fd.append('image',new Blob([a],{type:'image/png'}),'map.png');fd.append('prompt',$('mp').value);$('ms').textContent='Enhancing…';try{let r=await fetch($('mep').value,{method:'POST',body:fd}),p=await r.json();let u=p.image_url||p.url||(p.image_base64?`data:image/png;base64,${p.image_base64}`:'');if(!u)throw Error('No image returned');$('map').style.backgroundImage=`url("${u}")`;$('ms').textContent='Enhanced. Verify against official source.'}catch(e){$('ms').textContent='Failed: '+e.message}}
+$('sum').onclick=async()=>{try{let r=await fetch($('sep').value,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({guidance:$('gd').value})}),p=await r.json();[['pt','mainTakeaway'],['st','supportingLine'],['wh','where'],['wn','when'],['im','biggestImpact']].forEach(([id,k])=>{if(p[k]){$(id).value=p[k];$(id).dispatchEvent(new Event('input'))}});$('ss').textContent='Copy built. Review before publishing.'}catch(e){$('ss').textContent='Failed: '+e.message}}
+$('exp').onclick=async()=>{let t=c.style.transform;c.style.transform='none';let out=await html2canvas(c,{scale:1,useCORS:true});let a=document.createElement('a');a.href=out.toDataURL('image/png');a.download='weathervalet-tornado-threat.png';a.click();c.style.transform=t}
+</script><script src="/graphics/assets/wv-fit.js"></script></body></html>
