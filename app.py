@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-92"
+BACKEND_BUILD = "0702-93"
 
 
 def _epoch_ms(ts):
@@ -22500,14 +22500,26 @@ def _field_rain_totals(lat: float, lng: float, plant_date: str) -> Optional[dict
     hourly = recent.get("hourly") or {}
     htimes = hourly.get("time") or []
     hvals = hourly.get("precipitation") or []
-    now_iso = _dt.datetime.now().strftime("%Y-%m-%dT%H:00")
-    cutoff = (_dt.datetime.now() - _dt.timedelta(hours=24)).strftime("%Y-%m-%dT%H:00")
-    last24 = sum((v or 0) for t, v in zip(htimes, hvals) if cutoff <= t <= now_iso)
-    dvals = (recent.get("daily") or {}).get("precipitation_sum") or []
-    dtimes = (recent.get("daily") or {}).get("time") or []
-    last7 = sum((v or 0) for t, v in zip(dtimes, dvals) if t <= today.isoformat())
-    since_plant = last7
+    # July 24, 2026: the server runs on UTC but Open-Meteo returns each
+    # field's hours in LOCAL time. The old window used the server clock,
+    # so it dropped last evening (when High Plains storms actually fire)
+    # and counted a few hours of future forecast instead. Use the field's
+    # own offset for every comparison from here down.
+    off = int(recent.get("utc_offset_seconds") or 0)
+    local_now = (_dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
+                 + _dt.timedelta(seconds=off))
+    today = local_now.date()
+    now_iso = local_now.strftime("%Y-%m-%dT%H:00")
+    cut24 = (local_now - _dt.timedelta(hours=24)).strftime("%Y-%m-%dT%H:00")
+    cut7 = (local_now - _dt.timedelta(days=7)).strftime("%Y-%m-%dT%H:00")
+    last24 = sum((v or 0) for t, v in zip(htimes, hvals) if cut24 < t <= now_iso)
+    # Hourly rather than daily totals, so today's number is rain that has
+    # already fallen instead of the rest of today's forecast.
+    last7 = sum((v or 0) for t, v in zip(htimes, hvals) if cut7 < t <= now_iso)
     window_start = today - _dt.timedelta(days=7)
+    start_dt = pd if pd > window_start else window_start
+    since_plant = sum((v or 0) for t, v in zip(htimes, hvals)
+                      if start_dt.isoformat() + "T00:00" <= t <= now_iso)
     def _gdd_day(tmax, tmin):
         # Corn/milo standard: base 50F, cap 86F, floor at base.
         if tmax is None or tmin is None:
