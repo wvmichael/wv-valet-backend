@@ -220,7 +220,14 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-95"
+BACKEND_BUILD = "0702-96"
+
+# Resend key as a module-level name (July 24, 2026). Two email senders,
+# team invites and Crew welcome emails, referenced this bare name but it
+# was never defined, so every one of those sends failed with a NameError
+# and retried forever. Everywhere else reads the env var locally; this
+# one line makes the bare references work too.
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
 
 
 def _epoch_ms(ts):
