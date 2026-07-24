@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-91"
+BACKEND_BUILD = "0702-92"
 
 
 def _epoch_ms(ts):
@@ -14815,10 +14815,9 @@ def admin_add_field(user_id):
         return jsonify({"ok": False, "error": "need-label-and-where"}), 400
     lat = lng = None
     addr = where
-    import re as _re
-    m = _re.match(r"^\s*(-?\d{1,2}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)\s*$", where)
-    if m:
-        lat, lng = float(m.group(1)), float(m.group(2))
+    pair = _parse_latlng(where)
+    if pair:
+        lat, lng = pair
         addr = f"{lat:.5f}, {lng:.5f}"
     else:
         geo = _geocode_address(where)
@@ -14968,14 +14967,11 @@ def fields_page():
             where = (request.form.get("where") or "").strip()
             plant = (request.form.get("plant") or "").strip()[:10] or None
             if label and where:
-                import re as _re
-                m = _re.match(r"^\s*(-?\d{1,2}(?:\.\d+)?)\s*,?\s*(-?\d{1,3}(?:\.\d+)?)\s*$", where)
+                pair = _parse_latlng(where)
                 lat = lng = None
                 addr = where
-                if m:
-                    lat, lng = float(m.group(1)), float(m.group(2))
-                    if lng > 50:
-                        lng = -lng  # farmers write "101.36" meaning west; add the minus for them
+                if pair:
+                    lat, lng = pair
                     addr = f"{lat:.5f}, {lng:.5f}"
                 else:
                     geo = _geocode_address(where)
@@ -15060,11 +15056,18 @@ def fields_page():
             seen_points[pt] = seen_points.get(pt, 0) + 1
             named = r.get("address_text") or ""
             spot = pt if named.replace(" ", "").replace(",", "").replace("-", "").replace(".", "").isdigit() else (named + " &rarr; " + pt if named else pt)
+            # No plant date means no honest "since planting" number. Show
+            # dashes rather than the internal April 15 fallback, which
+            # read as if the farmer had told us something he never did.
+            if r.get("plant_date"):
+                since_c = f"<td>{t['since_plant']:.2f}\"</td><td>{t['gdd']}</td><td>{t['plant_date']}</td>"
+            else:
+                since_c = ("<td class=none>&mdash;</td><td class=none>&mdash;</td>"
+                           "<td class=none>no plant date</td>")
             rows_html += (f"<tr><td><b>{r.get('label') or 'Field'}</b>"
                           f"<div class=pt>{spot}</div></td>"
                           f"<td>{t['last24']:.2f}\"</td><td>{t['last7']:.2f}\"</td>"
-                          f"<td>{t['since_plant']:.2f}\"</td><td>{t['gdd']}</td>"
-                          f"<td>{t['plant_date']}</td><td>{delbtn}</td></tr>")
+                          + since_c + f"<td>{delbtn}</td></tr>")
         if not rows_html:
             rows_html = "<tr><td colspan=7 style=opacity:0.6>No fields yet. Add the first one below.</td></tr>"
         dupes = [p for p, n in seen_points.items() if n > 1]
@@ -15085,8 +15088,10 @@ def fields_page():
             "<input name=where placeholder=\"GPS 39.57,-101.36 or address\" required size=24> "
             "<input name=plant type=date title=\"plant date\"> "
             "<button class=primary>Add field</button></form>"
-            "<p style=\"opacity:0.6;font-size:13px\">Coordinates: north number first, then the west number. "
-            "Forget the minus sign on the west number? We add it for you.</p>")
+            "<p style=\"opacity:0.6;font-size:13px\">Coordinates go in any usual form: "
+            "39.57,-101.36 or 39.57N 101.36W or 39 34 12 N 101 21 36 W. North number first. "
+            "Forget the minus sign on the west number? We add it for you. "
+            "Anything with words in it is treated as an address instead.</p>")
     opts = "".join(
         f"<option value={r['id']}{' selected' if sel and int(sel)==r['id'] else ''}>{r['nm']}</option>"
         for r in subs)
@@ -15106,6 +15111,7 @@ def fields_page():
             ".warn{background:#2a2415;border:1px solid #a83;color:#fd9;padding:8px 12px;"
             "border-radius:6px;margin:10px 0;font-size:13px}"
             ".pt{font-family:ui-monospace,monospace;font-size:11.5px;opacity:0.6}"
+            "td.none{opacity:0.4}"
             "</style></head><body>"
             "<h2>Field Rain &amp; GDD</h2>"
             "<p style=\"opacity:0.7\">Pick a subscriber. Fields show rain last 24 hr, last 7 days, "
@@ -22414,6 +22420,57 @@ def _fetch_openmeteo_json(url: str) -> Optional[dict]:
     except Exception as e:
         print(f"[rain-fetch] failed: {e!r}", flush=True)
         return None
+
+
+def _parse_latlng(text: str):
+    """Read coordinates the way a farmer actually types them (July 24,
+    2026). John texted "39.57N 101.36W" and the old check only accepted
+    bare numbers, so it silently fell through to the address lookup and
+    stored a place named "Th Co Ee, Kansas". Accepts decimal degrees,
+    degrees+minutes, and degrees+minutes+seconds, with or without
+    N/S/E/W. Returns (lat, lng) or None if this looks like an address.
+    """
+    import re as _re
+    if not text:
+        return None
+    t = text.upper()
+    for ch in ("\u00b0", "\u00ba", "\u2019", "\u2018", "\u201c", "\u201d", "'", '"', ",", ";", "/"):
+        t = t.replace(ch, " ")
+    # Anything with real words in it is an address, not coordinates.
+    if _re.sub(r"[NSEW\s\d.+\-]", "", t):
+        return None
+    nums = _re.findall(r"[+-]?\d+(?:\.\d+)?", t)
+    if len(nums) not in (2, 4, 6):
+        return None
+    vals = [float(n) for n in nums]
+    per = len(vals) // 2
+    def _dms(parts):
+        deg = parts[0]
+        sign = -1.0 if deg < 0 else 1.0
+        out = abs(deg)
+        if len(parts) > 1:
+            out += parts[1] / 60.0
+        if len(parts) > 2:
+            out += parts[2] / 3600.0
+        return sign * out
+    lat = _dms(vals[:per])
+    lng = _dms(vals[per:])
+    hemis = _re.findall(r"[NSEW]", t)
+    if "S" in hemis:
+        lat = -abs(lat)
+    elif "N" in hemis:
+        lat = abs(lat)
+    if "W" in hemis:
+        lng = -abs(lng)
+    elif "E" in hemis:
+        lng = abs(lng)
+    elif lng > 50:
+        # No hemisphere given and a big positive longitude: our farmers
+        # mean west, so add the minus for them.
+        lng = -lng
+    if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lng <= 180.0):
+        return None
+    return (round(lat, 6), round(lng, 6))
 
 
 def _field_rain_totals(lat: float, lng: float, plant_date: str) -> Optional[dict]:
