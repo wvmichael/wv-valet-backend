@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-89"
+BACKEND_BUILD = "0702-91"
 
 
 def _epoch_ms(ts):
@@ -15024,6 +15024,7 @@ def fields_page():
         subs = []
     rows_html = ""
     section = ""
+    seen_points = {}
     if sel:
         sel_i = int(sel)
         if not is_admin and sel_i not in _met_subscriber_ids(user["id"]):
@@ -15055,16 +15056,29 @@ def fields_page():
                           f"<input type=hidden name=loc value={r['id']}>"
                           "<button style='background:none;border:none;color:#c33;"
                           "font-weight:bold;cursor:pointer'>&times;</button></form>")
-            rows_html += (f"<tr><td><b>{r.get('label') or 'Field'}</b></td>"
+            pt = f"{float(r['lat']):.4f}, {float(r['lng']):.4f}"
+            seen_points[pt] = seen_points.get(pt, 0) + 1
+            named = r.get("address_text") or ""
+            spot = pt if named.replace(" ", "").replace(",", "").replace("-", "").replace(".", "").isdigit() else (named + " &rarr; " + pt if named else pt)
+            rows_html += (f"<tr><td><b>{r.get('label') or 'Field'}</b>"
+                          f"<div class=pt>{spot}</div></td>"
                           f"<td>{t['last24']:.2f}\"</td><td>{t['last7']:.2f}\"</td>"
                           f"<td>{t['since_plant']:.2f}\"</td><td>{t['gdd']}</td>"
                           f"<td>{t['plant_date']}</td><td>{delbtn}</td></tr>")
         if not rows_html:
             rows_html = "<tr><td colspan=7 style=opacity:0.6>No fields yet. Add the first one below.</td></tr>"
+        dupes = [p for p, n in seen_points.items() if n > 1]
+        dupe_note = ""
+        if dupes:
+            dupe_note = ("<div class=warn>More than one row is sitting on the same point ("
+                         + "; ".join(dupes) + "). Rows on the same point will always show the "
+                         "same rain. Enter each field's own pin-drop coordinates to separate them. "
+                         "Also note the weather model grid is about 6 to 10 miles wide, so fields "
+                         "closer than that can match even with different pins.</div>")
         section = (
             "<table><tr><th>Field</th><th>24 hr</th><th>7 day</th><th>Since plant</th>"
-            "<th>GDD</th><th>Planted</th><th></th></tr>" + rows_html + "</table>"
-            "<h3>Add a field</h3>"
+            "<th>GDD</th><th>Planted</th><th></th></tr>" + rows_html + "</table>" + dupe_note
+            + "<h3>Add a field</h3>"
             "<form method=post>"
             f"<input type=hidden name=sub value={sel_i}>"
             "<input name=label placeholder=\"field name (Milo early)\" required> "
@@ -15088,7 +15102,11 @@ def fields_page():
             "background:#1c212c;color:#fff;font-size:14px}"
             "button.primary{background:#2E4FB8;border:none;font-weight:700;cursor:pointer}"
             ".msg{background:#1d2a1d;border:1px solid #2f5;color:#bfa;padding:8px 12px;"
-            "border-radius:6px;margin:10px 0}</style></head><body>"
+            "border-radius:6px;margin:10px 0}"
+            ".warn{background:#2a2415;border:1px solid #a83;color:#fd9;padding:8px 12px;"
+            "border-radius:6px;margin:10px 0;font-size:13px}"
+            ".pt{font-family:ui-monospace,monospace;font-size:11.5px;opacity:0.6}"
+            "</style></head><body>"
             "<h2>Field Rain &amp; GDD</h2>"
             "<p style=\"opacity:0.7\">Pick a subscriber. Fields show rain last 24 hr, last 7 days, "
             "since planting, and GDD. Estimates from model data.</p>"
