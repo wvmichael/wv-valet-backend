@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-96"
+BACKEND_BUILD = "0702-97"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -701,6 +701,23 @@ CREATE TABLE IF NOT EXISTS business_trial_intakes (
     user_id BIGINT
 );
 CREATE INDEX IF NOT EXISTS idx_bti_phone10 ON business_trial_intakes (phone_last10);
+
+-- ── TRIAL keyword signups (July 24, 2026) ──
+-- A brand-new prospect texts the single word TRIAL to the main line
+-- (direct-mail letter campaign). One row per signup: the raw inbound
+-- text is the written consent record, with a timestamp, for carrier
+-- and TCPA purposes. state walks awaiting_address -> complete.
+CREATE TABLE IF NOT EXISTS trial_keyword_signups (
+    id            SERIAL PRIMARY KEY,
+    phone_last10  TEXT NOT NULL,
+    raw_message   TEXT NOT NULL,          -- the exact inbound text, verbatim
+    consent_at    BIGINT NOT NULL,        -- ms since epoch, when TRIAL arrived
+    user_id       INTEGER,                -- the account we created
+    address_text  TEXT,                   -- their follow-up reply, verbatim
+    state         TEXT NOT NULL DEFAULT 'awaiting_address',
+    created_at    BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tks_phone10 ON trial_keyword_signups (phone_last10);
 
 -- July 2026: Onboarding Hub. Versioned policy acknowledgments and native
 -- onboarding forms for Mets and sales reps. Crew keeps its simple intro.
@@ -40539,6 +40556,179 @@ def _crew_line_inbound(from_phone: str, body: str):
                   "being our eyes on the ground!")
 
 
+def _looks_like_trial_keyword(body: str) -> bool:
+    """True when an inbound text is someone answering the letter campaign:
+    the message starts with the word TRIAL and is short. 'TRIAL',
+    'Trial please', 'TRIAL!' all count. 'My trial ended' does not."""
+    words = re.findall(r"[A-Za-z]+", (body or "").upper())
+    return bool(words) and words[0] == "TRIAL" and len(body or "") <= 60
+
+
+def _handle_trial_keyword(from_phone: str, body: str):
+    """A prospect texted TRIAL to the main line (July 24, 2026).
+
+    Creates a 30 day pro trial keyed to their phone, logs the inbound
+    text verbatim as the consent record, replies asking for their town
+    or job site, and emails the team. Mirrors _activate_business_intake
+    where possible so keyword signups behave like every other trial.
+    A placeholder email (trial-<last10>@sms-signup.weathervalet.ai)
+    satisfies the users.email NOT NULL constraint until the team
+    collects a real one; it is deterministic so repeats reuse the row.
+    """
+    now = now_ts()
+    last10 = _phone_last10(from_phone)
+    if not last10:
+        return ("<?xml version='1.0' encoding='UTF-8'?><Response/>",
+                200, {"Content-Type": "text/xml"})
+
+    # Existing account with this phone? Never hijack a real user.
+    existing_id = None
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id FROM users
+                        WHERE RIGHT(regexp_replace(COALESCE(phone, ''),
+                                    '\\D', '', 'g'), 10) = %s
+                          AND is_active = TRUE
+                        LIMIT 1""",
+                    (last10,))
+                row = cur.fetchone()
+                if row:
+                    existing_id = row["id"]
+    except Exception as e:
+        print(f"[trial-keyword] existing lookup failed: {e!r}", flush=True)
+
+    if existing_id:
+        reply = ("You're already set up with WeatherValet! Questions? Just "
+                 "reply here and a real Meteorologist will answer.")
+        twiml = ("<?xml version='1.0' encoding='UTF-8'?><Response><Message>"
+                 + escape_xml(reply) + "</Message></Response>")
+        return (twiml, 200, {"Content-Type": "text/xml"})
+
+    placeholder_email = f"trial-{last10}@sms-signup.weathervalet.ai"
+    ends = now + BOONE_TRIAL_DAYS * 24 * 60 * 60
+    user_id = None
+    try:
+        with db() as conn:
+            user_id = _get_or_create_user(placeholder_email, conn)
+            _grant_subscriber_role(user_id, conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE users
+                          SET subscription_tier = 'pro_single',
+                              phone = COALESCE(NULLIF(phone, ''), %s),
+                              trial_cohort = 'sms_keyword',
+                              trial_category = 'letter',
+                              trial_started_at = %s,
+                              trial_ends_at = %s,
+                              trial_status = 'active',
+                              operational_sms_consent_at = %s
+                        WHERE id = %s""",
+                    (from_phone, now, ends, now * 1000, user_id))
+                cur.execute(
+                    """INSERT INTO trial_keyword_signups
+                         (phone_last10, raw_message, consent_at, user_id,
+                          state, created_at)
+                       VALUES (%s,%s,%s,%s,'awaiting_address',%s)""",
+                    (last10, (body or "")[:500], now * 1000, user_id,
+                     now * 1000))
+    except Exception as e:
+        print(f"[trial-keyword] signup failed for {last10}: {e!r}", flush=True)
+        reply = ("Something went wrong starting your trial. Please email "
+                 "hello@weathervalet.ai and a real person will set you up.")
+        twiml = ("<?xml version='1.0' encoding='UTF-8'?><Response><Message>"
+                 + escape_xml(reply) + "</Message></Response>")
+        return (twiml, 200, {"Content-Type": "text/xml"})
+
+    try:
+        _send_team_notification(
+            subject=f"New TRIAL keyword signup: {from_phone}",
+            html_body=(f"<p><b>{_html_escape(from_phone)}</b> texted TRIAL to the "
+                       f"main line and a 30 day pro trial was created "
+                       f"(user id {user_id}). They were asked to reply with "
+                       f"their town or job site. Set their name, email, "
+                       f"location, and Meteorologist in the Control Center "
+                       f"when their reply lands.</p>"),
+            text_body=(f"{from_phone} texted TRIAL. 30 day trial created "
+                       f"(user id {user_id}). Awaiting their address reply."))
+    except Exception as e:
+        print(f"[trial-keyword] team notification failed: {e!r}", flush=True)
+
+    print(f"[trial-keyword] signup created user={user_id} phone={last10}",
+          flush=True)
+    reply = ("Welcome to WeatherValet! Your free 30 day trial is on. Reply "
+             "with your town or job site address so your Meteorologist knows "
+             "where to watch the sky for you. No app, no card needed.")
+    twiml = ("<?xml version='1.0' encoding='UTF-8'?><Response><Message>"
+             + escape_xml(reply) + "</Message></Response>")
+    return (twiml, 200, {"Content-Type": "text/xml"})
+
+
+def _handle_trial_address_reply(from_phone: str, body: str, signup):
+    """The follow-up text after a TRIAL signup is their location.
+    Store it verbatim, try to geocode it into their primary saved
+    location the same way the YES flow does, tell the team, thank them."""
+    now = now_ts()
+    user_id = signup.get("user_id")
+    geocoded = ""
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE trial_keyword_signups
+                          SET address_text = %s, state = 'complete'
+                        WHERE id = %s""",
+                    ((body or "")[:300], signup["id"]))
+            if user_id:
+                try:
+                    geo = _geocode_address(body)
+                    if geo and _geocode_looks_confident(body, geo):
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """UPDATE saved_locations SET is_primary = FALSE
+                                    WHERE user_id = %s AND is_primary = TRUE""",
+                                (user_id,))
+                            cur.execute(
+                                """INSERT INTO saved_locations
+                                     (user_id, label, address_text, lat, lng,
+                                      county, is_primary, created_at, updated_at)
+                                   VALUES (%s,%s,%s,%s,%s,%s,TRUE,%s,%s)""",
+                                (user_id, (body or "")[:80], (body or "")[:300],
+                                 geo["lat"], geo["lng"], geo.get("county"),
+                                 now * 1000, now * 1000))
+                            cur.execute(
+                                """UPDATE users SET timezone = %s
+                                    WHERE id = %s
+                                      AND (timezone IS NULL OR timezone = ''
+                                           OR timezone = 'America/Indiana/Indianapolis')""",
+                                (_approx_us_tz_from_lng(geo["lng"]), user_id))
+                        geocoded = " Location was placed on the map automatically."
+                except Exception as e:
+                    print(f"[trial-keyword] geocode failed: {e!r}", flush=True)
+    except Exception as e:
+        print(f"[trial-keyword] address store failed: {e!r}", flush=True)
+
+    try:
+        _send_team_notification(
+            subject=f"TRIAL signup replied with location: {from_phone}",
+            html_body=(f"<p><b>{_html_escape(from_phone)}</b> (user id {user_id}) "
+                       f"replied: <b>{_html_escape((body or '')[:300])}</b>."
+                       f"{geocoded} Finish their setup in the Control Center: "
+                       f"name, email, and Meteorologist.</p>"),
+            text_body=(f"{from_phone} (user id {user_id}) replied: "
+                       f"{(body or '')[:300]}.{geocoded}"))
+    except Exception as e:
+        print(f"[trial-keyword] address notification failed: {e!r}", flush=True)
+
+    reply = ("Got it! Your Meteorologist will start watching the sky there. "
+             "Watch for your first forecast soon. Questions anytime? Just "
+             "reply here and a real person answers.")
+    twiml = ("<?xml version='1.0' encoding='UTF-8'?><Response><Message>"
+             + escape_xml(reply) + "</Message></Response>")
+    return (twiml, 200, {"Content-Type": "text/xml"})
+
+
 @app.route("/api/v1/sms-inbound-router", methods=["OPTIONS"])
 def _sms_inbound_router_preflight():
     return ("", 204)
@@ -40574,6 +40764,31 @@ def sms_inbound_router():
     if TWILIO_CREW_NUMBER and _phone_last10(to_phone) == _phone_last10(TWILIO_CREW_NUMBER):
         print(f"[sms-router] crew line from={from_phone} body_len={len(body)}", flush=True)
         return _crew_line_inbound(from_phone, body)
+
+    # ── TRIAL keyword signup (July 24, 2026): a letter-campaign prospect
+    # texting the single word TRIAL becomes a 30 day trial on the spot.
+    # Checked before user matching because no account exists yet, and
+    # before the awaiting-address capture so a repeat TRIAL is not
+    # mistaken for a location.
+    if _looks_like_trial_keyword(body):
+        return _handle_trial_keyword(from_phone, body)
+
+    # A fresh TRIAL signup's next text is their town or job site.
+    if from_phone and body.strip().upper() not in ("STOP", "NO", "YES", "Y"):
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT * FROM trial_keyword_signups
+                            WHERE phone_last10 = %s AND state = 'awaiting_address'
+                            ORDER BY created_at DESC LIMIT 1""",
+                        (_phone_last10(from_phone),))
+                    _tks = cur.fetchone()
+        except Exception as e:
+            print(f"[sms-router] tks lookup failed: {e!r}", flush=True)
+            _tks = None
+        if _tks:
+            return _handle_trial_address_reply(from_phone, body, _tks)
 
     # ── Business-trial consent (July 2026): a pending intake's prospect
     # texting YES on the main line IS their signup. Checked before user
