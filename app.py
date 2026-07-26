@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-98"
+BACKEND_BUILD = "0702-99"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -433,6 +433,18 @@ REVIEW_CLAIM_TTL_MINUTES = 30
 #   - All other column types (TEXT, etc.) are identical.
 
 SCHEMA = """
+-- users first: nearly everything references users(id), so on a fresh
+-- database it must exist before any other table (July 24, 2026 fix).
+CREATE TABLE IF NOT EXISTS users (
+    id              SERIAL PRIMARY KEY,
+    email           TEXT UNIQUE NOT NULL,
+    password_hash   TEXT,                       -- bcrypt hash; nullable for legacy accounts
+    name            TEXT,                       -- nullable; collected after first login
+    created_at      BIGINT NOT NULL,
+    last_login_at   BIGINT                      -- null until first successful login
+);
+CREATE INDEX IF NOT EXISTS idx_users_email_lower ON users(LOWER(email));
+
 CREATE TABLE IF NOT EXISTS verification_requests (
     id                  SERIAL PRIMARY KEY,
     created_at          BIGINT NOT NULL,
@@ -564,15 +576,8 @@ CREATE INDEX IF NOT EXISTS idx_briefs_meteorologist ON brief_submissions(meteoro
 -- in via password; they need to set one via the password-reset flow
 -- (which uses the magic-link infrastructure we kept around for that
 -- purpose).
-CREATE TABLE IF NOT EXISTS users (
-    id              SERIAL PRIMARY KEY,
-    email           TEXT UNIQUE NOT NULL,
-    password_hash   TEXT,                       -- bcrypt hash; nullable for legacy accounts
-    name            TEXT,                       -- nullable; collected after first login
-    created_at      BIGINT NOT NULL,
-    last_login_at   BIGINT                      -- null until first successful login
-);
-CREATE INDEX IF NOT EXISTS idx_users_email_lower ON users(LOWER(email));
+-- users table is created at the TOP of this schema (moved July 24, 2026:
+-- earlier tables reference users(id), which broke fresh-database boots).
 
 -- Existing-deploy migration: if the users table was created before
 -- password_hash existed, add the column. Postgres makes this idempotent
@@ -815,9 +820,9 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_commission_cents INTEGER NOT NU
 -- Set by admin; powers the Command Center totals board.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS is_discounted BOOLEAN NOT NULL DEFAULT FALSE;
 
--- Met recognition (July 2026): a personal thanks sent from the Crew line.
-ALTER TABLE crew_reports ADD COLUMN IF NOT EXISTS thanked_at BIGINT;
-ALTER TABLE crew_reports ADD COLUMN IF NOT EXISTS thanked_by_name TEXT;
+-- (crew_reports thanked_at/thanked_by_name migrations moved below the
+--  crew_reports CREATE, July 24, 2026: they ran before the table existed
+--  on fresh databases.)
 
 -- Phase 10 Met tips: track which Met completed each verification + a
 -- customer-facing token for the review/tip page (separate from Met's
@@ -2470,6 +2475,10 @@ CREATE TABLE IF NOT EXISTS crew_reports (
     is_hidden       BOOLEAN NOT NULL DEFAULT FALSE,  -- admin moderation soft-hide
     created_at      BIGINT NOT NULL
 );
+
+-- Met recognition (July 2026): a personal thanks sent from the Crew line.
+ALTER TABLE crew_reports ADD COLUMN IF NOT EXISTS thanked_at BIGINT;
+ALTER TABLE crew_reports ADD COLUMN IF NOT EXISTS thanked_by_name TEXT;
 CREATE INDEX IF NOT EXISTS idx_crew_reports_user
     ON crew_reports(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_crew_reports_recent
