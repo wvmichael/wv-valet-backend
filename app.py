@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-97"
+BACKEND_BUILD = "0702-98"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -718,6 +718,22 @@ CREATE TABLE IF NOT EXISTS trial_keyword_signups (
     created_at    BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tks_phone10 ON trial_keyword_signups (phone_last10);
+
+-- ── Field gauge readings (July 24, 2026) ──
+-- Ground truth beats the model. A Met (or later the farmer) enters a
+-- rain gauge reading for one field on one date. Totals on the Field
+-- Rain page then show BOTH numbers side by side: the model estimate
+-- and the gauge sum, honestly labeled, and the reader picks.
+CREATE TABLE IF NOT EXISTS field_gauge_readings (
+    id             SERIAL PRIMARY KEY,
+    location_id    INTEGER NOT NULL,      -- saved_locations.id (the field)
+    reading_inches REAL NOT NULL,
+    reading_date   TEXT NOT NULL,         -- YYYY-MM-DD the rain fell
+    note           TEXT,
+    entered_by     INTEGER,               -- users.id of who typed it
+    created_at     BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fgr_loc ON field_gauge_readings (location_id);
 
 -- July 2026: Onboarding Hub. Versioned policy acknowledgments and native
 -- onboarding forms for Mets and sales reps. Crew keeps its simple intro.
@@ -15250,6 +15266,50 @@ for _wv_sum_path in _WV_SUMMARY_ENDPOINTS:
 
 
 
+def _field_gauge_totals(location_id: int, plant_date: str):
+    """Sum the gauge readings for one field over the same three windows
+    the model estimate uses (July 24, 2026). Day-granularity: last 24 hr
+    means readings dated today or yesterday. Returns None when the field
+    has no readings at all, so the page can stay quiet about gauges for
+    fields that never use them."""
+    import datetime as _dt
+    today = _dt.date.today()
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT reading_inches, reading_date
+                         FROM field_gauge_readings
+                        WHERE location_id = %s""", (location_id,))
+                rows = cur.fetchall()
+    except Exception as e:
+        print(f"[gauge] totals failed loc={location_id}: {e!r}", flush=True)
+        return None
+    if not rows:
+        return None
+    g24 = g7 = gsince = 0.0
+    n = 0
+    pd = None
+    try:
+        pd = _dt.date.fromisoformat((plant_date or "")[:10])
+    except Exception:
+        pd = None
+    for r in rows:
+        try:
+            d = _dt.date.fromisoformat((r["reading_date"] or "")[:10])
+            amt = float(r["reading_inches"] or 0)
+        except Exception:
+            continue
+        n += 1
+        if (today - d).days <= 1:
+            g24 += amt
+        if (today - d).days <= 7:
+            g7 += amt
+        if pd and d >= pd:
+            gsince += amt
+    return {"g24": g24, "g7": g7, "gsince": gsince if pd else None, "count": n}
+
+
 @app.route("/fields", methods=["GET", "POST"])
 def fields_page():
     """Standalone Field Rain page (July 23, 2026). Server-rendered,
@@ -15268,6 +15328,57 @@ def fields_page():
         if not is_admin and sub_id not in _met_subscriber_ids(user["id"]):
             return ("forbidden", 403)
         action = request.form.get("action") or "add"
+        if action == "gauge":
+            loc_id = int(request.form.get("loc") or 0)
+            try:
+                amount = float(request.form.get("amount") or "")
+            except Exception:
+                amount = -1
+            rdate = (request.form.get("rdate") or "").strip()[:10]
+            note = (request.form.get("note") or "").strip()[:120]
+            if not rdate:
+                import datetime as _dt
+                rdate = _dt.date.today().isoformat()
+            if not (0 <= amount <= 30):
+                msg = "Gauge amount needs to be between 0 and 30 inches."
+            else:
+                try:
+                    with db() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "SELECT 1 FROM saved_locations WHERE id=%s AND user_id=%s",
+                                (loc_id, sub_id))
+                            if not cur.fetchone():
+                                msg = "That field does not belong to this subscriber."
+                            else:
+                                cur.execute(
+                                    """INSERT INTO field_gauge_readings
+                                         (location_id, reading_inches, reading_date,
+                                          note, entered_by, created_at)
+                                       VALUES (%s,%s,%s,%s,%s,%s)""",
+                                    (loc_id, amount, rdate, note or None,
+                                     user["id"], int(time.time() * 1000)))
+                                msg = f"Gauge reading saved: {amount:.2f} inches on {rdate}."
+                except Exception as e:
+                    print(f"[fields-page] gauge add failed: {e!r}", flush=True)
+                    msg = "Gauge save failed."
+            return redirect(f"/fields?sub={sub_id}&m={urllib.parse.quote(msg)}")
+        if action == "gdel":
+            g_id = int(request.form.get("g") or 0)
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """DELETE FROM field_gauge_readings g
+                                USING saved_locations sl
+                                WHERE g.id = %s AND g.location_id = sl.id
+                                  AND sl.user_id = %s""",
+                            (g_id, sub_id))
+                        msg = "Gauge reading removed." if cur.rowcount else "Could not remove that reading."
+            except Exception as e:
+                print(f"[fields-page] gauge del failed: {e!r}", flush=True)
+                msg = "Remove failed."
+            return redirect(f"/fields?sub={sub_id}&m={urllib.parse.quote(msg)}")
         if action == "del":
             loc_id = int(request.form.get("loc") or 0)
             try:
@@ -15378,14 +15489,24 @@ def fields_page():
             # No plant date means no honest "since planting" number. Show
             # dashes rather than the internal April 15 fallback, which
             # read as if the farmer had told us something he never did.
+            g = _field_gauge_totals(r["id"], r.get("plant_date") or "")
+            def _cell(model_v, gauge_v):
+                out = f"{model_v:.2f}\"<div class=src>model</div>"
+                if gauge_v is not None:
+                    out += f"<div class=gv>{gauge_v:.2f}\"</div><div class=src>gauge</div>"
+                return out
+            c24 = _cell(t['last24'], g['g24'] if g else None)
+            c7 = _cell(t['last7'], g['g7'] if g else None)
             if r.get("plant_date"):
-                since_c = f"<td>{t['since_plant']:.2f}\"</td><td>{t['gdd']}</td><td>{t['plant_date']}</td>"
+                csince = _cell(t['since_plant'],
+                               g['gsince'] if (g and g.get('gsince') is not None) else None)
+                since_c = f"<td>{csince}</td><td>{t['gdd']}</td><td>{t['plant_date']}</td>"
             else:
                 since_c = ("<td class=none>&mdash;</td><td class=none>&mdash;</td>"
                            "<td class=none>no plant date</td>")
             rows_html += (f"<tr><td><b>{r.get('label') or 'Field'}</b>"
                           f"<div class=pt>{spot}</div></td>"
-                          f"<td>{t['last24']:.2f}\"</td><td>{t['last7']:.2f}\"</td>"
+                          f"<td>{c24}</td><td>{c7}</td>"
                           + since_c + f"<td>{delbtn}</td></tr>")
         if not rows_html:
             rows_html = "<tr><td colspan=7 style=opacity:0.6>No fields yet. Add the first one below.</td></tr>"
@@ -15411,6 +15532,57 @@ def fields_page():
             "39.57,-101.36 or 39.57N 101.36W or 39 34 12 N 101 21 36 W. North number first. "
             "Forget the minus sign on the west number? We add it for you. "
             "Anything with words in it is treated as an address instead.</p>")
+        # ── Gauge entry (July 24, 2026): ground truth beats the model ──
+        non_primary = [r for r in locs if r.get("lat") is not None]
+        if non_primary:
+            fopts = "".join(
+                f"<option value={r['id']}>{(r.get('label') or 'Field')}</option>"
+                for r in non_primary)
+            recent_html = ""
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """SELECT g.id, g.reading_inches, g.reading_date, g.note,
+                                      sl.label
+                                 FROM field_gauge_readings g
+                                 JOIN saved_locations sl ON sl.id = g.location_id
+                                WHERE sl.user_id = %s
+                                ORDER BY g.reading_date DESC, g.id DESC
+                                LIMIT 10""", (sel_i,))
+                        recents = cur.fetchall()
+            except Exception:
+                recents = []
+            for gr in recents:
+                gnote = f" &middot; {gr['note']}" if gr.get("note") else ""
+                recent_html += (
+                    f"<tr><td>{gr['reading_date']}</td>"
+                    f"<td>{gr.get('label') or 'Field'}</td>"
+                    f"<td>{float(gr['reading_inches']):.2f}\"{gnote}</td>"
+                    "<td><form method=post style='display:inline' "
+                    "onsubmit=\"return confirm('Remove this reading?')\">"
+                    f"<input type=hidden name=sub value={sel_i}>"
+                    "<input type=hidden name=action value=gdel>"
+                    f"<input type=hidden name=g value={gr['id']}>"
+                    "<button style='background:none;border:none;color:#c33;"
+                    "font-weight:bold;cursor:pointer'>&times;</button></form></td></tr>")
+            section += (
+                "<h3>Enter a gauge reading</h3>"
+                "<p style=\"opacity:0.7;font-size:13px\">The gauge is ground truth. "
+                "Readings show next to the model estimate on each field, and both "
+                "stay visible so anyone can see the one they trust.</p>"
+                "<form method=post>"
+                f"<input type=hidden name=sub value={sel_i}>"
+                "<input type=hidden name=action value=gauge>"
+                f"<select name=loc>{fopts}</select> "
+                "<input name=amount type=number step=0.01 min=0 max=30 "
+                "placeholder=\"0.56\" required style=width:90px> "
+                "<input name=rdate type=date title=\"date the rain fell\"> "
+                "<input name=note placeholder=\"note (optional)\" size=16> "
+                "<button class=primary>Save reading</button></form>")
+            if recent_html:
+                section += ("<table><tr><th>Date</th><th>Field</th>"
+                            "<th>Gauge</th><th></th></tr>" + recent_html + "</table>")
     opts = "".join(
         f"<option value={r['id']}{' selected' if sel and int(sel)==r['id'] else ''}>{r['nm']}</option>"
         for r in subs)
@@ -15431,10 +15603,13 @@ def fields_page():
             "border-radius:6px;margin:10px 0;font-size:13px}"
             ".pt{font-family:ui-monospace,monospace;font-size:11.5px;opacity:0.6}"
             "td.none{opacity:0.4}"
+            ".gv{color:#8fd18f;font-weight:700;margin-top:2px}"
+            ".src{font-size:10px;opacity:0.45;text-transform:uppercase;letter-spacing:0.05em}"
             "</style></head><body>"
             "<h2>Field Rain &amp; GDD</h2>"
             "<p style=\"opacity:0.7\">Pick a subscriber. Fields show rain last 24 hr, last 7 days, "
-            "since planting, and GDD. Estimates from model data.</p>"
+            "since planting, and GDD. Model numbers are grid estimates; gauge numbers "
+            "are real readings entered below. Both stay visible.</p>"
             + msg_html +
             "<form method=get><select name=sub onchange=\"this.form.submit()\">"
             "<option value=\"\">Choose a subscriber...</option>" + opts + "</select> "
