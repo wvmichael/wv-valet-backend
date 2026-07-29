@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-99"
+BACKEND_BUILD = "0702-100"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -7595,6 +7595,8 @@ BOONE_NOTIFY_RECIPIENTS = [
     "michael@weathervalet.com",
     "timmy@weathervalet.com",
     "reynolds.evan.m@gmail.com",
+    "jackie@weathervalet.com",
+    "laura@weathervalet.com",
 ]
 
 # Lead Meteorologist per trial region. A new signup notifies this Met on top
@@ -48404,8 +48406,9 @@ def sales_pipeline():
         if not r["is_active"]:
             status = "deactivated"
         elif r.get("trial_status") == "active":
-            ends = r.get("trial_ends_at") or 0
-            started = r.get("trial_started_at") or r["signed_up_at"]
+            # trial_* on users can be seconds or ms — normalize (July 28, 2026)
+            ends = _epoch_ms(r.get("trial_ends_at") or 0)
+            started = _epoch_ms(r.get("trial_started_at") or r["signed_up_at"])
             if ends and now_ms >= ends:
                 status = "trial_ended"
             else:
@@ -48428,6 +48431,147 @@ def sales_pipeline():
             "trial_days_total": days_total,
         })
     return jsonify({"ok": True, "pipeline": out})
+
+
+@app.route("/api/v1/sales/messages", methods=["OPTIONS"])
+def _sales_messages_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/sales/messages")
+def sales_messages_accounts():
+    """Account-manager view (July 28, 2026): the rep's own customers with
+    outbound-message health at a glance. OUTBOUND ONLY by design — what
+    the Meteorologists have sent, never what the subscriber wrote back.
+    A subscriber's side of a Pro Thread is a private conversation with
+    their Met; reps act on what WE said and when, and reach out through
+    their own email or phone."""
+    user, rep = _current_sales_rep()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-signed-in"}), 401
+    if rep is None:
+        return jsonify({"ok": False, "error": "not-a-rep"}), 403
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id AS user_id, u.name, u.email,
+                          u.trial_business_name, u.trial_status,
+                          u.trial_started_at, u.trial_ends_at,
+                          u.subscription_tier, u.is_active,
+                          a.signed_up_at,
+                          loc.label AS loc_label, loc.address_text,
+                          (SELECT MAX(bh.delivered_at) FROM brief_history bh
+                            WHERE bh.user_id = u.id) AS last_brief_at,
+                          (SELECT COUNT(*) FROM brief_history bh
+                            WHERE bh.user_id = u.id
+                              AND bh.delivered_at > %s) AS briefs_7d,
+                          (SELECT MAX(m.created_at)
+                             FROM pro_thread_messages m
+                             JOIN pro_threads t ON t.id = m.thread_id
+                            WHERE t.subscriber_user_id = u.id
+                              AND m.sender_role = 'met') AS last_thread_at
+                   FROM sales_attributions a
+                   JOIN users u ON u.id = a.user_id
+                   LEFT JOIN saved_locations loc
+                          ON loc.user_id = u.id AND loc.is_primary = TRUE
+                   WHERE a.rep_slug = %s
+                   ORDER BY a.signed_up_at DESC""",
+                (int(time.time() * 1000) - 7 * 86400000, rep["slug"]),
+            )
+            rows = cur.fetchall()
+    now_ms = int(time.time() * 1000)
+    out = []
+    for r in rows:
+        last_out = max(_epoch_ms(r.get("last_brief_at") or 0),
+                       _epoch_ms(r.get("last_thread_at") or 0)) or None
+        quiet_days = (int((now_ms - last_out) // 86400000)
+                      if last_out else None)
+        trial_day = None
+        if r.get("trial_status") == "active":
+            started = _epoch_ms(r.get("trial_started_at") or r.get("signed_up_at"))
+            if started:
+                trial_day = max(1, int((now_ms - started) // 86400000) + 1)
+        out.append({
+            "user_id": r["user_id"],
+            "display_name": (r.get("trial_business_name") or r.get("name")
+                             or r.get("email")),
+            "contact_name": r.get("name") or "",
+            "email": r.get("email") or "",
+            "location": r.get("loc_label") or r.get("address_text") or "",
+            "tier": r.get("subscription_tier") or "",
+            "trial_status": r.get("trial_status") or "",
+            "trial_day": trial_day,
+            "is_active": bool(r.get("is_active")),
+            "last_outbound_at": last_out,
+            "quiet_days": quiet_days,
+            "briefs_7d": int(r.get("briefs_7d") or 0),
+        })
+    return jsonify({"ok": True, "accounts": out})
+
+
+@app.route("/api/v1/sales/messages/<int:customer_id>", methods=["OPTIONS"])
+def _sales_messages_flow_preflight(customer_id):
+    return ("", 204)
+
+
+@app.get("/api/v1/sales/messages/<int:customer_id>")
+def sales_messages_flow(customer_id: int):
+    """The full outbound flow for ONE of the rep's customers: every brief,
+    severe alert, threshold alert, and Met thread message we have sent
+    them, newest first. Subscriber replies are intentionally absent."""
+    user, rep = _current_sales_rep()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-signed-in"}), 401
+    if rep is None:
+        return jsonify({"ok": False, "error": "not-a-rep"}), 403
+    with db() as conn:
+        with conn.cursor() as cur:
+            # Ownership: the customer must be in this rep's book.
+            cur.execute(
+                "SELECT 1 FROM sales_attributions WHERE user_id = %s AND rep_slug = %s",
+                (customer_id, rep["slug"]))
+            if not cur.fetchone():
+                return jsonify({"ok": False, "error": "not-your-account"}), 403
+            cur.execute(
+                """SELECT delivered_at, brief_type, verdict, snippet,
+                          full_body, is_met_touched, met_name, channels_used
+                   FROM brief_history
+                   WHERE user_id = %s
+                   ORDER BY delivered_at DESC
+                   LIMIT 150""", (customer_id,))
+            briefs = cur.fetchall()
+            cur.execute(
+                """SELECT m.created_at, m.sender_name, m.body
+                   FROM pro_thread_messages m
+                   JOIN pro_threads t ON t.id = m.thread_id
+                   WHERE t.subscriber_user_id = %s
+                     AND m.sender_role = 'met'
+                   ORDER BY m.created_at DESC
+                   LIMIT 150""", (customer_id,))
+            thread_msgs = cur.fetchall()
+    feed = []
+    for b in briefs:
+        feed.append({
+            "kind": (b.get("brief_type") or "brief"),
+            "at": _epoch_ms(b.get("delivered_at")),
+            "verdict": b.get("verdict") or "",
+            "body": (b.get("full_body") or b.get("snippet") or "")[:2000],
+            "met_touched": bool(b.get("is_met_touched")),
+            "who": b.get("met_name") or ("Meteorologist" if b.get("is_met_touched") else "AI brief"),
+            "channels": b.get("channels_used") or "",
+        })
+    for m in thread_msgs:
+        feed.append({
+            "kind": "thread",
+            "at": _epoch_ms(m.get("created_at")),
+            "verdict": "",
+            "body": (m.get("body") or "")[:2000],
+            "met_touched": True,
+            "who": m.get("sender_name") or "Meteorologist",
+            "channels": "thread",
+        })
+    feed.sort(key=lambda x: x["at"], reverse=True)
+    return jsonify({"ok": True, "flow": feed[:200]})
 
 
 @app.route("/api/v1/sales/commissions", methods=["OPTIONS"])
