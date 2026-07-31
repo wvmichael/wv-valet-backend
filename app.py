@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-100"
+BACKEND_BUILD = "0702-101"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -739,6 +739,28 @@ CREATE TABLE IF NOT EXISTS field_gauge_readings (
     created_at     BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_fgr_loc ON field_gauge_readings (location_id);
+
+-- ── Severe warning auto-relay (July 29, 2026 — Met-approved design) ──
+-- Timmy and Chris chose Option A: the instant a warning covers a
+-- subscriber, the system texts the factual NWS relay in the agreed
+-- template ("WeatherValet Alert: A {event} is in effect for {area}
+-- until {time}."). The Met is still paged and follows up personally;
+-- the personal all-clear stays human. When the warning expires or is
+-- cancelled, an automated factual notice goes out once. One row per
+-- (alert, subscriber): the dedupe ledger and the expiry-notice queue.
+CREATE TABLE IF NOT EXISTS severe_alert_relays (
+    id                    SERIAL PRIMARY KEY,
+    nws_alert_id          TEXT NOT NULL,
+    user_id               INTEGER NOT NULL,
+    event                 TEXT NOT NULL,
+    area_label            TEXT NOT NULL,
+    sent_at               BIGINT NOT NULL,
+    alert_expires_at      BIGINT,
+    expiry_notice_sent_at BIGINT,
+    UNIQUE (nws_alert_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sar_pending
+    ON severe_alert_relays (expiry_notice_sent_at, alert_expires_at);
 
 -- July 2026: Onboarding Hub. Versioned policy acknowledgments and native
 -- onboarding forms for Mets and sales reps. Crew keeps its simple intro.
@@ -27040,8 +27062,9 @@ def _find_pro_subscribers_in_polygon(geom: dict) -> list:
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT u.id, u.name, u.email, u.phone,
-                          u.subscription_tier,
+                          u.subscription_tier, u.timezone,
                           loc.label AS loc_label, loc.lat, loc.lng,
+                          loc.county AS loc_county,
                           cov.primary_met_id AS met_id,
                           met.name  AS met_name,
                           met.phone AS met_phone,
@@ -27079,7 +27102,9 @@ def _find_pro_subscribers_in_polygon(geom: dict) -> list:
                 "email": r["email"],
                 "phone": r.get("phone") or "",
                 "tier": r["subscription_tier"],
+                "timezone": r.get("timezone"),
                 "loc_label": r["loc_label"],
+                "loc_county": r.get("loc_county") or r.get("county"),
                 "met_id": r.get("met_id"),
                 "met_name": r.get("met_name") or "",
                 "met_phone": r.get("met_phone") or "",
@@ -27109,7 +27134,7 @@ def _find_pro_subscribers_by_county(alert: dict) -> list:
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT u.id, u.name, u.email, u.phone,
-                          u.subscription_tier,
+                          u.subscription_tier, u.timezone,
                           loc.label AS loc_label, loc.county, loc.address_text,
                           cov.primary_met_id AS met_id,
                           met.name  AS met_name,
@@ -27159,7 +27184,9 @@ def _find_pro_subscribers_by_county(alert: dict) -> list:
                 "email": r["email"],
                 "phone": r.get("phone") or "",
                 "tier": r["subscription_tier"],
+                "timezone": r.get("timezone"),
                 "loc_label": r["loc_label"],
+                "loc_county": r.get("loc_county") or r.get("county"),
                 "met_id": r.get("met_id"),
                 "met_name": r.get("met_name") or "",
                 "met_phone": r.get("met_phone") or "",
@@ -28075,6 +28102,172 @@ def _severe_fallback_pages() -> list:
     return out
 
 
+# Warning types that auto-relay to subscribers the moment they hit
+# (July 29, 2026). Warnings only — watches still page the Met without
+# texting subscribers, because a watch is hours of lead time and a
+# human call, while a warning is minutes and silence is not an option.
+_AUTO_RELAY_EVENTS = (
+    "Tornado Warning",
+    "Severe Thunderstorm Warning",
+    "Flash Flood Warning",
+)
+
+
+def _relay_local_time(expires_ms, tz_name: str) -> str:
+    """'8:30 PM' in the subscriber's own timezone. The server runs UTC
+    and that trap has bitten before; never format a subscriber-facing
+    time without going through their zone."""
+    if not expires_ms:
+        return ""
+    try:
+        from zoneinfo import ZoneInfo
+        import datetime as _dt
+        dt = _dt.datetime.fromtimestamp(expires_ms / 1000,
+                                        ZoneInfo(tz_name or "America/Indiana/Indianapolis"))
+        return dt.strftime("%I:%M %p").lstrip("0")
+    except Exception:
+        return ""
+
+
+def _relay_area_label(alert: dict, sub: dict) -> str:
+    """Prefer the subscriber's own county; fall back to the first area in
+    the NWS list; last resort, the event's area text as-is."""
+    county = (sub.get("loc_county") or "").strip()
+    if county:
+        return county if "county" in county.lower() else county + " County"
+    area = (alert.get("area_desc") or "").strip()
+    if ";" in area:
+        area = area.split(";")[0].strip()
+    return area or "your area"
+
+
+def _auto_relay_warning(alert: dict, affected: list) -> int:
+    """Option A core: text every affected subscriber the factual warning
+    relay, once per (alert, subscriber). Template agreed with Timmy and
+    Chris on July 29, 2026. Returns how many were messaged."""
+    if (alert.get("event") or "") not in _AUTO_RELAY_EVENTS:
+        return 0
+    sent = 0
+    now_ms = int(time.time() * 1000)
+    for sub in affected:
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO severe_alert_relays
+                             (nws_alert_id, user_id, event, area_label,
+                              sent_at, alert_expires_at)
+                           VALUES (%s, %s, %s, %s, %s, %s)
+                           ON CONFLICT (nws_alert_id, user_id) DO NOTHING""",
+                        (alert["nws_alert_id"] if "nws_alert_id" in alert else alert["nws_id"],
+                         sub["user_id"], alert.get("event") or "",
+                         _relay_area_label(alert, sub), now_ms,
+                         alert.get("expires_at")))
+                    fresh = (cur.rowcount == 1)
+        except Exception as e:
+            print(f"[severe-relay] ledger insert failed user={sub.get('user_id')}: {e!r}",
+                  flush=True)
+            continue
+        if not fresh:
+            continue  # already relayed this alert to this subscriber
+        area = _relay_area_label(alert, sub)
+        until = _relay_local_time(alert.get("expires_at"), sub.get("timezone"))
+        body = f"WeatherValet Alert: A {alert.get('event')} is in effect for {area}"
+        body += f" until {until}." if until else "."
+        delivered = False
+        phone = (sub.get("phone") or "").strip()
+        if phone:
+            try:
+                delivered = bool(send_sms(phone, body))
+            except Exception as e:
+                print(f"[severe-relay] sms failed user={sub['user_id']}: {e!r}", flush=True)
+        if not delivered and sub.get("email"):
+            try:
+                _send_email(sub["email"], f"WeatherValet Alert: {alert.get('event')}",
+                            f"<p>{_html_escape(body)}</p>", body)
+                delivered = True
+            except Exception as e:
+                print(f"[severe-relay] email failed user={sub['user_id']}: {e!r}", flush=True)
+        try:
+            _record_brief_delivery(sub["user_id"], "severe", "risk",
+                                   body[:200], body,
+                                   "sent" if delivered else "failed",
+                                   "sms" if phone else "email",
+                                   is_met_touched=False, met_name=None)
+        except Exception as e:
+            print(f"[severe-relay] history record failed: {e!r}", flush=True)
+        if delivered:
+            sent += 1
+    if sent:
+        print(f"[severe-relay] {alert.get('event')!r} relayed to {sent} subscriber(s)",
+              flush=True)
+    return sent
+
+
+def _send_relay_expiry_notices(active_ids: set) -> None:
+    """Automated factual close-out (July 29, 2026): once a relayed warning
+    has expired (or vanished from the NWS feed well before its end time,
+    which means cancelled), tell the subscriber, once. The Met's personal
+    all-clear remains a separate, human touch on top of this."""
+    now_ms = int(time.time() * 1000)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT r.id, r.nws_alert_id, r.user_id, r.event,
+                              r.area_label, r.alert_expires_at, r.sent_at,
+                              u.phone, u.email
+                         FROM severe_alert_relays r
+                         JOIN users u ON u.id = r.user_id
+                        WHERE r.expiry_notice_sent_at IS NULL
+                        ORDER BY r.id
+                        LIMIT 200""")
+                rows = cur.fetchall()
+    except Exception as e:
+        print(f"[severe-relay] expiry scan failed: {e!r}", flush=True)
+        return
+    for r in rows:
+        expired = bool(r.get("alert_expires_at")) and now_ms >= r["alert_expires_at"]
+        vanished = (r["nws_alert_id"] not in active_ids
+                    and now_ms - (r.get("sent_at") or 0) > 10 * 60 * 1000
+                    and bool(r.get("alert_expires_at"))
+                    and now_ms < r["alert_expires_at"] - 10 * 60 * 1000)
+        if not expired and not vanished:
+            continue
+        verb = "has expired" if expired else "has been cancelled"
+        body = f"WeatherValet Alert: The {r['event']} for {r['area_label']} {verb}."
+        delivered = False
+        phone = (r.get("phone") or "").strip()
+        if phone:
+            try:
+                delivered = bool(send_sms(phone, body))
+            except Exception as e:
+                print(f"[severe-relay] expiry sms failed user={r['user_id']}: {e!r}", flush=True)
+        if not delivered and r.get("email"):
+            try:
+                _send_email(r["email"], "WeatherValet Alert update",
+                            f"<p>{_html_escape(body)}</p>", body)
+                delivered = True
+            except Exception as e:
+                print(f"[severe-relay] expiry email failed user={r['user_id']}: {e!r}", flush=True)
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE severe_alert_relays SET expiry_notice_sent_at = %s WHERE id = %s",
+                        (now_ms, r["id"]))
+        except Exception as e:
+            print(f"[severe-relay] expiry mark failed: {e!r}", flush=True)
+        if delivered:
+            try:
+                _record_brief_delivery(r["user_id"], "severe", "clear",
+                                       body[:200], body, "sent",
+                                       "sms" if phone else "email",
+                                       is_met_touched=False, met_name=None)
+            except Exception:
+                pass
+
+
 def _process_severe_alerts() -> None:
     """One scheduler tick: fetch alerts, match against subscribers, page Met."""
     # Relief half (#C14): send all-clears for alerts that have passed their
@@ -28085,6 +28278,15 @@ def _process_severe_alerts() -> None:
         print(f"[nws-process] all-clear pass failed: {e}", flush=True)
 
     alerts = _fetch_active_nws_alerts()
+
+    # Automated factual close-outs for relays whose warning ended
+    # (July 29, 2026). Runs every tick, even when nothing is active,
+    # so expiry notices go out promptly after the last warning ends.
+    try:
+        _send_relay_expiry_notices({a["nws_id"] for a in alerts})
+    except Exception as e:
+        print(f"[nws-process] relay expiry pass failed: {e}", flush=True)
+
     if not alerts:
         return
 
@@ -28124,6 +28326,14 @@ def _process_severe_alerts() -> None:
             # record. (We could record for analytics but it'd pile up
             # quickly — every NWS alert nationally would create a row.)
             continue
+
+        # ── Option A relay (July 29, 2026): subscribers hear the factual
+        # warning immediately, in the Met-approved template, regardless of
+        # whether any Met is reachable. Paging continues below unchanged.
+        try:
+            _auto_relay_warning(alert, affected)
+        except Exception as e:
+            print(f"[nws-process] auto-relay failed: {e!r}", flush=True)
 
         # Route affected subscribers to the humans who can confirm the alert
         # (primary Met, backup Met, on-call fallback). See routing below.
