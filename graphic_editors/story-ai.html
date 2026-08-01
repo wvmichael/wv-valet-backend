@@ -16,7 +16,8 @@
 button:disabled{opacity:.5;cursor:not-allowed}
 .small-note{font-size:11px;color:#7f91a8;line-height:1.35;margin-top:7px}
 @media(max-width:1000px){.app{grid-template-columns:1fr}.controls{border-right:0;border-bottom:1px solid #ffffff1a}}
-</style></head>
+</style><link rel="stylesheet" href="/graphics/assets/wv-fit.css">
+<link rel="stylesheet" href="/graphics/assets/wv-brand.css"></head>
 <body><div class="app">
 <aside class="controls"><h1>WeatherValet Story Editor</h1><p>Edit the fields, upload a cinematic background, upload a map/radar image, then export a 1600×900 PNG.</p>
 <div class="group"><label>Headline</label><textarea id="headlineInput">DRY & COOLER TODAY</textarea><label>Summary</label><textarea id="summaryInput">Comfortable conditions today before warmer temperatures return this weekend. Storm chances arrive Sunday night.</textarea><label>Date (DAY|DATE)</label><input id="dateInput" value="FRIDAY|MAY 16, 2025"></div>
@@ -180,4 +181,5 @@ $('downloadEnhancedBtn').addEventListener('click',()=>{
 });
 $('exportBtn').addEventListener('click',async()=>{const p=story.style.transform;story.style.transform='none';const c=await html2canvas(story,{backgroundColor:null,scale:1,useCORS:true});const a=document.createElement('a');a.download='weathervalet-daily-story.png';a.href=c.toDataURL('image/png');a.click();story.style.transform=p});$('resetBtn').addEventListener('click',()=>location.reload());
 window.WeatherValetStory={setData(d={}){Object.entries(d).forEach(([k,v])=>{if($(k)){ $(k).value=v;$(k).dispatchEvent(new Event('input'))}});if(d.backgroundUrl)$('bg').style.backgroundImage=`url("${d.backgroundUrl}")`;if(d.mapUrl)$('mapimg').style.backgroundImage=`url("${d.mapUrl}")`;if(d.sponsorUrl){$('sponsorImage').src=d.sponsorUrl;$('sponsorImage').style.display='block';$('sponsorPlaceholder').style.display='none'}},getData(){return{headline:$('headlineInput').value,summary:$('summaryInput').value,date:$('dateInput').value,impact:$('impactText').value,updated:$('updatedInput').value}}};
-</script></body></html>
+</script><script src="/graphics/assets/wv-fit.js"></script>
+<script src="/graphics/assets/wv-brand.js"></script></body></html>

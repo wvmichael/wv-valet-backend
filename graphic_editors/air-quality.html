@@ -59,7 +59,8 @@ button{background:#1579ff;font-weight:900;cursor:pointer}button.secondary{backgr
 .editable[contenteditable=true]{outline:none}.editable[contenteditable=true]:focus{box-shadow:0 0 0 3px #19a8ff80;border-radius:5px}
 @media(max-width:1050px){.app{grid-template-columns:1fr}.controls{border-right:0;border-bottom:1px solid var(--line)}}
 </style>
-</head>
+<link rel="stylesheet" href="/graphics/assets/wv-fit.css">
+<link rel="stylesheet" href="/graphics/assets/wv-brand.css"></head>
 <body>
 <div class="app">
 <aside class="controls">
@@ -193,5 +194,6 @@ $('loadExampleBtn').addEventListener('click',()=>setStatus('summaryStatus','Exam
 $('exportBtn').addEventListener('click',async()=>{const prior=canvas.style.transform;canvas.style.transform='none';const c=await html2canvas(canvas,{backgroundColor:null,scale:1,useCORS:true});const a=document.createElement('a');a.download='weathervalet-air-quality.png';a.href=c.toDataURL('image/png');a.click();canvas.style.transform=prior});
 $('resetBtn').addEventListener('click',()=>location.reload());
 </script>
-</body>
+<script src="/graphics/assets/wv-fit.js"></script>
+<script src="/graphics/assets/wv-brand.js"></script></body>
 </html>

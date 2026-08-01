@@ -1,0 +1,52 @@
+/* ── WeatherValet broadcast branding kit (Aug 1, 2026) ──
+   Loaded by every editor after its own styles, so these win the cascade.
+   Applies: blue palette, angled blue date banner, branded footer band.
+   Layout positions stay owned by each editor; this skins, never moves. */
+:root{ --wvblue:#1E7FFF; }
+
+/* Date card → angled blue banner, single line */
+#canvas .date-card{
+  background:var(--wvblue) !important;
+  border:0 !important;
+  border-radius:0 !important;
+  clip-path:polygon(22px 0,100% 0,100% 100%,0 100%);
+  padding:11px 26px 11px 30px !important;
+  min-width:0 !important;
+  text-align:right !important;
+}
+#canvas .date-card .dow,#canvas .date-card .date{
+  display:inline !important;
+  color:#fff !important;
+  font-size:24px !important;
+  font-weight:900 !important;
+  letter-spacing:.05em;
+  text-transform:uppercase;
+  margin:0 !important;
+}
+#canvas .date-card .dow::after{content:", "}
+
+/* Branded footer band (contents rebuilt by wv-brand.js) */
+#canvas .footer.wv-branded{
+  background:#0a1422 !important;
+  border:0 !important;
+  border-top:4px solid var(--wvblue) !important;
+  border-radius:0 !important;
+  left:0 !important; right:0 !important; bottom:0 !important;
+  top:auto !important;
+  height:84px !important;
+  display:grid !important;
+  grid-template-columns:1fr 1fr 1fr auto !important;
+  align-items:center !important;
+  padding:0 36px !important;
+  overflow:hidden;
+}
+.wv-feat{display:flex;align-items:center;gap:10px;min-width:0}
+.wv-feat + .wv-feat{border-left:1px solid rgba(255,255,255,.22);padding-left:22px}
+.wv-feat .ic{font-size:30px;color:var(--wvblue)}
+.wv-feat .l1{font-size:18px;font-weight:950;letter-spacing:.02em;text-transform:uppercase;line-height:1.1;white-space:nowrap}
+.wv-feat .l2{font-size:15px;font-weight:900;letter-spacing:.02em;text-transform:uppercase;color:var(--wvblue);line-height:1.1;white-space:nowrap}
+.wv-sitebox{position:relative;text-align:right;padding-left:34px;display:flex;flex-direction:column;justify-content:center}
+.wv-sitebox::before{content:"";position:absolute;left:10px;top:-30px;bottom:-30px;width:4px;background:var(--wvblue);transform:skewX(-18deg)}
+.wv-sitebox .site{font-size:24px;font-weight:950;letter-spacing:.02em;white-space:nowrap}
+.wv-sitebox .upd{font-size:14px;font-weight:900;color:var(--wvblue);letter-spacing:.03em;margin-top:3px;text-transform:uppercase;white-space:nowrap}
+.wv-orphans{display:none !important}

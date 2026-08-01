@@ -23,7 +23,8 @@ textarea{min-height:68px}.actions{display:grid;grid-template-columns:1fr 1fr;gap
 .action{position:absolute;left:34px;right:34px;bottom:28px;height:68px;border-radius:12px;background:var(--red);display:flex;align-items:center;justify-content:center;text-align:center;font-size:22px;font-weight:950;z-index:9}
 .site{position:absolute;bottom:2px;left:0;right:0;text-align:center}.ai{padding:12px;border:1px solid #19a8ff55;border-radius:12px;background:#0a1828}.status{font-size:12px;padding:8px;margin-top:8px;background:#07111e;border-radius:8px}
 </style>
-</head>
+<link rel="stylesheet" href="/graphics/assets/wv-fit.css">
+<link rel="stylesheet" href="/graphics/assets/wv-brand.css"></head>
 <body>
 <div class="app">
 <aside class="controls">
@@ -47,11 +48,13 @@ textarea{min-height:68px}.actions{display:grid;grid-template-columns:1fr 1fr;gap
 <script src="/graphics/assets/html2canvas.min.js"></script>
 <script>
 const $=x=>document.getElementById(x),c=$('canvas'),s=$('shell');function fit(){let z=s.clientWidth/1600;c.style.transform=`scale(${z})`;s.style.height=`${900*z}px`}addEventListener('resize',fit);fit();
-[['ht','oht'],['hb','ohb'],['sl','osl'],['pt','opt'],['st','ost'],['wh','owh'],['wn','own'],['im','oim'],['ac','oac']].forEach(([a,b])=>$(a).oninput=e=>$(b).textContent=e.target.value);
+[['ht','oht'],['hb','ohb'],['sl','osl'],['pt','opt'],['st','ost'],['wh','owh'],['wn','own'],['im','oim'],['ac','oac']].forEach(([a,b])=>$(a).oninput=e=>{$(b).textContent=e.target.value;fitHero()});
+function fitHero(){const hero=document.querySelector('.hero'),big=$('opt'),bot=$('ost');let bigSize=60,botSize=23;big.style.fontSize=bigSize+'px';bot.style.fontSize=botSize+'px';const limit=635;let guard=0;while(hero.offsetTop+hero.offsetHeight>limit&&bigSize>32&&guard<40){bigSize-=2;botSize=Math.max(15,botSize-1);big.style.fontSize=bigSize+'px';bot.style.fontSize=botSize+'px';guard++}}fitHero();
 $('bgup').onchange=e=>{let f=e.target.files[0];if(!f)return;let r=new FileReader();r.onload=()=>$('bg').style.backgroundImage=`url("${r.result}")`;r.readAsDataURL(f)}
 let original='';$('mapup').onchange=e=>{let f=e.target.files[0];if(!f)return;let r=new FileReader();r.onload=()=>{original=r.result;$('map').style.backgroundImage=`url("${original}")`;$('ms').textContent='Official map loaded.'};r.readAsDataURL(f)}
 $('orig').onclick=()=>{if(original)$('map').style.backgroundImage=`url("${original}")`}
 $('enh').onclick=async()=>{if(!original)return $('ms').textContent='Upload a map first.';let [h,d]=original.split(','),b=atob(d),a=new Uint8Array(b.length);for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);let fd=new FormData();fd.append('image',new Blob([a],{type:'image/png'}),'map.png');fd.append('prompt',$('mp').value);$('ms').textContent='Enhancing…';try{let r=await fetch($('mep').value,{method:'POST',body:fd}),p=await r.json();let u=p.image_url||p.url||(p.image_base64?`data:image/png;base64,${p.image_base64}`:'');if(!u)throw Error('No image returned');$('map').style.backgroundImage=`url("${u}")`;$('ms').textContent='Enhanced. Verify against official source.'}catch(e){$('ms').textContent='Failed: '+e.message}}
 $('sum').onclick=async()=>{try{let r=await fetch($('sep').value,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({guidance:$('gd').value})}),p=await r.json();[['pt','mainTakeaway'],['st','supportingLine'],['wh','where'],['wn','when'],['im','biggestImpact']].forEach(([id,k])=>{if(p[k]){$(id).value=p[k];$(id).dispatchEvent(new Event('input'))}});$('ss').textContent='Copy built. Review before publishing.'}catch(e){$('ss').textContent='Failed: '+e.message}}
 $('exp').onclick=async()=>{let t=c.style.transform;c.style.transform='none';let out=await html2canvas(c,{scale:1,useCORS:true});let a=document.createElement('a');a.href=out.toDataURL('image/png');a.download='weathervalet-tornado-threat.png';a.click();c.style.transform=t}
-</script></body></html>
+</script><script src="/graphics/assets/wv-fit.js"></script>
+<script src="/graphics/assets/wv-brand.js"></script></body></html>

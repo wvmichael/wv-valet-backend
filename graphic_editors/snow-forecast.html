@@ -67,7 +67,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
 }
 .map-glow{position:absolute;inset:4%;border-radius:30%;box-shadow:0 0 80px rgba(55,140,255,.28);pointer-events:none}
 .stats{position:absolute;right:28px;top:165px;width:270px;z-index:6;display:grid;gap:13px}
-.stat{min-height:138px;padding:15px;border-radius:18px;background:#06101ee3;border:1px solid rgba(255,255,255,.3);display:grid;grid-template-columns:72px 1fr;gap:12px;align-items:center;backdrop-filter:blur(10px)}
+.stats .stat>*{min-width:0}.stat{max-width:100%;overflow:hidden;min-height:138px;padding:15px;border-radius:18px;background:#06101ee3;border:1px solid rgba(255,255,255,.3);display:grid;grid-template-columns:72px 1fr;gap:12px;align-items:center;backdrop-filter:blur(10px)}
 .stat-icon{width:66px;height:66px;border-radius:50%;display:grid;place-items:center;font-size:34px;background:radial-gradient(circle at 35% 30%,#d9f3ff,#4ba9ed 60%,#13558f)}
 .stat .label{font-size:15px;font-weight:900;color:#d7e2ed}
 .stat .value{font-size:35px;font-weight:950;line-height:1;margin-top:4px}
@@ -96,7 +96,8 @@ button:disabled{opacity:.5;cursor:not-allowed}
 .editable[contenteditable=true]:focus{box-shadow:0 0 0 3px rgba(29,168,255,.5);border-radius:5px}
 @media(max-width:1050px){.app{grid-template-columns:1fr}.controls{border-right:0;border-bottom:1px solid var(--line)}}
 </style>
-</head>
+<link rel="stylesheet" href="/graphics/assets/wv-fit.css">
+<link rel="stylesheet" href="/graphics/assets/wv-brand.css"></head>
 <body>
 <div class="app">
 <aside class="controls">
@@ -332,5 +333,6 @@ $('exportBtn').addEventListener('click',async()=>{
 });
 $('resetBtn').addEventListener('click',()=>location.reload());
 </script>
-</body>
+<script src="/graphics/assets/wv-fit.js"></script>
+<script src="/graphics/assets/wv-brand.js"></script></body>
 </html>

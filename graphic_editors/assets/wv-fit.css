@@ -1,0 +1,11 @@
+/* WeatherValet graphic containment (July 24, 2026).
+   Long text stays inside its card instead of pushing the card past the
+   1600x900 canvas edge. Pairs with wv-fit.js font shrinking. */
+.stats .stat > * , .risk-rail .risk-card > * , .phase > * , .kp > * ,
+.cards .card > * , .card .value , .stat .value , .stat .detail {
+  min-width: 0;
+}
+.stat, .risk-card, .phase, .kp, .card {
+  max-width: 100%;
+  overflow: hidden;
+}
