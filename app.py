@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-102"
+BACKEND_BUILD = "0702-103"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -28400,6 +28400,28 @@ def _process_severe_alerts() -> None:
         except Exception as e:
             print(f"[nws-process] crew notify pass failed: {e}", flush=True)
 
+        # Find affected subscribers FIRST, by polygon (warnings) or by
+        # county (geometry-less alerts like watches). Moved ahead of the
+        # page dedupe (Aug 1, 2026) so the relay runs EVERY tick: it has
+        # its own per-(alert, subscriber) ledger, which means a warning
+        # already paged by an older build still relays after a deploy,
+        # and a subscriber added mid-warning still gets their text.
+        if alert.get("match_mode") == "county" or not alert.get("geometry"):
+            affected = _find_pro_subscribers_by_county(alert)
+        else:
+            affected = _find_pro_subscribers_in_polygon(alert["geometry"])
+        if not affected:
+            # No subscribers in this alert's area; don't relay, don't page.
+            continue
+
+        # ── Option A relay (July 29, 2026): subscribers hear the factual
+        # warning immediately, in the Met-approved template, regardless of
+        # whether any Met is reachable. Self-deduped, safe to call every tick.
+        try:
+            _auto_relay_warning(alert, affected)
+        except Exception as e:
+            print(f"[nws-process] auto-relay failed: {e!r}", flush=True)
+
         # Dedupe — have we already paged for this alert?
         try:
             with db() as conn:
@@ -28409,30 +28431,10 @@ def _process_severe_alerts() -> None:
                         (nws_id,),
                     )
                     if cur.fetchone():
-                        continue  # already paged
+                        continue  # already paged; relay above already ran
         except Exception as e:
             print(f"[nws-process] dedupe check failed: {e}", flush=True)
             continue
-
-        # Find affected Pro subscribers, by polygon (warnings) or by county
-        # (geometry-less alerts like watches).
-        if alert.get("match_mode") == "county" or not alert.get("geometry"):
-            affected = _find_pro_subscribers_by_county(alert)
-        else:
-            affected = _find_pro_subscribers_in_polygon(alert["geometry"])
-        if not affected:
-            # No Pro subscribers in this alert's area; don't page, don't
-            # record. (We could record for analytics but it'd pile up
-            # quickly — every NWS alert nationally would create a row.)
-            continue
-
-        # ── Option A relay (July 29, 2026): subscribers hear the factual
-        # warning immediately, in the Met-approved template, regardless of
-        # whether any Met is reachable. Paging continues below unchanged.
-        try:
-            _auto_relay_warning(alert, affected)
-        except Exception as e:
-            print(f"[nws-process] auto-relay failed: {e!r}", flush=True)
 
         # Route affected subscribers to the humans who can confirm the alert
         # (primary Met, backup Met, on-call fallback). See routing below.
