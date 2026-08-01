@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-101"
+BACKEND_BUILD = "0702-102"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -1680,6 +1680,15 @@ CREATE TABLE IF NOT EXISTS saved_locations (
     created_at      BIGINT NOT NULL,
     updated_at      BIGINT NOT NULL
 );
+
+-- ── County/state backfill (Aug 1, 2026) ──
+-- County-based severe alerts (watches, some flood warnings) match on the
+-- saved location's county + state. Older locations were created before
+-- county capture, so watches were silently undercounting who's affected.
+-- The scheduler backfills county + state from the NWS points API, a few
+-- rows per pass. attempts caps retries so a bad coordinate can't loop.
+ALTER TABLE saved_locations ADD COLUMN IF NOT EXISTS state TEXT;
+ALTER TABLE saved_locations ADD COLUMN IF NOT EXISTS county_backfill_attempts INTEGER DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_saved_locations_user ON saved_locations(user_id, is_primary DESC);
 
 -- ── Subscriber portal: brief delivery preferences (Phase 10) ──
@@ -26291,6 +26300,10 @@ def _brief_scheduler_loop() -> None:
             _process_pending_team_invites()
         except Exception as e:
             print(f"[team-invite-heal] tick failed: {e!r}", flush=True)
+        try:
+            _backfill_location_counties()
+        except Exception as e:
+            print(f"[county-backfill] tick failed: {e!r}", flush=True)
         time.sleep(60)
 
 
@@ -27135,7 +27148,7 @@ def _find_pro_subscribers_by_county(alert: dict) -> list:
             cur.execute(
                 """SELECT u.id, u.name, u.email, u.phone,
                           u.subscription_tier, u.timezone,
-                          loc.label AS loc_label, loc.county, loc.address_text,
+                          loc.label AS loc_label, loc.county, loc.state, loc.address_text,
                           cov.primary_met_id AS met_id,
                           met.name  AS met_name,
                           met.phone AS met_phone,
@@ -27169,10 +27182,13 @@ def _find_pro_subscribers_by_county(alert: dict) -> list:
         county = (r.get("county") or "").lower().replace(" county", "").strip()
         if not county:
             continue
-        # State = the 2-letter code at the end of address_text ("Lebanon, IN").
-        addr = (r.get("address_text") or "").strip()
-        m = _re.search(r",\s*([A-Za-z]{2})\b\s*$", addr)
-        st = m.group(1).lower() if m else ""
+        # State: prefer the backfilled state column (Aug 1, 2026), fall
+        # back to the 2-letter code at the end of address_text ("Lebanon, IN").
+        st = (r.get("state") or "").strip().lower()
+        if not st:
+            addr = (r.get("address_text") or "").strip()
+            m = _re.search(r",\s*([A-Za-z]{2})\b\s*$", addr)
+            st = m.group(1).lower() if m else ""
         if not st:
             # Without a reliable state we can't safely pair-match; skip to
             # avoid cross-state false positives.
@@ -28100,6 +28116,89 @@ def _severe_fallback_pages() -> list:
     if not out and METEOROLOGIST_PHONE:
         out.append((METEOROLOGIST_PHONE, "On-call Meteorologist"))
     return out
+
+
+_COUNTY_BACKFILL_LAST_RUN = {"ts": 0.0}
+
+
+def _nws_county_state(lat: float, lng: float):
+    """(county_name, state) for a point, from the NWS points API. Two
+    requests: /points gives the county-zone URL, the zone gives its name
+    and state. Returns (None, None) on any failure."""
+    try:
+        req = urllib.request.Request(
+            f"https://api.weather.gov/points/{lat:.4f},{lng:.4f}",
+            headers={"User-Agent": "WeatherValet/1.0 (+https://weathervalet.ai)",
+                     "Accept": "application/geo+json"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            pdata = json.loads(resp.read().decode("utf-8"))
+        county_url = (pdata.get("properties") or {}).get("county")
+        if not county_url:
+            return (None, None)
+        req2 = urllib.request.Request(
+            county_url,
+            headers={"User-Agent": "WeatherValet/1.0 (+https://weathervalet.ai)",
+                     "Accept": "application/geo+json"})
+        with urllib.request.urlopen(req2, timeout=8) as resp:
+            zdata = json.loads(resp.read().decode("utf-8"))
+        zprops = zdata.get("properties") or {}
+        name = (zprops.get("name") or "").strip()
+        state = (zprops.get("state") or "").strip().upper()
+        return (name or None, state or None)
+    except Exception as e:
+        print(f"[county-backfill] lookup failed {lat},{lng}: {e!r}", flush=True)
+        return (None, None)
+
+
+def _backfill_location_counties() -> None:
+    """Fill missing county/state on saved locations, 5 rows per pass, at
+    most once per 10 minutes (Aug 1, 2026). Fixes the watch undercount
+    Michael spotted: a Severe Thunderstorm Watch listing half of Indiana
+    matched only 3 subscribers because older locations carried no county."""
+    import time as _t
+    if _t.time() - _COUNTY_BACKFILL_LAST_RUN["ts"] < 600:
+        return
+    _COUNTY_BACKFILL_LAST_RUN["ts"] = _t.time()
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, lat, lng FROM saved_locations
+                        WHERE lat IS NOT NULL AND lng IS NOT NULL
+                          AND COALESCE(county_backfill_attempts, 0) < 3
+                          AND (COALESCE(county, '') = ''
+                               OR COALESCE(state, '') = '')
+                        ORDER BY id LIMIT 5""")
+                rows = cur.fetchall()
+    except Exception as e:
+        print(f"[county-backfill] scan failed: {e!r}", flush=True)
+        return
+    for r in rows:
+        county, state = _nws_county_state(float(r["lat"]), float(r["lng"]))
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    if county and state:
+                        cur.execute(
+                            """UPDATE saved_locations
+                                  SET county = CASE WHEN COALESCE(county,'') = ''
+                                                    THEN %s ELSE county END,
+                                      state = CASE WHEN COALESCE(state,'') = ''
+                                                   THEN %s ELSE state END,
+                                      county_backfill_attempts =
+                                          COALESCE(county_backfill_attempts,0)
+                                WHERE id = %s""",
+                            (county, state, r["id"]))
+                        print(f"[county-backfill] loc={r['id']} -> {county}, {state}",
+                              flush=True)
+                    else:
+                        cur.execute(
+                            """UPDATE saved_locations
+                                  SET county_backfill_attempts =
+                                      COALESCE(county_backfill_attempts,0) + 1
+                                WHERE id = %s""", (r["id"],))
+        except Exception as e:
+            print(f"[county-backfill] update failed loc={r['id']}: {e!r}", flush=True)
 
 
 # Warning types that auto-relay to subscribers the moment they hit
