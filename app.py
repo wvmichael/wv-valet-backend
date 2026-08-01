@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-103"
+BACKEND_BUILD = "0702-104"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -723,6 +723,12 @@ CREATE TABLE IF NOT EXISTS trial_keyword_signups (
     created_at    BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tks_phone10 ON trial_keyword_signups (phone_last10);
+
+-- Onboarding link (Aug 1, 2026): each keyword signup gets a tokenized
+-- welcome page where the prospect enters their own name, business, and
+-- email. Their thumbs, not the team's evening.
+ALTER TABLE trial_keyword_signups ADD COLUMN IF NOT EXISTS onboard_token TEXT;
+ALTER TABLE trial_keyword_signups ADD COLUMN IF NOT EXISTS onboarded_at BIGINT;
 
 -- ── Field gauge readings (July 24, 2026) ──
 -- Ground truth beats the model. A Met (or later the farmer) enters a
@@ -41108,6 +41114,7 @@ def _handle_trial_keyword(from_phone: str, body: str):
     user_id = None
     try:
         with db() as conn:
+            _tok = secrets.token_urlsafe(9)
             user_id = _get_or_create_user(placeholder_email, conn)
             _grant_subscriber_role(user_id, conn)
             with conn.cursor() as cur:
@@ -41126,10 +41133,10 @@ def _handle_trial_keyword(from_phone: str, body: str):
                 cur.execute(
                     """INSERT INTO trial_keyword_signups
                          (phone_last10, raw_message, consent_at, user_id,
-                          state, created_at)
-                       VALUES (%s,%s,%s,%s,'awaiting_address',%s)""",
+                          state, created_at, onboard_token)
+                       VALUES (%s,%s,%s,%s,'awaiting_address',%s,%s)""",
                     (last10, (body or "")[:500], now * 1000, user_id,
-                     now * 1000))
+                     now * 1000, _tok))
     except Exception as e:
         print(f"[trial-keyword] signup failed for {last10}: {e!r}", flush=True)
         reply = ("Something went wrong starting your trial. Please email "
@@ -41148,7 +41155,9 @@ def _handle_trial_keyword(from_phone: str, body: str):
                        f"location, and Meteorologist in the Control Center "
                        f"when their reply lands.</p>"),
             text_body=(f"{from_phone} texted TRIAL. 30 day trial created "
-                       f"(user id {user_id}). Awaiting their address reply."))
+                       f"(user id {user_id}). Awaiting their address reply. "
+                       f"Their onboarding link (share if needed): "
+                       f"{PUBLIC_BASE_URL}/welcome/{_tok}"))
     except Exception as e:
         print(f"[trial-keyword] team notification failed: {e!r}", flush=True)
 
@@ -41218,12 +41227,143 @@ def _handle_trial_address_reply(from_phone: str, body: str, signup):
     except Exception as e:
         print(f"[trial-keyword] address notification failed: {e!r}", flush=True)
 
+    link = ""
+    try:
+        if signup.get("onboard_token"):
+            link = (" Finish setup (name and email) here: "
+                    f"{PUBLIC_BASE_URL}/welcome/{signup['onboard_token']}")
+    except Exception:
+        link = ""
     reply = ("Got it! Your Meteorologist will start watching the sky there. "
-             "Watch for your first forecast soon. Questions anytime? Just "
-             "reply here and a real person answers.")
+             "Watch for your first forecast soon." + link + " Questions? "
+             "Just reply here and a real person answers.")
     twiml = ("<?xml version='1.0' encoding='UTF-8'?><Response><Message>"
              + escape_xml(reply) + "</Message></Response>")
     return (twiml, 200, {"Content-Type": "text/xml"})
+
+
+_WELCOME_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Welcome to WeatherValet</title><style>
+body{margin:0;background:#0a1422;color:#fff;font-family:Inter,Arial,Helvetica,sans-serif}
+.wrap{max-width:480px;margin:0 auto;padding:28px 20px 60px}
+.brand{font-size:26px;font-weight:900;letter-spacing:-.02em}
+.brand .bolt{color:#1E7FFF}.brand .valet{color:#1E7FFF}
+h1{font-size:24px;margin:22px 0 6px}
+p{color:#b9c6d8;line-height:1.5;font-size:15px;margin:6px 0 18px}
+label{display:block;font-size:13px;font-weight:800;margin:14px 0 6px;color:#dbe5f0}
+input{width:100%;box-sizing:border-box;padding:13px 12px;border-radius:10px;border:1px solid rgba(255,255,255,.22);background:#101d31;color:#fff;font-size:16px}
+button{width:100%;margin-top:22px;padding:15px;border:0;border-radius:10px;background:#1E7FFF;color:#fff;font-size:17px;font-weight:900;cursor:pointer}
+.done{padding:16px;border-radius:12px;background:#0b2518;color:#baf5ce;font-size:16px;line-height:1.5;margin-top:20px}
+.err{padding:12px;border-radius:10px;background:#2a0e12;color:#ffc4cb;font-size:14px;margin-top:14px}
+.small{font-size:12px;color:#7a8aa0;margin-top:26px;line-height:1.5}
+</style></head><body><div class=wrap>
+<div class=brand><span class=bolt>&#9889;</span>Weather<span class=valet>Valet</span></div>
+__BODY__
+<p class=small>A real Meteorologist watches the sky for you and messages you before weather affects your plans. Questions? Just reply to any of our messages.</p>
+</div></body></html>"""
+
+
+@app.get("/welcome/<token>")
+def trial_welcome_page(token: str):
+    """Public onboarding page for a TRIAL keyword signup (Aug 1, 2026).
+    The token is the key; the prospect fills in their own name, business,
+    and email so the team is not typing it for them."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT s.id, s.onboarded_at, u.name, u.trial_business_name, u.email
+                     FROM trial_keyword_signups s
+                     JOIN users u ON u.id = s.user_id
+                    WHERE s.onboard_token = %s
+                    ORDER BY s.id DESC LIMIT 1""", (token,))
+            row = cur.fetchone()
+    if not row:
+        return _WELCOME_PAGE.replace("__BODY__",
+            "<h1>Link not found</h1><p>This welcome link is not valid. "
+            "Text TRIAL to 855-625-6862 to start your free 30 day trial, "
+            "or email hello@weathervalet.ai.</p>"), 404
+    if row.get("onboarded_at"):
+        return _WELCOME_PAGE.replace("__BODY__",
+            "<h1>You're all set!</h1><div class=done>Your Meteorologist has "
+            "everything needed. Watch for your briefs, and reply to any "
+            "message to reach a real person.</div>")
+    email_val = row.get("email") or ""
+    if email_val.startswith("trial-") and email_val.endswith("@sms-signup.weathervalet.ai"):
+        email_val = ""
+    form = (
+        "<h1>Welcome! Let's finish your setup.</h1>"
+        "<p>Thirty seconds, three fields, and your Meteorologist knows who "
+        "they're watching the sky for.</p>"
+        f"<form method=post action='/welcome/{escape_xml(token)}'>"
+        "<label>Your name</label><input name=name maxlength=80 required "
+        f"value=\"{_html_escape(row.get('name') or '')}\">"
+        "<label>Business name (optional)</label><input name=business maxlength=120 "
+        f"value=\"{_html_escape(row.get('trial_business_name') or '')}\">"
+        "<label>Email</label><input name=email type=email maxlength=200 required "
+        f"value=\"{_html_escape(email_val)}\">"
+        "<button>Finish setup</button></form>")
+    return _WELCOME_PAGE.replace("__BODY__", form)
+
+
+@app.post("/welcome/<token>")
+def trial_welcome_submit(token: str):
+    name = (request.form.get("name") or "").strip()[:80]
+    business = (request.form.get("business") or "").strip()[:120]
+    email = (request.form.get("email") or "").strip().lower()[:200]
+    if not name or not email or "@" not in email:
+        return _WELCOME_PAGE.replace("__BODY__",
+            "<h1>Almost</h1><div class=err>Name and a valid email are needed. "
+            "Go back and try again.</div>"), 400
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT s.id, s.user_id, s.onboarded_at
+                     FROM trial_keyword_signups s
+                    WHERE s.onboard_token = %s
+                    ORDER BY s.id DESC LIMIT 1""", (token,))
+            row = cur.fetchone()
+            if not row:
+                return _WELCOME_PAGE.replace("__BODY__",
+                    "<h1>Link not found</h1><p>This welcome link is not valid.</p>"), 404
+            user_id = row["user_id"]
+            email_note = ""
+            cur.execute("SELECT id FROM users WHERE LOWER(email) = %s AND id <> %s",
+                        (email, user_id))
+            if cur.fetchone():
+                email_note = (" NOTE: the email they entered already belongs to "
+                              "another account, so it was NOT changed. Merge by hand.")
+                cur.execute(
+                    "UPDATE users SET name = %s, trial_business_name = NULLIF(%s,'') WHERE id = %s",
+                    (name, business, user_id))
+            else:
+                cur.execute(
+                    """UPDATE users SET name = %s,
+                              trial_business_name = NULLIF(%s,''),
+                              email = %s
+                        WHERE id = %s""",
+                    (name, business, email, user_id))
+            cur.execute(
+                "UPDATE trial_keyword_signups SET onboarded_at = %s WHERE id = %s",
+                (int(time.time() * 1000), row["id"]))
+    try:
+        _send_team_notification(
+            subject=f"TRIAL signup onboarded: {name}" + (f" ({business})" if business else ""),
+            html_body=(f"<p><b>{_html_escape(name)}</b>"
+                       + (f" of <b>{_html_escape(business)}</b>" if business else "")
+                       + f" finished onboarding (user id {user_id}, email "
+                       f"{_html_escape(email)}).{_html_escape(email_note)} "
+                       f"Remaining in Control Center: confirm location, assign "
+                       f"Meteorologist and salesperson.</p>"),
+            text_body=(f"{name}" + (f" ({business})" if business else "")
+                       + f" finished onboarding. user id {user_id}, {email}.{email_note}"))
+    except Exception as e:
+        print(f"[trial-welcome] notify failed: {e!r}", flush=True)
+    return _WELCOME_PAGE.replace("__BODY__",
+        "<h1>You're all set" + (f", {_html_escape(name.split()[0])}" if name else "") + "!</h1>"
+        "<div class=done>Your Meteorologist has what they need. Your briefs "
+        "come by text, and you can reply to any of them to reach a real "
+        "person. Welcome to WeatherValet.</div>")
 
 
 @app.route("/api/v1/sms-inbound-router", methods=["OPTIONS"])
