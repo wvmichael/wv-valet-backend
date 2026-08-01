@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-104"
+BACKEND_BUILD = "0702-105"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -729,6 +729,20 @@ CREATE INDEX IF NOT EXISTS idx_tks_phone10 ON trial_keyword_signups (phone_last1
 -- email. Their thumbs, not the team's evening.
 ALTER TABLE trial_keyword_signups ADD COLUMN IF NOT EXISTS onboard_token TEXT;
 ALTER TABLE trial_keyword_signups ADD COLUMN IF NOT EXISTS onboarded_at BIGINT;
+
+-- ── Met-sent welcome + portal setup (Aug 1, 2026) ──
+-- One button in the Met Portal sends the Met's personal welcome text
+-- (and email when a real address exists) with a tokenized link where
+-- the subscriber creates their portal password. Thresholds and alert
+-- settings live in the portal, so the invitation is part of onboarding.
+CREATE TABLE IF NOT EXISTS portal_setup_tokens (
+    id         SERIAL PRIMARY KEY,
+    user_id    INTEGER NOT NULL,
+    token      TEXT UNIQUE NOT NULL,
+    created_at BIGINT NOT NULL,
+    used_at    BIGINT
+);
+CREATE INDEX IF NOT EXISTS idx_pst_token ON portal_setup_tokens (token);
 
 -- ── Field gauge readings (July 24, 2026) ──
 -- Ground truth beats the model. A Met (or later the farmer) enters a
@@ -41242,6 +41256,166 @@ def _handle_trial_address_reply(from_phone: str, body: str, signup):
     return (twiml, 200, {"Content-Type": "text/xml"})
 
 
+@app.route("/api/v1/met/subscribers/<int:sub_id>/send-welcome", methods=["OPTIONS"])
+def _met_send_welcome_preflight(sub_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/met/subscribers/<int:sub_id>/send-welcome")
+def met_send_welcome(sub_id: int):
+    """The one-button welcome (Aug 1, 2026, Michael's design): the Met
+    sends their personal welcome message with a portal setup link. Texts
+    when a phone exists, emails when a real address exists, marks the
+    welcome flag, and tells the Met exactly what went out."""
+    user = _get_current_user()
+    if not user:
+        return jsonify({"ok": False, "error": "not-signed-in"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "met-or-admin-only"}), 403
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.name, u.email, u.phone, u.trial_business_name
+                     FROM users u
+                    WHERE u.id = %s AND u.is_active = TRUE
+                      AND EXISTS (SELECT 1 FROM user_roles ur
+                                   WHERE ur.user_id = u.id AND ur.role = 'subscriber')""",
+                (sub_id,))
+            sub = cur.fetchone()
+            if not sub:
+                return jsonify({"ok": False, "error": "not-a-subscriber"}), 404
+            tok = secrets.token_urlsafe(9)
+            cur.execute(
+                """INSERT INTO portal_setup_tokens (user_id, token, created_at)
+                   VALUES (%s, %s, %s)""",
+                (sub_id, tok, int(time.time() * 1000)))
+    met_name = (user.get("name") or "").strip() or "your Meteorologist"
+    first = ((sub.get("name") or "").strip().split() or ["there"])[0]
+    link = f"{PUBLIC_BASE_URL}/portal-setup/{tok}"
+    body = (f"Hi {first}, this is Meteorologist {met_name} with WeatherValet. "
+            f"I'll be watching the sky for you. Your forecasts arrive right "
+            f"here by text, and you can reply to me anytime. No app or "
+            f"password needed. Want the web portal too, for alert thresholds "
+            f"and notification settings? Set yours up here: {link}")
+    sent_sms = sent_email = False
+    phone = (sub.get("phone") or "").strip()
+    if phone:
+        try:
+            sent_sms = bool(send_sms(phone, body))
+        except Exception as e:
+            print(f"[met-welcome] sms failed user={sub_id}: {e!r}", flush=True)
+    email = (sub.get("email") or "").strip()
+    real_email = email and not (email.startswith("trial-")
+                                and email.endswith("@sms-signup.weathervalet.ai"))
+    if real_email:
+        try:
+            _send_email(email, f"Welcome to WeatherValet from Meteorologist {met_name}",
+                        f"<p>{_html_escape(body)}</p>", body)
+            sent_email = True
+        except Exception as e:
+            print(f"[met-welcome] email failed user={sub_id}: {e!r}", flush=True)
+    if not sent_sms and not sent_email:
+        return jsonify({"ok": False,
+                        "error": "no-reachable-contact",
+                        "message": "No phone or usable email on file."}), 422
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET welcome_sent_at = COALESCE(welcome_sent_at, %s) WHERE id = %s",
+                (int(time.time() * 1000), sub_id))
+    print(f"[met-welcome] sent to user={sub_id} sms={sent_sms} email={sent_email}",
+          flush=True)
+    return jsonify({"ok": True, "sent_sms": sent_sms, "sent_email": sent_email})
+
+
+@app.get("/portal-setup/<token>")
+def portal_setup_page(token: str):
+    """Public page where a subscriber creates their portal password
+    from the Met's welcome link (Aug 1, 2026)."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT t.id, t.used_at, u.email, u.name
+                     FROM portal_setup_tokens t JOIN users u ON u.id = t.user_id
+                    WHERE t.token = %s""", (token,))
+            row = cur.fetchone()
+    if not row:
+        return _WELCOME_PAGE.replace("__BODY__",
+            "<h1>Link not found</h1><p>This setup link is not valid. Reply to "
+            "any WeatherValet message and a real person will help.</p>"), 404
+    if row.get("used_at"):
+        return _WELCOME_PAGE.replace("__BODY__",
+            "<h1>Already set!</h1><div class=done>Your portal password is set. "
+            "Sign in at weathervalet.ai with your email.</div>")
+    email = row.get("email") or ""
+    placeholder = email.startswith("trial-") and email.endswith("@sms-signup.weathervalet.ai")
+    email_field = ""
+    if placeholder:
+        email_field = ("<label>Your email (for signing in)</label>"
+                       "<input name=email type=email maxlength=200 required>")
+    form = (
+        "<h1>Set up your WeatherValet portal</h1>"
+        "<p>Alert thresholds, notification settings, and maps live in your "
+        "portal. Create a password and you're in.</p>"
+        f"<form method=post action='/portal-setup/{escape_xml(token)}'>"
+        + email_field +
+        "<label>Password (at least 4 characters)</label>"
+        "<input name=password type=password minlength=4 required>"
+        "<button>Create my portal login</button></form>")
+    return _WELCOME_PAGE.replace("__BODY__", form)
+
+
+@app.post("/portal-setup/<token>")
+def portal_setup_submit(token: str):
+    password = (request.form.get("password") or "")
+    new_email = (request.form.get("email") or "").strip().lower()[:200]
+    if len(password) < 4:
+        return _WELCOME_PAGE.replace("__BODY__",
+            "<h1>Almost</h1><div class=err>Password needs at least 4 "
+            "characters. Go back and try again.</div>"), 400
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT t.id, t.used_at, t.user_id, u.email
+                     FROM portal_setup_tokens t JOIN users u ON u.id = t.user_id
+                    WHERE t.token = %s""", (token,))
+            row = cur.fetchone()
+            if not row:
+                return _WELCOME_PAGE.replace("__BODY__",
+                    "<h1>Link not found</h1><p>This setup link is not valid.</p>"), 404
+            if row.get("used_at"):
+                return _WELCOME_PAGE.replace("__BODY__",
+                    "<h1>Already set!</h1><div class=done>Your portal password "
+                    "is set. Sign in at weathervalet.ai.</div>")
+            uid = row["user_id"]
+            email = row.get("email") or ""
+            placeholder = email.startswith("trial-") and email.endswith("@sms-signup.weathervalet.ai")
+            if placeholder:
+                if not new_email or "@" not in new_email:
+                    return _WELCOME_PAGE.replace("__BODY__",
+                        "<h1>Almost</h1><div class=err>A valid email is needed "
+                        "for signing in. Go back and try again.</div>"), 400
+                cur.execute("SELECT id FROM users WHERE LOWER(email) = %s AND id <> %s",
+                            (new_email, uid))
+                if cur.fetchone():
+                    return _WELCOME_PAGE.replace("__BODY__",
+                        "<h1>That email is taken</h1><div class=err>That email "
+                        "already has a WeatherValet account. Reply to any of "
+                        "our messages and a real person will sort it out.</div>"), 400
+                cur.execute("UPDATE users SET email = %s WHERE id = %s", (new_email, uid))
+                email = new_email
+            cur.execute("UPDATE users SET password_hash = %s WHERE id = %s",
+                        (hash_password(password), uid))
+            cur.execute("UPDATE portal_setup_tokens SET used_at = %s WHERE id = %s",
+                        (int(time.time() * 1000), row["id"]))
+    return _WELCOME_PAGE.replace("__BODY__",
+        "<h1>You're in!</h1><div class=done>Portal login created. Sign in at "
+        f"<b>weathervalet.ai</b> with <b>{_html_escape(email)}</b> and your new "
+        "password. Set your alert thresholds and notification preferences "
+        "there, that's where the magic happens.</div>")
+
+
 _WELCOME_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>Welcome to WeatherValet</title><style>
@@ -43128,7 +43302,7 @@ def met_my_subscribers():
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT u.id, u.email, u.name, u.phone, u.subscription_tier,
-                          u.timezone,
+                          u.timezone, u.welcome_sent_at,
                           loc.label AS loc_label,
                           loc.address_text AS loc_address,
                           loc.county AS loc_county,
@@ -43176,6 +43350,7 @@ def met_my_subscribers():
             "phone": r.get("phone") or None,
             "tier": r.get("subscription_tier") or "free",
             "timezone": r.get("timezone"),
+            "welcome_sent_at": r.get("welcome_sent_at"),
             "loc_label": r.get("loc_label"),
             "loc_address": r.get("loc_address"),
             "loc_county": r.get("loc_county"),
