@@ -47,3 +47,28 @@
     document.addEventListener('DOMContentLoaded', brand);
   } else { brand(); }
 })();
+
+
+/* ── Spellcheck for editor fields (Aug 2, 2026, Mets' request) ──
+   Native browser spellcheck on prose fields; endpoint/coordinate-style
+   inputs excluded by keyword. Covers all 29 editors via this shared kit. */
+(function () {
+  var SKIP = /endpoint|url|email|gps|coord|token|slug/i;
+  function apply(el) {
+    if (el.tagName === 'TEXTAREA' || el.isContentEditable) {
+      el.setAttribute('spellcheck', 'true');
+    } else if (el.tagName === 'INPUT') {
+      var type = (el.getAttribute('type') || 'text').toLowerCase();
+      if (type !== 'text' && type !== '') return;
+      if (SKIP.test((el.id || '') + (el.name || '') + (el.placeholder || ''))) return;
+      el.setAttribute('spellcheck', 'true');
+    }
+  }
+  function boot() {
+    var els = document.querySelectorAll('textarea, input, [contenteditable]');
+    for (var i = 0; i < els.length; i++) apply(els[i]);
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+  } else { boot(); }
+})();
