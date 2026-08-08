@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-107"
+BACKEND_BUILD = "0702-108"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -2369,6 +2369,22 @@ CREATE TABLE IF NOT EXISTS search_events (
 );
 CREATE INDEX IF NOT EXISTS idx_search_events_at ON search_events(searched_at_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_search_events_loc ON search_events(location_text, searched_at_ms DESC);
+
+-- ── Search funnel events (Aug 4, 2026) ──
+-- search_events counts the top of the free-search funnel. This table
+-- counts the steps after: the $19 review button click, the plans button
+-- click, and (recorded server-side at the Stripe webhook, so it cannot
+-- be faked or missed) the actual paid review. Together they answer the
+-- question that gates advertising spend: do searchers convert?
+CREATE TABLE IF NOT EXISTS funnel_events (
+    id            BIGSERIAL PRIMARY KEY,
+    event         TEXT NOT NULL,          -- review_click | plans_click | review_paid
+    visitor_hash  TEXT,
+    session       TEXT,
+    meta          TEXT,
+    created_at    BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_funnel_events_at ON funnel_events(event, created_at DESC);
 
 -- ── NWS severe alert pages (Phase 10 Item #7) ──
 -- One row per NWS alert that affected at least one Pro subscriber.
@@ -7302,6 +7318,16 @@ def _mark_paid_and_notify(request_id: int, *, payment_id: Optional[str] = None,
                 "UPDATE verification_requests SET status='paid', stripe_payment_id=%s, updated_at=%s WHERE id=%s",
                 (payment_id, now_ts(), request_id),
             )
+            # Funnel truth (Aug 4, 2026): count the paid review at the exact
+            # moment it becomes real. The pending-status guard above makes
+            # this idempotent across Stripe webhook retries.
+            try:
+                cur.execute(
+                    """INSERT INTO funnel_events (event, meta, created_at)
+                       VALUES ('review_paid', %s, %s)""",
+                    (f"request:{request_id}", int(time.time() * 1000)))
+            except Exception as _fe:
+                print(f"[funnel] review_paid record failed: {_fe!r}", flush=True)
 
     # Customer SMS — the standby promise. Keep it short, warm, time-bounded.
     # (Fixed May 22, 2026 — was using a legacy single-Met name var that
@@ -12198,6 +12224,79 @@ def analytics_visit():
         # Best-effort: never break the visitor's experience
         print(f"[analytics-visit] failed: {e}", flush=True)
     return jsonify({"ok": True})
+
+
+@app.route("/api/v1/funnel/event", methods=["OPTIONS"])
+def _funnel_event_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/funnel/event")
+def funnel_event():
+    """Beacon from the public search page (Aug 4, 2026): review_click and
+    plans_click. review_paid is NOT accepted here; the Stripe webhook
+    records that one so money numbers stay honest."""
+    try:
+        data = request.get_json(silent=True) or {}
+        event = (data.get("event") or "").strip()
+        if event not in ("review_click", "plans_click"):
+            return jsonify({"ok": False}), 400
+        session = (data.get("session") or "")[:60]
+        meta = (data.get("meta") or "")[:200]
+        visitor_hash = _hash_visitor(_client_ip())
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO funnel_events
+                         (event, visitor_hash, session, meta, created_at)
+                       VALUES (%s,%s,%s,%s,%s)""",
+                    (event, visitor_hash, session, meta,
+                     int(time.time() * 1000)))
+    except Exception as e:
+        print(f"[funnel] event failed: {e!r}", flush=True)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/v1/admin/funnel/summary", methods=["OPTIONS"])
+def _funnel_summary_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/funnel/summary")
+def admin_funnel_summary():
+    """The whole free-search funnel in one response (Aug 4, 2026):
+    searches -> review clicks -> paid reviews, plus plans clicks, over the
+    requested window. This is the number that decides advertising spend."""
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "admin-only"}), 403
+    try:
+        days = max(1, min(365, int(request.args.get("days") or 30)))
+    except Exception:
+        days = 30
+    since = int(time.time() * 1000) - days * 86400000
+    out = {"ok": True, "days": days}
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT COUNT(*) AS n, COUNT(DISTINCT visitor_hash) AS u
+                   FROM search_events WHERE searched_at_ms >= %s""", (since,))
+            r = cur.fetchone()
+            out["searches"] = int(r["n"] or 0)
+            out["unique_searchers"] = int(r["u"] or 0)
+            cur.execute(
+                """SELECT event, COUNT(*) AS n, COUNT(DISTINCT visitor_hash) AS u
+                   FROM funnel_events WHERE created_at >= %s GROUP BY event""",
+                (since,))
+            counts = {row["event"]: (int(row["n"] or 0), int(row["u"] or 0))
+                      for row in cur.fetchall()}
+    out["review_clicks"] = counts.get("review_click", (0, 0))[0]
+    out["plans_clicks"] = counts.get("plans_click", (0, 0))[0]
+    out["reviews_paid"] = counts.get("review_paid", (0, 0))[0]
+    s = out["searches"]
+    out["search_to_review_click_pct"] = round(100.0 * out["review_clicks"] / s, 1) if s else None
+    out["search_to_paid_pct"] = round(100.0 * out["reviews_paid"] / s, 1) if s else None
+    return jsonify(out)
 
 
 @app.route("/api/v1/analytics/search", methods=["OPTIONS"])
