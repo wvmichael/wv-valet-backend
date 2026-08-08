@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-108"
+BACKEND_BUILD = "0702-109"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -2386,6 +2386,27 @@ CREATE TABLE IF NOT EXISTS funnel_events (
 );
 CREATE INDEX IF NOT EXISTS idx_funnel_events_at ON funnel_events(event, created_at DESC);
 
+-- ── Letter campaign prospects (Aug 8, 2026) ──
+-- The 43 Boone County businesses that received the mailed letters.
+-- These are PROSPECTS, deliberately not user accounts: pre-creating
+-- users would collide with TRIAL keyword signups (phone matching).
+-- Reps claim their own from the Sales Portal; nothing is pre-assigned.
+CREATE TABLE IF NOT EXISTS sales_prospects (
+    id            SERIAL PRIMARY KEY,
+    business_name TEXT UNIQUE NOT NULL,
+    owner_name    TEXT,
+    address       TEXT,
+    phone         TEXT,
+    website       TEXT,
+    email         TEXT,
+    wave          TEXT,
+    status        TEXT NOT NULL DEFAULT 'letter_sent',
+    claimed_by    TEXT,
+    notes         TEXT,
+    created_at    BIGINT NOT NULL,
+    updated_at    BIGINT NOT NULL
+);
+
 -- ── NWS severe alert pages (Phase 10 Item #7) ──
 -- One row per NWS alert that affected at least one Pro subscriber.
 -- Created by the scheduler when polling NWS detects a new alert whose
@@ -3144,6 +3165,7 @@ def init_db() -> None:
         _backfill_welcome_sent_at()
     except Exception as e:
         print(f"[welcome-backfill] failed: {e}", flush=True)
+    _seed_sales_prospects()
     # Backfill phone/name from approved crew applications to users
     # (May 24, 2026). The crew-verify endpoint was not copying phone
     # to users.phone, so existing approved Crew can't receive mission
@@ -48930,6 +48952,576 @@ def admin_sales_rep_set_email(slug):
         return jsonify({"ok": False, "error": "no-such-rep"}), 404
     print(f"[rep-email] {slug} -> {email}", flush=True)
     return jsonify({"ok": True, "email": email})
+
+
+# The mailed Boone County letter list (Aug 8, 2026). Baked into the code
+# so a normal paste-deploy seeds production; ON CONFLICT keeps it
+# idempotent across every future boot.
+_SEED_BOONE_PROSPECTS = [
+    {
+        "business": "Adams Electric Inc.",
+        "owner": "Kirt Adams",
+        "address": "8040 N. State Road 39, Lebanon, IN 46052",
+        "phone": "(765) 325-2838",
+        "website": "http://www.adamselectric.net",
+        "email": "alissa@adamselectric.net",
+        "wave": "Week 1",
+        "note": ""
+    },
+    {
+        "business": "Airy Time Heating and Cooling",
+        "owner": "Daniel Eckerle",
+        "address": "204 E Main St, Lebanon, IN 46052",
+        "phone": "(317) 649-3811",
+        "website": "https://airy-time.com",
+        "email": "",
+        "wave": "Week 1",
+        "note": ""
+    },
+    {
+        "business": "Best Option Restoration of Northern Indianapolis",
+        "owner": "Carson Riddle",
+        "address": "107 N Meridian St., Lebanon, IN 46052",
+        "phone": "(765) 484-3939",
+        "website": "http://www.bornorthindy.com",
+        "email": "",
+        "wave": "Week 1",
+        "note": "Carson Riddle is a Lebanon High grad. Warm local hook."
+    },
+    {
+        "business": "Blue Fox Heating & Cooling",
+        "owner": "James Disher",
+        "address": "1325 W. South Street, Lebanon, IN 46052",
+        "phone": "(765) 859-0880",
+        "website": "http://www.bluefoxhvac.com",
+        "email": "",
+        "wave": "Week 1",
+        "note": "James Disher, founder and owner (started 2017). Regional, HQ West Lafayette."
+    },
+    {
+        "business": "Cunningham Construction Group LLC",
+        "owner": "Nick Cunningham",
+        "address": "602 Ransdell Road, Lebanon, IN 46052",
+        "phone": "(765) 891-0870",
+        "website": "http://www.cunninghamconstructiongroup.com",
+        "email": "",
+        "wave": "Week 1",
+        "note": ""
+    },
+    {
+        "business": "D&R Excavating, Inc DBA Earth Resources",
+        "owner": "David Graham",
+        "address": "7210 South St Rd 267, Lebanon, IN 46052",
+        "phone": "(317) 769-4966",
+        "website": "http://www.earthresourcesexcavating.com",
+        "email": "",
+        "wave": "Week 1",
+        "note": ""
+    },
+    {
+        "business": "Dotlich Contractors, Inc.",
+        "owner": "John Dotlich",
+        "address": "3025 South Indianapolis Rd, Lebanon, IN 46052",
+        "phone": "(317) 769-5400",
+        "website": "https://dotlichcontractors.com/",
+        "email": "",
+        "wave": "Week 1",
+        "note": ""
+    },
+    {
+        "business": "Drainage Solutions, Inc.",
+        "owner": "Terry Noriega",
+        "address": "2478 N. Lebanon St, Lebanon, IN 46052",
+        "phone": "(765) 484-8788",
+        "website": "http://www.drainagesolutionsinc.com",
+        "email": "",
+        "wave": "Week 1",
+        "note": ""
+    },
+    {
+        "business": "Express Conveying",
+        "owner": "Grace Werlinger",
+        "address": "3875 N 350 W, Lebanon, IN 46052",
+        "phone": "(317) 447-9548",
+        "website": "http://expressconveying.com",
+        "email": "",
+        "wave": "Week 1",
+        "note": "Grace Werlinger, President (per BBB)."
+    },
+    {
+        "business": "Triangle Asphalt Paving Corporation",
+        "owner": "Steve Day",
+        "address": "501 Sam Ralston Road PO Box 521, Lebanon, IN 46052",
+        "phone": "(765) 482-5701",
+        "website": "http://www.triangleasphalt.com",
+        "email": "",
+        "wave": "Week 1",
+        "note": "3rd-gen Boone County family; grandfather ran county roads."
+    },
+    {
+        "business": "Bane-Welker Equipment",
+        "owner": "Phil Bane (CEO)",
+        "address": "1940 Indianapolis Ave., Lebanon, IN 46052",
+        "phone": "(765) 482-2303",
+        "website": "http://www.bane-welker.com/location/lebanon-in/",
+        "email": "",
+        "wave": "Week 1",
+        "note": "Large employee-owned dealer. Lebanon is a branch; address the store manager or Phil Bane."
+    },
+    {
+        "business": "Crew Carwash",
+        "owner": "Bill Dahm (CEO)",
+        "address": "6480 Center Drive, Whitestown, IN 46075",
+        "phone": "(317) 572-2422",
+        "website": "http://www.crewcarwash.com",
+        "email": "",
+        "wave": "Week 1",
+        "note": "Family-owned by the Dahm family. Bill Dahm, CEO; Sally Dahm Grant, EVP. Large chain, so more of a corporate letter than a neighbor letter."
+    },
+    {
+        "business": "Deater Brothers Lawn & Tree Care",
+        "owner": "Josh & Ben Deater",
+        "address": "6300 S 175 W, Lebanon, IN 46052",
+        "phone": "(317) 286-7680",
+        "website": "http://www.deaterbrothers.com",
+        "email": "",
+        "wave": "Week 1",
+        "note": ""
+    },
+    {
+        "business": "Fox Contractors Corp",
+        "owner": "Adam Day (GM)",
+        "address": "4355 S. Indianapolis Road., Whitestown, IN 46075",
+        "phone": "260-410-2982",
+        "website": "http://www.foxcontractors.com",
+        "email": "",
+        "wave": "Week 1",
+        "note": "HQ is Fort Wayne; address the Whitestown office / Adam Day."
+    },
+    {
+        "business": "Howard's Lawn & Garden",
+        "owner": "Howard Hosfield",
+        "address": "1115 W. South St., Lebanon, IN 46052",
+        "phone": "(765) 482-1300",
+        "website": "http://www.howardslawnandgarden.biz",
+        "email": "",
+        "wave": "Week 1",
+        "note": ""
+    },
+    {
+        "business": "Jones Greenhouse",
+        "owner": "David Jones",
+        "address": "645 N. 650 E., Lebanon, IN 46052",
+        "phone": "(317) 769-3254",
+        "website": "http://www.jonesgreenhouse.com",
+        "email": "bjones@jonesgreenhouse.com",
+        "wave": "Week 1",
+        "note": ""
+    },
+    {
+        "business": "Morning Dove Therapeutic Riding",
+        "owner": "Matthew Meeks (Exec. Dir.)",
+        "address": "433 N 700 E PO Box 721, Whitestown, IN 46075",
+        "phone": "(317) 733-9393",
+        "website": "http://www.morningdovetrc.org",
+        "email": "",
+        "wave": "Week 1",
+        "note": "Nonprofit. Matthew Meeks is Executive Director."
+    },
+    {
+        "business": "Nameless Catering Co",
+        "owner": "Jeremy Brown",
+        "address": "Po Box 311, Lebanon, IN 46052",
+        "phone": "(317) 344-8449",
+        "website": "http://www.namelesscatering.com",
+        "email": "",
+        "wave": "Week 1",
+        "note": "Owner Jeremy Brown and wife Jessica live in Boone County. Nice local tie."
+    },
+    {
+        "business": "Notch Above Lawn Care",
+        "owner": "Garrett Alexander",
+        "address": "1338 S Lebanon St., Lebanon, IN 46052",
+        "phone": "(765) 891-2735",
+        "website": "http://notchabovelawncare.com",
+        "email": "",
+        "wave": "Week 1",
+        "note": "Sister company of Grade Tech Contracting. Co-owner Garrett Alexander."
+    },
+    {
+        "business": "On The Go Catering",
+        "owner": "Tony Amich",
+        "address": "8245 N SR 39, Lebanon, IN 46052",
+        "phone": "(765) 577-1589",
+        "website": "http://www.otgcatering.com",
+        "email": "",
+        "wave": "Week 1",
+        "note": "Tony Amich, owner. Lebanon-based, grown through the Lilly Lebanon project. Strong LEAP-boom hook."
+    },
+    {
+        "business": "Reynolds Farm Equipment, Inc.",
+        "owner": "Gary Reynolds (owner)",
+        "address": "2509 Indianapolis Ave., Lebanon, IN 46052",
+        "phone": "(765) 482-1711",
+        "website": "http://reynoldsfarmequiqment.com",
+        "email": "",
+        "wave": "Week 1",
+        "note": "7-store John Deere dealer. Owner Gary Reynolds, pres. Angela Hungate. Lebanon is a branch, so address the store manager."
+    },
+    {
+        "business": "The Sixpence Wedding & Event Space",
+        "owner": "Shelby Dempsey",
+        "address": "4400 N 1000 E, Whitestown, IN 46075",
+        "phone": "(317) 296-8200",
+        "website": "http://thesizpence.com",
+        "email": "",
+        "wave": "Week 1",
+        "note": ""
+    },
+    {
+        "business": "BIRDHOUSE EXTERIORS LLC",
+        "owner": "Garrett Siegel & Donnie Donatelli",
+        "address": "75 N Main St, Zionsville, IN 46077",
+        "phone": "(317) 350-4044",
+        "website": "birdhouseexteriors.com",
+        "email": "",
+        "wave": "Week 2",
+        "note": "STRONG. Zionsville roofing/exterior."
+    },
+    {
+        "business": "Grade Tech Contracting Corporation",
+        "owner": "Garrett Alexander",
+        "address": "2632 S SR 75, Jamestown, IN 46147",
+        "phone": "(765) 891-2735",
+        "website": "http://gradetechcontracting.com",
+        "email": "",
+        "wave": "Week 2",
+        "note": "STRONG. Sister company of Notch Above (Wave 1)."
+    },
+    {
+        "business": "Grilliant Foods",
+        "owner": "",
+        "address": "1125 Indianapolis Ave, Lebanon, IN 46052",
+        "phone": "(317) 289-5043",
+        "website": "http://www.Grilliantfoods.com",
+        "email": "",
+        "wave": "Week 2",
+        "note": "LIGHTER FIT. Local food producer, weather mostly shipping/logistics. Pamela Verbarg is President; ownership not confirmed."
+    },
+    {
+        "business": "J.L. Anderson Heating & Cooling",
+        "owner": "Jim Anderson",
+        "address": "7159 Whitestown Parkway, Zionsville, IN 46077",
+        "phone": "(317) 342-9707",
+        "website": "http://www.jlanderson.net",
+        "email": "",
+        "wave": "Week 2",
+        "note": "STRONG. Zionsville HVAC."
+    },
+    {
+        "business": "Jim Russell Comfort",
+        "owner": "Derek Brandt",
+        "address": "PO Box 667, Zionsville, IN 46077",
+        "phone": "(317) 873-5773",
+        "website": "http://www.jimrussell.net",
+        "email": "",
+        "wave": "Week 2",
+        "note": "STRONG. Zionsville HVAC."
+    },
+    {
+        "business": "Kaylor Plumbing",
+        "owner": "Jason Kaylor",
+        "address": "910 John Bart Rd, Lebanon, IN 46052",
+        "phone": "(765) 366-9660",
+        "website": "http://www.kaylorplumbing.com",
+        "email": "",
+        "wave": "Week 2",
+        "note": "STRONG. Moved from Wave 1. Address corrected to 910 John Bart Rd."
+    },
+    {
+        "business": "Metal Tech of Indiana, Inc",
+        "owner": "Donna Hoyt (co-owner)",
+        "address": "810 Hendricks Drive, Lebanon, IN 46052",
+        "phone": "(765) 482-1100",
+        "website": "http://www.metaltechcoatings.com",
+        "email": "",
+        "wave": "Week 2",
+        "note": "LIGHTER FIT. Local manufacturer, outdoor material handling. Donna Hoyt confirmed co-owner; full ownership group not verified."
+    },
+    {
+        "business": "Mitchell Excavating & Transport, LLC",
+        "owner": "Matthew Mitchell",
+        "address": "2632 S SR 75, Jamestown, IN 46147",
+        "phone": "7654816550",
+        "website": "https://www.mitchellexc.com/",
+        "email": "",
+        "wave": "Week 2",
+        "note": "STRONG. Shares Jamestown address/phone with Grade Tech."
+    },
+    {
+        "business": "Mossman Metal Works",
+        "owner": "Matthew Mossman",
+        "address": "3595 W 200 S, Lebanon, IN 46052",
+        "phone": "(765) 676-6055",
+        "website": "",
+        "email": "",
+        "wave": "Week 2",
+        "note": "LIGHTER FIT. Local metal fab."
+    },
+    {
+        "business": "Prodigy Pro Painters",
+        "owner": "Bunty Badasay",
+        "address": "610 W Poplar Street #13, Zionsville, IN 46077",
+        "phone": "(317) 775-8984",
+        "website": "http://www.prodigypropainters.com",
+        "email": "",
+        "wave": "Week 2",
+        "note": "STRONG. Zionsville exterior painting, weather-driven."
+    },
+    {
+        "business": "RL Turner Corp",
+        "owner": "",
+        "address": "1000 W. Oak St, Zionsville, IN 46077",
+        "phone": "(317) 873-2712",
+        "website": "http://rlturner.com",
+        "email": "",
+        "wave": "Week 2",
+        "note": "STRONG. Longtime Zionsville builder, built the town hall. Great hook. Leadership is Adam Owens (Pres/CEO); ownership not public. Address the company."
+    },
+    {
+        "business": "United States Cold Storage",
+        "owner": "John Swire & Sons Inc. (parent co.)",
+        "address": "415 S. Mt. Zion Rd, Lebanon, IN 46052",
+        "phone": "(765) 482-2653",
+        "website": "http://uscold.com",
+        "email": "",
+        "wave": "Week 2",
+        "note": "LIGHTER FIT. Logistics, trucking weather exposure. Owner is the national parent company, not a local individual. Address the Lebanon facility."
+    },
+    {
+        "business": "Brick Street Catering",
+        "owner": "",
+        "address": "156 S 1st Street, Zionsville, IN 46077",
+        "phone": "(463) 800-8847",
+        "website": "http://www.Brickstreetcatering.com",
+        "email": "",
+        "wave": "Week 2",
+        "note": "STRONG. Zionsville events/catering. An Ideal Food Group company; personal owner not confirmed."
+    },
+    {
+        "business": "Cochrans Catering & Cake",
+        "owner": "Rodney Cochran",
+        "address": "29 West Main Street, Jamestown, IN 46147",
+        "phone": "765-676-6369",
+        "website": "http://www.cochranscateringandcakes.com",
+        "email": "",
+        "wave": "Week 2",
+        "note": "STRONG. Jamestown caterer, outdoor events."
+    },
+    {
+        "business": "Dulls Tree Farm",
+        "owner": "Tom & Kerry Dull",
+        "address": "1765 W. Blubaugh Ave, Thorntown, IN 46071",
+        "phone": "(765) 894-9456",
+        "website": "http://www.dullstreefarm.com",
+        "email": "",
+        "wave": "Week 2",
+        "note": "STRONG. Family tree farm, entirely weather-dependent. Great hook."
+    },
+    {
+        "business": "Ken's Foods",
+        "owner": "",
+        "address": "917 Edwards Dr, Lebanon, IN 46052",
+        "phone": "(765) 505-7900",
+        "website": "http://www.kensfoods.com",
+        "email": "",
+        "wave": "Week 2",
+        "note": "LIGHTER FIT. Local food producer. Family-owned; specific owner not confirmed."
+    },
+    {
+        "business": "King's Mulch, Stone & Excavating, LLC",
+        "owner": "Roy King",
+        "address": "8175 E. 550 S, Zionsville, IN 46077",
+        "phone": "(317) 769-3671",
+        "website": "http://www.kings-mulch.com",
+        "email": "",
+        "wave": "Week 2",
+        "note": "STRONG. Family business since 1952. Great hook."
+    },
+    {
+        "business": "Moody's Butcher Shops, LLC",
+        "owner": "",
+        "address": "20 E Cedar Street, Zionsville, IN 46077",
+        "phone": "(317) 733-1230",
+        "website": "http://moodysbutchershop.com",
+        "email": "",
+        "wave": "Week 2",
+        "note": "LIGHTER FIT. Zionsville butcher/retail. 2020 ownership group led by Erik Risman; full group not confirmed."
+    },
+    {
+        "business": "The LadyBug Pest & Wildlife Control",
+        "owner": "Jaclyn Ricci & Johnny Ricci",
+        "address": "920 Hendricks Dr, Lebanon, IN 46052",
+        "phone": "(317) 601-2873",
+        "website": "http://www.calltheladybug.com",
+        "email": "",
+        "wave": "Week 2",
+        "note": "STRONG. Lebanon, outdoor field work."
+    },
+    {
+        "business": "Thorntown Parks & Recreations Department",
+        "owner": "",
+        "address": "101 W Main St, Thorntown, IN 46071",
+        "phone": "765-436-2205",
+        "website": "http://townofthorntown.com",
+        "email": "",
+        "wave": "Week 2",
+        "note": "STRONG for outdoor rec. Public dept, so it is a relationship play. Government department, no owner."
+    },
+    {
+        "business": "Triple B's Catering",
+        "owner": "Riley Bennett",
+        "address": "2605 Dover Court, Lebanon, IN 46052",
+        "phone": "(317) 902-0917",
+        "website": "http://triplebscatering.com",
+        "email": "",
+        "wave": "Week 2",
+        "note": "STRONG. Lebanon caterer, outdoor events."
+    }
+]
+
+
+def _seed_sales_prospects() -> None:
+    try:
+        now_ms = int(time.time() * 1000)
+        with db() as conn:
+            with conn.cursor() as cur:
+                for p in _SEED_BOONE_PROSPECTS:
+                    cur.execute(
+                        """INSERT INTO sales_prospects
+                             (business_name, owner_name, address, phone,
+                              website, email, wave, notes, created_at, updated_at)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           ON CONFLICT (business_name) DO NOTHING""",
+                        (p["business"], p["owner"], p["address"], p["phone"],
+                         p["website"], p["email"], p["wave"], p["note"],
+                         now_ms, now_ms))
+        print(f"[prospects] seed pass complete ({len(_SEED_BOONE_PROSPECTS)} in list)",
+              flush=True)
+    except Exception as e:
+        print(f"[prospects] seed failed: {e!r}", flush=True)
+
+
+_PROSPECT_STATUSES = ("letter_sent", "followed_up", "interested",
+                      "trial", "converted", "not_interested")
+
+
+@app.route("/api/v1/sales/prospects", methods=["OPTIONS"])
+def _sales_prospects_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/sales/prospects")
+def sales_prospects_list():
+    """The letter campaign board (Aug 8, 2026): every mailed business,
+    who has claimed it, and where it stands. Visible to every rep and
+    admin so the team can divide the follow-up work themselves."""
+    user, rep = _current_sales_rep()
+    is_admin = bool(user and "admin" in (user.get("roles") or []))
+    if user is None or (rep is None and not is_admin):
+        return jsonify({"ok": False, "error": "rep-or-admin-only"}), 403
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, business_name, owner_name, address, phone,
+                          website, email, wave, status, claimed_by, notes,
+                          updated_at
+                   FROM sales_prospects
+                   ORDER BY wave, business_name""")
+            rows = cur.fetchall()
+    return jsonify({"ok": True,
+                    "me": (rep or {}).get("slug"),
+                    "statuses": list(_PROSPECT_STATUSES),
+                    "prospects": [dict(r) for r in rows]})
+
+
+@app.route("/api/v1/sales/prospects/<int:pid>/claim", methods=["OPTIONS"])
+def _sales_prospect_claim_preflight(pid):
+    return ("", 204)
+
+
+@app.post("/api/v1/sales/prospects/<int:pid>/claim")
+def sales_prospect_claim(pid: int):
+    """Claim (or release) a prospect. First come, first served; a rep can
+    release their own claim; admin can clear anyone's."""
+    user, rep = _current_sales_rep()
+    is_admin = bool(user and "admin" in (user.get("roles") or []))
+    if user is None or (rep is None and not is_admin):
+        return jsonify({"ok": False, "error": "rep-or-admin-only"}), 403
+    me = (rep or {}).get("slug") or "admin"
+    release = bool((request.get_json(silent=True) or {}).get("release"))
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT claimed_by FROM sales_prospects WHERE id = %s", (pid,))
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"ok": False, "error": "not-found"}), 404
+            current = row.get("claimed_by")
+            if release:
+                if current and (current == me or is_admin):
+                    cur.execute(
+                        "UPDATE sales_prospects SET claimed_by = NULL, updated_at = %s WHERE id = %s",
+                        (now_ms, pid))
+                    return jsonify({"ok": True, "claimed_by": None})
+                return jsonify({"ok": False, "error": "not-yours"}), 403
+            if current and current != me and not is_admin:
+                return jsonify({"ok": False, "error": "already-claimed",
+                                "claimed_by": current}), 409
+            cur.execute(
+                "UPDATE sales_prospects SET claimed_by = %s, updated_at = %s WHERE id = %s",
+                (me, now_ms, pid))
+    return jsonify({"ok": True, "claimed_by": me})
+
+
+@app.route("/api/v1/sales/prospects/<int:pid>/update", methods=["OPTIONS"])
+def _sales_prospect_update_preflight(pid):
+    return ("", 204)
+
+
+@app.post("/api/v1/sales/prospects/<int:pid>/update")
+def sales_prospect_update(pid: int):
+    """Update a prospect's status and append a dated note. Notes append,
+    never overwrite: the trail of touches IS the campaign record."""
+    user, rep = _current_sales_rep()
+    is_admin = bool(user and "admin" in (user.get("roles") or []))
+    if user is None or (rep is None and not is_admin):
+        return jsonify({"ok": False, "error": "rep-or-admin-only"}), 403
+    data = request.get_json(silent=True) or {}
+    status = (data.get("status") or "").strip()
+    note = (data.get("note") or "").strip()[:500]
+    if status and status not in _PROSPECT_STATUSES:
+        return jsonify({"ok": False, "error": "bad-status"}), 400
+    me = (rep or {}).get("slug") or "admin"
+    now_ms = int(time.time() * 1000)
+    sets, vals = ["updated_at = %s"], [now_ms]
+    if status:
+        sets.append("status = %s"); vals.append(status)
+    if note:
+        import datetime as _dt
+        stamp = _dt.datetime.now().strftime("%b %d")
+        sets.append("notes = COALESCE(NULLIF(notes,''), '') || %s")
+        vals.append(f"\n[{stamp} {me}] {note}")
+    vals.append(pid)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE sales_prospects SET {', '.join(sets)} WHERE id = %s RETURNING status, notes",
+                vals)
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"ok": False, "error": "not-found"}), 404
+    return jsonify({"ok": True, "status": row["status"], "notes": row["notes"]})
 
 
 @app.route("/api/v1/sales/roster", methods=["OPTIONS"])
