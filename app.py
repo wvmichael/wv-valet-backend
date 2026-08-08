@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-105"
+BACKEND_BUILD = "0702-107"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -4803,6 +4803,15 @@ def _add_security_headers(response):
     if path.startswith("/api/v1/widget/"):
         # Do not set X-Frame-Options (no DENY); permit embedding anywhere.
         pass
+    elif path == "/graphics" or path.startswith("/graphics/"):
+        # Graphics Studio is embedded inside the Met Portal (Aug 1, 2026).
+        # XFO cannot express an allow-list, so omit it and use CSP
+        # frame-ancestors restricted to our own sites. Auth still applies;
+        # this only governs who may FRAME the pages.
+        response.headers["Content-Security-Policy"] = (
+            "frame-ancestors 'self' https://weathervalet.ai "
+            "https://www.weathervalet.ai https://weathervalet.com "
+            "https://www.weathervalet.com")
     else:
         response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
@@ -19647,6 +19656,9 @@ def _record_crew_checkin_from_sms(matched_user_id: int, body: str,
             cur.execute(
                 """SELECT u.timezone, u.name,
                           u.crew_home_lat, u.crew_home_lng,
+                          (SELECT ca.county FROM crew_applications ca
+                            WHERE ca.created_user_id = u.id
+                            ORDER BY ca.id DESC LIMIT 1) AS crew_county,
                           EXISTS (SELECT 1 FROM user_roles ur
                                   WHERE ur.user_id = u.id AND ur.role = 'crew') AS is_crew,
                           EXISTS (SELECT 1 FROM user_roles ur3
@@ -19662,9 +19674,19 @@ def _record_crew_checkin_from_sms(matched_user_id: int, body: str,
     condition = _parse_crew_condition(body)
     user_tz = urow.get("timezone") or "America/Indianapolis"
     date_key = _local_date_key(user_tz)
-    # Store the recognized condition if we found one, else a short
-    # snippet of what they actually said.
-    checkin_label = condition or ((body or "").strip()[:40] or "reported")
+    # The livestream shows this text, so it must carry a PLACE (Aug 2,
+    # 2026, Michael's request). Keep the member's full reply (they're now
+    # asked for conditions plus town), and if no place made it into the
+    # text, append their signup county so the stream never shows a
+    # placeless report.
+    raw = (body or "").strip()
+    checkin_label = raw[:90] or condition or "reported"
+    county = (urow.get("crew_county") or "").strip()
+    if county:
+        county_word = county.lower().replace(" county", "").replace(" co", "").strip()
+        if county_word and county_word not in raw.lower():
+            short = county if "co" in county.lower().split() or "county" in county.lower() else county + " Co"
+            checkin_label = (checkin_label[:90 - len(short) - 3] + f" ({short})")
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -27358,35 +27380,20 @@ def _notify_crew_in_severe_alert(alert: dict) -> None:
 # Sent from the toll-free number, so a reply lands in the inbound webhook
 # (rosie_sms_inbound) and checks them in.
 _CREW_DAILY_NUDGE_MESSAGES = [
-    "Good morning from WeatherValet! What does it look like outside right now? Reply clear, cloudy, rain, or storm, or send a photo of your sky.",
-    "Valet Crew check-in time! A quick word (clear, cloudy, rain, storm) or a photo puts you on the Crew map today.",
-    "Our WeatherValet Meteorologists need your eyes. What does it look like at your location? Photos welcome!",
-    "Valet Crew: take a look outside. Is it clear, cloudy, raining, or storming? Snap a photo if the sky is doing something interesting.",
-    "Daily WeatherValet update: what does it look like outside at your location? A photo says it best.",
-    "Weather check from the Valet Crew line! What are conditions like right now? Reply with a word or a picture.",
-    "WeatherValet here. Help us monitor conditions in your area: what does the weather look like outside?",
-    "Valet Crew: take a quick glance outside and let us know what you see. Clear, cloudy, rain, or storm.",
-    "WeatherValet would love an update from your location. What are current conditions outside? Photos land straight on the Crew map.",
-    "Ground truth matters to our Meteorologists. Valet Crew, what does the sky look like where you are right now?",
-    "It's WeatherValet! Can you help us out with a quick observation? Reply clear, cloudy, rain, or storm, or just send a photo.",
-    "Valet Crew: what's happening outside your window? A word or a photo checks you in for today.",
-    "Conditions can change quickly, and the Valet Crew sees it first. What does the weather look like at your location right now?",
-    "WeatherValet observation request: is it clear, cloudy, raining, or storming where you are?",
-    "Today's Valet Crew check-in: what are you seeing outside? Bonus points for a great sky photo.",
-    "Help improve WeatherValet's weather picture. What does it look like outside right now?",
-    "Quick Valet Crew check: are conditions clear, cloudy, rainy, or stormy in your area?",
-    "Your observation helps everyone WeatherValet watches over in your region. What are conditions like outside?",
-    "What does the sky have in store today? Tell your Valet Crew line: clear, cloudy, rain, or storm, or show us with a photo.",
-    "WeatherValet is checking conditions across the region. What does it look like where you are?",
-    "Valet Crew: step outside or look out a window. What are you seeing right now? Photos welcome.",
-    "A quick update from you goes a long way at WeatherValet. What's the weather doing at your location?",
-    "Valet Crew conditions check: clear, cloudy, rain, or storm? A photo works too.",
-    "Take 5 seconds for WeatherValet. What does the weather look like where you are?",
-    "Valet Crew, we need your eyes on the sky. What's it looking like at your location? Send a photo if it's a good one.",
-    "Good day from WeatherValet! Crew check-in: what are current conditions where you are?",
-    "Help WeatherValet build a real-time weather picture. A word or a photo does it.",
-    "Your local observation helps everyone. Valet Crew, what conditions are you seeing at your location?",
-    "Be WeatherValet's spotter for the day. Is it clear, cloudy, raining, or storming where you are?",
+    "Good morning from WeatherValet! What does it look like outside, and what town are you in? Reply like: clear, Lebanon. Photos welcome!",
+    "Valet Crew check-in time! Reply with conditions and your town (like: rain, Whitestown) or a photo, and you're on the Crew map today.",
+    "Our WeatherValet Meteorologists need your eyes. What is the sky doing, and what town are you watching it from? Photos welcome!",
+    "Valet Crew: take a look outside. Reply with what you see and your town, like: cloudy, Zionsville. A photo says even more.",
+    "Daily WeatherValet update: conditions plus your town, please! Example: storm rolling in, Atwood. Photos land straight on the Crew map.",
+    "Weather check from the Valet Crew line! What is it doing outside, and where? A word and a town, or a picture.",
+    "WeatherValet here. Help us monitor conditions: what does the weather look like, and what town are you in?",
+    "Valet Crew: quick glance outside. Reply conditions plus town, like: clear, Lebanon. That is all it takes.",
+    "WeatherValet would love an update. Current conditions and your town, or a photo. Example: light rain, Thornton.",
+    "Ground truth matters to our Meteorologists. What does the sky look like, and what town is under it? Reply like: windy, Atwood.",
+    "It's WeatherValet! A quick observation helps: conditions and your town, like: cloudy, Jamestown. Or just send a photo.",
+    "Valet Crew: what's happening outside your window, and what town is that window in? A word, a town, or a photo checks you in.",
+    "Conditions change fast and the Valet Crew sees it first. What is the weather doing, and in what town? Example: storm, Lebanon.",
+    "WeatherValet observation request: conditions plus your town, please. Like: clear and hot, Whitestown.",
 ]
 
 _CREW_CONDITION_WORDS = {
