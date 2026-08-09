@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-109"
+BACKEND_BUILD = "0702-113"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -12246,6 +12246,76 @@ def analytics_visit():
         # Best-effort: never break the visitor's experience
         print(f"[analytics-visit] failed: {e}", flush=True)
     return jsonify({"ok": True})
+
+
+def _notify_team_warning_map(alert: dict, map_url: str) -> None:
+    """Email the freshly built warning graphic to the team with a
+    ready-to-paste caption, so posting to Facebook is one tap while the
+    Meta developer maze stays unsolved (Aug 9, 2026)."""
+    event = alert.get("event") or "Warning"
+    area = (alert.get("area_desc") or "").strip()
+    caption = (f"{event} in effect for {area}. Our Meteorologists are "
+               f"watching it live. WeatherValet subscribers were alerted "
+               f"the moment it was issued. WeatherValet.com")
+    _send_team_notification(
+        subject=f"POST THIS: {event} map ready",
+        html_body=(f"<p>The warning graphic for the {_html_escape(event)} is ready:</p>"
+                   f"<p><a href='{map_url}'>{map_url}</a></p>"
+                   f"<p><img src='{map_url}' width='560' style='max-width:100%'></p>"
+                   f"<p>Suggested caption:</p><p>{_html_escape(caption)}</p>"),
+        text_body=f"Warning graphic ready: {map_url}\n\nCaption: {caption}")
+
+
+@app.get("/warning-maps/<token>.png")
+def serve_warning_map(token: str):
+    """Serve a generated warning map (Twilio fetches these for MMS)."""
+    safe = "".join(ch for ch in token if ch.isalnum() or ch in "-_")
+    path = os.path.join(WARNING_MAP_DIR, f"{safe}.png")
+    if not os.path.isfile(path):
+        return ("Not found", 404)
+    from flask import send_file
+    return send_file(path, mimetype="image/png", max_age=86400)
+
+
+@app.route("/api/v1/admin/test-warning-map", methods=["OPTIONS"])
+def _test_warning_map_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/test-warning-map")
+def admin_test_warning_map():
+    """Generate a sample warning graphic on demand (admin): a fake
+    Severe Thunderstorm Warning polygon around the given point, run
+    through the real pipeline against live radar and map servers. The
+    on-demand storm drill, so verifying doesn't require weather."""
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "admin-only"}), 403
+    data = request.get_json(silent=True) or {}
+    try:
+        lat = float(data.get("lat") or 40.05)
+        lng = float(data.get("lng") or -86.47)
+    except Exception:
+        lat, lng = 40.05, -86.47
+    dl, dn = 0.38, 0.22
+    fake = {
+        "nws_id": "urn:test:map-drill",
+        "event": "Severe Thunderstorm Warning",
+        "area_desc": "Boone, IN; Hendricks, IN; Montgomery, IN",
+        "expires_at": int(time.time() * 1000) + 45 * 60 * 1000,
+        "parameters": {"maxWindGust": ["60 mph"], "maxHailSize": ["1.00"],
+                       "eventMotionDescription": ["2026-08-09T20:00:00-00:00...storm...255DEG...20KT"]},
+        "geometry": {"type": "Polygon", "coordinates": [[
+            [lng - dl, lat - dn], [lng + dl, lat - dn * 0.6],
+            [lng + dl * 0.8, lat + dn], [lng - dl * 0.7, lat + dn * 0.8],
+            [lng - dl, lat - dn]]]},
+    }
+    url = _warning_map_for_alert(fake)
+    if not url:
+        return jsonify({"ok": False,
+                        "error": "generation-failed-or-timed-out",
+                        "hint": "Check Render logs for [warn-map] lines."}), 502
+    return jsonify({"ok": True, "url": url})
 
 
 @app.route("/api/v1/funnel/event", methods=["OPTIONS"])
@@ -27220,6 +27290,8 @@ def _fetch_active_nws_alerts() -> list:
             "match_mode": match_mode,
             "same_codes": same_codes,
             "expires_at": expires_ms,
+            # NWS tags for the warning graphic (Aug 9, 2026)
+            "parameters": props.get("parameters") or {},
         })
     return out
 
@@ -28388,6 +28460,280 @@ def _relay_area_label(alert: dict, sub: dict) -> str:
     return area or "your area"
 
 
+# ═══════════════════════════════════════════════════════════════════
+# Warning map graphics (Aug 9, 2026, Michael's request)
+# Composites basemap + live radar + the warning polygon + a branded
+# stats sidebar into a single social-ready image, generated the moment
+# a Tornado or Severe Thunderstorm Warning relays. HARD RULE: the
+# subscriber text never waits more than _MAP_BUDGET_S seconds; if the
+# image isn't ready, the plain text goes alone.
+# ═══════════════════════════════════════════════════════════════════
+
+_MAP_EVENTS = ("Tornado Warning", "Severe Thunderstorm Warning")
+_MAP_BUDGET_S = 8.0
+_MAP_TILE_TIMEOUT_S = 2.5
+WARNING_MAP_DIR = os.environ.get("WARNING_MAP_DIR", "/tmp/wv-warning-maps")
+_MAP_W, _MAP_H = 1280, 720
+_SIDEBAR_W = 320
+
+
+def _tile_xy(lat: float, lng: float, z: int):
+    import math as _m
+    n = 2 ** z
+    x = (lng + 180.0) / 360.0 * n
+    lat_r = _m.radians(lat)
+    y = (1.0 - _m.log(_m.tan(lat_r) + 1 / _m.cos(lat_r)) / _m.pi) / 2.0 * n
+    return x, y
+
+
+def _fetch_tile(url: str, deadline: float):
+    """One tile, respecting the global deadline. Returns PIL Image or None."""
+    import time as _t
+    from PIL import Image as _Img
+    import io as _io
+    remaining = deadline - _t.monotonic()
+    if remaining <= 0.2:
+        return None
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "WeatherValet/1.0 (+https://weathervalet.ai; warning graphics)"})
+        with urllib.request.urlopen(req, timeout=min(_MAP_TILE_TIMEOUT_S, remaining)) as resp:
+            return _Img.open(_io.BytesIO(resp.read())).convert("RGBA")
+    except Exception:
+        return None
+
+
+def _polygon_rings(geom: dict):
+    if not geom:
+        return []
+    if geom.get("type") == "Polygon":
+        return geom.get("coordinates") or []
+    if geom.get("type") == "MultiPolygon":
+        return [ring for poly in (geom.get("coordinates") or []) for ring in poly]
+    return []
+
+
+def _build_warning_map(alert: dict):
+    """Composite the warning graphic. Returns PNG bytes or None. Never
+    raises; never exceeds the time budget by more than one tile fetch."""
+    import time as _t
+    from PIL import Image as _Img, ImageDraw as _Draw, ImageFont as _Font
+    deadline = _t.monotonic() + _MAP_BUDGET_S
+    rings = _polygon_rings(alert.get("geometry"))
+    if not rings:
+        return None
+    pts = [(p[0], p[1]) for ring in rings for p in ring]
+    lngs = [p[0] for p in pts]; lats = [p[1] for p in pts]
+    min_lng, max_lng = min(lngs), max(lngs)
+    min_lat, max_lat = min(lats), max(lats)
+    c_lat = (min_lat + max_lat) / 2; c_lng = (min_lng + max_lng) / 2
+    map_w = _MAP_W - _SIDEBAR_W
+    z = 10
+    for zc in range(11, 6, -1):
+        x0, _ = _tile_xy(min_lat, min_lng, zc)
+        x1, _ = _tile_xy(min_lat, max_lng, zc)
+        _, y0 = _tile_xy(max_lat, c_lng, zc)
+        _, y1 = _tile_xy(min_lat, c_lng, zc)
+        if (x1 - x0) * 256 <= map_w * 0.55 and abs(y1 - y0) * 256 <= _MAP_H * 0.60:
+            z = zc
+            break
+    cx, cy = _tile_xy(c_lat, c_lng, z)
+    px_left = cx * 256 - map_w / 2
+    px_top = cy * 256 - _MAP_H / 2
+    tx0, ty0 = int(px_left // 256), int(px_top // 256)
+    tx1 = int((px_left + map_w) // 256) + 1
+    ty1 = int((px_top + _MAP_H) // 256) + 1
+    base = _Img.new("RGBA", (map_w, _MAP_H), (14, 20, 32, 255))
+    n_max = 2 ** z
+    for tx in range(tx0, tx1 + 1):
+        for ty in range(ty0, ty1 + 1):
+            if ty < 0 or ty >= n_max:
+                continue
+            wrap_tx = tx % n_max
+            ox = int(tx * 256 - px_left); oy = int(ty * 256 - px_top)
+            # Dark broadcast basemap (Aug 9, 2026): CartoDB dark tiles,
+            # free with attribution, matching the approved design.
+            t = _fetch_tile(f"https://basemaps.cartocdn.com/dark_all/{z}/{wrap_tx}/{ty}.png", deadline)
+            if t:
+                base.paste(t, (ox, oy))
+            r = _fetch_tile(
+                f"https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-900913/{z}/{wrap_tx}/{ty}.png",
+                deadline)
+            if r:
+                base.alpha_composite(r, (ox, oy))
+    def to_px(lng, lat):
+        x, y = _tile_xy(lat, lng, z)
+        return (x * 256 - px_left, y * 256 - px_top)
+    # Polygon on its own transparent layer, then alpha-composited, so the
+    # fill is genuinely translucent and the radar stays visible under it
+    # (Aug 9, 2026 fix: drawing straight onto the map rendered solid).
+    overlay = _Img.new("RGBA", base.size, (0, 0, 0, 0))
+    odraw = _Draw.Draw(overlay)
+    for ring in rings:
+        poly_px = [to_px(p[0], p[1]) for p in ring]
+        odraw.polygon(poly_px, fill=(255, 160, 30, 58))
+        closed = poly_px + [poly_px[0]]
+        # glow: wide faint strokes under a crisp core (approved design)
+        odraw.line(closed, fill=(255, 170, 40, 60), width=15)
+        odraw.line(closed, fill=(255, 170, 40, 130), width=9)
+        odraw.line(closed, fill=(255, 200, 60, 255), width=4)
+    base = _Img.alpha_composite(base, overlay)
+    img = _Img.new("RGBA", (_MAP_W, _MAP_H), (10, 20, 34, 255))
+    img.paste(base, (_SIDEBAR_W, 0))
+    d = _Draw.Draw(img, "RGBA")
+    def font(sz, bold=True):
+        try:
+            path = ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold
+                    else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+            return _Font.truetype(path, sz)
+        except Exception:
+            return _Font.load_default()
+    is_tor = alert.get("event") == "Tornado Warning"
+    accent = (225, 29, 46, 255) if is_tor else (255, 150, 20, 255)
+    hazard_yellow = (245, 195, 30, 255)
+    d.rectangle([0, 0, _SIDEBAR_W, _MAP_H], fill=(10, 20, 34, 255))
+    d.rectangle([_SIDEBAR_W - 5, 0, _SIDEBAR_W, _MAP_H], fill=(30, 127, 255, 255))
+    # Real logo top-left when the asset exists on the server; text fallback.
+    y = 24
+    logo_path = os.path.join("graphic_editors", "assets", "weathervalet-logo-white.png")
+    try:
+        if os.path.isfile(logo_path):
+            logo = _Img.open(logo_path).convert("RGBA")
+            lh = 34
+            lw = int(logo.width * lh / logo.height)
+            img.alpha_composite(logo.resize((lw, lh), _Img.LANCZOS), (22, y))
+            y += lh + 22
+        else:
+            d.text((22, y), "WeatherValet", font=font(24), fill=(255, 255, 255, 255))
+            y += 50
+    except Exception:
+        d.text((22, y), "WeatherValet", font=font(24), fill=(255, 255, 255, 255))
+        y += 50
+    max_w = _SIDEBAR_W - 44
+    hazard_words = {"TORNADO", "THUNDERSTORM", "FLOOD"}
+    for word in (alert.get("event") or "Warning").upper().split():
+        sz = 34
+        f = font(sz)
+        while sz > 18 and d.textlength(word, font=f) > max_w:
+            sz -= 2
+            f = font(sz)
+        color = (accent if is_tor else hazard_yellow) if word in hazard_words else (255, 255, 255, 255)
+        d.text((22, y), word, font=f, fill=color)
+        y += sz + 8
+    until = ""
+    try:
+        if alert.get("expires_at"):
+            from zoneinfo import ZoneInfo
+            import datetime as _dt
+            local = _dt.datetime.fromtimestamp(alert["expires_at"] / 1000,
+                                               ZoneInfo("America/Indiana/Indianapolis"))
+            until = "Until " + local.strftime("%I:%M %p %m/%d").lstrip("0")
+    except Exception:
+        until = ""
+    if until:
+        d.text((22, y + 4), until, font=font(19, bold=False), fill=(160, 180, 205, 255))
+        y += 34
+    y += 14
+    params = alert.get("parameters") or {}
+    def p1(key):
+        v = params.get(key)
+        if isinstance(v, list) and v:
+            return str(v[0])
+        return str(v) if v else ""
+    rows = []
+    wind = p1("maxWindGust")
+    if wind:
+        rows.append(("PEAK WIND", wind.replace("mph", "MPH").upper()))
+    hail = p1("maxHailSize")
+    if hail:
+        try:
+            rows.append(("PEAK HAIL", '{:.2f}" HAIL'.format(float(hail))))
+        except Exception:
+            rows.append(("PEAK HAIL", hail))
+    motion = p1("eventMotionDescription")
+    if motion and "DEG" in motion.upper():
+        try:
+            seg = motion.split("...")
+            deg = int(seg[-2].upper().replace("DEG", "").strip())
+            kt = seg[-1].upper().replace("KT", "").strip()
+            dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"]
+            toward = dirs[int(((deg + 180) % 360) / 22.5 + 0.5) % 16]
+            mph = int(float(kt) * 1.15078)
+            rows.append(("STORM MOTION", f"{toward} {mph} MPH"))
+        except Exception:
+            pass
+    for label, value in rows:
+        d.rectangle([18, y, _SIDEBAR_W - 24, y + 58], fill=(18, 30, 48, 255),
+                    outline=(50, 70, 100, 255))
+        d.text((30, y + 8), label, font=font(14, bold=False), fill=(140, 165, 195, 255))
+        d.text((30, y + 27), value, font=font(21), fill=(255, 255, 255, 255))
+        y += 68
+    counties = [a.strip() for a in (alert.get("area_desc") or "").split(";") if a.strip()]
+    if len(counties) > 4:
+        counties = counties[:4] + [f"+{len(counties) - 4} more"]
+    f_area = font(14, bold=False)
+    max_aw = _SIDEBAR_W - 44
+    lines, cur = [], ""
+    for c_name in counties:
+        trial = (cur + "; " if cur else "") + c_name
+        if d.textlength(trial, font=f_area) <= max_aw:
+            cur = trial
+        else:
+            if cur:
+                lines.append(cur)
+            cur = c_name
+    if cur:
+        lines.append(cur)
+    lines = lines[:2]
+    ay = _MAP_H - 70 - 18 * len(lines)
+    for ln in lines:
+        d.text((22, ay), ln, font=f_area, fill=(160, 180, 205, 255))
+        ay += 18
+    d.text((22, _MAP_H - 68), "WeatherValet", font=font(28), fill=(255, 255, 255, 255))
+    d.text((22, _MAP_H - 32), "WEATHERVALET.COM", font=font(16),
+           fill=(30, 127, 255, 255))
+    d.text((_SIDEBAR_W + 8, _MAP_H - 18),
+           "Map (c) OpenStreetMap contributors (c) CARTO - Radar: Iowa Environmental Mesonet",
+           font=font(11, bold=False), fill=(210, 220, 235, 210))
+    import io as _io
+    buf = _io.BytesIO()
+    img.convert("RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _store_warning_map(alert: dict, png: bytes):
+    """Save the PNG under a token filename and return its public URL."""
+    try:
+        os.makedirs(WARNING_MAP_DIR, exist_ok=True)
+        tok = secrets.token_urlsafe(8)
+        path = os.path.join(WARNING_MAP_DIR, f"{tok}.png")
+        with open(path, "wb") as f:
+            f.write(png)
+        return f"{PUBLIC_BASE_URL}/warning-maps/{tok}.png"
+    except Exception as e:
+        print(f"[warn-map] store failed: {e!r}", flush=True)
+        return None
+
+
+def _warning_map_for_alert(alert: dict):
+    """Generate + store, budget-guarded, never raises. Returns URL or None."""
+    if (alert.get("event") or "") not in _MAP_EVENTS:
+        return None
+    import time as _t
+    t0 = _t.monotonic()
+    try:
+        png = _build_warning_map(alert)
+    except Exception as e:
+        print(f"[warn-map] build failed: {e!r}", flush=True)
+        return None
+    if not png:
+        print(f"[warn-map] no image within budget ({_t.monotonic()-t0:.1f}s)", flush=True)
+        return None
+    url = _store_warning_map(alert, png)
+    print(f"[warn-map] built in {_t.monotonic()-t0:.1f}s -> {url}", flush=True)
+    return url
+
+
 def _auto_relay_warning(alert: dict, affected: list) -> int:
     """Option A core: text every affected subscriber the factual warning
     relay, once per (alert, subscriber). Template agreed with Timmy and
@@ -28396,6 +28742,19 @@ def _auto_relay_warning(alert: dict, affected: list) -> int:
         return 0
     sent = 0
     now_ms = int(time.time() * 1000)
+    # Warning map (Aug 9, 2026): built ONCE per alert, budget-guarded.
+    # If it isn't ready inside the budget, texts go without it; the
+    # warning never waits. Cached on the alert dict so every scheduler
+    # tick (self-heal retries) doesn't rebuild it.
+    map_url = alert.get("_map_url")
+    if map_url is None and (alert.get("event") or "") in _MAP_EVENTS:
+        map_url = _warning_map_for_alert(alert) or ""
+        alert["_map_url"] = map_url
+        if map_url:
+            try:
+                _notify_team_warning_map(alert, map_url)
+            except Exception as e:
+                print(f"[warn-map] team notify failed: {e!r}", flush=True)
     for sub in affected:
         try:
             with db() as conn:
@@ -28425,7 +28784,8 @@ def _auto_relay_warning(alert: dict, affected: list) -> int:
         phone = (sub.get("phone") or "").strip()
         if phone:
             try:
-                delivered = bool(send_sms(phone, body))
+                delivered = bool(send_sms(phone, body,
+                                          media_url=(map_url or None)))
             except Exception as e:
                 print(f"[severe-relay] sms failed user={sub['user_id']}: {e!r}", flush=True)
         if not delivered and sub.get("email"):
@@ -49414,6 +49774,66 @@ def _seed_sales_prospects() -> None:
 
 _PROSPECT_STATUSES = ("letter_sent", "followed_up", "interested",
                       "trial", "converted", "not_interested")
+
+
+_CAMPAIGN_LETTER_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>The Boone County Letter - WeatherValet</title><style>
+body{margin:0;background:#ece9e2;font-family:Georgia,'Times New Roman',serif;color:#1a1c20}
+.page{max-width:680px;margin:24px auto;background:#fffdf8;padding:52px 58px;box-shadow:0 10px 40px rgba(0,0,0,.18)}
+.brand{font-family:Inter,Arial,sans-serif;font-weight:900;font-size:22px;letter-spacing:-.01em}
+.tag{font-family:Inter,Arial,sans-serif;font-size:10px;letter-spacing:.32em;color:#5b6470;margin-top:2px}
+.note{font-family:Inter,Arial,sans-serif;background:#eef4ff;border:1px solid #c6d8f7;border-radius:9px;padding:10px 14px;font-size:13px;color:#2E4FB8;margin:22px 0}
+p{font-size:15.5px;line-height:1.62;margin:14px 0}
+.ps{border-top:1px solid #ddd;margin-top:22px;padding-top:16px}
+.foot{font-family:Inter,Arial,sans-serif;font-size:10.5px;letter-spacing:.18em;color:#5b6470;text-align:center;margin-top:34px}
+b.tw{white-space:nowrap}
+@media(max-width:720px){.page{padding:30px 22px;margin:0}}
+</style></head><body><div class=page>
+<div class=brand>&#9889;WeatherValet</div>
+<div class=tag>DECISION-GRADE WEATHER</div>
+<div class=note>This is the letter all 43 Boone County businesses received (mailed Aug 2026).
+The first sentence was personalized to each business; everything else is identical.
+The mailing also included product one-pagers alongside this letter.</div>
+<p><i>[Personalized opening, e.g.: "Field work in every kind of weather is exactly the
+sort of day we help people plan around."]</i> We just joined the Boone County Chamber,
+so I wanted to introduce myself the old fashioned way, on paper. My name is Michael
+Reynolds, and I started WeatherValet right here in Boone County.</p>
+<p>Honestly, I despise weather apps. They are often wrong, and they never answer the
+real question. What does "40% chance of rain" even mean? Just tell me if it will rain,
+when it starts, and when it stops.</p>
+<p>So I built WeatherValet: a team of meteorologists who watch the weather for you and
+answer in plain language you can trust. You do not pay $700,000 a year for your own
+team. I pay for them. You pay $400 a month for a daily forecast and a real person
+watching the sky for you all day.</p>
+<p>It is not just for work. At the IU football game against Illinois this past season,
+I asked my meteorologists for a 15-minute warning before rain reached campus. While
+everyone around me stared at their phones, I sat back and enjoyed the game. A wedding,
+a ballgame, a long drive, whatever it is, your WeatherValet team has you covered.</p>
+<p>Here is the honest reason I am writing. We are both local, and we will cross paths
+at Chamber events and around town. I would rather launch alongside the best companies
+in the county than be one more name on a call list.</p>
+<p>The enclosed pages show how the service works, including one real day we worked,
+right through a confirmed tornado, where we reached our subscribers before the
+official warning did.</p>
+<p>I hope to shake your hand soon.</p>
+<p>Sincerely,<br>Michael Reynolds<br>Founder, WeatherValet<br>
+<b class=tw>317-493-0005</b>, text or call anytime<br>
+Fellow Boone County Chamber member</p>
+<p class=ps><b>P.S.</b> Want to help us launch? Text the word <b>TRIAL</b> to
+<b class=tw>855-625-6862</b> to start a 30-day free trial for your business and your
+family. No credit card, no obligation. Or just text or call me at
+<b class=tw>317-493-0005</b>.</p>
+<div class=foot>WEATHERVALET.COM &middot; CERTIFIED METEOROLOGISTS FOR BOONE COUNTY</div>
+</div></body></html>"""
+
+
+@app.get("/sales/letter")
+def sales_campaign_letter():
+    """The Boone County campaign letter (Aug 8, 2026), linked from every
+    prospect card so a rep reads exactly what is on the owner's desk
+    before dialing."""
+    return _CAMPAIGN_LETTER_HTML
 
 
 @app.route("/api/v1/sales/prospects", methods=["OPTIONS"])
