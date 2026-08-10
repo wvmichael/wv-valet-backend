@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-113"
+BACKEND_BUILD = "0702-114"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -781,6 +781,18 @@ CREATE TABLE IF NOT EXISTS severe_alert_relays (
 );
 CREATE INDEX IF NOT EXISTS idx_sar_pending
     ON severe_alert_relays (expiry_notice_sent_at, alert_expires_at);
+
+-- ── Warning map ledger (Aug 10, 2026) ──
+-- One row per warning: the built map URL (or '' for a failed build) and
+-- whether the team email went. The Aug 9 build cached this on the alert
+-- dict, which is rebuilt every scheduler tick, so one storm sent the
+-- team 110 emails. The database remembers; dicts don't.
+CREATE TABLE IF NOT EXISTS warning_maps (
+    nws_alert_id TEXT PRIMARY KEY,
+    map_url      TEXT NOT NULL DEFAULT '',
+    created_at   BIGINT NOT NULL,
+    notified_at  BIGINT
+);
 
 -- July 2026: Onboarding Hub. Versioned policy acknowledgments and native
 -- onboarding forms for Mets and sales reps. Crew keeps its simple intro.
@@ -12257,13 +12269,23 @@ def _notify_team_warning_map(alert: dict, map_url: str) -> None:
     caption = (f"{event} in effect for {area}. Our Meteorologists are "
                f"watching it live. WeatherValet subscribers were alerted "
                f"the moment it was issued. WeatherValet.com")
-    _send_team_notification(
-        subject=f"POST THIS: {event} map ready",
-        html_body=(f"<p>The warning graphic for the {_html_escape(event)} is ready:</p>"
-                   f"<p><a href='{map_url}'>{map_url}</a></p>"
-                   f"<p><img src='{map_url}' width='560' style='max-width:100%'></p>"
-                   f"<p>Suggested caption:</p><p>{_html_escape(caption)}</p>"),
-        text_body=f"Warning graphic ready: {map_url}\n\nCaption: {caption}")
+    # Audience (Aug 10, 2026): the people who post to social, not the
+    # sales reps. Overridable without a deploy via WARNING_MAP_NOTIFY.
+    recipients = [r.strip() for r in os.environ.get(
+        "WARNING_MAP_NOTIFY",
+        "michael@weathervalet.com,timmy@weathervalet.com,sramek@weathervalet.com"
+    ).split(",") if r.strip()]
+    subject = f"POST THIS: {event} map ready"
+    html = (f"<p>The warning graphic for the {_html_escape(event)} is ready:</p>"
+            f"<p><a href='{map_url}'>{map_url}</a></p>"
+            f"<p><img src='{map_url}' width='560' style='max-width:100%'></p>"
+            f"<p>Suggested caption:</p><p>{_html_escape(caption)}</p>")
+    text = f"Warning graphic ready: {map_url}\n\nCaption: {caption}"
+    for addr in recipients:
+        try:
+            _send_email(addr, subject, html, text)
+        except Exception as e:
+            print(f"[warn-map] notify to {addr} failed: {e!r}", flush=True)
 
 
 @app.get("/warning-maps/<token>.png")
@@ -28742,19 +28764,53 @@ def _auto_relay_warning(alert: dict, affected: list) -> int:
         return 0
     sent = 0
     now_ms = int(time.time() * 1000)
-    # Warning map (Aug 9, 2026): built ONCE per alert, budget-guarded.
-    # If it isn't ready inside the budget, texts go without it; the
-    # warning never waits. Cached on the alert dict so every scheduler
-    # tick (self-heal retries) doesn't rebuild it.
-    map_url = alert.get("_map_url")
-    if map_url is None and (alert.get("event") or "") in _MAP_EVENTS:
-        map_url = _warning_map_for_alert(alert) or ""
-        alert["_map_url"] = map_url
-        if map_url:
-            try:
-                _notify_team_warning_map(alert, map_url)
-            except Exception as e:
-                print(f"[warn-map] team notify failed: {e!r}", flush=True)
+    # Warning map (fixed Aug 10, 2026): the once-per-warning memory lives
+    # in the warning_maps table, because alert dicts are rebuilt every
+    # scheduler tick. Exactly one build and one team email per warning,
+    # guaranteed by the primary key, even across worker races. A failed
+    # build stores '' and is never retried (the drill endpoint exists for
+    # verification on demand).
+    map_url = ""
+    if (alert.get("event") or "") in _MAP_EVENTS:
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT map_url FROM warning_maps WHERE nws_alert_id = %s",
+                                (alert.get("nws_id"),))
+                    row = cur.fetchone()
+            if row is not None:
+                map_url = row.get("map_url") or ""
+            else:
+                built = _warning_map_for_alert(alert) or ""
+                claimed = False
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """INSERT INTO warning_maps (nws_alert_id, map_url, created_at)
+                               VALUES (%s, %s, %s)
+                               ON CONFLICT (nws_alert_id) DO NOTHING
+                               RETURNING nws_alert_id""",
+                            (alert.get("nws_id"), built, now_ms))
+                        claimed = cur.fetchone() is not None
+                        if not claimed:
+                            cur.execute("SELECT map_url FROM warning_maps WHERE nws_alert_id = %s",
+                                        (alert.get("nws_id"),))
+                            r2 = cur.fetchone()
+                            built = (r2 or {}).get("map_url") or ""
+                map_url = built
+                if claimed and map_url:
+                    try:
+                        _notify_team_warning_map(alert, map_url)
+                        with db() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    "UPDATE warning_maps SET notified_at = %s WHERE nws_alert_id = %s",
+                                    (int(time.time() * 1000), alert.get("nws_id")))
+                    except Exception as e:
+                        print(f"[warn-map] team notify failed: {e!r}", flush=True)
+        except Exception as e:
+            print(f"[warn-map] ledger failed: {e!r}", flush=True)
+            map_url = ""
     for sub in affected:
         try:
             with db() as conn:
