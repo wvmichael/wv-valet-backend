@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-114"
+BACKEND_BUILD = "0702-115"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -28566,6 +28566,8 @@ def _build_warning_map(alert: dict):
     tx1 = int((px_left + map_w) // 256) + 1
     ty1 = int((px_top + _MAP_H) // 256) + 1
     base = _Img.new("RGBA", (map_w, _MAP_H), (14, 20, 32, 255))
+    radar_layer = _Img.new("RGBA", (map_w, _MAP_H), (0, 0, 0, 0))
+    labels_layer = _Img.new("RGBA", (map_w, _MAP_H), (0, 0, 0, 0))
     n_max = 2 ** z
     for tx in range(tx0, tx1 + 1):
         for ty in range(ty0, ty1 + 1):
@@ -28573,16 +28575,29 @@ def _build_warning_map(alert: dict):
                 continue
             wrap_tx = tx % n_max
             ox = int(tx * 256 - px_left); oy = int(ty * 256 - px_top)
-            # Dark broadcast basemap (Aug 9, 2026): CartoDB dark tiles,
-            # free with attribution, matching the approved design.
-            t = _fetch_tile(f"https://basemaps.cartocdn.com/dark_all/{z}/{wrap_tx}/{ty}.png", deadline)
+            # Layered stack (Aug 10, 2026, Michael's readability fix):
+            # dark base WITHOUT labels, translucent radar, then a
+            # labels-only layer ON TOP of the radar so city names stay
+            # readable inside heavy returns. Polygon glows above all.
+            t = _fetch_tile(f"https://basemaps.cartocdn.com/dark_nolabels/{z}/{wrap_tx}/{ty}.png", deadline)
             if t:
                 base.paste(t, (ox, oy))
             r = _fetch_tile(
                 f"https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-900913/{z}/{wrap_tx}/{ty}.png",
                 deadline)
             if r:
-                base.alpha_composite(r, (ox, oy))
+                # scale radar alpha to ~62% so the map ghosts through
+                try:
+                    alpha = r.getchannel("A").point(lambda a: int(a * 0.62))
+                    r.putalpha(alpha)
+                except Exception:
+                    pass
+                radar_layer.alpha_composite(r, (ox, oy))
+            lbl = _fetch_tile(f"https://basemaps.cartocdn.com/dark_only_labels/{z}/{wrap_tx}/{ty}.png", deadline)
+            if lbl:
+                labels_layer.alpha_composite(lbl, (ox, oy))
+    base = _Img.alpha_composite(base, radar_layer)
+    base = _Img.alpha_composite(base, labels_layer)
     def to_px(lng, lat):
         x, y = _tile_xy(lat, lng, z)
         return (x * 256 - px_left, y * 256 - px_top)
