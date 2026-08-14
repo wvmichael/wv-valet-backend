@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-115"
+BACKEND_BUILD = "0702-116"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -49822,12 +49822,236 @@ _SEED_BOONE_PROSPECTS = [
 ]
 
 
+_SEED_AUG17_PROSPECTS = [
+    {
+        "business": "Fairfield Inn & Suites, Lebanon",
+        "owner": "",
+        "address": "410 Gateway Avenue, Lebanon, IN 46052",
+        "phone": "317-600-9820",
+        "website": "fairfieldinnlebanon.com",
+        "email": "",
+        "wave": "Week of Aug 17",
+        "note": ""
+    },
+    {
+        "business": "Holiday Inn Express - Lebanon",
+        "owner": "",
+        "address": "335 N Mt. Zion Rd., Lebanon, IN 46052",
+        "phone": "(765) 483-4100",
+        "website": "hiexpress.com",
+        "email": "",
+        "wave": "Week of Aug 17",
+        "note": ""
+    },
+    {
+        "business": "Leo Chevrolet GMC",
+        "owner": "",
+        "address": "1920 N. Lebanon St., Lebanon, IN 46052",
+        "phone": "(765) 553-7881",
+        "website": "leochevygmc.com",
+        "email": "",
+        "wave": "Week of Aug 17",
+        "note": ""
+    },
+    {
+        "business": "D-Patrick Lebanon Ford",
+        "owner": "",
+        "address": "1515 Indianapolis Ave., Lebanon, IN 46052",
+        "phone": "(765) 482-0170",
+        "website": "dpatricklebanonford.com",
+        "email": "",
+        "wave": "Week of Aug 17",
+        "note": ""
+    },
+    {
+        "business": "Culligan Water of Boone County",
+        "owner": "",
+        "address": "1328 W Main St. (PO Box 797), Lebanon, IN 46052",
+        "phone": "(765) 482-2570",
+        "website": "culligancentralindiana.com",
+        "email": "",
+        "wave": "Week of Aug 17",
+        "note": ""
+    },
+    {
+        "business": "Batts Real Estate Group",
+        "owner": "",
+        "address": "1601 Indianapolis Ave., Lebanon, IN 46052",
+        "phone": "(765) 894-0575",
+        "website": "battsrealestategroup.com",
+        "email": "",
+        "wave": "Week of Aug 17",
+        "note": ""
+    },
+    {
+        "business": "Traditions Realty",
+        "owner": "",
+        "address": "2602 Viceroy Lane, Lebanon, IN 46052",
+        "phone": "(765) 481-9210",
+        "website": "mytraditionsrealty.com",
+        "email": "",
+        "wave": "Week of Aug 17",
+        "note": ""
+    },
+    {
+        "business": "Mount's Flowers & Gifts",
+        "owner": "",
+        "address": "226 N. Lebanon St., Lebanon, IN 46052",
+        "phone": "(765) 482-1130",
+        "website": "mountsflowers.com",
+        "email": "",
+        "wave": "Week of Aug 17",
+        "note": ""
+    },
+    {
+        "business": "Witham Family YMCA",
+        "owner": "",
+        "address": "2791 N Lebanon St, Lebanon, IN 46052",
+        "phone": "(765) 535-7919",
+        "website": "indymca.org",
+        "email": "",
+        "wave": "Week of Aug 17",
+        "note": ""
+    },
+    {
+        "business": "The Farmers Bank Fieldhouse",
+        "owner": "",
+        "address": "645 Fieldhouse Way, Lebanon, IN 46052",
+        "phone": "(317) 437-3329",
+        "website": "thefarmersbankfh.com",
+        "email": "",
+        "wave": "Week of Aug 17",
+        "note": ""
+    },
+    {
+        "business": "Freedom Church",
+        "owner": "",
+        "address": "2061 Indianapolis Avenue, Lebanon, IN 46052",
+        "phone": "(765) 482-7220",
+        "website": "welcometofreedom.church",
+        "email": "",
+        "wave": "Week of Aug 17",
+        "note": ""
+    },
+    {
+        "business": "Cowan Drugs, Inc.",
+        "owner": "",
+        "address": "112 N. Lebanon St., Lebanon, IN 46052",
+        "phone": "(765) 482-0180",
+        "website": "cowandrugslebanon.com",
+        "email": "",
+        "wave": "Week of Aug 17",
+        "note": ""
+    },
+    {
+        "business": "Double Eagle Golf Club",
+        "owner": "",
+        "address": "390 N. Mount Zion Rd, Lebanon, IN 46052",
+        "phone": "765-995-0191",
+        "website": "doubleegc.com",
+        "email": "",
+        "wave": "Week of Aug 17",
+        "note": ""
+    },
+    {
+        "business": "Backroads BBQ",
+        "owner": "",
+        "address": "1404 W. South Street, Lebanon, IN 46052",
+        "phone": "(765) 482-2303",
+        "website": "thebackroadsbbq.com",
+        "email": "",
+        "wave": "Week of Aug 17",
+        "note": ""
+    },
+    {
+        "business": "Jawbone BBQ",
+        "owner": "",
+        "address": "104 N. Main St., Advance, IN 46102",
+        "phone": "(765) 577-1722",
+        "website": "jawbonebbqcatering.com",
+        "email": "",
+        "wave": "Week of Aug 17",
+        "note": ""
+    },
+    {
+        "business": "Four Finger Distillery",
+        "owner": "",
+        "address": "126 W Washington Street Ste, Lebanon, IN 46052",
+        "phone": "(765) 859-3256",
+        "website": "fourfingerdistillery.com/lebanon",
+        "email": "",
+        "wave": "Week of Aug 17",
+        "note": ""
+    },
+    {
+        "business": "1830 Chophouse",
+        "owner": "",
+        "address": "111 W Main St, Lebanon, IN 46052",
+        "phone": "(765) 764-0764",
+        "website": "1830chophouse.com",
+        "email": "",
+        "wave": "Week of Aug 17",
+        "note": ""
+    },
+    {
+        "business": "Arni's of Lebanon",
+        "owner": "",
+        "address": "202 W Washington, Lebanon, IN 46052",
+        "phone": "(765) 485-2764",
+        "website": "meetyouatarnis.com",
+        "email": "",
+        "wave": "Week of Aug 17",
+        "note": ""
+    },
+    {
+        "business": "Titus Bakery, LLC",
+        "owner": "",
+        "address": "802 W. South St., Lebanon, IN 46052",
+        "phone": "(765) 482-1740",
+        "website": "titusbakery.com",
+        "email": "",
+        "wave": "Week of Aug 17",
+        "note": ""
+    },
+    {
+        "business": "Donaldson's Finer Chocolates",
+        "owner": "",
+        "address": "600 S. State Rd. 39, Lebanon, IN 46052",
+        "phone": "(765) 482-3334",
+        "website": "donaldsonschocolates.com",
+        "email": "",
+        "wave": "Week of Aug 17",
+        "note": ""
+    },
+    {
+        "business": "Tanorria's Table",
+        "owner": "",
+        "address": "6945 Wheatly Road, Whitestown, IN 46075",
+        "phone": "(317) 413-2074",
+        "website": "tanorriastable.com",
+        "email": "",
+        "wave": "Week of Aug 17",
+        "note": ""
+    },
+    {
+        "business": "Cobblestone",
+        "owner": "",
+        "address": "160 S. Main St., Zionsville, IN 46077",
+        "phone": "(317) 873-4745",
+        "website": "cobblestoneZ.com",
+        "email": "",
+        "wave": "Week of Aug 17",
+        "note": ""
+    }
+]
+
+
 def _seed_sales_prospects() -> None:
     try:
         now_ms = int(time.time() * 1000)
         with db() as conn:
             with conn.cursor() as cur:
-                for p in _SEED_BOONE_PROSPECTS:
+                for p in _SEED_BOONE_PROSPECTS + _SEED_AUG17_PROSPECTS:
                     cur.execute(
                         """INSERT INTO sales_prospects
                              (business_name, owner_name, address, phone,
@@ -49837,7 +50061,8 @@ def _seed_sales_prospects() -> None:
                         (p["business"], p["owner"], p["address"], p["phone"],
                          p["website"], p["email"], p["wave"], p["note"],
                          now_ms, now_ms))
-        print(f"[prospects] seed pass complete ({len(_SEED_BOONE_PROSPECTS)} in list)",
+        print(f"[prospects] seed pass complete "
+              f"({len(_SEED_BOONE_PROSPECTS) + len(_SEED_AUG17_PROSPECTS)} in list)",
               flush=True)
     except Exception as e:
         print(f"[prospects] seed failed: {e!r}", flush=True)
@@ -49863,9 +50088,10 @@ b.tw{white-space:nowrap}
 </style></head><body><div class=page>
 <div class=brand>&#9889;WeatherValet</div>
 <div class=tag>DECISION-GRADE WEATHER</div>
-<div class=note>This is the letter all 43 Boone County businesses received (mailed Aug 2026).
-The first sentence was personalized to each business; everything else is identical.
-The mailing also included product one-pagers alongside this letter.</div>
+<div class=note>This is the letter every Boone County business on the campaign board
+received (mailed in waves, Aug 2026). The first sentence was personalized to each
+business; everything else is identical. The mailing also included product
+one-pagers alongside this letter.</div>
 <p><i>[Personalized opening, e.g.: "Field work in every kind of weather is exactly the
 sort of day we help people plan around."]</i> We just joined the Boone County Chamber,
 so I wanted to introduce myself the old fashioned way, on paper. My name is Michael
