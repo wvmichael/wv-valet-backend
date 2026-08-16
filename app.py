@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-118"
+BACKEND_BUILD = "0702-119"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -808,6 +808,7 @@ CREATE TABLE IF NOT EXISTS sentry_subscribers (
     lng                DOUBLE PRECISION,
     status             TEXT NOT NULL DEFAULT 'pending',  -- pending|active|canceled
     tornado_call       BOOLEAN NOT NULL DEFAULT TRUE,
+    phone2             TEXT,
     stripe_customer_id TEXT,
     stripe_session_id  TEXT,
     created_at         BIGINT NOT NULL,
@@ -826,6 +827,22 @@ CREATE TABLE IF NOT EXISTS sentry_relay_log (
     allclear_at      BIGINT,
     PRIMARY KEY (nws_alert_id, sentry_id)
 );
+-- ── GameDay Weather passes (Aug 16, 2026) ──
+-- Season presale for the Bloomington/IU football GameDay channel.
+-- $12 one-time for the season (8 home Saturdays). Not affiliated with
+-- Indiana University; nominative reference only.
+CREATE TABLE IF NOT EXISTS gameday_passes (
+    id                SERIAL PRIMARY KEY,
+    venue             TEXT NOT NULL DEFAULT 'iu',
+    name              TEXT,
+    email             TEXT NOT NULL,
+    phone             TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'pending',
+    stripe_session_id TEXT,
+    created_at        BIGINT NOT NULL,
+    updated_at        BIGINT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sentry_relay_pending
     ON sentry_relay_log (allclear_at, alert_expires_at);
 
@@ -1756,6 +1773,7 @@ CREATE TABLE IF NOT EXISTS saved_locations (
 -- rows per pass. attempts caps retries so a bad coordinate can't loop.
 ALTER TABLE saved_locations ADD COLUMN IF NOT EXISTS state TEXT;
 ALTER TABLE saved_locations ADD COLUMN IF NOT EXISTS county_backfill_attempts INTEGER DEFAULT 0;
+ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS phone2 TEXT;
 CREATE INDEX IF NOT EXISTS idx_saved_locations_user ON saved_locations(user_id, is_primary DESC);
 
 -- ── Subscriber portal: brief delivery preferences (Phase 10) ──
@@ -10011,6 +10029,16 @@ def stripe_webhook_v2():
             #   - SMSes the meteorologist with the claim link + AI brief
             session_metadata = session.get("metadata") or {}
 
+            # GameDay season pass (Aug 16, 2026): routed by metadata before
+            # the Met Review flow.
+            if (session_metadata.get("wv_product") or "") == "gameday":
+                try:
+                    _activate_gameday_pass(int(session_metadata.get("gameday_pass_id") or 0))
+                except Exception as e:
+                    print(f"[stripe-webhook] gameday activation failed: {e!r}", flush=True)
+                _mark_stripe_event_processed(event_id)
+                return jsonify({"ok": True})
+
             # Phase 10 Met tips: tip-mode checkout? Routed by metadata.
             # wv_tip_for_review is the verification_request_id, not a tip_id —
             # we look up by stripe_session_id (which we stored at tip creation).
@@ -12427,6 +12455,184 @@ def admin_test_warning_map():
 # labor and no machine-written forecast prose anywhere in this path.
 # ═══════════════════════════════════════════════════════════════════
 
+GAMEDAY_PRICE_CENTS = 1200
+
+_GAMEDAY_IU_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>GameDay Weather - Bloomington - $12 for the season</title><style>
+:root{--crim:#B31B1B;--navy:#0A1422}
+body{margin:0;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;background:#F6F7FB;color:#0F1216}
+.hero{background:linear-gradient(160deg,#1A0505,#3D0E0E 60%,#0A1422);color:#fff;padding:44px 20px 36px;text-align:center}
+.hero .brand{font-weight:900;font-size:20px;margin-bottom:18px}
+.hero h1{font-size:clamp(26px,5vw,40px);margin:0 0 10px;line-height:1.15}
+.hero h1 em{color:#F5C31E;font-style:normal}
+.hero p{color:#E3C7C7;max-width:560px;margin:0 auto;font-size:16.5px;line-height:1.55}
+.price{display:inline-block;background:var(--crim);border-radius:999px;padding:8px 22px;font-weight:800;margin-top:18px;font-size:18px}
+.wrap{max-width:640px;margin:0 auto;padding:26px 18px 40px}
+.card{background:#fff;border:1px solid rgba(15,18,22,.09);border-radius:14px;padding:22px;margin-bottom:18px;box-shadow:0 2px 10px rgba(10,20,34,.05)}
+.card h2{margin:0 0 12px;font-size:17px}
+ul.feat{list-style:none;padding:0;margin:0}
+ul.feat li{padding:7px 0 7px 30px;position:relative;font-size:15px;line-height:1.5}
+ul.feat li:before{content:"\26A1";position:absolute;left:2px}
+label{display:block;font-size:12.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:#5B6470;margin:14px 0 5px}
+input{width:100%;box-sizing:border-box;padding:12px;border:1px solid rgba(15,18,22,.18);border-radius:8px;font-size:16px}
+button{width:100%;margin-top:20px;background:var(--crim);color:#fff;border:none;border-radius:9px;padding:15px;font-size:17px;font-weight:800;cursor:pointer}
+button:disabled{opacity:.6}
+.fine{font-size:12px;color:#5B6470;margin-top:12px;line-height:1.5;text-align:center}
+.err{display:none;background:#FDECEC;border:1px solid #F3B4B4;color:#8A1F1F;border-radius:8px;padding:10px 12px;margin-top:14px;font-size:14px}
+</style></head><body>
+<div class=hero>
+  <div class=brand>&#9889; WeatherValet</div>
+  <h1>Bloomington GameDay Weather. <em>$12 for the whole season.</em></h1>
+  <p>Real, certified Meteorologists watching every Indiana home football Saturday.
+  Tailgate timing, rain windows, lightning holds, and the all-clear, texted to you live.</p>
+  <div class=price>8 home Saturdays &middot; $1.50 a game</div>
+</div>
+<div class=wrap>
+  <div class=card>
+    <h2>Every home Saturday, on your phone</h2>
+    <ul class=feat>
+      <li><b>The morning outlook</b>, written by the WeatherValet Meteorologist on duty: tailgate hours, kickoff, and the drive home.</li>
+      <li><b>Live alerts during the window</b> if storms, lightning, or severe weather approach the stadium area.</li>
+      <li><b>The all-clear</b> when it passes, so you're not refreshing a radar app in section 24.</li>
+      <li><b>No app.</b> Plain texts, any phone.</li>
+    </ul>
+  </div>
+  <div class=card>
+    <h2>Get on the season roster</h2>
+    <div id=err class=err></div>
+    <label for=g-name>Your name</label><input id=g-name autocomplete=name>
+    <label for=g-email>Email</label><input id=g-email type=email autocomplete=email>
+    <label for=g-phone>Mobile phone (where GameDay texts go)</label><input id=g-phone type=tel autocomplete=tel placeholder="812-555-0123">
+    <button id=g-go>Join for the season &middot; $12</button>
+    <div class=fine>Coverage runs the 8-game home schedule starting with the home opener.
+    One-time payment via Stripe. WeatherValet is an independent weather service, not affiliated
+    with or endorsed by Indiana University.</div>
+  </div>
+</div>
+<script>
+document.getElementById('g-go').addEventListener('click', function(){
+  var btn = this; btn.disabled = true; btn.textContent = 'One moment...';
+  var err = document.getElementById('err'); err.style.display = 'none';
+  fetch('/api/v1/gameday/checkout', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      name: document.getElementById('g-name').value,
+      email: document.getElementById('g-email').value,
+      phone: document.getElementById('g-phone').value,
+      venue: 'iu'
+    })
+  }).then(function(r){ return r.json(); }).then(function(d){
+    if (d.ok && d.url) { window.location.href = d.url; return; }
+    err.textContent = d.error || 'Something went wrong. Check the fields and try again.';
+    err.style.display = 'block'; btn.disabled = false; btn.textContent = 'Join for the season \u00b7 $12';
+  }).catch(function(){
+    err.textContent = 'Connection problem. Try again.';
+    err.style.display = 'block'; btn.disabled = false; btn.textContent = 'Join for the season \u00b7 $12';
+  });
+});
+</script></body></html>"""
+
+
+@app.get("/gameday/iu")
+def gameday_iu_page():
+    return _GAMEDAY_IU_PAGE
+
+
+@app.route("/api/v1/gameday/checkout", methods=["OPTIONS"])
+def _gameday_checkout_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/gameday/checkout")
+def gameday_checkout():
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()[:120]
+    email = (data.get("email") or "").strip()[:200]
+    phone = _normalize_phone((data.get("phone") or "").strip())
+    if not email or not is_valid_email(email):
+        return jsonify({"ok": False, "error": "Enter a valid email."}), 400
+    if not phone:
+        return jsonify({"ok": False, "error": "Enter a valid mobile number."}), 400
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO gameday_passes (venue, name, email, phone, created_at, updated_at)
+                   VALUES ('iu',%s,%s,%s,%s,%s) RETURNING id""",
+                (name, email, phone, now_ms, now_ms))
+            pass_id = cur.fetchone()["id"]
+    if not stripe:
+        return jsonify({"ok": False, "error": "Payments aren't configured yet."}), 503
+    try:
+        session = stripe.checkout.Session.create(
+            mode="payment",
+            line_items=[{
+                "quantity": 1,
+                "price_data": {
+                    "currency": "usd",
+                    "unit_amount": GAMEDAY_PRICE_CENTS,
+                    "product_data": {
+                        "name": "GameDay Weather - Bloomington season pass",
+                        "description": "8 home football Saturdays: Meteorologist morning outlook, live weather alerts during the game window, all-clear. Independent service; not affiliated with Indiana University."
+                    },
+                },
+            }],
+            customer_email=email,
+            metadata={"wv_product": "gameday", "gameday_pass_id": str(pass_id)},
+            success_url=f"{PUBLIC_BASE_URL}/gameday/welcome",
+            cancel_url=f"{PUBLIC_BASE_URL}/gameday/iu",
+        )
+    except Exception as e:
+        print(f"[gameday] stripe session failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "Checkout couldn't start. Try again in a minute."}), 502
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE gameday_passes SET stripe_session_id = %s, updated_at = %s WHERE id = %s",
+                        (session.id, now_ms, pass_id))
+    return jsonify({"ok": True, "url": session.url})
+
+
+@app.get("/gameday/welcome")
+def gameday_welcome_page():
+    return """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>You're on the roster</title><style>body{font-family:Inter,Arial,sans-serif;background:#1A0505;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:center;padding:20px}
+.b{max-width:440px}h1{font-size:26px}p{color:#E3C7C7;line-height:1.6}</style></head>
+<body><div class=b><div style="font-size:44px">&#127944;</div><h1>You're on the season roster.</h1>
+<p>Payment received. You'll get a welcome text shortly, and your first GameDay morning outlook
+arrives the Saturday of the home opener. See you out there.</p></div></body></html>"""
+
+
+def _activate_gameday_pass(pass_id: int) -> None:
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE gameday_passes SET status = 'active', updated_at = %s
+                   WHERE id = %s AND status != 'active' RETURNING name, phone""",
+                (now_ms, pass_id))
+            row = cur.fetchone()
+    if not row:
+        return
+    first = (row.get("name") or "").split(" ")[0]
+    hello = f"{first}, you" if first else "You"
+    try:
+        send_sms(row["phone"],
+                 f"{hello}'re on the GameDay Weather roster for the Bloomington season. "
+                 f"Every home Saturday: the Meteorologist's morning outlook, live alerts "
+                 f"if weather threatens the game window, and the all-clear. First outlook "
+                 f"lands the morning of the home opener. - WeatherValet")
+    except Exception as e:
+        print(f"[gameday] welcome sms failed: {e!r}", flush=True)
+    try:
+        _send_team_notification(
+            subject="GameDay season pass sold",
+            html_body=f"<p>New GameDay Weather season pass: {_html_escape(row.get('name') or 'name not given')}.</p>",
+            text_body=f"New GameDay season pass: {row.get('name') or ''}")
+    except Exception:
+        pass
+
+
 SENTRY_PRICE_CENTS = 1200
 SENTRY_NAME = "WeatherValet Sentry"
 
@@ -12471,6 +12677,7 @@ button:disabled{opacity:.6}
       <li><b>The 2 AM tornado phone call.</b> A real phone call that says the warning twice. Texts get ignored at night; a ringing phone doesn't. (Your welcome text shows the one setting that lets our call ring even on Do Not Disturb.)</li>
       <li><b>The all-clear</b> when the warning expires, so you're not guessing in the basement.</li>
       <li><b>No app.</b> Works on every phone ever made, including your mom's flip phone.</li>
+      <li><b>Two phone numbers included.</b> Yours and your spouse's, or yours and Mom's.</li>
     </ul>
   </div>
   <div class=card>
@@ -12479,6 +12686,7 @@ button:disabled{opacity:.6}
     <label for=s-name>Your name</label><input id=s-name autocomplete=name>
     <label for=s-email>Email</label><input id=s-email type=email autocomplete=email>
     <label for=s-phone>Mobile phone (where alerts go)</label><input id=s-phone type=tel autocomplete=tel placeholder="317-555-0123">
+    <label for=s-phone2>Second phone (optional, included): spouse, kid, anyone</label><input id=s-phone2 type=tel placeholder="Optional">
     <label for=s-address>The address to watch</label><input id=s-address autocomplete=street-address placeholder="123 Main St, Lebanon, IN">
     <button id=s-go>Protect this address &middot; $12/year</button>
     <div class=fine>Checkout is handled by Stripe. Cancel anytime. Alerts relay official National Weather Service warnings for your exact location.</div>
@@ -12497,6 +12705,7 @@ document.getElementById('s-go').addEventListener('click', function(){
       name: document.getElementById('s-name').value,
       email: document.getElementById('s-email').value,
       phone: document.getElementById('s-phone').value,
+      phone2: document.getElementById('s-phone2').value,
       address: document.getElementById('s-address').value
     })
   }).then(function(r){ return r.json(); }).then(function(d){
@@ -12535,6 +12744,7 @@ def sentry_checkout():
     name = (data.get("name") or "").strip()[:120]
     email = (data.get("email") or "").strip()[:200]
     phone = _normalize_phone((data.get("phone") or "").strip())
+    phone2 = _normalize_phone((data.get("phone2") or "").strip()) if (data.get("phone2") or "").strip() else ""
     address = (data.get("address") or "").strip()[:300]
     if not email or not is_valid_email(email):
         return jsonify({"ok": False, "error": "Enter a valid email."}), 400
@@ -12554,9 +12764,9 @@ def sentry_checkout():
         with conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO sentry_subscribers
-                     (email, phone, name, address, lat, lng, status, created_at, updated_at)
-                   VALUES (%s,%s,%s,%s,%s,%s,'pending',%s,%s) RETURNING id""",
-                (email, phone, name, address, geo["lat"], geo["lng"], now_ms, now_ms))
+                     (email, phone, phone2, name, address, lat, lng, status, created_at, updated_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s) RETURNING id""",
+                (email, phone, phone2, name, address, geo["lat"], geo["lng"], now_ms, now_ms))
             sentry_id = cur.fetchone()["id"]
     if not stripe:
         return jsonify({"ok": False, "error": "Payments aren't configured yet."}), 503
@@ -29129,7 +29339,7 @@ def _sentry_relay_warning(alert: dict) -> int:
     now_ms = int(time.time() * 1000)
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute("""SELECT id, phone, address, lat, lng, tornado_call
+            cur.execute("""SELECT id, phone, phone2, address, lat, lng, tornado_call
                            FROM sentry_subscribers WHERE status = 'active'
                            AND lat IS NOT NULL""")
             subs = cur.fetchall()
@@ -29172,18 +29382,23 @@ def _sentry_relay_warning(alert: dict) -> int:
             body += f" until {until}." if until else "."
             body += " " + _SENTRY_SAFETY.get(event, "")
             body += " We'll text the all-clear."
-            delivered = send_sms(sub["phone"], body, media_url=(map_url or None))
+            targets = [sub["phone"]] + ([sub["phone2"]] if sub.get("phone2") else [])
+            delivered = False
+            for tphone in targets:
+                if send_sms(tphone, body, media_url=(map_url or None)):
+                    delivered = True
             if delivered:
                 sent += 1
             if event == "Tornado Warning" and sub.get("tornado_call"):
-                try:
-                    place_voice_call(
-                        sub["phone"],
-                        f"This is WeatherValet Sentry. A tornado warning includes your "
-                        f"address{(' until ' + until) if until else ''}. Take shelter now "
-                        f"in an interior room on the lowest floor, away from windows.")
-                except Exception as e:
-                    print(f"[sentry] voice call failed: {e!r}", flush=True)
+                for tphone in targets:
+                    try:
+                        place_voice_call(
+                            tphone,
+                            f"This is WeatherValet Sentry. A tornado warning includes your "
+                            f"address{(' until ' + until) if until else ''}. Take shelter now "
+                            f"in an interior room on the lowest floor, away from windows.")
+                    except Exception as e:
+                        print(f"[sentry] voice call failed: {e!r}", flush=True)
         except Exception as e:
             print(f"[sentry] relay to sub {sub.get('id')} failed: {e!r}", flush=True)
     if sent:
@@ -29199,7 +29414,7 @@ def _sentry_allclear_pass() -> int:
         with db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """SELECT l.nws_alert_id, l.sentry_id, l.event, s.phone, s.address
+                    """SELECT l.nws_alert_id, l.sentry_id, l.event, s.phone, s.phone2, s.address
                        FROM sentry_relay_log l
                        JOIN sentry_subscribers s ON s.id = l.sentry_id
                        WHERE l.allclear_at IS NULL
@@ -29209,9 +29424,12 @@ def _sentry_allclear_pass() -> int:
                 rows = cur.fetchall()
         for r in rows:
             try:
-                ok = send_sms(r["phone"],
-                              f"WeatherValet Sentry: all clear. The {r['event']} that "
-                              f"included your address ({r['address']}) has expired.")
+                ok = False
+                for tphone in [r["phone"]] + ([r["phone2"]] if r.get("phone2") else []):
+                    if send_sms(tphone,
+                                f"WeatherValet Sentry: all clear. The {r['event']} that "
+                                f"included your address ({r['address']}) has expired."):
+                        ok = True
                 with db() as conn:
                     with conn.cursor() as cur:
                         cur.execute(
