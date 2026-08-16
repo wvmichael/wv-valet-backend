@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-124"
+BACKEND_BUILD = "0702-125"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -845,6 +845,12 @@ CREATE TABLE IF NOT EXISTS gameday_passes (
     created_at        BIGINT NOT NULL,
     updated_at        BIGINT NOT NULL
 );
+-- Migration order matters (Aug 16, 2026 outage): these ALTERs must run
+-- BEFORE the ref_code index below, because production's gameday_passes
+-- predates these columns. On fresh databases they're no-ops.
+ALTER TABLE gameday_passes ADD COLUMN IF NOT EXISTS pass_type TEXT NOT NULL DEFAULT 'season';
+ALTER TABLE gameday_passes ADD COLUMN IF NOT EXISTS amount_cents INTEGER NOT NULL DEFAULT 1600;
+ALTER TABLE gameday_passes ADD COLUMN IF NOT EXISTS ref_code TEXT;
 CREATE INDEX IF NOT EXISTS idx_gameday_ref ON gameday_passes(ref_code, status);
 
 -- GameDay partners (Aug 16, 2026): social accounts promoting passes for
@@ -1792,9 +1798,6 @@ CREATE TABLE IF NOT EXISTS saved_locations (
 ALTER TABLE saved_locations ADD COLUMN IF NOT EXISTS state TEXT;
 ALTER TABLE saved_locations ADD COLUMN IF NOT EXISTS county_backfill_attempts INTEGER DEFAULT 0;
 ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS phone2 TEXT;
-ALTER TABLE gameday_passes ADD COLUMN IF NOT EXISTS pass_type TEXT NOT NULL DEFAULT 'season';
-ALTER TABLE gameday_passes ADD COLUMN IF NOT EXISTS amount_cents INTEGER NOT NULL DEFAULT 1600;
-ALTER TABLE gameday_passes ADD COLUMN IF NOT EXISTS ref_code TEXT;
 CREATE INDEX IF NOT EXISTS idx_saved_locations_user ON saved_locations(user_id, is_primary DESC);
 
 -- ── Subscriber portal: brief delivery preferences (Phase 10) ──
