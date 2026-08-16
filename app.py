@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-116"
+BACKEND_BUILD = "0702-117"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -793,6 +793,41 @@ CREATE TABLE IF NOT EXISTS warning_maps (
     created_at   BIGINT NOT NULL,
     notified_at  BIGINT
 );
+
+-- ── WeatherValet Sentry (Aug 15, 2026) ──
+-- The $12/yr consumer storm-alert product. Fully automated: warning
+-- texts + map for one exact address, tornado voice call, all-clear.
+-- No Met labor anywhere in this path; official NWS text and data only.
+CREATE TABLE IF NOT EXISTS sentry_subscribers (
+    id                 SERIAL PRIMARY KEY,
+    email              TEXT NOT NULL,
+    phone              TEXT NOT NULL,
+    name               TEXT,
+    address            TEXT NOT NULL,
+    lat                DOUBLE PRECISION,
+    lng                DOUBLE PRECISION,
+    status             TEXT NOT NULL DEFAULT 'pending',  -- pending|active|canceled
+    tornado_call       BOOLEAN NOT NULL DEFAULT TRUE,
+    stripe_customer_id TEXT,
+    stripe_session_id  TEXT,
+    created_at         BIGINT NOT NULL,
+    updated_at         BIGINT NOT NULL,
+    canceled_at        BIGINT
+);
+CREATE INDEX IF NOT EXISTS idx_sentry_active ON sentry_subscribers(status);
+
+CREATE TABLE IF NOT EXISTS sentry_relay_log (
+    nws_alert_id     TEXT NOT NULL,
+    sentry_id        INTEGER NOT NULL,
+    event            TEXT,
+    area_desc        TEXT,
+    alert_expires_at BIGINT,
+    warned_at        BIGINT,
+    allclear_at      BIGINT,
+    PRIMARY KEY (nws_alert_id, sentry_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sentry_relay_pending
+    ON sentry_relay_log (allclear_at, alert_expires_at);
 
 -- July 2026: Onboarding Hub. Versioned policy acknowledgments and native
 -- onboarding forms for Mets and sales reps. Crew keeps its simple intro.
@@ -4487,6 +4522,31 @@ def send_sms(to: str, body: str, media_url=None) -> bool:
     except Exception as e:
         # Twilio errors come in many flavors; log the type, never crash the request
         print(f"[sms] FAILED to={to}: {type(e).__name__}: {e}", flush=True)
+        return False
+
+
+def place_voice_call(to: str, say_text: str) -> bool:
+    """Automated voice call (Aug 15, 2026, Sentry tornado calls). Rings
+    through silent mode the way texts can't at 2 AM. Inline TwiML, spoken
+    twice so a groggy listener catches it the second time. Never raises."""
+    if not (TwilioClient and TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER):
+        print(f"[voice] (not configured) would call {to}: {say_text[:80]}", flush=True)
+        return False
+    try:
+        try:
+            from twilio.http.http_client import TwilioHttpClient
+            client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN,
+                                  http_client=TwilioHttpClient(timeout=15))
+        except Exception:
+            client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        safe = _html_escape(say_text)
+        twiml = (f"<Response><Pause length='1'/><Say voice='Polly.Matthew'>{safe}</Say>"
+                 f"<Pause length='1'/><Say voice='Polly.Matthew'>{safe}</Say></Response>")
+        call = client.calls.create(to=to, from_=TWILIO_FROM_NUMBER, twiml=twiml)
+        print(f"[voice] call placed to {to} sid={call.sid}", flush=True)
+        return True
+    except Exception as e:
+        print(f"[voice] call to {to} failed: {e!r}", flush=True)
         return False
 
 
@@ -9739,6 +9799,17 @@ def stripe_webhook_v2():
         )
 
         if mode == "subscription":
+            # Sentry (Aug 15, 2026): the $12/yr storm-alert product rides
+            # subscription mode too, tagged in metadata. Route it before
+            # the Pro account-creation flow touches it.
+            md = session.get("metadata") or {}
+            if (md.get("wv_product") or "") == "sentry":
+                try:
+                    _activate_sentry(int(md.get("sentry_id") or 0), stripe_customer_id)
+                except Exception as e:
+                    print(f"[stripe-webhook] sentry activation failed: {e!r}", flush=True)
+                _mark_stripe_event_processed(event_id)
+                return jsonify({"ok": True})
             # Account-creation flow. We need a valid email; without it, we
             # can't create a user or send a welcome link.
             if not email or not is_valid_email(email):
@@ -10022,6 +10093,15 @@ def stripe_webhook_v2():
     # customer.subscription.deleted — subscription cancellation (Phase 1)
     # ────────────────────────────────────────────────────────────────
     if event_type == "customer.subscription.deleted":
+        # Sentry cancellations (Aug 15, 2026): match by customer id first.
+        try:
+            sub_obj = event.get("data", {}).get("object", {})
+            if _cancel_sentry_by_customer(sub_obj.get("customer") or ""):
+                print("[stripe-webhook] sentry subscription canceled", flush=True)
+                _mark_stripe_event_processed(event_id)
+                return jsonify({"ok": True})
+        except Exception as e:
+            print(f"[stripe-webhook] sentry cancel check failed: {e!r}", flush=True)
         # For this event, data.object is the Subscription, not a checkout
         # session. The key fields we care about:
         #   - customer: the Stripe customer ID
@@ -12338,6 +12418,258 @@ def admin_test_warning_map():
                         "error": "generation-failed-or-timed-out",
                         "hint": "Check Render logs for [warn-map] lines."}), 502
     return jsonify({"ok": True, "url": url})
+
+
+# ═══════════════════════════════════════════════════════════════════
+# WeatherValet Sentry (Aug 15, 2026) — the $12/yr storm alert product.
+# Robot layer only: NWS warning relay + map + tornado voice call +
+# all-clear for one exact address. Nationwide from day one. No Met
+# labor and no machine-written forecast prose anywhere in this path.
+# ═══════════════════════════════════════════════════════════════════
+
+SENTRY_PRICE_CENTS = 1200
+SENTRY_NAME = "WeatherValet Sentry"
+
+_SENTRY_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>WeatherValet Sentry - $12/year storm alerts for your exact address</title><style>
+:root{--blue:#1E7FFF;--navy:#0A1422;--ink:#0F1216}
+body{margin:0;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;background:#F6F7FB;color:var(--ink)}
+.hero{background:linear-gradient(160deg,#0A1422,#12233D);color:#fff;padding:44px 20px 36px;text-align:center}
+.hero .brand{font-weight:900;font-size:20px;letter-spacing:-.01em;margin-bottom:18px}
+.hero h1{font-size:clamp(26px,5vw,40px);margin:0 0 10px;line-height:1.15}
+.hero h1 em{color:#F5C31E;font-style:normal}
+.hero p{color:#B9C7DC;max-width:560px;margin:0 auto;font-size:16.5px;line-height:1.55}
+.price{display:inline-block;background:var(--blue);border-radius:999px;padding:8px 22px;font-weight:800;margin-top:18px;font-size:18px}
+.wrap{max-width:640px;margin:0 auto;padding:26px 18px 60px}
+.card{background:#fff;border:1px solid rgba(15,18,22,.09);border-radius:14px;padding:22px;margin-bottom:18px;box-shadow:0 2px 10px rgba(10,20,34,.05)}
+.card h2{margin:0 0 12px;font-size:17px}
+ul.feat{list-style:none;padding:0;margin:0}
+ul.feat li{padding:7px 0 7px 30px;position:relative;font-size:15px;line-height:1.5}
+ul.feat li:before{content:"\26A1";position:absolute;left:2px}
+label{display:block;font-size:12.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:#5B6470;margin:14px 0 5px}
+input{width:100%;box-sizing:border-box;padding:12px;border:1px solid rgba(15,18,22,.18);border-radius:8px;font-size:16px}
+button{width:100%;margin-top:20px;background:var(--blue);color:#fff;border:none;border-radius:9px;padding:15px;font-size:17px;font-weight:800;cursor:pointer}
+button:disabled{opacity:.6}
+.fine{font-size:12.5px;color:#5B6470;margin-top:12px;line-height:1.5;text-align:center}
+.err{display:none;background:#FDECEC;border:1px solid #F3B4B4;color:#8A1F1F;border-radius:8px;padding:10px 12px;margin-top:14px;font-size:14px}
+.ladder{text-align:center;font-size:13.5px;color:#5B6470;padding:0 18px 40px;max-width:640px;margin:0 auto}
+.ladder a{color:var(--blue);font-weight:700;text-decoration:none}
+</style></head><body>
+<div class=hero>
+  <div class=brand>&#9889; WeatherValet</div>
+  <h1>The robot that <em>rings your phone</em> when it matters.</h1>
+  <p>WeatherValet Sentry watches one exact address, yours, around the clock.
+  The moment the National Weather Service puts it inside a warning, you know.</p>
+  <div class=price>$12 a year</div>
+</div>
+<div class=wrap>
+  <div class=card>
+    <h2>What Sentry does</h2>
+    <ul class=feat>
+      <li><b>Warning texts with the radar map</b> the moment a Severe Thunderstorm, Tornado, or Flash Flood Warning includes your address. Not your county. Your address.</li>
+      <li><b>The 2 AM tornado phone call.</b> A real phone call that rings through silent mode and says it twice. Texts don't wake people. Calls do.</li>
+      <li><b>The all-clear</b> when the warning expires, so you're not guessing in the basement.</li>
+      <li><b>No app.</b> Works on every phone ever made, including your mom's flip phone.</li>
+    </ul>
+  </div>
+  <div class=card>
+    <h2>Stand your Sentry up</h2>
+    <div id=err class=err></div>
+    <label for=s-name>Your name</label><input id=s-name autocomplete=name>
+    <label for=s-email>Email</label><input id=s-email type=email autocomplete=email>
+    <label for=s-phone>Mobile phone (where alerts go)</label><input id=s-phone type=tel autocomplete=tel placeholder="317-555-0123">
+    <label for=s-address>The address to watch</label><input id=s-address autocomplete=street-address placeholder="123 Main St, Lebanon, IN">
+    <button id=s-go>Protect this address &middot; $12/year</button>
+    <div class=fine>Checkout is handled by Stripe. Cancel anytime. Alerts relay official National Weather Service warnings for your exact location.</div>
+  </div>
+</div>
+<div class=ladder>Robots watch addresses. Meteorologists watch your plans.<br>
+Big day coming? A real Meteorologist will work your forecast for $19 at
+<a href="https://weathervalet.ai">WeatherValet.ai</a></div>
+<script>
+document.getElementById('s-go').addEventListener('click', function(){
+  var btn = this; btn.disabled = true; btn.textContent = 'One moment...';
+  var err = document.getElementById('err'); err.style.display = 'none';
+  fetch('/api/v1/sentry/checkout', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      name: document.getElementById('s-name').value,
+      email: document.getElementById('s-email').value,
+      phone: document.getElementById('s-phone').value,
+      address: document.getElementById('s-address').value
+    })
+  }).then(function(r){ return r.json(); }).then(function(d){
+    if (d.ok && d.url) { window.location.href = d.url; return; }
+    err.textContent = d.error || 'Something went wrong. Check the fields and try again.';
+    err.style.display = 'block'; btn.disabled = false; btn.textContent = 'Protect this address \u00b7 $12/year';
+  }).catch(function(){
+    err.textContent = 'Connection problem. Try again.';
+    err.style.display = 'block'; btn.disabled = false; btn.textContent = 'Protect this address \u00b7 $12/year';
+  });
+});
+</script></body></html>"""
+
+
+@app.get("/sentry")
+def sentry_page():
+    """The Sentry marketing + signup page."""
+    return _SENTRY_PAGE
+
+
+@app.get("/alerts")
+def sentry_page_alias():
+    return _SENTRY_PAGE
+
+
+@app.route("/api/v1/sentry/checkout", methods=["OPTIONS"])
+def _sentry_checkout_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/sentry/checkout")
+def sentry_checkout():
+    """Validate, geocode the address, park a pending row, and hand the
+    person to Stripe for the $12/yr subscription."""
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()[:120]
+    email = (data.get("email") or "").strip()[:200]
+    phone = _normalize_phone((data.get("phone") or "").strip())
+    address = (data.get("address") or "").strip()[:300]
+    if not email or not is_valid_email(email):
+        return jsonify({"ok": False, "error": "Enter a valid email."}), 400
+    if not phone:
+        return jsonify({"ok": False, "error": "Enter a valid mobile number."}), 400
+    if len(address) < 8:
+        return jsonify({"ok": False, "error": "Enter the full street address to watch."}), 400
+    geo = None
+    try:
+        geo = _geocode_address(address)
+    except Exception as e:
+        print(f"[sentry] geocode error: {e!r}", flush=True)
+    if not geo or geo.get("lat") is None:
+        return jsonify({"ok": False, "error": "We couldn't pin that address. Add city and state, e.g. '123 Main St, Lebanon, IN'."}), 400
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO sentry_subscribers
+                     (email, phone, name, address, lat, lng, status, created_at, updated_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,'pending',%s,%s) RETURNING id""",
+                (email, phone, name, address, geo["lat"], geo["lng"], now_ms, now_ms))
+            sentry_id = cur.fetchone()["id"]
+    if not stripe:
+        return jsonify({"ok": False, "error": "Payments aren't configured yet."}), 503
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[{
+                "quantity": 1,
+                "price_data": {
+                    "currency": "usd",
+                    "unit_amount": SENTRY_PRICE_CENTS,
+                    "recurring": {"interval": "year"},
+                    "product_data": {
+                        "name": f"{SENTRY_NAME} - storm alerts for one address",
+                        "description": "Warning texts with radar map, tornado voice call, all-clear. Official NWS warnings for your exact address."
+                    },
+                },
+            }],
+            customer_email=email,
+            metadata={"wv_product": "sentry", "sentry_id": str(sentry_id)},
+            subscription_data={"metadata": {"wv_product": "sentry", "sentry_id": str(sentry_id)}},
+            success_url=f"{PUBLIC_BASE_URL}/sentry/welcome?sid={sentry_id}",
+            cancel_url=f"{PUBLIC_BASE_URL}/sentry",
+        )
+    except Exception as e:
+        print(f"[sentry] stripe session failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "Checkout couldn't start. Try again in a minute."}), 502
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE sentry_subscribers SET stripe_session_id = %s, updated_at = %s WHERE id = %s",
+                        (session.id, now_ms, sentry_id))
+    return jsonify({"ok": True, "url": session.url})
+
+
+@app.get("/sentry/welcome")
+def sentry_welcome_page():
+    return """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Sentry is standing guard</title><style>body{font-family:Inter,Arial,sans-serif;background:#0A1422;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:center;padding:20px}
+.b{max-width:440px}h1{font-size:26px}p{color:#B9C7DC;line-height:1.6}</style></head>
+<body><div class=b><div style="font-size:44px">&#9889;</div><h1>Your Sentry is standing guard.</h1>
+<p>Payment received. You'll get a welcome text shortly confirming the address we're watching.
+From now on, if the National Weather Service puts your address inside a warning, you'll know.</p></div></body></html>"""
+
+
+def _activate_sentry(sentry_id: int, stripe_customer_id: str) -> None:
+    """Webhook target: flip pending -> active, welcome the subscriber."""
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE sentry_subscribers
+                   SET status = 'active', stripe_customer_id = %s, updated_at = %s
+                   WHERE id = %s AND status != 'active'
+                   RETURNING phone, address, name""",
+                (stripe_customer_id or "", now_ms, sentry_id))
+            row = cur.fetchone()
+    if not row:
+        print(f"[sentry] activate: id {sentry_id} not found or already active", flush=True)
+        return
+    first = (row.get("name") or "").split(" ")[0]
+    hello = f"Hi {first}, " if first else ""
+    try:
+        send_sms(row["phone"],
+                 f"{hello}your WeatherValet Sentry is standing guard at {row['address']}. "
+                 f"If the National Weather Service puts this address inside a severe "
+                 f"thunderstorm, tornado, or flash flood warning, you'll hear from us "
+                 f"here the moment it happens. Tornado warnings also ring your phone. "
+                 f"Welcome aboard. - WeatherValet")
+    except Exception as e:
+        print(f"[sentry] welcome sms failed: {e!r}", flush=True)
+    try:
+        _send_team_notification(
+            subject=f"Sentry signup: {row['address']}",
+            html_body=f"<p>New {SENTRY_NAME} subscriber: {_html_escape(row.get('name') or 'name not given')}, {_html_escape(row['address'])}.</p>",
+            text_body=f"New Sentry subscriber: {row.get('name') or ''} {row['address']}")
+    except Exception:
+        pass
+
+
+def _cancel_sentry_by_customer(stripe_customer_id: str) -> bool:
+    if not stripe_customer_id:
+        return False
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE sentry_subscribers
+                   SET status = 'canceled', canceled_at = %s, updated_at = %s
+                   WHERE stripe_customer_id = %s AND status = 'active'
+                   RETURNING id""",
+                (now_ms, now_ms, stripe_customer_id))
+            return cur.fetchone() is not None
+
+
+@app.route("/api/v1/admin/sentry/summary", methods=["OPTIONS"])
+def _sentry_summary_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/sentry/summary")
+def admin_sentry_summary():
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "admin-only"}), 403
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT status, COUNT(*) AS n FROM sentry_subscribers GROUP BY status")
+            counts = {r["status"]: int(r["n"]) for r in cur.fetchall()}
+            cur.execute("""SELECT name, address, created_at FROM sentry_subscribers
+                           WHERE status = 'active' ORDER BY created_at DESC LIMIT 10""")
+            recent = [dict(r) for r in cur.fetchall()]
+    return jsonify({"ok": True, "counts": counts, "recent": recent,
+                    "annual_run_rate_usd": counts.get("active", 0) * 12})
 
 
 @app.route("/api/v1/funnel/event", methods=["OPTIONS"])
@@ -28771,6 +29103,128 @@ def _warning_map_for_alert(alert: dict):
     return url
 
 
+_SENTRY_EVENTS = ("Tornado Warning", "Severe Thunderstorm Warning", "Flash Flood Warning")
+_SENTRY_SAFETY = {
+    "Tornado Warning": "Take shelter now: interior room, lowest floor, away from windows.",
+    "Severe Thunderstorm Warning": "Damaging wind and hail possible. Move indoors, away from windows.",
+    "Flash Flood Warning": "Never walk or drive through floodwater. Move to higher ground if water rises.",
+}
+
+
+def _sentry_relay_warning(alert: dict) -> int:
+    """Sentry core (Aug 15, 2026): text every ACTIVE Sentry address inside
+    the warning polygon, once per (warning, subscriber), with the map for
+    tornado/severe and a voice call for tornado. Runs after the Pro relay
+    each tick, so the warning-map ledger is already populated. Official
+    NWS relay language only; no machine-written forecast prose."""
+    event = alert.get("event") or ""
+    if event not in _SENTRY_EVENTS:
+        return 0
+    geom = alert.get("geometry")
+    if not geom:
+        return 0
+    geom_str = json.dumps(geom)
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id, phone, address, lat, lng, tornado_call
+                           FROM sentry_subscribers WHERE status = 'active'
+                           AND lat IS NOT NULL""")
+            subs = cur.fetchall()
+    if not subs:
+        return 0
+    # Map URL from the ledger the Pro relay already populated this tick.
+    map_url = ""
+    if event in _MAP_EVENTS:
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT map_url FROM warning_maps WHERE nws_alert_id = %s",
+                                (alert.get("nws_id"),))
+                    r = cur.fetchone()
+                    map_url = (r or {}).get("map_url") or ""
+        except Exception:
+            map_url = ""
+    sent = 0
+    for sub in subs:
+        try:
+            if not _point_in_polygon_geojson(sub["lat"], sub["lng"], geom_str):
+                continue
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO sentry_relay_log
+                             (nws_alert_id, sentry_id, event, area_desc,
+                              alert_expires_at, warned_at)
+                           VALUES (%s,%s,%s,%s,%s,%s)
+                           ON CONFLICT (nws_alert_id, sentry_id) DO NOTHING
+                           RETURNING sentry_id""",
+                        (alert.get("nws_id"), sub["id"], event,
+                         (alert.get("area_desc") or "")[:200],
+                         alert.get("expires_at"), now_ms))
+                    claimed = cur.fetchone() is not None
+            if not claimed:
+                continue
+            until = _relay_local_time(alert.get("expires_at"), None)
+            body = f"WeatherValet Sentry: A {event} includes your address ({sub['address']})"
+            body += f" until {until}." if until else "."
+            body += " " + _SENTRY_SAFETY.get(event, "")
+            body += " We'll text the all-clear."
+            delivered = send_sms(sub["phone"], body, media_url=(map_url or None))
+            if delivered:
+                sent += 1
+            if event == "Tornado Warning" and sub.get("tornado_call"):
+                try:
+                    place_voice_call(
+                        sub["phone"],
+                        f"This is WeatherValet Sentry. A tornado warning includes your "
+                        f"address{(' until ' + until) if until else ''}. Take shelter now "
+                        f"in an interior room on the lowest floor, away from windows.")
+                except Exception as e:
+                    print(f"[sentry] voice call failed: {e!r}", flush=True)
+        except Exception as e:
+            print(f"[sentry] relay to sub {sub.get('id')} failed: {e!r}", flush=True)
+    if sent:
+        print(f"[sentry] relayed {event} to {sent} subscriber(s)", flush=True)
+    return sent
+
+
+def _sentry_allclear_pass() -> int:
+    """Each tick: text the all-clear for expired warnings, once."""
+    now_ms = int(time.time() * 1000)
+    sent = 0
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT l.nws_alert_id, l.sentry_id, l.event, s.phone, s.address
+                       FROM sentry_relay_log l
+                       JOIN sentry_subscribers s ON s.id = l.sentry_id
+                       WHERE l.allclear_at IS NULL
+                         AND l.alert_expires_at IS NOT NULL
+                         AND l.alert_expires_at < %s
+                       LIMIT 200""", (now_ms,))
+                rows = cur.fetchall()
+        for r in rows:
+            try:
+                ok = send_sms(r["phone"],
+                              f"WeatherValet Sentry: all clear. The {r['event']} that "
+                              f"included your address ({r['address']}) has expired.")
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """UPDATE sentry_relay_log SET allclear_at = %s
+                               WHERE nws_alert_id = %s AND sentry_id = %s""",
+                            (now_ms, r["nws_alert_id"], r["sentry_id"]))
+                if ok:
+                    sent += 1
+            except Exception as e:
+                print(f"[sentry] all-clear failed: {e!r}", flush=True)
+    except Exception as e:
+        print(f"[sentry] all-clear pass failed: {e!r}", flush=True)
+    return sent
+
+
 def _auto_relay_warning(alert: dict, affected: list) -> int:
     """Option A core: text every affected subscriber the factual warning
     relay, once per (alert, subscriber). Template agreed with Timmy and
@@ -28965,6 +29419,12 @@ def _process_severe_alerts() -> None:
     except Exception as e:
         print(f"[nws-process] relay expiry pass failed: {e}", flush=True)
 
+    # Sentry all-clears (Aug 15, 2026): same rhythm, consumer tier.
+    try:
+        _sentry_allclear_pass()
+    except Exception as e:
+        print(f"[nws-process] sentry all-clear pass failed: {e}", flush=True)
+
     if not alerts:
         return
 
@@ -29000,6 +29460,13 @@ def _process_severe_alerts() -> None:
             _auto_relay_warning(alert, affected)
         except Exception as e:
             print(f"[nws-process] auto-relay failed: {e!r}", flush=True)
+
+        # Sentry relay (Aug 15, 2026): $12/yr consumer addresses, after
+        # the Pro relay so the warning-map ledger is warm. Self-deduped.
+        try:
+            _sentry_relay_warning(alert)
+        except Exception as e:
+            print(f"[nws-process] sentry relay failed: {e!r}", flush=True)
 
         # Dedupe — have we already paged for this alert?
         try:
