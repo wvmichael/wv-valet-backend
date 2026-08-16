@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-117"
+BACKEND_BUILD = "0702-118"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -12468,7 +12468,7 @@ button:disabled{opacity:.6}
     <h2>What Sentry does</h2>
     <ul class=feat>
       <li><b>Warning texts with the radar map</b> the moment a Severe Thunderstorm, Tornado, or Flash Flood Warning includes your address. Not your county. Your address.</li>
-      <li><b>The 2 AM tornado phone call.</b> A real phone call that rings through silent mode and says it twice. Texts don't wake people. Calls do.</li>
+      <li><b>The 2 AM tornado phone call.</b> A real phone call that says the warning twice. Texts get ignored at night; a ringing phone doesn't. (Your welcome text shows the one setting that lets our call ring even on Do Not Disturb.)</li>
       <li><b>The all-clear</b> when the warning expires, so you're not guessing in the basement.</li>
       <li><b>No app.</b> Works on every phone ever made, including your mom's flip phone.</li>
     </ul>
@@ -12623,8 +12623,10 @@ def _activate_sentry(sentry_id: int, stripe_customer_id: str) -> None:
                  f"{hello}your WeatherValet Sentry is standing guard at {row['address']}. "
                  f"If the National Weather Service puts this address inside a severe "
                  f"thunderstorm, tornado, or flash flood warning, you'll hear from us "
-                 f"here the moment it happens. Tornado warnings also ring your phone. "
-                 f"Welcome aboard. - WeatherValet")
+                 f"here the moment it happens. Tornado warnings also ring your phone "
+                 f"with a voice call. One important step: save this number as "
+                 f"WeatherValet and allow it in Do Not Disturb, so the 2 AM call "
+                 f"always rings. Welcome aboard. - WeatherValet")
     except Exception as e:
         print(f"[sentry] welcome sms failed: {e!r}", flush=True)
     try:
