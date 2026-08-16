@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-119"
+BACKEND_BUILD = "0702-120"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -22582,6 +22582,22 @@ def subscribe_create_checkout():
 
     price_id = TIER_PRICE_MAP[tier_key]
 
+    # Inline pricing (Aug 16, 2026): pro_single is priced IN CODE, the
+    # same way Sentry and GameDay are, so a pricing change is just an
+    # app.py deploy. No Stripe dashboard products, no Render env vars.
+    # (The old env-var price IDs still serve any legacy tier keys.)
+    INLINE_TIER_PRICING = {
+        "pro_single": {
+            "unit_amount": 9900,   # $99/mo — the Aug 16, 2026 restructure
+            "name": "WeatherValet Pro",
+            "description": ("Your own team of Meteorologists: daily written "
+                            "briefs, direct messaging, custom Watch Cards, "
+                            "severe weather priority. One user, one location "
+                            "included."),
+        },
+    }
+    inline = INLINE_TIER_PRICING.get(tier_key)
+
     # Starter Month — only applies to pro_single
     use_starter = bool(data.get("starter")) and tier_key == "pro_single"
 
@@ -22629,7 +22645,16 @@ def subscribe_create_checkout():
     session_params = {
         "mode": "subscription",
         "payment_method_types": ["card"],
-        "line_items": [{"price": price_id, "quantity": 1}],
+        "line_items": ([{
+            "quantity": 1,
+            "price_data": {
+                "currency": "usd",
+                "unit_amount": inline["unit_amount"],
+                "recurring": {"interval": "month"},
+                "product_data": {"name": inline["name"],
+                                  "description": inline["description"]},
+            },
+        }] if inline else [{"price": price_id, "quantity": 1}]),
         "metadata": metadata,
         # Also attach the tier to the subscription itself, so we can
         # read it back later via subscription metadata if needed.
