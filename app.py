@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-120"
+BACKEND_BUILD = "0702-121"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -12459,57 +12459,140 @@ GAMEDAY_PRICE_CENTS = 1200
 
 _GAMEDAY_IU_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>GameDay Weather - Bloomington - $12 for the season</title><style>
-:root{--crim:#B31B1B;--navy:#0A1422}
-body{margin:0;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;background:#F6F7FB;color:#0F1216}
-.hero{background:linear-gradient(160deg,#1A0505,#3D0E0E 60%,#0A1422);color:#fff;padding:44px 20px 36px;text-align:center}
-.hero .brand{font-weight:900;font-size:20px;margin-bottom:18px}
-.hero h1{font-size:clamp(26px,5vw,40px);margin:0 0 10px;line-height:1.15}
-.hero h1 em{color:#F5C31E;font-style:normal}
-.hero p{color:#E3C7C7;max-width:560px;margin:0 auto;font-size:16.5px;line-height:1.55}
-.price{display:inline-block;background:var(--crim);border-radius:999px;padding:8px 22px;font-weight:800;margin-top:18px;font-size:18px}
-.wrap{max-width:640px;margin:0 auto;padding:26px 18px 40px}
-.card{background:#fff;border:1px solid rgba(15,18,22,.09);border-radius:14px;padding:22px;margin-bottom:18px;box-shadow:0 2px 10px rgba(10,20,34,.05)}
-.card h2{margin:0 0 12px;font-size:17px}
-ul.feat{list-style:none;padding:0;margin:0}
-ul.feat li{padding:7px 0 7px 30px;position:relative;font-size:15px;line-height:1.5}
-ul.feat li:before{content:"\26A1";position:absolute;left:2px}
-label{display:block;font-size:12.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:#5B6470;margin:14px 0 5px}
-input{width:100%;box-sizing:border-box;padding:12px;border:1px solid rgba(15,18,22,.18);border-radius:8px;font-size:16px}
-button{width:100%;margin-top:20px;background:var(--crim);color:#fff;border:none;border-radius:9px;padding:15px;font-size:17px;font-weight:800;cursor:pointer}
+<title>GameDay Weather - Bloomington - $12 season pass</title>
+<link rel=preconnect href=https://fonts.googleapis.com>
+<link rel=preconnect href=https://fonts.gstatic.com crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;600;800&display=swap" rel=stylesheet>
+<style>
+:root{--crim:#A6192E;--crim-deep:#7E1322;--night:#140A0C;--cream:#F3EAD3;--bolt:#FFCE44;--ink:#1B1416}
+*{box-sizing:border-box}
+body{margin:0;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;background:var(--night);color:var(--cream)}
+.field{position:relative;overflow:hidden;background:
+  linear-gradient(180deg,rgba(20,10,12,0) 55%,rgba(20,10,12,.92) 100%),
+  radial-gradient(1200px 500px at 50% -180px,rgba(255,206,68,.20),rgba(255,206,68,0) 60%),
+  repeating-linear-gradient(90deg,rgba(243,234,211,.05) 0 2px,transparent 2px 96px),
+  linear-gradient(180deg,#5E0F1C,#7E1322 45%,#3A0910);
+  padding:34px 18px 30px;text-align:center}
+.brand{font-family:Inter;font-weight:800;font-size:17px;letter-spacing:.01em;color:var(--cream)}
+.brand .bolt{color:var(--bolt)}
+h1{font-family:'Bebas Neue',Inter,sans-serif;font-weight:400;letter-spacing:.015em;
+   font-size:clamp(58px,13vw,124px);line-height:.88;margin:22px 0 6px;color:var(--cream);text-transform:uppercase}
+h1 .pop{color:var(--bolt)}
+.sub{font-size:clamp(15px,2.6vw,18px);color:#E9C9C9;max-width:520px;margin:10px auto 0;line-height:1.5}
+.sub b{color:var(--cream)}
+.kick{display:inline-flex;align-items:center;gap:10px;margin-top:20px;background:var(--crim);
+  border:2px solid rgba(243,234,211,.35);border-radius:999px;padding:10px 22px;
+  font-family:'Bebas Neue';font-size:22px;letter-spacing:.06em;color:#fff}
+.phone-wrap{margin:34px auto 0;max-width:392px;perspective:900px}
+.phone{background:#0D0D10;border:2px solid #2A2A30;border-radius:34px;padding:14px 12px 18px;
+  box-shadow:0 30px 60px rgba(0,0,0,.55),0 0 0 6px rgba(255,206,68,.06);
+  transform:rotateX(4deg);text-align:left}
+.notch{width:96px;height:9px;border-radius:9px;background:#2A2A30;margin:0 auto 12px}
+.thread-head{display:flex;align-items:center;gap:9px;padding:0 6px 10px;border-bottom:1px solid #23232A}
+.avatar{width:30px;height:30px;border-radius:50%;background:var(--crim);display:flex;align-items:center;justify-content:center;font-size:15px}
+.thread-head b{font-size:13.5px;color:#EDEDF2}
+.thread-head span{display:block;font-size:10.5px;color:#8B8B96}
+.msgs{padding:12px 4px 2px;display:flex;flex-direction:column;gap:9px}
+.stamp{align-self:center;font-size:10px;color:#6E6E7A;letter-spacing:.06em;text-transform:uppercase}
+.msg{max-width:88%;background:#1D1D24;border-radius:15px 15px 15px 5px;padding:9px 12px;font-size:12.9px;line-height:1.45;color:#E6E6EC;
+  opacity:0;transform:translateY(8px);animation:pop .45s ease forwards}
+.msg b{color:var(--bolt);font-weight:800}
+.msg.alert{background:#3A1016;border:1px solid #6E1B27}
+.msg.clear{background:#12251A;border:1px solid #1E4D30}
+.msg:nth-child(2){animation-delay:.15s}.msg:nth-child(4){animation-delay:.5s}
+.msg:nth-child(6){animation-delay:.85s}.msg:nth-child(8){animation-delay:1.2s}
+@keyframes pop{to{opacity:1;transform:none}}
+@media (prefers-reduced-motion: reduce){.msg{animation:none;opacity:1;transform:none}}
+.row3{display:flex;justify-content:center;gap:26px;flex-wrap:wrap;margin:30px auto 4px;max-width:640px}
+.f{display:flex;flex-direction:column;align-items:center;gap:7px;width:150px}
+.f svg{width:34px;height:34px}
+.f span{font-family:'Bebas Neue';font-size:19px;letter-spacing:.08em;color:var(--cream)}
+.f small{font-size:12px;color:#D9AFAF;line-height:1.4}
+.ticketzone{background:var(--night);padding:38px 16px 46px}
+.ticket{position:relative;max-width:520px;margin:0 auto;background:var(--cream);color:var(--ink);
+  border-radius:16px;padding:26px 26px 22px;
+  box-shadow:0 18px 50px rgba(0,0,0,.5)}
+.ticket:before,.ticket:after{content:"";position:absolute;top:50%;width:26px;height:26px;border-radius:50%;background:var(--night);transform:translateY(-50%)}
+.ticket:before{left:-13px}.ticket:after{right:-13px}
+.t-head{display:flex;justify-content:space-between;align-items:baseline;border-bottom:2px dashed rgba(27,20,22,.28);padding-bottom:12px;margin-bottom:14px}
+.t-head .tt{font-family:'Bebas Neue';font-size:30px;letter-spacing:.05em}
+.t-head .pr{font-family:'Bebas Neue';font-size:30px;color:var(--crim)}
+.t-sub{font-size:12.5px;color:#5B4A4E;margin:-8px 0 14px;letter-spacing:.05em;text-transform:uppercase;font-weight:600}
+label{display:block;font-size:11px;font-weight:800;letter-spacing:.07em;text-transform:uppercase;color:#6E5A5F;margin:12px 0 4px}
+input{width:100%;padding:12px;border:1.5px solid rgba(27,20,22,.25);border-radius:9px;font-size:16px;background:#FFFDF7;color:var(--ink)}
+input:focus{outline:2px solid var(--crim);outline-offset:1px;border-color:var(--crim)}
+button{width:100%;margin-top:18px;background:var(--crim);color:#fff;border:none;border-radius:10px;padding:15px;
+  font-family:'Bebas Neue';font-size:24px;letter-spacing:.07em;cursor:pointer}
+button:hover{background:var(--crim-deep)}
 button:disabled{opacity:.6}
-.fine{font-size:12px;color:#5B6470;margin-top:12px;line-height:1.5;text-align:center}
-.err{display:none;background:#FDECEC;border:1px solid #F3B4B4;color:#8A1F1F;border-radius:8px;padding:10px 12px;margin-top:14px;font-size:14px}
+.fine{font-size:11px;color:#7A686C;margin-top:12px;line-height:1.55;text-align:center}
+.err{display:none;background:#FBE3E3;border:1px solid #E3A9A9;color:#7E1322;border-radius:8px;padding:10px 12px;margin-top:12px;font-size:13.5px}
+.foot{text-align:center;font-size:11.5px;color:#8A6F73;padding:0 18px 34px;line-height:1.6}
+.foot a{color:#C89AA1}
 </style></head><body>
-<div class=hero>
-  <div class=brand>&#9889; WeatherValet</div>
-  <h1>Bloomington GameDay Weather. <em>$12 for the whole season.</em></h1>
-  <p>Real, certified Meteorologists watching every Indiana home football Saturday.
-  Tailgate timing, rain windows, lightning holds, and the all-clear, texted to you live.</p>
-  <div class=price>8 home Saturdays &middot; $1.50 a game</div>
-</div>
-<div class=wrap>
-  <div class=card>
-    <h2>Every home Saturday, on your phone</h2>
-    <ul class=feat>
-      <li><b>The morning outlook</b>, written by the WeatherValet Meteorologist on duty: tailgate hours, kickoff, and the drive home.</li>
-      <li><b>Live alerts during the window</b> if storms, lightning, or severe weather approach the stadium area.</li>
-      <li><b>The all-clear</b> when it passes, so you're not refreshing a radar app in section 24.</li>
-      <li><b>No app.</b> Plain texts, any phone.</li>
-    </ul>
+
+<div class=field>
+  <div class=brand><span class=bolt>&#9889;</span> WeatherValet</div>
+  <h1>Rain or shine,<br>know before <span class=pop>kickoff.</span></h1>
+  <p class=sub>Real, certified Meteorologists watching every Bloomington home-game
+  Saturday. <b>Texted to you live</b>: tailgate timing, storm alerts, lightning holds, the all-clear.</p>
+  <div class=kick>&#127944; 8 home Saturdays &middot; $12 &middot; $1.50 a game</div>
+
+  <div class=phone-wrap>
+    <div class=phone aria-hidden=true>
+      <div class=notch></div>
+      <div class=thread-head>
+        <div class=avatar>&#9889;</div>
+        <div><b>GameDay Weather</b><span>Bloomington &middot; Sat</span></div>
+      </div>
+      <div class=msgs>
+        <div class=stamp>Sat 9:02 AM</div>
+        <div class=msg>Morning, Bloomington. <b>Tailgate looks dry until about 2 PM.</b> A line of storms is west of Terre Haute, moving east. Kickoff itself: watching closely. - Meteorologist on duty</div>
+        <div class=stamp>2:14 PM</div>
+        <div class="msg alert"><b>Lightning within 8 miles.</b> Expect a stadium hold. Storms pass through by about 3. Stay near cover.</div>
+        <div class=stamp>3:05 PM</div>
+        <div class="msg clear"><b>All clear.</b> Line is east of campus. Rest of the game looks dry. Enjoy it.</div>
+        <div class=stamp>6:48 PM</div>
+        <div class=msg>Dry drive home in all directions. See you next Saturday. &#9889;</div>
+      </div>
+    </div>
   </div>
-  <div class=card>
-    <h2>Get on the season roster</h2>
+
+  <div class=row3>
+    <div class=f>
+      <svg viewBox="0 0 24 24" fill="none" stroke="#FFCE44" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4.4" fill="#FFCE44" stroke="none"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.2 5.2l2.1 2.1M16.7 16.7l2.1 2.1M18.8 5.2l-2.1 2.1M7.3 16.7l-2.1 2.1"/></svg>
+      <span>Morning outlook</span>
+      <small>Written by the Met on duty: tailgate, kickoff, drive home</small>
+    </div>
+    <div class=f>
+      <svg viewBox="0 0 24 24" fill="#FFCE44"><path d="M13 2 4.5 13.5h5L10 22l8.5-11.5h-5L13 2z"/></svg>
+      <span>Live storm alerts</span>
+      <small>Lightning holds and severe weather, the moment it matters</small>
+    </div>
+    <div class=f>
+      <svg viewBox="0 0 24 24" fill="none" stroke="#7BD48E" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg>
+      <span>The all-clear</span>
+      <small>So nobody's refreshing radar in the student section</small>
+    </div>
+  </div>
+</div>
+
+<div class=ticketzone>
+  <div class=ticket>
+    <div class=t-head><span class=tt>Season Pass</span><span class=pr>$12</span></div>
+    <div class=t-sub>Bloomington &middot; 8 home Saturdays &middot; one-time</div>
     <div id=err class=err></div>
-    <label for=g-name>Your name</label><input id=g-name autocomplete=name>
+    <label for=g-name>Name</label><input id=g-name autocomplete=name>
     <label for=g-email>Email</label><input id=g-email type=email autocomplete=email>
-    <label for=g-phone>Mobile phone (where GameDay texts go)</label><input id=g-phone type=tel autocomplete=tel placeholder="812-555-0123">
-    <button id=g-go>Join for the season &middot; $12</button>
+    <label for=g-phone>Mobile (where GameDay texts go)</label><input id=g-phone type=tel autocomplete=tel placeholder="812-555-0123">
+    <button id=g-go>Claim my season pass</button>
     <div class=fine>Coverage runs the 8-game home schedule starting with the home opener.
-    One-time payment via Stripe. WeatherValet is an independent weather service, not affiliated
-    with or endorsed by Indiana University.</div>
+    One-time payment via Stripe. Group of tailgaters? Everyone needs their own pass; it's $1.50 a game.</div>
   </div>
+  <p class=foot>WeatherValet is an independent weather service, not affiliated with or endorsed by Indiana University.<br>
+  Want weather for YOUR life, not just Saturdays? <a href="https://weathervalet.ai">WeatherValet.ai</a></p>
 </div>
+
 <script>
 document.getElementById('g-go').addEventListener('click', function(){
   var btn = this; btn.disabled = true; btn.textContent = 'One moment...';
@@ -12525,13 +12608,14 @@ document.getElementById('g-go').addEventListener('click', function(){
   }).then(function(r){ return r.json(); }).then(function(d){
     if (d.ok && d.url) { window.location.href = d.url; return; }
     err.textContent = d.error || 'Something went wrong. Check the fields and try again.';
-    err.style.display = 'block'; btn.disabled = false; btn.textContent = 'Join for the season \u00b7 $12';
+    err.style.display = 'block'; btn.disabled = false; btn.textContent = 'Claim my season pass';
   }).catch(function(){
     err.textContent = 'Connection problem. Try again.';
-    err.style.display = 'block'; btn.disabled = false; btn.textContent = 'Join for the season \u00b7 $12';
+    err.style.display = 'block'; btn.disabled = false; btn.textContent = 'Claim my season pass';
   });
 });
-</script></body></html>"""
+</script></body></html>
+"""
 
 
 @app.get("/gameday/iu")
@@ -12652,7 +12736,7 @@ body{margin:0;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;backgrou
 .card h2{margin:0 0 12px;font-size:17px}
 ul.feat{list-style:none;padding:0;margin:0}
 ul.feat li{padding:7px 0 7px 30px;position:relative;font-size:15px;line-height:1.5}
-ul.feat li:before{content:"\26A1";position:absolute;left:2px}
+ul.feat li:before{content:"⚡";position:absolute;left:2px}
 label{display:block;font-size:12.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:#5B6470;margin:14px 0 5px}
 input{width:100%;box-sizing:border-box;padding:12px;border:1px solid rgba(15,18,22,.18);border-radius:8px;font-size:16px}
 button{width:100%;margin-top:20px;background:var(--blue);color:#fff;border:none;border-radius:9px;padding:15px;font-size:17px;font-weight:800;cursor:pointer}
