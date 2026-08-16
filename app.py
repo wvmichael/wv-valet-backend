@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-121"
+BACKEND_BUILD = "0702-123"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -837,10 +837,28 @@ CREATE TABLE IF NOT EXISTS gameday_passes (
     name              TEXT,
     email             TEXT NOT NULL,
     phone             TEXT NOT NULL,
+    pass_type         TEXT NOT NULL DEFAULT 'season',  -- season|single
+    amount_cents      INTEGER NOT NULL DEFAULT 1600,
+    ref_code          TEXT,                            -- partner attribution
     status            TEXT NOT NULL DEFAULT 'pending',
     stripe_session_id TEXT,
     created_at        BIGINT NOT NULL,
     updated_at        BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_gameday_ref ON gameday_passes(ref_code, status);
+
+-- GameDay partners (Aug 16, 2026): social accounts promoting passes for
+-- a per-sale cut. Each gets a public live-stats page at
+-- /gameday/partners/<code> so the numbers are never just our word.
+CREATE TABLE IF NOT EXISTS gameday_partners (
+    code        TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    season_cut_cents INTEGER NOT NULL DEFAULT 200,
+    single_cut_cents INTEGER NOT NULL DEFAULT 50,
+    charity_name TEXT,
+    charity_season_cents INTEGER NOT NULL DEFAULT 100,
+    charity_single_cents INTEGER NOT NULL DEFAULT 25,
+    created_at  BIGINT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_sentry_relay_pending
@@ -1774,6 +1792,9 @@ CREATE TABLE IF NOT EXISTS saved_locations (
 ALTER TABLE saved_locations ADD COLUMN IF NOT EXISTS state TEXT;
 ALTER TABLE saved_locations ADD COLUMN IF NOT EXISTS county_backfill_attempts INTEGER DEFAULT 0;
 ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS phone2 TEXT;
+ALTER TABLE gameday_passes ADD COLUMN IF NOT EXISTS pass_type TEXT NOT NULL DEFAULT 'season';
+ALTER TABLE gameday_passes ADD COLUMN IF NOT EXISTS amount_cents INTEGER NOT NULL DEFAULT 1600;
+ALTER TABLE gameday_passes ADD COLUMN IF NOT EXISTS ref_code TEXT;
 CREATE INDEX IF NOT EXISTS idx_saved_locations_user ON saved_locations(user_id, is_primary DESC);
 
 -- ── Subscriber portal: brief delivery preferences (Phase 10) ──
@@ -12455,7 +12476,8 @@ def admin_test_warning_map():
 # labor and no machine-written forecast prose anywhere in this path.
 # ═══════════════════════════════════════════════════════════════════
 
-GAMEDAY_PRICE_CENTS = 1200
+GAMEDAY_SEASON_CENTS = 1600
+GAMEDAY_SINGLE_CENTS = 500
 
 _GAMEDAY_IU_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
@@ -12534,9 +12556,9 @@ button:disabled{opacity:.6}
 <div class=field>
   <div class=brand><span class=bolt>&#9889;</span> WeatherValet</div>
   <h1>Rain or shine,<br>know before <span class=pop>kickoff.</span></h1>
-  <p class=sub>Real, certified Meteorologists watching every Bloomington home-game
-  Saturday. <b>Texted to you live</b>: tailgate timing, storm alerts, lightning holds, the all-clear.</p>
-  <div class=kick>&#127944; 8 home Saturdays &middot; $12 &middot; $1.50 a game</div>
+  <p class=sub>Real, certified Meteorologists watching every Bloomington home game.
+  <b>Texted to you live</b>: tailgate timing, storm alerts, lightning holds, the all-clear.</p>
+  <div class=kick>&#127944; Season $16 ($2 a game) &middot; or one game for $5</div>
 
   <div class=phone-wrap>
     <div class=phone aria-hidden=true>
@@ -12562,7 +12584,7 @@ button:disabled{opacity:.6}
     <div class=f>
       <svg viewBox="0 0 24 24" fill="none" stroke="#FFCE44" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4.4" fill="#FFCE44" stroke="none"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.2 5.2l2.1 2.1M16.7 16.7l2.1 2.1M18.8 5.2l-2.1 2.1M7.3 16.7l-2.1 2.1"/></svg>
       <span>Morning outlook</span>
-      <small>Written by the Met on duty: tailgate, kickoff, drive home</small>
+      <small>Written by the Met on duty: tailgate, kickoff, drive home, every home game</small>
     </div>
     <div class=f>
       <svg viewBox="0 0 24 24" fill="#FFCE44"><path d="M13 2 4.5 13.5h5L10 22l8.5-11.5h-5L13 2z"/></svg>
@@ -12579,21 +12601,45 @@ button:disabled{opacity:.6}
 
 <div class=ticketzone>
   <div class=ticket>
-    <div class=t-head><span class=tt>Season Pass</span><span class=pr>$12</span></div>
-    <div class=t-sub>Bloomington &middot; 8 home Saturdays &middot; one-time</div>
+    <div class=t-head><span class=tt id=t-title>Season Pass</span><span class=pr id=t-price>$16</span></div>
+    <div class=t-sub id=t-sub>Bloomington &middot; 8 home games &middot; one-time</div>
+    <div style="display:flex;gap:8px;margin-bottom:4px;">
+      <button type=button id=opt-season style="flex:1;margin-top:0;padding:10px;font-size:17px;background:#A6192E;">Season &middot; $16</button>
+      <button type=button id=opt-single style="flex:1;margin-top:0;padding:10px;font-size:17px;background:#FFFDF7;color:#7E1322;border:1.5px solid #A6192E;">Next game &middot; $5</button>
+    </div>
     <div id=err class=err></div>
     <label for=g-name>Name</label><input id=g-name autocomplete=name>
     <label for=g-email>Email</label><input id=g-email type=email autocomplete=email>
     <label for=g-phone>Mobile (where GameDay texts go)</label><input id=g-phone type=tel autocomplete=tel placeholder="812-555-0123">
     <button id=g-go>Claim my season pass</button>
-    <div class=fine>Coverage runs the 8-game home schedule starting with the home opener.
-    One-time payment via Stripe. Group of tailgaters? Everyone needs their own pass; it's $1.50 a game.</div>
+    <div class=fine>Season covers all 8 home games starting with the opener (including the Friday
+    night game); single covers the next home game after you buy. One-time payment via Stripe.
+    Group of tailgaters? Everyone needs their own pass.</div>
   </div>
   <p class=foot>WeatherValet is an independent weather service, not affiliated with or endorsed by Indiana University.<br>
-  Want weather for YOUR life, not just Saturdays? <a href="https://weathervalet.ai">WeatherValet.ai</a></p>
+  Want weather for YOUR life, not just gamedays? <a href="https://weathervalet.ai">WeatherValet.ai</a></p>
 </div>
 
 <script>
+var PASS = { type: 'season' };
+try { PASS.ref = new URLSearchParams(location.search).get('ref') || ''; } catch (e) { PASS.ref = ''; }
+function setType(t){
+  PASS.type = t;
+  var s = document.getElementById('opt-season'), g = document.getElementById('opt-single');
+  var seasonOn = (t === 'season');
+  s.style.background = seasonOn ? '#A6192E' : '#FFFDF7'; s.style.color = seasonOn ? '#fff' : '#7E1322';
+  s.style.border = seasonOn ? 'none' : '1.5px solid #A6192E';
+  g.style.background = seasonOn ? '#FFFDF7' : '#A6192E'; g.style.color = seasonOn ? '#7E1322' : '#fff';
+  g.style.border = seasonOn ? '1.5px solid #A6192E' : 'none';
+  document.getElementById('t-title').textContent = seasonOn ? 'Season Pass' : 'Single Game';
+  document.getElementById('t-price').textContent = seasonOn ? '$16' : '$5';
+  document.getElementById('t-sub').textContent = seasonOn
+    ? 'Bloomington \u00b7 8 home games \u00b7 one-time'
+    : 'Bloomington \u00b7 next home game \u00b7 one-time';
+  document.getElementById('g-go').textContent = seasonOn ? 'Claim my season pass' : 'Cover me for the next game';
+}
+document.getElementById('opt-season').addEventListener('click', function(){ setType('season'); });
+document.getElementById('opt-single').addEventListener('click', function(){ setType('single'); });
 document.getElementById('g-go').addEventListener('click', function(){
   var btn = this; btn.disabled = true; btn.textContent = 'One moment...';
   var err = document.getElementById('err'); err.style.display = 'none';
@@ -12603,15 +12649,17 @@ document.getElementById('g-go').addEventListener('click', function(){
       name: document.getElementById('g-name').value,
       email: document.getElementById('g-email').value,
       phone: document.getElementById('g-phone').value,
+      pass_type: PASS.type,
+      ref: PASS.ref,
       venue: 'iu'
     })
   }).then(function(r){ return r.json(); }).then(function(d){
     if (d.ok && d.url) { window.location.href = d.url; return; }
     err.textContent = d.error || 'Something went wrong. Check the fields and try again.';
-    err.style.display = 'block'; btn.disabled = false; btn.textContent = 'Claim my season pass';
+    err.style.display = 'block'; btn.disabled = false; setType(PASS.type);
   }).catch(function(){
     err.textContent = 'Connection problem. Try again.';
-    err.style.display = 'block'; btn.disabled = false; btn.textContent = 'Claim my season pass';
+    err.style.display = 'block'; btn.disabled = false; setType(PASS.type);
   });
 });
 </script></body></html>
@@ -12634,6 +12682,11 @@ def gameday_checkout():
     name = (data.get("name") or "").strip()[:120]
     email = (data.get("email") or "").strip()[:200]
     phone = _normalize_phone((data.get("phone") or "").strip())
+    pass_type = "single" if (data.get("pass_type") or "") == "single" else "season"
+    amount = GAMEDAY_SINGLE_CENTS if pass_type == "single" else GAMEDAY_SEASON_CENTS
+    ref_code = (data.get("ref") or "").strip().lower()[:40] or None
+    if ref_code and not re.fullmatch(r"[a-z0-9_-]+", ref_code):
+        ref_code = None
     if not email or not is_valid_email(email):
         return jsonify({"ok": False, "error": "Enter a valid email."}), 400
     if not phone:
@@ -12642,9 +12695,10 @@ def gameday_checkout():
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO gameday_passes (venue, name, email, phone, created_at, updated_at)
-                   VALUES ('iu',%s,%s,%s,%s,%s) RETURNING id""",
-                (name, email, phone, now_ms, now_ms))
+                """INSERT INTO gameday_passes
+                     (venue, name, email, phone, pass_type, amount_cents, ref_code, created_at, updated_at)
+                   VALUES ('iu',%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (name, email, phone, pass_type, amount, ref_code, now_ms, now_ms))
             pass_id = cur.fetchone()["id"]
     if not stripe:
         return jsonify({"ok": False, "error": "Payments aren't configured yet."}), 503
@@ -12655,10 +12709,10 @@ def gameday_checkout():
                 "quantity": 1,
                 "price_data": {
                     "currency": "usd",
-                    "unit_amount": GAMEDAY_PRICE_CENTS,
+                    "unit_amount": amount,
                     "product_data": {
-                        "name": "GameDay Weather - Bloomington season pass",
-                        "description": "8 home football Saturdays: Meteorologist morning outlook, live weather alerts during the game window, all-clear. Independent service; not affiliated with Indiana University."
+                        "name": ("GameDay Weather - Bloomington season pass" if pass_type == "season" else "GameDay Weather - single home game"),
+                        "description": (("All 8 home football games" if pass_type == "season" else "The next home game") + ": Meteorologist gameday-morning outlook, live weather alerts during the game window, all-clear. Independent service; not affiliated with Indiana University.")
                     },
                 },
             }],
@@ -12684,7 +12738,104 @@ def gameday_welcome_page():
 .b{max-width:440px}h1{font-size:26px}p{color:#E3C7C7;line-height:1.6}</style></head>
 <body><div class=b><div style="font-size:44px">&#127944;</div><h1>You're on the season roster.</h1>
 <p>Payment received. You'll get a welcome text shortly, and your first GameDay morning outlook
-arrives the Saturday of the home opener. See you out there.</p></div></body></html>"""
+arrives the morning of the home opener. See you out there.</p></div></body></html>"""
+
+
+@app.post("/api/v1/admin/gameday/partners")
+def admin_create_gameday_partner():
+    """Create or update a GameDay partner (admin only). Body: code, name,
+    optional season_cut_cents/single_cut_cents."""
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "admin-only"}), 403
+    data = request.get_json(silent=True) or {}
+    code = (data.get("code") or "").strip().lower()[:40]
+    name = (data.get("name") or "").strip()[:120]
+    if not re.fullmatch(r"[a-z0-9_-]{3,40}", code or ""):
+        return jsonify({"ok": False, "error": "Code: 3-40 chars, letters/numbers/dashes."}), 400
+    if not name:
+        return jsonify({"ok": False, "error": "Name required."}), 400
+    season_cut = int(data.get("season_cut_cents") or 200)
+    single_cut = int(data.get("single_cut_cents") or 50)
+    charity_name = (data.get("charity_name") or "").strip()[:120] or None
+    charity_season = int(data.get("charity_season_cents") or 100)
+    charity_single = int(data.get("charity_single_cents") or 25)
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO gameday_partners
+                     (code, name, season_cut_cents, single_cut_cents,
+                      charity_name, charity_season_cents, charity_single_cents, created_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (code) DO UPDATE
+                     SET name = EXCLUDED.name,
+                         season_cut_cents = EXCLUDED.season_cut_cents,
+                         single_cut_cents = EXCLUDED.single_cut_cents,
+                         charity_name = EXCLUDED.charity_name,
+                         charity_season_cents = EXCLUDED.charity_season_cents,
+                         charity_single_cents = EXCLUDED.charity_single_cents""",
+                (code, name, season_cut, single_cut, charity_name, charity_season, charity_single, now_ms))
+    link = f"{PUBLIC_BASE_URL}/gameday/iu?ref={code}"
+    stats = f"{PUBLIC_BASE_URL}/gameday/partners/{code}"
+    return jsonify({"ok": True, "code": code, "share_link": link, "stats_page": stats})
+
+
+@app.get("/gameday/partners/<code>")
+def gameday_partner_stats(code):
+    """Public live scoreboard for a partner: their sales, their earnings,
+    updated on every page load straight from the database. Transparency
+    is the deal: they never have to take our word for a number."""
+    code = (code or "").strip().lower()[:40]
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT name, season_cut_cents, single_cut_cents, charity_name, charity_season_cents, charity_single_cents FROM gameday_partners WHERE code = %s", (code,))
+            partner = cur.fetchone()
+            if not partner:
+                return "Partner code not found.", 404
+            cur.execute(
+                """SELECT pass_type, COUNT(*) AS n FROM gameday_passes
+                   WHERE ref_code = %s AND status = 'active' GROUP BY pass_type""",
+                (code,))
+            counts = {r["pass_type"]: int(r["n"]) for r in cur.fetchall()}
+    seasons = counts.get("season", 0)
+    singles = counts.get("single", 0)
+    earned = (seasons * partner["season_cut_cents"] + singles * partner["single_cut_cents"]) / 100.0
+    charity = _html_escape(partner.get("charity_name") or "")
+    raised = ((seasons * (partner.get("charity_season_cents") or 0)
+               + singles * (partner.get("charity_single_cents") or 0)) / 100.0) if charity else 0.0
+    if charity:
+        charity_tile = ("<div class=earn style=" + chr(34) + "background:#1E4D30;margin-top:12px;" + chr(34) + ">"
+                        + "<div class=n>$" + format(raised, ",.2f") + "</div>"
+                        + "<div class=l style=" + chr(34) + "color:#CDEBD6;" + chr(34) + ">Raised for " + charity + "</div></div>")
+    else:
+        charity_tile = ""
+    name = _html_escape(partner["name"])
+    return f"""<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>{name} - GameDay partner scoreboard</title><style>
+body{{margin:0;font-family:Inter,-apple-system,Arial,sans-serif;background:#140A0C;color:#F3EAD3;display:flex;align-items:center;justify-content:center;min-height:100vh;text-align:center;padding:20px}}
+.b{{max-width:460px;width:100%}}
+h1{{font-size:20px;margin:0 0 4px}}
+.sub{{color:#C89AA1;font-size:13px;margin-bottom:26px}}
+.grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}}
+.tile{{background:rgba(243,234,211,0.06);border:1px solid rgba(243,234,211,0.18);border-radius:12px;padding:18px 10px}}
+.tile .n{{font-size:34px;font-weight:800;color:#fff}}
+.tile .l{{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#C89AA1;margin-top:4px}}
+.earn{{background:#A6192E;border-radius:12px;padding:20px}}
+.earn .n{{font-size:40px;font-weight:800;color:#fff}}
+.earn .l{{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#F3D0D6;margin-top:4px}}
+.fine{{font-size:11.5px;color:#8A6F73;margin-top:20px;line-height:1.6}}
+</style></head><body><div class=b>
+<h1>&#9889; {name}</h1>
+<div class=sub>GameDay Weather partner scoreboard &middot; live from the database, updated every refresh</div>
+<div class=grid>
+  <div class=tile><div class=n>{seasons}</div><div class=l>Season passes</div></div>
+  <div class=tile><div class=n>{singles}</div><div class=l>Single games</div></div>
+</div>
+<div class=earn><div class=n>${earned:,.2f}</div><div class=l>Earned so far</div></div>
+{charity_tile}
+<div class=fine>Counts include paid passes only. Share link: api.weathervalet.ai/gameday/iu?ref={code}</div>
+</div></body></html>"""
 
 
 def _activate_gameday_pass(pass_id: int) -> None:
@@ -12693,7 +12844,7 @@ def _activate_gameday_pass(pass_id: int) -> None:
         with conn.cursor() as cur:
             cur.execute(
                 """UPDATE gameday_passes SET status = 'active', updated_at = %s
-                   WHERE id = %s AND status != 'active' RETURNING name, phone""",
+                   WHERE id = %s AND status != 'active' RETURNING name, phone, pass_type""",
                 (now_ms, pass_id))
             row = cur.fetchone()
     if not row:
@@ -12701,11 +12852,16 @@ def _activate_gameday_pass(pass_id: int) -> None:
     first = (row.get("name") or "").split(" ")[0]
     hello = f"{first}, you" if first else "You"
     try:
-        send_sms(row["phone"],
-                 f"{hello}'re on the GameDay Weather roster for the Bloomington season. "
-                 f"Every home Saturday: the Meteorologist's morning outlook, live alerts "
-                 f"if weather threatens the game window, and the all-clear. First outlook "
-                 f"lands the morning of the home opener. - WeatherValet")
+        if (row.get("pass_type") or "season") == "single":
+            body = (f"{hello}'re covered for the next home game. The Meteorologist's "
+                    f"outlook lands that morning, live alerts follow if weather "
+                    f"threatens the game window, and the all-clear closes it out. - WeatherValet")
+        else:
+            body = (f"{hello}'re on the GameDay Weather roster for the Bloomington season. "
+                    f"Every home game: the Meteorologist's morning outlook, live alerts "
+                    f"if weather threatens the game window, and the all-clear. First outlook "
+                    f"lands the morning of the home opener. - WeatherValet")
+        send_sms(row["phone"], body)
     except Exception as e:
         print(f"[gameday] welcome sms failed: {e!r}", flush=True)
     try:
