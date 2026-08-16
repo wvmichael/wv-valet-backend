@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-123"
+BACKEND_BUILD = "0702-124"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -12958,6 +12958,63 @@ document.getElementById('s-go').addEventListener('click', function(){
   });
 });
 </script></body></html>"""
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Diagnostics (Aug 16, 2026). Born from a production 500 nobody could
+# read because Render's logs are out of reach. /api/v1/healthz reports
+# build + database state in plain English; adding ?wvdebug=stormy2026
+# to any failing URL prints the real traceback instead of the generic
+# error page. The token gate keeps tracebacks away from strangers.
+# ═══════════════════════════════════════════════════════════════════
+
+WV_DEBUG_TOKEN = "stormy2026"
+
+
+@app.get("/api/v1/healthz")
+def healthz_deep():
+    report = {"build": BACKEND_BUILD, "ok": True, "checks": {}}
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 AS one")
+                report["checks"]["database"] = "ok"
+                for table in ("users", "sentry_subscribers", "gameday_passes",
+                              "gameday_partners", "sales_prospects"):
+                    try:
+                        cur.execute(f"SELECT COUNT(*) AS n FROM {table}")
+                        report["checks"][table] = f"ok ({cur.fetchone()['n']} rows)"
+                    except Exception as te:
+                        report["ok"] = False
+                        report["checks"][table] = f"MISSING or broken: {te!r}"
+                # column probes for this build's migrations
+                for table, col in (("gameday_passes", "ref_code"),
+                                   ("gameday_passes", "pass_type"),
+                                   ("sentry_subscribers", "phone2"),
+                                   ("gameday_partners", "charity_name")):
+                    try:
+                        cur.execute(f"SELECT {col} FROM {table} LIMIT 1")
+                        report["checks"][f"{table}.{col}"] = "ok"
+                    except Exception as ce:
+                        report["ok"] = False
+                        report["checks"][f"{table}.{col}"] = f"MISSING: {ce!r}"
+    except Exception as e:
+        report["ok"] = False
+        report["checks"]["database"] = f"DOWN: {e!r}"
+    return jsonify(report), (200 if report["ok"] else 500)
+
+
+@app.errorhandler(500)
+def _wv_error_reporter(err):
+    """Generic 500 page, unless the debug token is in the URL, in which
+    case show the real traceback so problems can be read from a browser."""
+    if request.args.get("wvdebug") == WV_DEBUG_TOKEN:
+        import traceback as _tb
+        detail = _tb.format_exc()
+        return ("<pre style='white-space:pre-wrap;font-size:13px;padding:20px;'>"
+                + _html_escape(f"BUILD {BACKEND_BUILD}\n\n" + detail) + "</pre>"), 500
+    return ("<h1>Something broke on our end.</h1>"
+            "<p>The team has a way to see exactly what. Try again in a minute.</p>"), 500
 
 
 @app.get("/sentry")
