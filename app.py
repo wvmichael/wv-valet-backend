@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-130"
+BACKEND_BUILD = "0702-131"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -13032,11 +13032,14 @@ function load(){
        +'</div>';
     });
     document.getElementById('games').innerHTML=h;
-    wire();
+    try { wire(); } catch(e) {
+      // A wiring bug must never erase the rendered games again.
+      console.error('console wiring error', e);
+    }
   }).catch(function(){document.getElementById('games').textContent='Could not load games.';});
 }
 function wire(){
-  document.querySelectorAll('.game').forEach(function(card){
+  document.querySelectorAll('.game[data-id]').forEach(function(card){
     var id=parseInt(card.getAttribute('data-id'),10);
     var st=card.querySelector('.status');
     var cb=card.querySelector('.claim-btn');
@@ -13044,12 +13047,12 @@ function wire(){
       fetch('/api/v1/met/gameday/claim',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({game_id:id})})
       .then(function(r){return r.json();}).then(function(d){ if(d.ok){load();} else {st.textContent=d.error||'Claim failed.';st.className='status bad';} });
     });
-    card.querySelector('.kick-save').addEventListener('click',function(){
+    var ks=card.querySelector('.kick-save'); if(ks) ks.addEventListener('click',function(){
       var v=card.querySelector('.kick-in').value;
       fetch('/api/v1/met/gameday/kickoff',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({game_id:id,kickoff:v})})
       .then(function(r){return r.json();}).then(function(d){ st.textContent=d.ok?'Kickoff saved.':'Save failed.'; st.className='status '+(d.ok?'ok':'bad'); });
     });
-    card.querySelector('.send').addEventListener('click',function(){
+    var snd=card.querySelector('.send'); if(snd) snd.addEventListener('click',function(){
       var body=card.querySelector('textarea').value.trim();
       var btn=this;
       if(body.length<10){st.textContent='Write the message first.';st.className='status bad';return;}
