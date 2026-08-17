@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-128"
+BACKEND_BUILD = "0702-130"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -13005,6 +13005,14 @@ textarea{width:100%;box-sizing:border-box;margin-top:10px;background:#0D0D10;col
 <div class=top>&#9889; GameDay Console <small>Plain-text broadcasts to everyone covered for each game. No links, under 480 characters. Sends run in the background; counts land in a minute.</small></div>
 <div class=wrap>
 <div class=note>Claim your game so the team knows who owns the window. Kickoff TBA? Update it when the TV window firms up; the Monday reminder texts use it.</div>
+<div class=game id=comp-box>
+  <div class=g-head><b>Comp a free pass</b></div>
+  <div class=meta>Founder promises and partner passes. Sends the normal welcome text.</div>
+  <div class=row><input class=kick-in style="width:160px" id=comp-name placeholder="Name">
+  <input class=kick-in style="width:170px" id=comp-phone placeholder="812-555-0123">
+  <button class=send id=comp-send>Comp season pass</button></div>
+  <div class=status id=comp-status></div>
+</div>
 <div id=games>Loading games&hellip;</div>
 </div>
 <script>
@@ -13056,8 +13064,55 @@ function wire(){
     });
   });
 }
+document.getElementById('comp-send').addEventListener('click', function(){
+  var st=document.getElementById('comp-status');
+  var nm=document.getElementById('comp-name').value.trim();
+  var ph=document.getElementById('comp-phone').value.trim();
+  if(!ph){st.textContent='Phone required.';st.className='status bad';return;}
+  if(!confirm('Comp a free SEASON pass to '+(nm||'this number')+'? They get the welcome text immediately.'))return;
+  fetch('/api/v1/met/gameday/comp',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:nm,phone:ph,pass_type:'season'})})
+  .then(function(r){return r.json();}).then(function(d){
+    if(d.ok){st.textContent='Comped. Welcome text sent.';st.className='status ok';document.getElementById('comp-name').value='';document.getElementById('comp-phone').value='';load();}
+    else{st.textContent=d.error||'Comp failed.';st.className='status bad';}
+  }).catch(function(){st.textContent='Connection problem.';st.className='status bad';});
+});
 load();
 </script></body></html>"""
+
+
+@app.post("/api/v1/met/gameday/comp")
+def met_gameday_comp():
+    """Comp a free pass (admin/met): founder promises, partner passes,
+    make-goods. Creates the pass active with amount 0 and sends the same
+    welcome text a paying subscriber gets."""
+    user = _require_met_or_admin()
+    if not user:
+        return jsonify({"ok": False, "error": "met-only"}), 403
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()[:120]
+    email = (data.get("email") or "").strip()[:200]
+    phone = _normalize_phone((data.get("phone") or "").strip())
+    pass_type = "single" if (data.get("pass_type") or "") == "single" else "season"
+    if not phone:
+        return jsonify({"ok": False, "error": "Enter a valid mobile number."}), 400
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id FROM gameday_passes
+                           WHERE phone = %s AND status = 'active' AND pass_type = 'season'""",
+                        (phone,))
+            if cur.fetchone():
+                return jsonify({"ok": False, "error": "That phone already has an active season pass."}), 409
+            cur.execute(
+                """INSERT INTO gameday_passes
+                     (venue, name, email, phone, pass_type, amount_cents, ref_code, game_id, status, created_at, updated_at)
+                   VALUES ('iu',%s,%s,%s,%s,0,'comp',%s,'pending',%s,%s) RETURNING id""",
+                (name, email or "comp@weathervalet.ai", phone, pass_type,
+                 (_next_gameday_game_id() if pass_type == "single" else None),
+                 now_ms, now_ms))
+            pass_id = cur.fetchone()["id"]
+    _activate_gameday_pass(pass_id)
+    return jsonify({"ok": True, "pass_id": pass_id})
 
 
 @app.get("/api/v1/met/gameday/games")
@@ -13253,7 +13308,7 @@ def _activate_gameday_pass(pass_id: int) -> None:
             body = (f"{hello}'re on the GameDay Weather roster for the Bloomington season. "
                     f"Every home game: the Meteorologist's morning outlook, live alerts "
                     f"if weather threatens the game window, and the all-clear. First outlook "
-                    f"lands the morning of the home opener. - WeatherValet")
+                    f"lands the evening before the home opener. - WeatherValet")
         send_sms(row["phone"], body)
     except Exception as e:
         print(f"[gameday] welcome sms failed: {e!r}", flush=True)
