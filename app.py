@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-125"
+BACKEND_BUILD = "0702-127"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -852,6 +852,39 @@ ALTER TABLE gameday_passes ADD COLUMN IF NOT EXISTS pass_type TEXT NOT NULL DEFA
 ALTER TABLE gameday_passes ADD COLUMN IF NOT EXISTS amount_cents INTEGER NOT NULL DEFAULT 1600;
 ALTER TABLE gameday_passes ADD COLUMN IF NOT EXISTS ref_code TEXT;
 CREATE INDEX IF NOT EXISTS idx_gameday_ref ON gameday_passes(ref_code, status);
+
+-- GameDay games board (Aug 16, 2026): one card per home game. Season
+-- passes cover every game implicitly; single passes attach to one game.
+-- The Met console at /gameday/console reads this board.
+CREATE TABLE IF NOT EXISTS gameday_games (
+    id          SERIAL PRIMARY KEY,
+    venue       TEXT NOT NULL DEFAULT 'iu',
+    game_no     INTEGER NOT NULL,
+    opponent    TEXT NOT NULL,
+    game_date   DATE NOT NULL,
+    kickoff     TEXT NOT NULL DEFAULT 'TBA',
+    tv          TEXT,
+    claimed_by  INTEGER,          -- Met user id who owns this game's window
+    UNIQUE (venue, game_no)
+);
+
+ALTER TABLE gameday_passes ADD COLUMN IF NOT EXISTS game_id INTEGER;
+
+CREATE TABLE IF NOT EXISTS gameday_broadcasts (
+    id          SERIAL PRIMARY KEY,
+    game_id     INTEGER NOT NULL,
+    met_user_id INTEGER,
+    body        TEXT NOT NULL,
+    sent_count  INTEGER NOT NULL DEFAULT 0,
+    created_at  BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS gameday_reminder_log (
+    game_id  INTEGER NOT NULL,
+    pass_id  INTEGER NOT NULL,
+    sent_at  BIGINT NOT NULL,
+    PRIMARY KEY (game_id, pass_id)
+);
 
 -- GameDay partners (Aug 16, 2026): social accounts promoting passes for
 -- a per-sale cut. Each gets a public live-stats page at
@@ -3255,6 +3288,7 @@ def init_db() -> None:
     except Exception as e:
         print(f"[welcome-backfill] failed: {e}", flush=True)
     _seed_sales_prospects()
+    _seed_gameday_games()
     # Backfill phone/name from approved crew applications to users
     # (May 24, 2026). The crew-verify endpoint was not copying phone
     # to users.phone, so existing approved Crew can't receive mission
@@ -12484,101 +12518,117 @@ GAMEDAY_SINGLE_CENTS = 500
 
 _GAMEDAY_IU_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>GameDay Weather - Bloomington - $12 season pass</title>
+<title>GameDay Weather - Every Indiana University Football home game - $16 season</title>
 <link rel=preconnect href=https://fonts.googleapis.com>
 <link rel=preconnect href=https://fonts.gstatic.com crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;600;800&display=swap" rel=stylesheet>
 <style>
 :root{--crim:#A6192E;--crim-deep:#7E1322;--night:#140A0C;--cream:#F3EAD3;--bolt:#FFCE44;--ink:#1B1416}
 *{box-sizing:border-box}
-body{margin:0;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;background:var(--night);color:var(--cream)}
+body{margin:0;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;background:var(--night);color:var(--cream);font-size:17px}
 .field{position:relative;overflow:hidden;background:
   linear-gradient(180deg,rgba(20,10,12,0) 55%,rgba(20,10,12,.92) 100%),
   radial-gradient(1200px 500px at 50% -180px,rgba(255,206,68,.20),rgba(255,206,68,0) 60%),
   repeating-linear-gradient(90deg,rgba(243,234,211,.05) 0 2px,transparent 2px 96px),
   linear-gradient(180deg,#5E0F1C,#7E1322 45%,#3A0910);
-  padding:34px 18px 30px;text-align:center}
-.brand{font-family:Inter;font-weight:800;font-size:17px;letter-spacing:.01em;color:var(--cream)}
+  padding:36px 18px 34px;text-align:center}
+.brand{font-weight:800;font-size:19px;color:var(--cream)}
 .brand .bolt{color:var(--bolt)}
 h1{font-family:'Bebas Neue',Inter,sans-serif;font-weight:400;letter-spacing:.015em;
-   font-size:clamp(58px,13vw,124px);line-height:.88;margin:22px 0 6px;color:var(--cream);text-transform:uppercase}
+   font-size:clamp(62px,13vw,128px);line-height:.88;margin:22px 0 8px;color:var(--cream);text-transform:uppercase}
 h1 .pop{color:var(--bolt)}
-.sub{font-size:clamp(15px,2.6vw,18px);color:#E9C9C9;max-width:520px;margin:10px auto 0;line-height:1.5}
+.sub{font-size:clamp(17px,2.8vw,20px);color:#EDD3D3;max-width:600px;margin:12px auto 0;line-height:1.55}
 .sub b{color:var(--cream)}
-.kick{display:inline-flex;align-items:center;gap:10px;margin-top:20px;background:var(--crim);
-  border:2px solid rgba(243,234,211,.35);border-radius:999px;padding:10px 22px;
-  font-family:'Bebas Neue';font-size:22px;letter-spacing:.06em;color:#fff}
-.phone-wrap{margin:34px auto 0;max-width:392px;perspective:900px}
+.kick{display:inline-flex;align-items:center;gap:10px;margin-top:22px;background:var(--crim);
+  border:2px solid rgba(243,234,211,.35);border-radius:999px;padding:12px 26px;
+  font-family:'Bebas Neue';font-size:25px;letter-spacing:.06em;color:#fff}
+.how{max-width:600px;margin:26px auto 0;font-size:16.5px;line-height:1.6;color:#EDD3D3}
+.how b{color:var(--bolt)}
+.phone-wrap{margin:34px auto 0;max-width:410px;perspective:900px}
 .phone{background:#0D0D10;border:2px solid #2A2A30;border-radius:34px;padding:14px 12px 18px;
   box-shadow:0 30px 60px rgba(0,0,0,.55),0 0 0 6px rgba(255,206,68,.06);
-  transform:rotateX(4deg);text-align:left}
+  transform:rotateX(3deg);text-align:left}
 .notch{width:96px;height:9px;border-radius:9px;background:#2A2A30;margin:0 auto 12px}
 .thread-head{display:flex;align-items:center;gap:9px;padding:0 6px 10px;border-bottom:1px solid #23232A}
-.avatar{width:30px;height:30px;border-radius:50%;background:var(--crim);display:flex;align-items:center;justify-content:center;font-size:15px}
-.thread-head b{font-size:13.5px;color:#EDEDF2}
-.thread-head span{display:block;font-size:10.5px;color:#8B8B96}
+.avatar{width:32px;height:32px;border-radius:50%;background:var(--crim);display:flex;align-items:center;justify-content:center;font-size:16px}
+.thread-head b{font-size:15px;color:#EDEDF2}
+.thread-head span{display:block;font-size:11.5px;color:#8B8B96}
 .msgs{padding:12px 4px 2px;display:flex;flex-direction:column;gap:9px}
-.stamp{align-self:center;font-size:10px;color:#6E6E7A;letter-spacing:.06em;text-transform:uppercase}
-.msg{max-width:88%;background:#1D1D24;border-radius:15px 15px 15px 5px;padding:9px 12px;font-size:12.9px;line-height:1.45;color:#E6E6EC;
+.stamp{align-self:center;font-size:11px;color:#7A7A86;letter-spacing:.06em;text-transform:uppercase}
+.msg{max-width:90%;background:#1D1D24;border-radius:15px 15px 15px 5px;padding:10px 13px;font-size:14.5px;line-height:1.5;color:#EAEAF0;
   opacity:0;transform:translateY(8px);animation:pop .45s ease forwards}
 .msg b{color:var(--bolt);font-weight:800}
 .msg.alert{background:#3A1016;border:1px solid #6E1B27}
 .msg.clear{background:#12251A;border:1px solid #1E4D30}
-.msg:nth-child(2){animation-delay:.15s}.msg:nth-child(4){animation-delay:.5s}
-.msg:nth-child(6){animation-delay:.85s}.msg:nth-child(8){animation-delay:1.2s}
 @keyframes pop{to{opacity:1;transform:none}}
 @media (prefers-reduced-motion: reduce){.msg{animation:none;opacity:1;transform:none}}
-.row3{display:flex;justify-content:center;gap:26px;flex-wrap:wrap;margin:30px auto 4px;max-width:640px}
-.f{display:flex;flex-direction:column;align-items:center;gap:7px;width:150px}
-.f svg{width:34px;height:34px}
-.f span{font-family:'Bebas Neue';font-size:19px;letter-spacing:.08em;color:var(--cream)}
-.f small{font-size:12px;color:#D9AFAF;line-height:1.4}
-.ticketzone{background:var(--night);padding:38px 16px 46px}
-.ticket{position:relative;max-width:520px;margin:0 auto;background:var(--cream);color:var(--ink);
-  border-radius:16px;padding:26px 26px 22px;
+.row3{display:flex;justify-content:center;gap:26px;flex-wrap:wrap;margin:32px auto 4px;max-width:680px}
+.f{display:flex;flex-direction:column;align-items:center;gap:7px;width:170px}
+.f svg{width:36px;height:36px}
+.f span{font-family:'Bebas Neue';font-size:22px;letter-spacing:.08em;color:var(--cream)}
+.f small{font-size:14px;color:#E0BABA;line-height:1.45}
+.ticketzone{background:var(--night);padding:40px 16px 20px}
+.pricing-line{text-align:center;font-size:17px;color:var(--cream);max-width:560px;margin:0 auto 24px;line-height:1.6}
+.pricing-line b{color:var(--bolt)}
+.ticket{position:relative;max-width:540px;margin:0 auto;background:var(--cream);color:var(--ink);
+  border-radius:16px;padding:28px 28px 24px;
   box-shadow:0 18px 50px rgba(0,0,0,.5)}
 .ticket:before,.ticket:after{content:"";position:absolute;top:50%;width:26px;height:26px;border-radius:50%;background:var(--night);transform:translateY(-50%)}
 .ticket:before{left:-13px}.ticket:after{right:-13px}
 .t-head{display:flex;justify-content:space-between;align-items:baseline;border-bottom:2px dashed rgba(27,20,22,.28);padding-bottom:12px;margin-bottom:14px}
-.t-head .tt{font-family:'Bebas Neue';font-size:30px;letter-spacing:.05em}
-.t-head .pr{font-family:'Bebas Neue';font-size:30px;color:var(--crim)}
-.t-sub{font-size:12.5px;color:#5B4A4E;margin:-8px 0 14px;letter-spacing:.05em;text-transform:uppercase;font-weight:600}
-label{display:block;font-size:11px;font-weight:800;letter-spacing:.07em;text-transform:uppercase;color:#6E5A5F;margin:12px 0 4px}
-input{width:100%;padding:12px;border:1.5px solid rgba(27,20,22,.25);border-radius:9px;font-size:16px;background:#FFFDF7;color:var(--ink)}
+.t-head .tt{font-family:'Bebas Neue';font-size:33px;letter-spacing:.05em}
+.t-head .pr{font-family:'Bebas Neue';font-size:33px;color:var(--crim)}
+.t-sub{font-size:14px;color:#5B4A4E;margin:-8px 0 14px;letter-spacing:.05em;text-transform:uppercase;font-weight:600}
+label{display:block;font-size:12.5px;font-weight:800;letter-spacing:.07em;text-transform:uppercase;color:#6E5A5F;margin:12px 0 4px}
+input{width:100%;padding:13px;border:1.5px solid rgba(27,20,22,.25);border-radius:9px;font-size:17px;background:#FFFDF7;color:var(--ink)}
 input:focus{outline:2px solid var(--crim);outline-offset:1px;border-color:var(--crim)}
-button{width:100%;margin-top:18px;background:var(--crim);color:#fff;border:none;border-radius:10px;padding:15px;
-  font-family:'Bebas Neue';font-size:24px;letter-spacing:.07em;cursor:pointer}
+button{width:100%;margin-top:18px;background:var(--crim);color:#fff;border:none;border-radius:10px;padding:16px;
+  font-family:'Bebas Neue';font-size:26px;letter-spacing:.07em;cursor:pointer}
 button:hover{background:var(--crim-deep)}
 button:disabled{opacity:.6}
-.fine{font-size:11px;color:#7A686C;margin-top:12px;line-height:1.55;text-align:center}
-.err{display:none;background:#FBE3E3;border:1px solid #E3A9A9;color:#7E1322;border-radius:8px;padding:10px 12px;margin-top:12px;font-size:13.5px}
-.foot{text-align:center;font-size:11.5px;color:#8A6F73;padding:0 18px 34px;line-height:1.6}
+.fine{font-size:13px;color:#7A686C;margin-top:12px;line-height:1.6;text-align:center}
+.err{display:none;background:#FBE3E3;border:1px solid #E3A9A9;color:#7E1322;border-radius:8px;padding:10px 12px;margin-top:12px;font-size:15px}
+.why{max-width:560px;margin:36px auto 0;padding:0 6px}
+.why h2{font-family:'Bebas Neue';font-size:34px;letter-spacing:.05em;color:var(--cream);text-align:center;margin:0 0 16px}
+.why ul{list-style:none;padding:0;margin:0}
+.why li{padding:10px 0 10px 36px;position:relative;font-size:16.5px;line-height:1.55;color:#EDD3D3;border-bottom:1px solid rgba(243,234,211,.1)}
+.why li:last-child{border-bottom:none}
+.why li:before{content:"\\26A1";position:absolute;left:4px;color:var(--bolt)}
+.why li b{color:var(--cream)}
+.foot{text-align:center;font-size:13px;color:#8A6F73;padding:26px 18px 36px;line-height:1.7}
 .foot a{color:#C89AA1}
 </style></head><body>
 
 <div class=field>
   <div class=brand><span class=bolt>&#9889;</span> WeatherValet</div>
   <h1>Rain or shine,<br>know before <span class=pop>kickoff.</span></h1>
-  <p class=sub>Real, certified Meteorologists watching every Bloomington home game.
-  <b>Texted to you live</b>: tailgate timing, storm alerts, lightning holds, the all-clear.</p>
-  <div class=kick>&#127944; Season $16 ($2 a game) &middot; or one game for $5</div>
+  <p class=sub>Real, certified Meteorologists covering <b>every Indiana University Football
+  home game</b>. Texted to you live: tailgate timing, storm alerts, rain start and stop, the all-clear.</p>
+  <div class=kick>&#127944; Season: all 8 home games, $16 &middot; Single game, $5</div>
+  <p class=how>How it works: <b>GameDay forecast the day before</b>, a <b>morning brief</b> on gameday,
+  and <b>live alerts as needed</b> throughout the day. Hopefully we stay ALL CLEAR all day, but if the
+  sky has other plans, our team of certified Meteorologists will text you as it happens.</p>
 
   <div class=phone-wrap>
     <div class=phone aria-hidden=true>
       <div class=notch></div>
       <div class=thread-head>
         <div class=avatar>&#9889;</div>
-        <div><b>GameDay Weather</b><span>Bloomington &middot; Sat</span></div>
+        <div><b>GameDay Weather</b><span>Bloomington</span></div>
       </div>
       <div class=msgs>
-        <div class=stamp>Sat 9:02 AM</div>
-        <div class=msg>Morning, Bloomington. <b>Tailgate looks dry until about 2 PM.</b> A line of storms is west of Terre Haute, moving east. Kickoff itself: watching closely. - Meteorologist on duty</div>
+        <div class=stamp>Friday 4:30 PM</div>
+        <div class=msg style="animation-delay:.1s">Tomorrow's outlook for Bloomington: <b>dry morning for the tailgate</b>, a line of storms possible mid-afternoon, clearing by evening. I'll be watching it all day for you. - Timmy, WeatherValet Meteorologist</div>
+        <div class=stamp>Saturday 9:02 AM</div>
+        <div class=msg style="animation-delay:.4s">Morning, Bloomington. <b>Tailgate looks dry until about 2 PM.</b> That line of storms is west of Terre Haute, moving east. More from me as it develops. - Timmy</div>
         <div class=stamp>2:14 PM</div>
-        <div class="msg alert"><b>Lightning within 8 miles.</b> Expect a stadium hold. Storms pass through by about 3. Stay near cover.</div>
+        <div class="msg alert" style="animation-delay:.7s"><b>Lightning within 8 miles of the stadium.</b> Rain reaches campus in about 15 minutes. Whole thing should last about 40 minutes, with the heaviest rain about 10 of those.</div>
+        <div class=stamp>2:52 PM</div>
+        <div class=msg style="animation-delay:1.0s">Rain is <b>down to sprinkles</b> and should stop completely within the next ten minutes.</div>
         <div class=stamp>3:05 PM</div>
-        <div class="msg clear"><b>All clear.</b> Line is east of campus. Rest of the game looks dry. Enjoy it.</div>
+        <div class="msg clear" style="animation-delay:1.3s"><b>All clear.</b> The line is east of campus. Rest of the game looks dry. Enjoy it.</div>
         <div class=stamp>6:48 PM</div>
-        <div class=msg>Dry drive home in all directions. See you next Saturday. &#9889;</div>
+        <div class=msg style="animation-delay:1.6s"><b>Dry drive home</b> in all directions. See you next game. &#9889;</div>
       </div>
     </div>
   </div>
@@ -12586,13 +12636,13 @@ button:disabled{opacity:.6}
   <div class=row3>
     <div class=f>
       <svg viewBox="0 0 24 24" fill="none" stroke="#FFCE44" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4.4" fill="#FFCE44" stroke="none"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.2 5.2l2.1 2.1M16.7 16.7l2.1 2.1M18.8 5.2l-2.1 2.1M7.3 16.7l-2.1 2.1"/></svg>
-      <span>Morning outlook</span>
-      <small>Written by the Met on duty: tailgate, kickoff, drive home, every home game</small>
+      <span>Day-before + morning</span>
+      <small>The GameDay forecast the evening before, the brief that morning</small>
     </div>
     <div class=f>
       <svg viewBox="0 0 24 24" fill="#FFCE44"><path d="M13 2 4.5 13.5h5L10 22l8.5-11.5h-5L13 2z"/></svg>
       <span>Live storm alerts</span>
-      <small>Lightning holds and severe weather, the moment it matters</small>
+      <small>Lightning nearby, when rain starts, and when it stops</small>
     </div>
     <div class=f>
       <svg viewBox="0 0 24 24" fill="none" stroke="#7BD48E" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg>
@@ -12603,12 +12653,14 @@ button:disabled{opacity:.6}
 </div>
 
 <div class=ticketzone>
+  <p class=pricing-line><b>Season pass: all 8 Indiana University Football home games for $16 total.</b><br>
+  Or cover a single game for $5. That's it. No subscription, no app.</p>
   <div class=ticket>
     <div class=t-head><span class=tt id=t-title>Season Pass</span><span class=pr id=t-price>$16</span></div>
     <div class=t-sub id=t-sub>Bloomington &middot; 8 home games &middot; one-time</div>
     <div style="display:flex;gap:8px;margin-bottom:4px;">
-      <button type=button id=opt-season style="flex:1;margin-top:0;padding:10px;font-size:17px;background:#A6192E;">Season &middot; $16</button>
-      <button type=button id=opt-single style="flex:1;margin-top:0;padding:10px;font-size:17px;background:#FFFDF7;color:#7E1322;border:1.5px solid #A6192E;">Next game &middot; $5</button>
+      <button type=button id=opt-season style="flex:1;margin-top:0;padding:11px;font-size:18px;background:#A6192E;">Season &middot; $16</button>
+      <button type=button id=opt-single style="flex:1;margin-top:0;padding:11px;font-size:18px;background:#FFFDF7;color:#7E1322;border:1.5px solid #A6192E;">Next game &middot; $5</button>
     </div>
     <div id=err class=err></div>
     <label for=g-name>Name</label><input id=g-name autocomplete=name>
@@ -12619,6 +12671,19 @@ button:disabled{opacity:.6}
     night game); single covers the next home game after you buy. One-time payment via Stripe.
     Group of tailgaters? Everyone needs their own pass.</div>
   </div>
+
+  <div class=why>
+    <h2>Why fans sign up</h2>
+    <ul>
+      <li><b>Plan the tailgate with confidence.</b> You'll know the dry window before you load the truck.</li>
+      <li><b>Know what the sky is doing before the stadium announces anything.</b> When lightning is near, you'll hear it from a Meteorologist first.</li>
+      <li><b>Rain that comes with a schedule.</b> When it starts, how long it lasts, when it's down to sprinkles, when it's done.</li>
+      <li><b>No app, no radar-squinting.</b> Plain texts on any phone, written by a certified Meteorologist, not an algorithm.</li>
+      <li><b>The drive home, covered too.</b> The day isn't over at the final whistle.</li>
+      <li><b>Two dollars a game.</b> All 8 home games for $16. Cheaper than one stadium bottle of water.</li>
+    </ul>
+  </div>
+
   <p class=foot>WeatherValet is an independent weather service, not affiliated with or endorsed by Indiana University.<br>
   Want weather for YOUR life, not just gamedays? <a href="https://weathervalet.ai">WeatherValet.ai</a></p>
 </div>
@@ -12637,8 +12702,8 @@ function setType(t){
   document.getElementById('t-title').textContent = seasonOn ? 'Season Pass' : 'Single Game';
   document.getElementById('t-price').textContent = seasonOn ? '$16' : '$5';
   document.getElementById('t-sub').textContent = seasonOn
-    ? 'Bloomington \u00b7 8 home games \u00b7 one-time'
-    : 'Bloomington \u00b7 next home game \u00b7 one-time';
+    ? 'Bloomington \\u00b7 8 home games \\u00b7 one-time'
+    : 'Bloomington \\u00b7 next home game \\u00b7 one-time';
   document.getElementById('g-go').textContent = seasonOn ? 'Claim my season pass' : 'Cover me for the next game';
 }
 document.getElementById('opt-season').addEventListener('click', function(){ setType('season'); });
@@ -12699,9 +12764,11 @@ def gameday_checkout():
         with conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO gameday_passes
-                     (venue, name, email, phone, pass_type, amount_cents, ref_code, created_at, updated_at)
-                   VALUES ('iu',%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
-                (name, email, phone, pass_type, amount, ref_code, now_ms, now_ms))
+                     (venue, name, email, phone, pass_type, amount_cents, ref_code, game_id, created_at, updated_at)
+                   VALUES ('iu',%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (name, email, phone, pass_type, amount, ref_code,
+                 (_next_gameday_game_id() if pass_type == "single" else None),
+                 now_ms, now_ms))
             pass_id = cur.fetchone()["id"]
     if not stripe:
         return jsonify({"ok": False, "error": "Payments aren't configured yet."}), 503
@@ -12841,13 +12908,324 @@ h1{{font-size:20px;margin:0 0 4px}}
 </div></body></html>"""
 
 
+_GAMEDAY_SEASON_2026 = [
+    # (game_no, opponent, date, kickoff, tv) — home games only
+    (1, "North Texas",      "2026-09-05", "Noon",   "FOX"),
+    (2, "Howard",           "2026-09-12", "Noon",   "BTN"),
+    (3, "Western Kentucky", "2026-09-19", "4 PM",   "Peacock"),
+    (4, "Northwestern",     "2026-09-25", "8 PM",   "FOX"),      # Friday night
+    (5, "Ohio State",       "2026-10-17", "TBA",    None),
+    (6, "Minnesota",        "2026-10-31", "TBA",    None),
+    (7, "USC",              "2026-11-14", "TBA",    None),
+    (8, "Purdue",           "2026-11-28", "TBA",    None),
+]
+
+
+def _seed_gameday_games() -> None:
+    """Idempotent: inserts missing games, never overwrites edits (kickoff
+    times firm up over the season and are updated on the console)."""
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                for no, opp, gdate, kick, tv in _GAMEDAY_SEASON_2026:
+                    cur.execute(
+                        """INSERT INTO gameday_games (venue, game_no, opponent, game_date, kickoff, tv)
+                           VALUES ('iu',%s,%s,%s,%s,%s)
+                           ON CONFLICT (venue, game_no) DO NOTHING""",
+                        (no, opp, gdate, kick, tv))
+        print("[gameday] season seed pass complete", flush=True)
+    except Exception as e:
+        print(f"[gameday] season seed failed: {e!r}", flush=True)
+
+
+def _next_gameday_game_id():
+    """The game a single-game pass bought right now covers."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id FROM gameday_games
+                           WHERE venue = 'iu' AND game_date >= CURRENT_DATE
+                           ORDER BY game_date LIMIT 1""")
+            r = cur.fetchone()
+            return r["id"] if r else None
+
+
+def _gameday_covered_passes(game_id: int) -> list:
+    """Everyone whose phone should get texts for this game: all active
+    season passes plus this game's active singles."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, name, phone, pass_type FROM gameday_passes
+                   WHERE status = 'active'
+                     AND (pass_type = 'season' OR game_id = %s)""",
+                (game_id,))
+            return cur.fetchall()
+
+
+def _require_met_or_admin():
+    user = _get_current_user()
+    if not user:
+        return None
+    roles = user.get("roles") or []
+    if "met" in roles or "admin" in roles:
+        return user
+    return None
+
+
+@app.get("/gameday/console")
+def gameday_console():
+    """The Met's GameDay screen: all 8 games, claim yours, see who's
+    covered, type the message, send. Plain text broadcasts only."""
+    user = _require_met_or_admin()
+    if not user:
+        return ("<h3 style='font-family:sans-serif;padding:30px;'>Meteorologists only. "
+                "Sign in at weathervalet.ai first, then come back.</h3>", 403)
+    return """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>GameDay Console - WeatherValet</title><style>
+body{margin:0;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;background:#140A0C;color:#F3EAD3;font-size:16px}
+.top{background:#7E1322;padding:16px 20px;font-weight:800;font-size:18px}
+.top small{display:block;font-weight:400;font-size:12.5px;color:#EDC7C7;margin-top:2px}
+.wrap{max-width:760px;margin:0 auto;padding:18px}
+.game{background:rgba(243,234,211,.05);border:1px solid rgba(243,234,211,.16);border-radius:12px;padding:16px;margin-bottom:14px}
+.g-head{display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;align-items:baseline}
+.g-head b{font-size:18px}
+.meta{font-size:13.5px;color:#D9AFAF;margin-top:2px}
+.claim{font-size:13px;margin-top:8px}
+.claim button, .send, .kick-save{background:#A6192E;color:#fff;border:none;border-radius:7px;padding:8px 14px;font-size:14px;font-weight:700;cursor:pointer}
+.claimed{color:#8FD8A0;font-weight:700}
+textarea{width:100%;box-sizing:border-box;margin-top:10px;background:#0D0D10;color:#EFEFF5;border:1px solid #33333B;border-radius:8px;padding:10px;font-size:15px;min-height:74px;font-family:inherit}
+.row{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
+.count{font-size:13px;color:#D9AFAF}
+.kick-in{background:#0D0D10;color:#EFEFF5;border:1px solid #33333B;border-radius:7px;padding:7px 9px;font-size:14px;width:90px}
+.status{font-size:13.5px;margin-top:6px;min-height:18px}
+.ok{color:#8FD8A0}.bad{color:#F2A6A6}
+.note{font-size:12.5px;color:#B08A90;margin:6px 0 18px;line-height:1.5}
+</style></head><body>
+<div class=top>&#9889; GameDay Console <small>Plain-text broadcasts to everyone covered for each game. No links, under 480 characters. Sends run in the background; counts land in a minute.</small></div>
+<div class=wrap>
+<div class=note>Claim your game so the team knows who owns the window. Kickoff TBA? Update it when the TV window firms up; the Monday reminder texts use it.</div>
+<div id=games>Loading games&hellip;</div>
+</div>
+<script>
+function esc(s){var d=document.createElement('div');d.textContent=s||'';return d.innerHTML;}
+function load(){
+  fetch('/api/v1/met/gameday/games',{credentials:'include'}).then(function(r){return r.json();}).then(function(d){
+    if(!d.ok){document.getElementById('games').textContent='Could not load games.';return;}
+    var h='';
+    d.games.forEach(function(g){
+      h+='<div class=game data-id="'+g.id+'">'
+       +'<div class=g-head><b>Game '+g.game_no+': Indiana vs '+esc(g.opponent)+'</b>'
+       +'<span class=meta>'+esc(g.game_date)+' &middot; kickoff <input class=kick-in value="'+esc(g.kickoff)+'"> <button class=kick-save>Save</button>'+(g.tv?(' &middot; '+esc(g.tv)):'')+'</span></div>'
+       +'<div class=claim>'+(g.claimed_by?('<span class=claimed>Claimed by '+esc(g.claimed_name||'a Met')+'</span>'):'<button class=claim-btn>Claim this game</button>')
+       +' &nbsp;<span class=count>'+g.covered+' covered phone'+(g.covered==1?'':'s')+'</span></div>'
+       +'<textarea placeholder="Type the message exactly as fans will read it. Sign it. No links."></textarea>'
+       +'<div class=row><button class=send>Send to '+g.covered+'</button><span class=status></span></div>'
+       +'</div>';
+    });
+    document.getElementById('games').innerHTML=h;
+    wire();
+  }).catch(function(){document.getElementById('games').textContent='Could not load games.';});
+}
+function wire(){
+  document.querySelectorAll('.game').forEach(function(card){
+    var id=parseInt(card.getAttribute('data-id'),10);
+    var st=card.querySelector('.status');
+    var cb=card.querySelector('.claim-btn');
+    if(cb)cb.addEventListener('click',function(){
+      fetch('/api/v1/met/gameday/claim',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({game_id:id})})
+      .then(function(r){return r.json();}).then(function(d){ if(d.ok){load();} else {st.textContent=d.error||'Claim failed.';st.className='status bad';} });
+    });
+    card.querySelector('.kick-save').addEventListener('click',function(){
+      var v=card.querySelector('.kick-in').value;
+      fetch('/api/v1/met/gameday/kickoff',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({game_id:id,kickoff:v})})
+      .then(function(r){return r.json();}).then(function(d){ st.textContent=d.ok?'Kickoff saved.':'Save failed.'; st.className='status '+(d.ok?'ok':'bad'); });
+    });
+    card.querySelector('.send').addEventListener('click',function(){
+      var body=card.querySelector('textarea').value.trim();
+      var btn=this;
+      if(body.length<10){st.textContent='Write the message first.';st.className='status bad';return;}
+      if(!confirm('Send this to every covered phone for this game?\n\n'+body))return;
+      btn.disabled=true;
+      fetch('/api/v1/met/gameday/broadcast',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({game_id:id,body:body})})
+      .then(function(r){return r.json();}).then(function(d){
+        btn.disabled=false;
+        if(d.ok){st.textContent='Queued to '+d.queued+' phones. Sending in the background.';st.className='status ok';card.querySelector('textarea').value='';}
+        else{st.textContent=d.error||'Send failed.';st.className='status bad';}
+      }).catch(function(){btn.disabled=false;st.textContent='Connection problem.';st.className='status bad';});
+    });
+  });
+}
+load();
+</script></body></html>"""
+
+
+@app.get("/api/v1/met/gameday/games")
+def met_gameday_games():
+    user = _require_met_or_admin()
+    if not user:
+        return jsonify({"ok": False, "error": "met-only"}), 403
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT g.id, g.game_no, g.opponent, g.game_date::text AS game_date,
+                                  g.kickoff, g.tv, g.claimed_by, u.name AS claimed_name
+                           FROM gameday_games g LEFT JOIN users u ON u.id = g.claimed_by
+                           WHERE g.venue = 'iu' ORDER BY g.game_date""")
+            games = [dict(r) for r in cur.fetchall()]
+            for g in games:
+                cur.execute("""SELECT COUNT(*) AS n FROM gameday_passes
+                               WHERE status = 'active' AND (pass_type = 'season' OR game_id = %s)""",
+                            (g["id"],))
+                g["covered"] = int(cur.fetchone()["n"])
+    return jsonify({"ok": True, "games": games})
+
+
+@app.post("/api/v1/met/gameday/claim")
+def met_gameday_claim():
+    user = _require_met_or_admin()
+    if not user:
+        return jsonify({"ok": False, "error": "met-only"}), 403
+    data = request.get_json(silent=True) or {}
+    game_id = int(data.get("game_id") or 0)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE gameday_games SET claimed_by = %s
+                           WHERE id = %s AND (claimed_by IS NULL OR claimed_by = %s)
+                           RETURNING id""", (user["id"], game_id, user["id"]))
+            ok = cur.fetchone() is not None
+    return jsonify({"ok": ok, "error": None if ok else "Already claimed by another Met."})
+
+
+@app.post("/api/v1/met/gameday/kickoff")
+def met_gameday_kickoff():
+    """Update kickoff time when the TV window firms up."""
+    user = _require_met_or_admin()
+    if not user:
+        return jsonify({"ok": False, "error": "met-only"}), 403
+    data = request.get_json(silent=True) or {}
+    game_id = int(data.get("game_id") or 0)
+    kickoff = (data.get("kickoff") or "").strip()[:20] or "TBA"
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE gameday_games SET kickoff = %s WHERE id = %s", (kickoff, game_id))
+    return jsonify({"ok": True})
+
+
+@app.post("/api/v1/met/gameday/broadcast")
+def met_gameday_broadcast():
+    """The send button: one plain text message to every covered phone.
+    Text only by design — no links, no media, nothing to filter."""
+    user = _require_met_or_admin()
+    if not user:
+        return jsonify({"ok": False, "error": "met-only"}), 403
+    data = request.get_json(silent=True) or {}
+    game_id = int(data.get("game_id") or 0)
+    body = (data.get("body") or "").strip()
+    if not body or len(body) < 10:
+        return jsonify({"ok": False, "error": "Write the message first (10+ characters)."}), 400
+    if len(body) > 480:
+        return jsonify({"ok": False, "error": "Keep it under 480 characters (about 3 SMS segments)."}), 400
+    if "http://" in body.lower() or "https://" in body.lower():
+        return jsonify({"ok": False, "error": "GameDay texts are plain text: no links."}), 400
+    covered = _gameday_covered_passes(game_id)
+    # Dedupe phones: a person can hold multiple passes; one text per phone.
+    seen, targets = set(), []
+    for p in covered:
+        ph = p["phone"]
+        if ph and ph not in seen:
+            seen.add(ph)
+            targets.append(ph)
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO gameday_broadcasts (game_id, met_user_id, body, sent_count, created_at)
+                           VALUES (%s,%s,%s,0,%s) RETURNING id""",
+                        (game_id, user["id"], body, now_ms))
+            broadcast_id = cur.fetchone()["id"]
+
+    # Send in the background: at hundreds or thousands of phones, a
+    # synchronous loop would hang the Met's browser past the HTTP
+    # timeout. The console gets an instant "queued" answer instead.
+    def _send_worker(bid, phones, text):
+        done = 0
+        for ph in phones:
+            try:
+                if send_sms(ph, text):
+                    done += 1
+            except Exception as e:
+                print(f"[gameday] broadcast send failed: {e!r}", flush=True)
+        try:
+            with db() as conn2:
+                with conn2.cursor() as cur2:
+                    cur2.execute("UPDATE gameday_broadcasts SET sent_count = %s WHERE id = %s",
+                                 (done, bid))
+        except Exception as e:
+            print(f"[gameday] broadcast count update failed: {e!r}", flush=True)
+        print(f"[gameday] broadcast {bid} complete: {done}/{len(phones)}", flush=True)
+
+    threading.Thread(target=_send_worker, args=(broadcast_id, targets, body), daemon=True).start()
+    return jsonify({"ok": True, "queued": len(targets), "broadcast_id": broadcast_id})
+
+
+def _gameday_monday_reminder_pass() -> int:
+    """Monday before each home game: remind everyone covered, once.
+    Runs inside the scheduler tick; only acts on Mondays (stadium local
+    time) with a game in the coming 1-6 days."""
+    try:
+        from zoneinfo import ZoneInfo
+        import datetime as _dt
+        today = _dt.datetime.now(ZoneInfo("America/Indiana/Indianapolis")).date()
+        if today.weekday() != 0:      # Monday only
+            return 0
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT id, opponent, game_date, kickoff,
+                                      to_char(game_date, 'Dy Mon FMDD') AS nice_date
+                               FROM gameday_games
+                               WHERE venue = 'iu'
+                                 AND game_date > %s
+                                 AND game_date <= %s""",
+                            (today, today + _dt.timedelta(days=6)))
+                games = cur.fetchall()
+        sent = 0
+        for g in games:
+            for p in _gameday_covered_passes(g["id"]):
+                try:
+                    with db() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute("""INSERT INTO gameday_reminder_log (game_id, pass_id, sent_at)
+                                           VALUES (%s,%s,%s)
+                                           ON CONFLICT (game_id, pass_id) DO NOTHING
+                                           RETURNING pass_id""",
+                                        (g["id"], p["id"], int(time.time() * 1000)))
+                            claimed = cur.fetchone() is not None
+                    if not claimed:
+                        continue
+                    kick = g["kickoff"] if g["kickoff"] and g["kickoff"] != "TBA" else "kickoff time TBA"
+                    kick_part = f"kickoff {kick}" if kick != "kickoff time TBA" else kick
+                    if send_sms(p["phone"],
+                                f"GameDay Weather this week: Indiana vs {g['opponent']}, "
+                                f"{g['nice_date']}, {kick_part}. Your Meteorologist's outlook "
+                                f"lands the evening before, the morning brief on game day, and "
+                                f"live alerts if the sky acts up. - WeatherValet"):
+                        sent += 1
+                except Exception as e:
+                    print(f"[gameday] reminder failed: {e!r}", flush=True)
+        if sent:
+            print(f"[gameday] monday reminders sent: {sent}", flush=True)
+        return sent
+    except Exception as e:
+        print(f"[gameday] reminder pass failed: {e!r}", flush=True)
+        return 0
+
+
 def _activate_gameday_pass(pass_id: int) -> None:
     now_ms = int(time.time() * 1000)
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """UPDATE gameday_passes SET status = 'active', updated_at = %s
-                   WHERE id = %s AND status != 'active' RETURNING name, phone, pass_type""",
+                   WHERE id = %s AND status != 'active' RETURNING name, phone, pass_type, game_id""",
                 (now_ms, pass_id))
             row = cur.fetchone()
     if not row:
@@ -12856,9 +13234,21 @@ def _activate_gameday_pass(pass_id: int) -> None:
     hello = f"{first}, you" if first else "You"
     try:
         if (row.get("pass_type") or "season") == "single":
-            body = (f"{hello}'re covered for the next home game. The Meteorologist's "
-                    f"outlook lands that morning, live alerts follow if weather "
-                    f"threatens the game window, and the all-clear closes it out. - WeatherValet")
+            game_bit = "the next home game"
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""SELECT g.opponent, to_char(g.game_date, 'Mon FMDD') AS d
+                                       FROM gameday_passes p JOIN gameday_games g ON g.id = p.game_id
+                                       WHERE p.id = %s""", (pass_id,))
+                        gr = cur.fetchone()
+                        if gr:
+                            game_bit = f"Indiana vs {gr['opponent']} on {gr['d']}"
+            except Exception:
+                pass
+            body = (f"{hello}'re covered for {game_bit}. The Meteorologist's "
+                    f"outlook lands the evening before, the morning brief on game day, "
+                    f"and live alerts follow if weather threatens the window. - WeatherValet")
         else:
             body = (f"{hello}'re on the GameDay Weather roster for the Bloomington season. "
                     f"Every home game: the Meteorologist's morning outlook, live alerts "
@@ -29969,6 +30359,12 @@ def _process_severe_alerts() -> None:
         _sentry_allclear_pass()
     except Exception as e:
         print(f"[nws-process] sentry all-clear pass failed: {e}", flush=True)
+
+    # GameDay Monday reminders (Aug 16, 2026): no-op except Mondays.
+    try:
+        _gameday_monday_reminder_pass()
+    except Exception as e:
+        print(f"[nws-process] gameday reminder pass failed: {e}", flush=True)
 
     if not alerts:
         return
