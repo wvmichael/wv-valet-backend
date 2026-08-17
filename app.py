@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-127"
+BACKEND_BUILD = "0702-128"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -12983,24 +12983,24 @@ def gameday_console():
     return """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>GameDay Console - WeatherValet</title><style>
-body{margin:0;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;background:#140A0C;color:#F3EAD3;font-size:16px}
-.top{background:#7E1322;padding:16px 20px;font-weight:800;font-size:18px}
-.top small{display:block;font-weight:400;font-size:12.5px;color:#EDC7C7;margin-top:2px}
+body{margin:0;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;background:#140A0C;color:#F3EAD3;font-size:18px}
+.top{background:#7E1322;padding:18px 22px;font-weight:800;font-size:22px}
+.top small{display:block;font-weight:400;font-size:15px;color:#EDC7C7;margin-top:4px}
 .wrap{max-width:760px;margin:0 auto;padding:18px}
 .game{background:rgba(243,234,211,.05);border:1px solid rgba(243,234,211,.16);border-radius:12px;padding:16px;margin-bottom:14px}
 .g-head{display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;align-items:baseline}
-.g-head b{font-size:18px}
-.meta{font-size:13.5px;color:#D9AFAF;margin-top:2px}
-.claim{font-size:13px;margin-top:8px}
-.claim button, .send, .kick-save{background:#A6192E;color:#fff;border:none;border-radius:7px;padding:8px 14px;font-size:14px;font-weight:700;cursor:pointer}
+.g-head b{font-size:21px}
+.meta{font-size:16px;color:#D9AFAF;margin-top:4px}
+.claim{font-size:16px;margin-top:10px}
+.claim button, .send, .kick-save{background:#A6192E;color:#fff;border:none;border-radius:7px;padding:11px 18px;font-size:17px;font-weight:700;cursor:pointer}
 .claimed{color:#8FD8A0;font-weight:700}
-textarea{width:100%;box-sizing:border-box;margin-top:10px;background:#0D0D10;color:#EFEFF5;border:1px solid #33333B;border-radius:8px;padding:10px;font-size:15px;min-height:74px;font-family:inherit}
+textarea{width:100%;box-sizing:border-box;margin-top:10px;background:#0D0D10;color:#EFEFF5;border:1px solid #33333B;border-radius:8px;padding:12px;font-size:17px;min-height:90px;font-family:inherit}
 .row{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
-.count{font-size:13px;color:#D9AFAF}
-.kick-in{background:#0D0D10;color:#EFEFF5;border:1px solid #33333B;border-radius:7px;padding:7px 9px;font-size:14px;width:90px}
-.status{font-size:13.5px;margin-top:6px;min-height:18px}
+.count{font-size:16px;color:#D9AFAF}
+.kick-in{background:#0D0D10;color:#EFEFF5;border:1px solid #33333B;border-radius:7px;padding:9px 11px;font-size:16px;width:100px}
+.status{font-size:16px;margin-top:8px;min-height:20px}
 .ok{color:#8FD8A0}.bad{color:#F2A6A6}
-.note{font-size:12.5px;color:#B08A90;margin:6px 0 18px;line-height:1.5}
+.note{font-size:15px;color:#B08A90;margin:8px 0 20px;line-height:1.55}
 </style></head><body>
 <div class=top>&#9889; GameDay Console <small>Plain-text broadcasts to everyone covered for each game. No links, under 480 characters. Sends run in the background; counts land in a minute.</small></div>
 <div class=wrap>
@@ -13045,7 +13045,7 @@ function wire(){
       var body=card.querySelector('textarea').value.trim();
       var btn=this;
       if(body.length<10){st.textContent='Write the message first.';st.className='status bad';return;}
-      if(!confirm('Send this to every covered phone for this game?\n\n'+body))return;
+      if(!confirm('Send this to every covered phone for this game? --- ' + body))return;
       btn.disabled=true;
       fetch('/api/v1/met/gameday/broadcast',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({game_id:id,body:body})})
       .then(function(r){return r.json();}).then(function(d){
