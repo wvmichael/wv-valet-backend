@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-132"
+BACKEND_BUILD = "0702-133"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -869,6 +869,15 @@ CREATE TABLE IF NOT EXISTS gameday_games (
 );
 
 ALTER TABLE gameday_passes ADD COLUMN IF NOT EXISTS game_id INTEGER;
+
+-- Consent record (Aug 17, 2026). Carriers and the TCPA both expect a
+-- provable opt-in per buyer: when they agreed, from what IP, and to which
+-- version of the disclosure text. Kept on the pass row itself so it can
+-- never drift away from the purchase it belongs to.
+ALTER TABLE gameday_passes ADD COLUMN IF NOT EXISTS consent_at BIGINT;
+ALTER TABLE gameday_passes ADD COLUMN IF NOT EXISTS consent_ip TEXT;
+ALTER TABLE gameday_passes ADD COLUMN IF NOT EXISTS consent_version TEXT;
+ALTER TABLE gameday_passes ADD COLUMN IF NOT EXISTS consent_user_agent TEXT;
 
 CREATE TABLE IF NOT EXISTS gameday_broadcasts (
     id          SERIAL PRIMARY KEY,
@@ -12515,6 +12524,128 @@ def admin_test_warning_map():
 # labor and no machine-written forecast prose anywhere in this path.
 # ═══════════════════════════════════════════════════════════════════
 
+GAMEDAY_TERMS_VERSION = "gameday-2026-08-17"
+
+_GAMEDAY_TERMS_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>GameDay Weather - Terms and Text Message Program</title><style>
+body{margin:0;background:#FFFDF7;color:#241A1C;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;
+  font-size:16.5px;line-height:1.62}
+.wrap{max-width:720px;margin:0 auto;padding:34px 22px 70px}
+a{color:#A6192E}
+h1{font-size:29px;line-height:1.2;margin:0 0 6px}
+h2{font-size:19px;margin:34px 0 8px;color:#7E1322}
+.eff{color:#6E5A5F;font-size:14px;margin:0 0 26px}
+ul{padding-left:20px}li{margin-bottom:7px}
+.box{background:#FDF3F4;border:1.5px solid rgba(166,25,46,.28);border-radius:10px;padding:16px 18px;margin:22px 0}
+.back{display:inline-block;margin-bottom:22px;font-weight:700;text-decoration:none}
+.foot{margin-top:44px;padding-top:18px;border-top:1px solid rgba(36,26,28,.15);color:#6E5A5F;font-size:14px}
+</style></head><body><div class=wrap>
+<a class=back href="/gameday/iu">&larr; Back to GameDay Weather</a>
+<h1>GameDay Weather: Terms and Text Message Program</h1>
+<p class=eff>Effective August 17, 2026. These terms cover GameDay Weather passes specifically and
+sit alongside the general <a href="https://weathervalet.ai/?legal=terms">WeatherValet Terms of Service</a>
+and <a href="https://weathervalet.ai/?legal=privacy">Privacy Policy</a>. Where they conflict, these
+GameDay terms control for your GameDay pass.</p>
+
+<h2>What you are buying</h2>
+<p>A GameDay Weather pass is a text message service for home football games in Bloomington, Indiana.
+For each game your pass covers, a certified WeatherValet Meteorologist reviews the forecast for the
+game window and messages the mobile number you gave us. A typical game brings a Meteorologist outlook
+the evening before, a morning brief on game day, live updates if weather threatens the window, and an
+all-clear when it passes. Season passes cover every remaining home game. Single game passes cover only
+the games you selected at checkout.</p>
+
+<h2>Text message program terms</h2>
+<ul>
+<li><b>Program:</b> WeatherValet GameDay Weather alerts.</li>
+<li><b>Frequency:</b> varies with the weather. Expect roughly two to six messages per game you are
+covered for, and more during an active weather day.</li>
+<li><b>Cost:</b> message and data rates may apply. Those are charged by your mobile carrier, not by us.</li>
+<li><b>Opt out:</b> reply STOP to any message to stop all GameDay messages. Reply HELP for help, or
+email hello@weathervalet.ai.</li>
+<li><b>Delivery of the service is the messages.</b> Because this product is delivered entirely by text,
+opting out ends the service. If you opt out before the first game your pass covers, email us and we
+will refund you in full.</li>
+<li>We do not sell or share your mobile number or your consent with third parties for their own
+marketing.</li>
+</ul>
+
+<div class=box>
+<b>Text messages can fail, and we cannot control that.</b> Message delivery depends on your mobile
+carrier, your device, and conditions we have no say over: weak or no cell coverage, congested networks
+inside a full stadium, a phone that is off, silenced, in Do Not Disturb, out of storage, or roaming,
+carrier spam filtering, a number that has been ported or reassigned, and outages at any carrier or at
+our messaging provider. Messages may arrive late, out of order, or not at all. You agree that
+WeatherValet is not responsible for any message that is delayed, filtered, blocked, or never delivered,
+and that you will not rely on this service as your only source of weather information.
+</div>
+
+<h2>Forecasts are judgment, not guarantees</h2>
+<p>Weather forecasting is inherently uncertain. Our Meteorologists give you their honest professional
+read of the atmosphere. They will sometimes be wrong about timing, amounts, or whether a storm holds
+together. Buying a pass does not buy a correct forecast, and no refund is owed because the weather
+turned out differently than the outlook described.</p>
+
+<h2>We are not an emergency service</h2>
+<p>GameDay Weather does not replace the National Weather Service, local emergency management, or stadium
+public address instructions. If an official warning is issued or venue staff give you an instruction,
+follow it regardless of anything we have sent you. Do not wait on a WeatherValet message to take shelter.</p>
+
+<h2>We do not decide what the venue does</h2>
+<p>Delays, evacuations, entry policies, and resumption of play are decided by the venue, the schools, and
+the game officials. We report the weather. We do not predict, announce, or influence those decisions, and
+we are not responsible for a game you missed, left early, or traveled to based on our messages.</p>
+
+<h2>Your phone number</h2>
+<ul>
+<li>You must give a mobile number you personally own or are authorized to use. Do not sign up someone
+else's phone without their permission.</li>
+<li>One pass covers one phone number. Tailgate groups need a pass per phone.</li>
+<li>Tell us if your number changes. We cannot deliver to a number we do not have.</li>
+<li>If your carrier has previously blocked WeatherValet messages, you may need to reply START to
+re-enable delivery before we can reach you.</li>
+</ul>
+
+<h2>Payment and refunds</h2>
+<ul>
+<li>Passes are a one-time charge, processed by Stripe. There is no subscription and nothing renews.</li>
+<li>Full refund on request any time before the first game your pass covers. Email hello@weathervalet.ai.</li>
+<li>After coverage has begun, we refund the portion of a season pass covering games not yet played, on
+request, at our discretion.</li>
+<li>If we fail to send anything at all for a game your pass covers, tell us and we will refund that game.</li>
+</ul>
+
+<h2>Limitation of liability</h2>
+<p>To the maximum extent allowed by law, WeatherValet's total liability for any claim arising out of a
+GameDay pass is limited to the amount you paid for that pass. We are not liable for indirect,
+incidental, or consequential damages, including travel costs, lost tickets, missed events, property
+damage, or personal injury. Some states do not allow these limits, and in those states the limit is the
+smallest amount the law allows.</p>
+
+<h2>Acceptable use</h2>
+<p>Do not resell, republish, or redistribute our GameDay messages as your own. Do not sign up numbers you
+do not control. We may cancel a pass and refund it if these terms are abused.</p>
+
+<h2>Not affiliated with the university</h2>
+<p>WeatherValet is an independent weather service. It is not affiliated with, sponsored by, licensed by,
+or endorsed by Indiana University or any school, conference, or venue. Team and school names appear only
+to describe which games a pass covers.</p>
+
+<h2>Changes and governing law</h2>
+<p>If we materially change these terms, we will post the new version here and email pass holders before it
+takes effect. These terms are governed by the laws of the State of Indiana, and disputes will be resolved
+in the state or federal courts located in Marion County, Indiana, unless consumer protection law gives you
+the right to bring a claim where you live.</p>
+
+<h2>Contact</h2>
+<p><b>WeatherValet</b><br>Indianapolis, IN<br>
+<a href="mailto:hello@weathervalet.ai">hello@weathervalet.ai</a></p>
+
+<p class=foot>WeatherValet is an independent weather service, not affiliated with or endorsed by
+Indiana University.</p>
+</div></body></html>"""
+
 GAMEDAY_SEASON_CENTS = 1600
 GAMEDAY_SINGLE_CENTS = 500
 
@@ -12586,6 +12717,10 @@ h1 .pop{color:var(--bolt)}
 .gp:last-child{margin-bottom:0}
 .gp input{width:auto;margin:0;flex:0 0 auto;transform:scale(1.3);accent-color:#A6192E}
 .gp-h{font-size:12.5px;font-weight:800;letter-spacing:.07em;text-transform:uppercase;color:#6E5A5F;margin:0 0 8px}
+.consent{display:flex;gap:10px;align-items:flex-start;margin:16px 0 2px;font-size:12.8px;line-height:1.5;
+  font-weight:500;letter-spacing:0;text-transform:none;color:#4A383C;cursor:pointer}
+.consent input{width:auto;margin:2px 0 0;flex:0 0 auto;transform:scale(1.25);accent-color:#A6192E}
+.consent a{color:#A6192E}
 label{display:block;font-size:12.5px;font-weight:800;letter-spacing:.07em;text-transform:uppercase;color:#6E5A5F;margin:12px 0 4px}
 input{width:100%;padding:13px;border:1.5px solid rgba(27,20,22,.25);border-radius:9px;font-size:17px;background:#FFFDF7;color:var(--ink)}
 input:focus{outline:2px solid var(--crim);outline-offset:1px;border-color:var(--crim)}
@@ -12678,6 +12813,14 @@ button:disabled{opacity:.6}
     <label for=g-name>Name</label><input id=g-name autocomplete=name>
     <label for=g-email>Email</label><input id=g-email type=email autocomplete=email>
     <label for=g-phone>Mobile (where GameDay texts go)</label><input id=g-phone type=tel autocomplete=tel placeholder="812-555-0123">
+    <label class=consent for=g-consent><input type=checkbox id=g-consent>
+      <span>I agree to receive GameDay Weather text messages from WeatherValet at the number above:
+      the Meteorologist's outlook the evening before, a game day morning brief, live updates if weather
+      threatens the game window, and the all-clear. Frequency varies with the weather, usually two to six
+      messages per game. Message and data rates may apply. Reply STOP to cancel, HELP for help. Text
+      delivery depends on your carrier and is not guaranteed. I agree to the
+      <a href="/gameday/terms" target="_blank" rel=noopener>GameDay Terms</a> and
+      <a href="https://weathervalet.ai/?legal=privacy" target="_blank" rel=noopener>Privacy Policy</a>.</span></label>
     <button id=g-go>Claim my season pass</button>
     <div class=fine>Season covers all 8 home games starting with the opener (including the Friday
     night game); single passes cover only the games you check above. One-time payment via Stripe.
@@ -12696,7 +12839,9 @@ button:disabled{opacity:.6}
     </ul>
   </div>
 
-  <p class=foot>WeatherValet is an independent weather service, not affiliated with or endorsed by Indiana University.<br>
+  <p class=foot><a href="/gameday/terms" style="color:#C8A2A8">GameDay Terms and text message program</a>
+  &middot; <a href="https://weathervalet.ai/?legal=privacy" style="color:#C8A2A8">Privacy</a><br>
+  WeatherValet is an independent weather service, not affiliated with or endorsed by Indiana University.<br>
   Want weather for YOUR life, not just gamedays? <a href="https://weathervalet.ai">WeatherValet.ai</a></p>
 </div>
 
@@ -12737,6 +12882,11 @@ gpBoxes().forEach(function(b){ b.addEventListener('change', function(){ setType(
 document.getElementById('g-go').addEventListener('click', function(){
   var btn = this; btn.disabled = true; btn.textContent = 'One moment...';
   var err = document.getElementById('err'); err.style.display = 'none';
+  var consent = document.getElementById('g-consent');
+  if (!consent || !consent.checked) {
+    err.textContent = 'Please check the box agreeing to receive GameDay text messages.';
+    err.style.display = 'block'; btn.disabled = false; setType(PASS.type); return;
+  }
   var chosen = (PASS.type === 'single') ? gpChosen() : [];
   if (PASS.type === 'single' && chosen.length === 0) {
     err.textContent = 'Pick at least one home game above.';
@@ -12750,6 +12900,8 @@ document.getElementById('g-go').addEventListener('click', function(){
       phone: document.getElementById('g-phone').value,
       pass_type: PASS.type,
       game_ids: chosen,
+      consent: true,
+      consent_version: 'gameday-2026-08-17',
       ref: PASS.ref,
       venue: 'iu'
     })
@@ -12764,6 +12916,11 @@ document.getElementById('g-go').addEventListener('click', function(){
 });
 </script></body></html>
 """
+
+
+@app.get("/gameday/terms")
+def gameday_terms_page():
+    return _GAMEDAY_TERMS_PAGE
 
 
 @app.get("/gameday/iu")
@@ -12790,6 +12947,14 @@ def gameday_checkout():
         return jsonify({"ok": False, "error": "Enter a valid email."}), 400
     if not phone:
         return jsonify({"ok": False, "error": "Enter a valid mobile number."}), 400
+    # Consent is required and recorded. Carriers and the TCPA both expect us
+    # to be able to prove who agreed to texts, when, and to what wording.
+    if not bool(data.get("consent")):
+        return jsonify({"ok": False,
+                        "error": "Please check the box agreeing to receive GameDay text messages."}), 400
+    consent_ip = ((request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+                   or request.remote_addr or "")[:64])
+    consent_ua = (request.headers.get("User-Agent", "") or "")[:300]
 
     # Single-game buyers pick which games they want (Aug 17, 2026). Anything
     # the buyer sends is checked against the real remaining schedule; an empty
@@ -12823,9 +12988,13 @@ def gameday_checkout():
             for game_id in ([int(g["id"]) for g in game_rows] if pass_type == "single" else [None]):
                 cur.execute(
                     """INSERT INTO gameday_passes
-                         (venue, name, email, phone, pass_type, amount_cents, ref_code, game_id, created_at, updated_at)
-                       VALUES ('iu',%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
-                    (name, email, phone, pass_type, unit_amount, ref_code, game_id, now_ms, now_ms))
+                         (venue, name, email, phone, pass_type, amount_cents, ref_code, game_id,
+                          consent_at, consent_ip, consent_version, consent_user_agent,
+                          created_at, updated_at)
+                       VALUES ('iu',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                    (name, email, phone, pass_type, unit_amount, ref_code, game_id,
+                     now_ms, consent_ip, GAMEDAY_TERMS_VERSION, consent_ua,
+                     now_ms, now_ms))
                 pass_ids.append(cur.fetchone()["id"])
     pass_id = pass_ids[0]
     if pass_type == "single":
