@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-133"
+BACKEND_BUILD = "0702-134"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -12916,6 +12916,18 @@ document.getElementById('g-go').addEventListener('click', function(){
 });
 </script></body></html>
 """
+
+
+@app.get("/terms")
+def _legal_terms_redirect():
+    """Carrier audits and older SMS disclosures point at the bare paths.
+    Send them to the real pages instead of a 404."""
+    return redirect("https://weathervalet.ai/?legal=terms", code=302)
+
+
+@app.get("/privacy")
+def _legal_privacy_redirect():
+    return redirect("https://weathervalet.ai/?legal=privacy", code=302)
 
 
 @app.get("/gameday/terms")
