@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-141"
+BACKEND_BUILD = "0702-142"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -13122,7 +13122,7 @@ def gameday_checkout():
             metadata={"wv_product": "gameday",
                       "gameday_pass_id": str(pass_id),
                       "gameday_pass_ids": ",".join(str(i) for i in pass_ids)},
-            success_url=f"{PUBLIC_BASE_URL}/gameday/welcome",
+            success_url=f"{PUBLIC_BASE_URL}/gameday/welcome?s={{CHECKOUT_SESSION_ID}}",
             cancel_url=f"{PUBLIC_BASE_URL}/gameday/iu",
         )
     except Exception as e:
@@ -13137,12 +13137,57 @@ def gameday_checkout():
 
 @app.get("/gameday/welcome")
 def gameday_welcome_page():
-    return """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>You're on the roster</title><style>body{font-family:Inter,Arial,sans-serif;background:#1A0505;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:center;padding:20px}
-.b{max-width:440px}h1{font-size:26px}p{color:#E3C7C7;line-height:1.6}</style></head>
-<body><div class=b><div style="font-size:44px">&#127944;</div><h1>You're on the season roster.</h1>
-<p>Payment received. You'll get a welcome text shortly, and your first GameDay morning outlook
-arrives the morning of the home opener. See you out there.</p></div></body></html>"""
+    """Confirmation after payment. Says what they actually bought: a series
+    pass, or the specific days they picked. Falls back to neutral wording if
+    the session id is missing rather than claiming a season nobody bought."""
+    sid = (request.args.get("s") or "").strip()[:200]
+    headline = "You're on the roster."
+    detail = ("Payment received. You'll get a welcome text shortly confirming the days "
+              "your Meteorologist is on duty for.")
+    if sid:
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""SELECT p.pass_type, g.opponent,
+                                          to_char(g.game_date, 'FMMon FMDD') AS d
+                                     FROM gameday_passes p
+                                LEFT JOIN gameday_games g ON g.id = p.game_id
+                                    WHERE p.stripe_session_id = %s
+                                 ORDER BY g.game_date""", (sid,))
+                    rows = cur.fetchall() or []
+            if rows:
+                if (rows[0].get("pass_type") or "season") == "season":
+                    headline = "You're covered for the whole series."
+                    detail = ("Payment received. You'll get a welcome text shortly. Your "
+                              "Meteorologist is on duty for all 8 home game days, starting "
+                              "with the opener.")
+                else:
+                    picks = [f"{r['opponent']} on {r['d']}" for r in rows if r.get("opponent")]
+                    if len(picks) == 1:
+                        headline = "You're covered for that day."
+                        detail = (f"Payment received. Your Meteorologist is on duty for "
+                                  f"Indiana vs {picks[0]}. You'll get a welcome text shortly, "
+                                  f"and the outlook lands the evening before.")
+                    elif picks:
+                        joined = ", ".join(picks[:-1]) + ", and " + picks[-1]
+                        headline = f"You're covered for {len(picks)} days."
+                        detail = (f"Payment received. Your Meteorologist is on duty for "
+                                  f"Indiana vs {joined}. You'll get a welcome text shortly, "
+                                  f"and each outlook lands the evening before.")
+        except Exception as e:
+            print(f"[onduty] welcome lookup failed: {e!r}", flush=True)
+    return ("""<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>You're covered</title><style>
+body{font-family:Inter,Arial,sans-serif;background:#1A0505;color:#fff;display:flex;
+align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:center;padding:20px}
+.b{max-width:460px}h1{font-size:26px;line-height:1.25}p{color:#E3C7C7;line-height:1.6}
+.f{color:#9E7C7C;font-size:12.5px;margin-top:26px;line-height:1.5}
+</style></head><body><div class=b><div style="font-size:44px">&#127944;</div>
+<h1>""" + _html_escape(headline) + """</h1>
+<p>""" + _html_escape(detail) + """</p>
+<p class=f>WeatherValet is an independent weather service, not affiliated with or
+endorsed by Indiana University.</p></div></body></html>""")
 
 
 @app.post("/api/v1/admin/gameday/partners")
