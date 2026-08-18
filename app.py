@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-142"
+BACKEND_BUILD = "0702-143"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -13920,7 +13920,7 @@ button:disabled{opacity:.6}
     <label for=s-email>Email</label><input id=s-email type=email autocomplete=email>
     <label for=s-phone>Mobile phone (where alerts go)</label><input id=s-phone type=tel autocomplete=tel placeholder="317-555-0123">
     <label for=s-phone2>Second phone (optional, included): spouse, kid, anyone</label><input id=s-phone2 type=tel placeholder="Optional">
-    <label for=s-address>The address to watch</label><input id=s-address autocomplete=street-address placeholder="123 Main St, Lebanon, IN">
+    <label for=s-address>The address to watch <span style="text-transform:none;letter-spacing:0;font-weight:500;color:#7A8494">(street, city, state)</span></label><input id=s-address autocomplete=street-address placeholder="1205 Chestnut Lane, Lebanon, IN 46052">
 
     <div class=addon-h>Add to this account</div>
 
@@ -13931,8 +13931,8 @@ button:disabled{opacity:.6}
       <span class=amt>+$8/yr</span></label>
 
     <div id=second-wrap style="display:none;margin:-2px 0 12px">
-      <label for=s-address2>Second address</label>
-      <input id=s-address2 placeholder="456 Oak St, Zionsville, IN">
+      <label for=s-address2>Second address <span style="text-transform:none;letter-spacing:0;font-weight:500;color:#7A8494">(street, city, state)</span></label>
+      <input id=s-address2 placeholder="456 Oak St, Zionsville, IN 46077">
       <label for=s-label2>Call it what? (optional)</label>
       <input id=s-label2 placeholder="Mom's house" maxlength=60>
     </div>
@@ -14175,7 +14175,7 @@ button:disabled{opacity:.6}
     <label for=w-name>Your name</label><input id=w-name autocomplete=name>
     <label for=w-email>Email</label><input id=w-email type=email autocomplete=email>
     <label for=w-phone>Mobile (where your messages go)</label><input id=w-phone type=tel placeholder="317-555-0123">
-    <label for=w-place>Where is it?</label><input id=w-place placeholder="Fairgrounds, 1300 E 100 S, Lebanon, IN">
+    <label for=w-place>Where is it? <span style="text-transform:none;letter-spacing:0;font-weight:500;color:#8A8272">(include city and state)</span></label><input id=w-place placeholder="Boone County Fairgrounds, Lebanon, IN 46052">
     <label for=w-date>What day?</label><input id=w-date type=date>
     <div class=row>
       <div><label for=w-start>Window starts</label><select id=w-start></select></div>
@@ -14502,8 +14502,9 @@ def watch_checkout():
         return jsonify({"ok": False, "error": "Enter a valid email."}), 400
     if not phone:
         return jsonify({"ok": False, "error": "Enter a valid mobile number."}), 400
-    if len(place) < 8:
-        return jsonify({"ok": False, "error": "Enter the full address or venue of your event."}), 400
+    if len(place) < 8 or _address_needs_more(place):
+        return jsonify({"ok": False,
+                        "error": "Add the city and state, e.g. 'Boone County Fairgrounds, Lebanon, IN'."}), 400
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", event_date):
         return jsonify({"ok": False, "error": "Pick the date of your event."}), 400
     if not (0 <= start_hour <= 23) or not (1 <= end_hour <= 24) or end_hour <= start_hour:
@@ -14816,8 +14817,14 @@ def sentry_checkout():
         return jsonify({"ok": False, "error": "Enter a valid mobile number."}), 400
     if len(address) < 8:
         return jsonify({"ok": False, "error": "Enter the full street address to watch."}), 400
+    if _address_needs_more(address):
+        return jsonify({"ok": False,
+                        "error": "Add the city and state so we watch the right place, e.g. '1205 Chestnut Lane, Lebanon, IN'."}), 400
     if address2 and len(address2) < 8:
         return jsonify({"ok": False, "error": "The second address needs a full street address, or leave it blank."}), 400
+    if address2 and _address_needs_more(address2):
+        return jsonify({"ok": False,
+                        "error": "Add the city and state to the second address too."}), 400
 
     # Geocode every address up front. A second address that cannot be pinned
     # must fail the whole checkout, not silently vanish after payment.
@@ -31059,6 +31066,49 @@ def _severe_fallback_pages() -> list:
 
 
 _COUNTY_BACKFILL_LAST_RUN = {"ts": 0.0}
+
+
+_US_STATE_ABBR = {
+    "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA",
+    "KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ",
+    "NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT",
+    "VA","WA","WV","WI","WY","DC","PR","VI","GU","AS","MP",
+}
+_US_STATE_NAMES = {
+    "ALABAMA","ALASKA","ARIZONA","ARKANSAS","CALIFORNIA","COLORADO","CONNECTICUT",
+    "DELAWARE","FLORIDA","GEORGIA","HAWAII","IDAHO","ILLINOIS","INDIANA","IOWA",
+    "KANSAS","KENTUCKY","LOUISIANA","MAINE","MARYLAND","MASSACHUSETTS","MICHIGAN",
+    "MINNESOTA","MISSISSIPPI","MISSOURI","MONTANA","NEBRASKA","NEVADA",
+    "NEW HAMPSHIRE","NEW JERSEY","NEW MEXICO","NEW YORK","NORTH CAROLINA",
+    "NORTH DAKOTA","OHIO","OKLAHOMA","OREGON","PENNSYLVANIA","RHODE ISLAND",
+    "SOUTH CAROLINA","SOUTH DAKOTA","TENNESSEE","TEXAS","UTAH","VERMONT","VIRGINIA",
+    "WASHINGTON","WEST VIRGINIA","WISCONSIN","WYOMING","PUERTO RICO",
+}
+
+
+def _address_needs_more(addr: str) -> bool:
+    """True when an address is too vague to geocode safely.
+
+    A bare street line like '1205 Chestnut Lane' will often geocode to a
+    same-named street in another state, and we would then watch the wrong
+    house forever without anyone noticing. Requiring a comma and a state
+    catches that at the door. Refusing is safe; guessing is not."""
+    a = (addr or "").strip()
+    if "," not in a:
+        return True
+    tail = a.rsplit(",", 1)[-1].strip().upper()
+    tail = tail.replace(".", "")
+    # Accept "IN", "IN 46052", or a real spelled-out state name. A city name
+    # in the last slot ("456 Oak St, Zionsville") must NOT count as a state.
+    first = tail.split()[0] if tail.split() else ""
+    if len(first) == 2 and first.isalpha() and first in _US_STATE_ABBR:
+        return False
+    if first.replace("-", " ") in _US_STATE_NAMES or tail.split(" ")[0] in _US_STATE_NAMES:
+        return False
+    for name in _US_STATE_NAMES:
+        if tail.startswith(name):
+            return False
+    return True
 
 
 def _tz_for_point(lat: float, lng: float) -> str:
