@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-134"
+BACKEND_BUILD = "0702-141"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -816,6 +816,71 @@ CREATE TABLE IF NOT EXISTS sentry_subscribers (
     canceled_at        BIGINT
 );
 CREATE INDEX IF NOT EXISTS idx_sentry_active ON sentry_subscribers(status);
+
+-- Sentry upsells (Aug 18, 2026). A single Stripe subscription can now cover
+-- more than one watched address: each address is still its own row (the relay
+-- engine is address-shaped and stays that way), and rows bought together share
+-- a group id so cancelling one cancels the set. pack_allseason turns on the
+-- winter, frost/freeze, and heat/wind events for that address.
+ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS pack_allseason BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS group_id INTEGER;
+ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS label TEXT;
+
+-- WeatherValet Watch (Aug 18, 2026): $49 per event day. A Meteorologist
+-- stands guard over ONE event window and messages the buyer as conditions
+-- change. One row per purchased event. Kept separate from gameday_passes
+-- because a Watch is bought for a window the buyer defines, not a date we
+-- published, and only one buyer exists per row.
+CREATE TABLE IF NOT EXISTS watch_orders (
+    id              SERIAL PRIMARY KEY,
+    name            TEXT,
+    email           TEXT NOT NULL,
+    phone           TEXT NOT NULL,
+    place           TEXT NOT NULL,
+    lat             DOUBLE PRECISION,
+    lng             DOUBLE PRECISION,
+    tz_name         TEXT,
+    event_date      DATE NOT NULL,
+    start_hour      INTEGER NOT NULL DEFAULT 8,
+    end_hour        INTEGER NOT NULL DEFAULT 20,
+    what            TEXT,
+    amount_cents    INTEGER NOT NULL DEFAULT 4900,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    met_user_id     INTEGER,
+    claimed_at      BIGINT,
+    stripe_session_id TEXT,
+    consent_at      BIGINT,
+    consent_ip      TEXT,
+    consent_version TEXT,
+    consent_user_agent TEXT,
+    created_at      BIGINT NOT NULL,
+    updated_at      BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_watch_status ON watch_orders(status);
+CREATE INDEX IF NOT EXISTS idx_watch_date ON watch_orders(event_date);
+
+-- Every message a Met sends on a Watch, so the buyer's thread is auditable
+-- and so we can prove a Meteorologist actually worked the window.
+CREATE TABLE IF NOT EXISTS watch_messages (
+    id          SERIAL PRIMARY KEY,
+    watch_id    INTEGER NOT NULL,
+    met_user_id INTEGER,
+    body        TEXT NOT NULL,
+    sent_ok     BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at  BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_watch_msg_watch ON watch_messages(watch_id);
+
+-- Stormline Daily (Aug 18, 2026). The daily morning message is a reformat of
+-- the NWS point forecast, always labeled automated. send_hour is the local
+-- hour the subscriber picked; tz_name is resolved from their coordinates so
+-- 7 AM means 7 AM where they live, not UTC. last_daily_ymd stops a restart of
+-- the scheduler from sending twice in one day.
+ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS daily BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS send_hour INTEGER NOT NULL DEFAULT 7;
+ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS tz_name TEXT;
+ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS last_daily_ymd TEXT;
+ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS manage_token TEXT;
 
 CREATE TABLE IF NOT EXISTS sentry_relay_log (
     nws_alert_id     TEXT NOT NULL,
@@ -9890,7 +9955,8 @@ def stripe_webhook_v2():
             md = session.get("metadata") or {}
             if (md.get("wv_product") or "") == "sentry":
                 try:
-                    _activate_sentry(int(md.get("sentry_id") or 0), stripe_customer_id)
+                    _sids = (md.get("sentry_ids") or md.get("sentry_id") or "")
+                    _activate_sentry_group(str(_sids).split(","), stripe_customer_id)
                 except Exception as e:
                     print(f"[stripe-webhook] sentry activation failed: {e!r}", flush=True)
                 _mark_stripe_event_processed(event_id)
@@ -10095,6 +10161,15 @@ def stripe_webhook_v2():
             #   - SMSes the customer their standby confirmation
             #   - SMSes the meteorologist with the claim link + AI brief
             session_metadata = session.get("metadata") or {}
+
+            # WeatherValet Watch (Aug 18, 2026): one paid event window.
+            if (session_metadata.get("wv_product") or "") == "watch":
+                try:
+                    _activate_watch(int(session_metadata.get("watch_id") or 0))
+                except Exception as e:
+                    print(f"[stripe-webhook] watch activation failed: {e!r}", flush=True)
+                _mark_stripe_event_processed(event_id)
+                return jsonify({"ok": True})
 
             # GameDay season pass (Aug 16, 2026): routed by metadata before
             # the Met Review flow.
@@ -12528,7 +12603,7 @@ GAMEDAY_TERMS_VERSION = "gameday-2026-08-17"
 
 _GAMEDAY_TERMS_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>GameDay Weather - Terms and Text Message Program</title><style>
+<title>WeatherValet On Duty - Terms and Text Message Program</title><style>
 body{margin:0;background:#FFFDF7;color:#241A1C;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;
   font-size:16.5px;line-height:1.62}
 .wrap{max-width:720px;margin:0 auto;padding:34px 22px 70px}
@@ -12541,28 +12616,29 @@ ul{padding-left:20px}li{margin-bottom:7px}
 .back{display:inline-block;margin-bottom:22px;font-weight:700;text-decoration:none}
 .foot{margin-top:44px;padding-top:18px;border-top:1px solid rgba(36,26,28,.15);color:#6E5A5F;font-size:14px}
 </style></head><body><div class=wrap>
-<a class=back href="/gameday/iu">&larr; Back to GameDay Weather</a>
-<h1>GameDay Weather: Terms and Text Message Program</h1>
-<p class=eff>Effective August 17, 2026. These terms cover GameDay Weather passes specifically and
+<a class=back href="/gameday/iu">&larr; Back to WeatherValet On Duty</a>
+<h1>WeatherValet On Duty: Terms and Text Message Program</h1>
+<p class=eff>Effective August 17, 2026. These terms cover WeatherValet On Duty passes specifically and
 sit alongside the general <a href="https://weathervalet.ai/?legal=terms">WeatherValet Terms of Service</a>
 and <a href="https://weathervalet.ai/?legal=privacy">Privacy Policy</a>. Where they conflict, these
 GameDay terms control for your GameDay pass.</p>
 
 <h2>What you are buying</h2>
-<p>A GameDay Weather pass is a text message service for home football games in Bloomington, Indiana.
+<p>A WeatherValet On Duty pass is a text message service for days when you will be outside. This
+series covers Indiana Football home games in Bloomington, Indiana.
 For each game your pass covers, a certified WeatherValet Meteorologist reviews the forecast for the
 game window and messages the mobile number you gave us. A typical game brings a Meteorologist outlook
 the evening before, a morning brief on game day, live updates if weather threatens the window, and an
-all-clear when it passes. Season passes cover every remaining home game. Single game passes cover only
+all-clear when it passes. Series passes cover every remaining home game. Single game passes cover only
 the games you selected at checkout.</p>
 
 <h2>Text message program terms</h2>
 <ul>
-<li><b>Program:</b> WeatherValet GameDay Weather alerts.</li>
+<li><b>Program:</b> WeatherValet On Duty alerts.</li>
 <li><b>Frequency:</b> varies with the weather. Expect roughly two to six messages per game you are
 covered for, and more during an active weather day.</li>
 <li><b>Cost:</b> message and data rates may apply. Those are charged by your mobile carrier, not by us.</li>
-<li><b>Opt out:</b> reply STOP to any message to stop all GameDay messages. Reply HELP for help, or
+<li><b>Opt out:</b> reply STOP to any message to stop all On Duty messages. Reply HELP for help, or
 email hello@weathervalet.ai.</li>
 <li><b>Delivery of the service is the messages.</b> Because this product is delivered entirely by text,
 opting out ends the service. If you opt out before the first game your pass covers, email us and we
@@ -12588,7 +12664,7 @@ together. Buying a pass does not buy a correct forecast, and no refund is owed b
 turned out differently than the outlook described.</p>
 
 <h2>We are not an emergency service</h2>
-<p>GameDay Weather does not replace the National Weather Service, local emergency management, or stadium
+<p>WeatherValet On Duty does not replace the National Weather Service, local emergency management, or stadium
 public address instructions. If an official warning is issued or venue staff give you an instruction,
 follow it regardless of anything we have sent you. Do not wait on a WeatherValet message to take shelter.</p>
 
@@ -12611,20 +12687,20 @@ re-enable delivery before we can reach you.</li>
 <ul>
 <li>Passes are a one-time charge, processed by Stripe. There is no subscription and nothing renews.</li>
 <li>Full refund on request any time before the first game your pass covers. Email hello@weathervalet.ai.</li>
-<li>After coverage has begun, we refund the portion of a season pass covering games not yet played, on
+<li>After coverage has begun, we refund the portion of a series pass covering games not yet played, on
 request, at our discretion.</li>
 <li>If we fail to send anything at all for a game your pass covers, tell us and we will refund that game.</li>
 </ul>
 
 <h2>Limitation of liability</h2>
 <p>To the maximum extent allowed by law, WeatherValet's total liability for any claim arising out of a
-GameDay pass is limited to the amount you paid for that pass. We are not liable for indirect,
+On Duty pass is limited to the amount you paid for that pass. We are not liable for indirect,
 incidental, or consequential damages, including travel costs, lost tickets, missed events, property
 damage, or personal injury. Some states do not allow these limits, and in those states the limit is the
 smallest amount the law allows.</p>
 
 <h2>Acceptable use</h2>
-<p>Do not resell, republish, or redistribute our GameDay messages as your own. Do not sign up numbers you
+<p>Do not resell, republish, or redistribute our On Duty messages as your own. Do not sign up numbers you
 do not control. We may cancel a pass and refund it if these terms are abused.</p>
 
 <h2>Not affiliated with the university</h2>
@@ -12651,7 +12727,7 @@ GAMEDAY_SINGLE_CENTS = 500
 
 _GAMEDAY_IU_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>GameDay Weather - Every Indiana University Football home game - $16 season</title>
+<title>WeatherValet On Duty - Indiana Football home games in Bloomington - $16 series pass</title>
 <link rel=preconnect href=https://fonts.googleapis.com>
 <link rel=preconnect href=https://fonts.gstatic.com crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;600;800&display=swap" rel=stylesheet>
@@ -12744,9 +12820,9 @@ button:disabled{opacity:.6}
 <div class=field>
   <div class=brand><span class=bolt>&#9889;</span> WeatherValet</div>
   <h1>Rain or shine,<br>know before <span class=pop>kickoff.</span></h1>
-  <p class=sub>Real, certified Meteorologists covering <b>every Indiana University Football
-  home game</b>. Texted to you live: tailgate timing, storm alerts, rain start and stop, the all-clear.</p>
-  <div class=kick>&#127944; Season: all 8 home games, $16 &middot; Single game, $5</div>
+  <p class=sub>Real, certified Meteorologists on duty for <b>every Indiana University Football
+  home game</b>. Messaged to you live: tailgate outlook, storm alerts, radar updates, the all-clear.</p>
+  <div class=kick>&#127944; Series pass: all 8 home games, $16 &middot; Single game, $5</div>
   <p class=how>How it works: <b>GameDay forecast the day before</b>, a <b>morning brief</b> on gameday,
   and <b>live alerts as needed</b> throughout the day. Hopefully we stay ALL CLEAR all day, but if the
   sky has other plans, our team of certified Meteorologists will text you as it happens.</p>
@@ -12756,7 +12832,7 @@ button:disabled{opacity:.6}
       <div class=notch></div>
       <div class=thread-head>
         <div class=avatar>&#9889;</div>
-        <div><b>GameDay Weather</b><span>Bloomington</span></div>
+        <div><b>WeatherValet On Duty</b><span>Bloomington</span></div>
       </div>
       <div class=msgs>
         <div class=stamp>Friday 4:30 PM</div>
@@ -12764,9 +12840,9 @@ button:disabled{opacity:.6}
         <div class=stamp>Saturday 9:02 AM</div>
         <div class=msg style="animation-delay:.4s">Morning, Bloomington. <b>Tailgate looks dry until about 2 PM.</b> That line of storms is west of Terre Haute, moving east. More from me as it develops. - Timmy</div>
         <div class=stamp>2:14 PM</div>
-        <div class="msg alert" style="animation-delay:.7s"><b>Lightning within 8 miles of the stadium.</b> Rain reaches campus in about 15 minutes. Whole thing should last about 40 minutes, with the heaviest rain about 10 of those.</div>
+        <div class="msg alert" style="animation-delay:.7s"><b>Lightning within 8 miles of the stadium.</b> The rain is close behind it, moving in from the west. Looks like a solid soaking, not an all-afternoon washout.</div>
         <div class=stamp>2:52 PM</div>
-        <div class=msg style="animation-delay:1.0s">Rain is <b>down to sprinkles</b> and should stop completely within the next ten minutes.</div>
+        <div class=msg style="animation-delay:1.0s">Rain is <b>down to sprinkles</b> and the back edge is nearly on us. Nearly done.</div>
         <div class=stamp>3:05 PM</div>
         <div class="msg clear" style="animation-delay:1.3s"><b>All clear.</b> The line is east of campus. Rest of the game looks dry. Enjoy it.</div>
         <div class=stamp>6:48 PM</div>
@@ -12795,14 +12871,14 @@ button:disabled{opacity:.6}
 </div>
 
 <div class=ticketzone>
-  <p class=pricing-line><b>Season pass: all 8 Indiana University Football home games for $16 total.</b><br>
+  <p class=pricing-line><b>Series pass: all 8 Indiana University Football home games for $16 total.</b><br>
   Or cover a single game for $5. That's it. No subscription, no app.</p>
   <div class=ticket>
-    <div class=t-head><span class=tt id=t-title>Season Pass</span><span class=pr id=t-price>$16</span></div>
+    <div class=t-head><span class=tt id=t-title>Series Pass</span><span class=pr id=t-price>$16</span></div>
     <div class=t-sub id=t-sub>Bloomington &middot; 8 home games &middot; one-time</div>
     <div style="display:flex;gap:8px;margin-bottom:4px;">
-      <button type=button id=opt-season style="flex:1;margin-top:0;padding:11px;font-size:18px;background:#A6192E;">Season &middot; $16</button>
-      <button type=button id=opt-single style="flex:1;margin-top:0;padding:11px;font-size:18px;background:#FFFDF7;color:#7E1322;border:1.5px solid #A6192E;">Next game &middot; $5</button>
+      <button type=button id=opt-season style="flex:1;margin-top:0;padding:11px;font-size:18px;background:#A6192E;">Series &middot; $16</button>
+      <button type=button id=opt-single style="flex:1;margin-top:0;padding:11px;font-size:18px;background:#FFFDF7;color:#7E1322;border:1.5px solid #A6192E;">Pick games &middot; $5</button>
     </div>
     <div id=gamepick style="display:none;margin:10px 0 2px;border:1.5px solid rgba(27,20,22,.22);
       border-radius:9px;padding:12px 13px;background:#FFFDF7">
@@ -12812,17 +12888,17 @@ button:disabled{opacity:.6}
     <div id=err class=err></div>
     <label for=g-name>Name</label><input id=g-name autocomplete=name>
     <label for=g-email>Email</label><input id=g-email type=email autocomplete=email>
-    <label for=g-phone>Mobile (where GameDay texts go)</label><input id=g-phone type=tel autocomplete=tel placeholder="812-555-0123">
+    <label for=g-phone>Mobile (where your messages go)</label><input id=g-phone type=tel autocomplete=tel placeholder="812-555-0123">
     <label class=consent for=g-consent><input type=checkbox id=g-consent>
-      <span>I agree to receive GameDay Weather text messages from WeatherValet at the number above:
+      <span>I agree to receive WeatherValet On Duty text messages at the number above:
       the Meteorologist's outlook the evening before, a game day morning brief, live updates if weather
       threatens the game window, and the all-clear. Frequency varies with the weather, usually two to six
       messages per game. Message and data rates may apply. Reply STOP to cancel, HELP for help. Text
       delivery depends on your carrier and is not guaranteed. I agree to the
-      <a href="/gameday/terms" target="_blank" rel=noopener>GameDay Terms</a> and
+      <a href="/gameday/terms" target="_blank" rel=noopener>On Duty Terms</a> and
       <a href="https://weathervalet.ai/?legal=privacy" target="_blank" rel=noopener>Privacy Policy</a>.</span></label>
-    <button id=g-go>Claim my season pass</button>
-    <div class=fine>Season covers all 8 home games starting with the opener (including the Friday
+    <button id=g-go>Claim my series pass</button>
+    <div class=fine>The series pass covers all 8 home games starting with the opener (including the Friday
     night game); single passes cover only the games you check above. One-time payment via Stripe.
     Group of tailgaters? Everyone needs their own pass.</div>
   </div>
@@ -12831,15 +12907,15 @@ button:disabled{opacity:.6}
     <h2>Why fans sign up</h2>
     <ul>
       <li><b>Plan the tailgate with confidence.</b> You'll know the dry window before you load the truck.</li>
-      <li><b>Know what the sky is doing before the stadium announces anything.</b> When lightning is near, you'll hear it from a Meteorologist first.</li>
-      <li><b>Rain that comes with a schedule.</b> When it starts, how long it lasts, when it's down to sprinkles, when it's done.</li>
+      <li><b>Know what the sky is doing.</b> When lightning is near, you'll hear it from a Meteorologist watching your day.</li>
+      <li><b>Straight talk about the rain.</b> Whether it is worth waiting out, and when a Meteorologist thinks it is easing.</li>
       <li><b>No app, no radar-squinting.</b> Plain texts on any phone, written by a certified Meteorologist, not an algorithm.</li>
       <li><b>The drive home, covered too.</b> The day isn't over at the final whistle.</li>
       <li><b>Two dollars a game.</b> All 8 home games for $16. Cheaper than one stadium bottle of water.</li>
     </ul>
   </div>
 
-  <p class=foot><a href="/gameday/terms" style="color:#C8A2A8">GameDay Terms and text message program</a>
+  <p class=foot><a href="/gameday/terms" style="color:#C8A2A8">On Duty Terms and text message program</a>
   &middot; <a href="https://weathervalet.ai/?legal=privacy" style="color:#C8A2A8">Privacy</a><br>
   WeatherValet is an independent weather service, not affiliated with or endorsed by Indiana University.<br>
   Want weather for YOUR life, not just gamedays? <a href="https://weathervalet.ai">WeatherValet.ai</a></p>
@@ -12867,13 +12943,13 @@ function setType(t){
   var n = seasonOn ? 0 : gpChosen().length;
   var shown = n || 1;
   document.getElementById('t-title').textContent = seasonOn
-    ? 'Season Pass' : (n > 1 ? (n + ' Single Games') : 'Single Game');
+    ? 'Series Pass' : (n > 1 ? (n + ' Single Games') : 'Single Game');
   document.getElementById('t-price').textContent = seasonOn ? '$16' : ('$' + (5 * shown));
   document.getElementById('t-sub').textContent = seasonOn
     ? 'Bloomington \\u00b7 8 home games \\u00b7 one-time'
     : ('Bloomington \\u00b7 ' + shown + (shown > 1 ? ' home games' : ' home game') + ' \\u00b7 one-time');
   document.getElementById('g-go').textContent = seasonOn
-    ? 'Claim my season pass'
+    ? 'Claim my series pass'
     : (n > 1 ? ('Cover me for these ' + n + ' games') : 'Cover me for this game');
 }
 document.getElementById('opt-season').addEventListener('click', function(){ setType('season'); });
@@ -12933,6 +13009,15 @@ def _legal_privacy_redirect():
 @app.get("/gameday/terms")
 def gameday_terms_page():
     return _GAMEDAY_TERMS_PAGE
+
+
+@app.get("/onduty")
+@app.get("/onduty/iu")
+def _onduty_alias():
+    """New product name, same page. The printed flyer and its QR code point
+    at /gameday/iu, so that path lives forever; this is the name people will
+    type after the rename."""
+    return redirect("/gameday/iu", code=302)
 
 
 @app.get("/gameday/iu")
@@ -13011,11 +13096,11 @@ def gameday_checkout():
     pass_id = pass_ids[0]
     if pass_type == "single":
         picks = ["%s vs %s" % (g.get("d") or "", g.get("opponent") or "") for g in game_rows]
-        line_name = ("GameDay Weather - single home game" if quantity == 1
-                     else "GameDay Weather - %d single home games" % quantity)
+        line_name = ("WeatherValet On Duty - single home game" if quantity == 1
+                     else "WeatherValet On Duty - %d single home games" % quantity)
         line_desc = ("; ".join(picks) if quantity <= 4 else "%d home games" % quantity)
     else:
-        line_name = "GameDay Weather - Bloomington season pass"
+        line_name = "WeatherValet On Duty - Bloomington series pass"
         line_desc = "All 8 home football games"
     if not stripe:
         return jsonify({"ok": False, "error": "Payments aren't configured yet."}), 503
@@ -13146,9 +13231,9 @@ h1{{font-size:20px;margin:0 0 4px}}
 .fine{{font-size:11.5px;color:#8A6F73;margin-top:20px;line-height:1.6}}
 </style></head><body><div class=b>
 <h1>&#9889; {name}</h1>
-<div class=sub>GameDay Weather partner scoreboard &middot; live from the database, updated every refresh</div>
+<div class=sub>WeatherValet On Duty partner scoreboard &middot; live from the database, updated every refresh</div>
 <div class=grid>
-  <div class=tile><div class=n>{seasons}</div><div class=l>Season passes</div></div>
+  <div class=tile><div class=n>{seasons}</div><div class=l>Series passes</div></div>
   <div class=tile><div class=n>{singles}</div><div class=l>Single games</div></div>
 </div>
 <div class=earn><div class=n>${earned:,.2f}</div><div class=l>Earned so far</div></div>
@@ -13210,7 +13295,7 @@ def _gameday_picker_html() -> str:
     games = _gameday_upcoming_games()
     if not games:
         return ('<div style="font-size:14.5px;color:#5B4A4E">The home schedule is finished for '
-                'this season. Season passes for next year open in the summer.</div>')
+                'this season. Series passes for next year open in the summer.</div>')
     out = []
     for i, g in enumerate(games):
         out.append(
@@ -13295,7 +13380,7 @@ textarea{width:100%;box-sizing:border-box;margin-top:10px;background:#0D0D10;col
   <div class=meta>Founder promises and partner passes. Sends the normal welcome text.</div>
   <div class=row><input class=kick-in style="width:160px" id=comp-name placeholder="Name">
   <input class=kick-in style="width:170px" id=comp-phone placeholder="812-555-0123">
-  <button class=send id=comp-send>Comp season pass</button></div>
+  <button class=send id=comp-send>Comp series pass</button></div>
   <div class=status id=comp-status></div>
 </div>
 <div id=games>Loading games&hellip;</div>
@@ -13390,7 +13475,7 @@ def met_gameday_comp():
                            WHERE phone = %s AND status = 'active' AND pass_type = 'season'""",
                         (phone,))
             if cur.fetchone():
-                return jsonify({"ok": False, "error": "That phone already has an active season pass."}), 409
+                return jsonify({"ok": False, "error": "That phone already has an active series pass."}), 409
             cur.execute(
                 """INSERT INTO gameday_passes
                      (venue, name, email, phone, pass_type, amount_cents, ref_code, game_id, status, created_at, updated_at)
@@ -13547,7 +13632,7 @@ def _gameday_monday_reminder_pass() -> int:
                     kick = g["kickoff"] if g["kickoff"] and g["kickoff"] != "TBA" else "kickoff time TBA"
                     kick_part = f"kickoff {kick}" if kick != "kickoff time TBA" else kick
                     if send_sms(p["phone"],
-                                f"GameDay Weather this week: Indiana vs {g['opponent']}, "
+                                f"WeatherValet On Duty this week: Indiana vs {g['opponent']}, "
                                 f"{g['nice_date']}, {kick_part}. Your Meteorologist's outlook "
                                 f"lands the evening before, the morning brief on game day, and "
                                 f"live alerts if the sky acts up. - WeatherValet"):
@@ -13622,31 +13707,55 @@ def _activate_gameday_passes(pass_ids) -> None:
                     f"outlook lands the evening before, the morning brief on game day, "
                     f"and live alerts follow if weather threatens the window. - WeatherValet")
         else:
-            body = (f"{hello}'re on the GameDay Weather roster for the Bloomington season. "
-                    f"Every home game: the Meteorologist's morning outlook, live alerts "
-                    f"if weather threatens the game window, and the all-clear. First outlook "
-                    f"lands the evening before the home opener. - WeatherValet")
+            body = (f"{hello}'re on the WeatherValet On Duty roster for Indiana Football home "
+                    f"games in Bloomington. Every home game: the Meteorologist's morning outlook, "
+                    f"live alerts if weather threatens the game window, and the all-clear. First "
+                    f"outlook lands the evening before the home opener. - WeatherValet")
         send_sms(row["phone"], body)
     except Exception as e:
         print(f"[gameday] welcome sms failed: {e!r}", flush=True)
     try:
-        sold = ("season pass" if (row.get("pass_type") or "season") != "single"
+        sold = ("series pass" if (row.get("pass_type") or "season") != "single"
                 else ("single game pass" if len(rows) == 1 else f"{len(rows)} single game passes"))
         who = row.get("name") or "name not given"
         _send_team_notification(
-            subject=f"GameDay {sold} sold",
-            html_body=f"<p>New GameDay Weather {sold}: {_html_escape(who)}.</p>",
-            text_body=f"New GameDay {sold}: {who}")
+            subject=f"On Duty {sold} sold",
+            html_body=f"<p>New WeatherValet On Duty {sold}: {_html_escape(who)}.</p>",
+            text_body=f"New On Duty {sold}: {who}")
     except Exception:
         pass
 
 
 SENTRY_PRICE_CENTS = 1200
-SENTRY_NAME = "WeatherValet Sentry"
+SENTRY_EXTRA_ADDRESS_CENTS = 800   # WeatherCall charges full price again; we don't
+SENTRY_ALLSEASON_CENTS = 900       # winter + frost/freeze + heat/wind, one checkbox
+SENTRY_DAILY_CENTS = 1200          # on top of the $12 base = $24/yr all in
+WATCH_CENTS = 4900                 # WeatherValet Watch, per event day
+WATCH_TERMS_VERSION = "watch-2026-08-18"
+
+_STORMLINE_MANAGE_HEAD = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Manage your Stormline</title><style>
+body{margin:0;background:#F6F7FB;color:#0F1216;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif}
+.wrap{max-width:520px;margin:0 auto;padding:30px 18px 60px}
+h1{font-size:23px;margin:0 0 4px}
+.sub{color:#5B6470;font-size:14.5px;margin:0 0 22px}
+.card{background:#fff;border:1px solid rgba(15,18,22,.1);border-radius:13px;padding:20px;margin-bottom:16px}
+h2{font-size:16px;margin:0 0 10px}
+ul{margin:0;padding-left:18px;color:#3C4655;font-size:14.5px;line-height:1.7}
+label{display:block;font-size:12.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:#5B6470;margin:12px 0 5px}
+select{width:100%;box-sizing:border-box;padding:12px;border:1px solid rgba(15,18,22,.18);border-radius:8px;font-size:16px;background:#fff}
+button{width:100%;margin-top:18px;background:#1E7FFF;color:#fff;border:none;border-radius:9px;padding:14px;font-size:16px;font-weight:800;cursor:pointer}
+.ok{background:#E8F6EC;border:1px solid #A9DCB8;color:#1B5E2A;border-radius:9px;padding:11px 13px;font-size:14.5px;margin-bottom:16px}
+.fine{font-size:12.5px;color:#5B6470;line-height:1.6;margin-top:14px}
+a{color:#1E7FFF}
+</style></head><body><div class=wrap>"""
+
+SENTRY_NAME = "WeatherValet Stormline"
 
 _SENTRY_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>WeatherValet Sentry - $12/year storm alerts for your exact address</title><style>
+<title>WeatherValet Stormline - watch the address you cannot stand next to - $12/year</title><style>
 :root{--blue:#1E7FFF;--navy:#0A1422;--ink:#0F1216}
 body{margin:0;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;background:#F6F7FB;color:var(--ink)}
 .hero{background:linear-gradient(160deg,#0A1422,#12233D);color:#fff;padding:44px 20px 36px;text-align:center}
@@ -13667,38 +13776,171 @@ button{width:100%;margin-top:20px;background:var(--blue);color:#fff;border:none;
 button:disabled{opacity:.6}
 .fine{font-size:12.5px;color:#5B6470;margin-top:12px;line-height:1.5;text-align:center}
 .err{display:none;background:#FDECEC;border:1px solid #F3B4B4;color:#8A1F1F;border-radius:8px;padding:10px 12px;margin-top:14px;font-size:14px}
+.addon{display:flex;gap:11px;align-items:flex-start;margin:0 0 10px;padding:13px 14px;border:1.5px solid #D5DCE6;
+  border-radius:10px;background:#fff;cursor:pointer}
+.addon.on{border-color:var(--blue);background:#F2F7FF}
+.addon input{width:auto;margin:2px 0 0;flex:0 0 auto;transform:scale(1.3);accent-color:var(--blue)}
+.addon b{display:block;font-size:15.5px;color:#0F1B2C}
+.addon i{display:block;font-style:normal;font-size:13.5px;color:#5B6470;line-height:1.5;margin-top:2px}
+.addon .amt{font-weight:800;font-size:15.5px;color:var(--blue);white-space:nowrap}
+.addon-h{font-size:12.5px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#5B6470;margin:22px 0 9px}
+.total{display:flex;justify-content:space-between;align-items:baseline;margin:16px 0 0;padding-top:14px;
+  border-top:1.5px solid #D5DCE6;font-size:15px;color:#5B6470}
+.total b{font-size:25px;color:#0F1B2C}
 .ladder{text-align:center;font-size:13.5px;color:#5B6470;padding:0 18px 40px;max-width:640px;margin:0 auto}
 .ladder a{color:var(--blue);font-weight:700;text-decoration:none}
+.who{list-style:none;padding:0;margin:0}
+.who li{padding:11px 0 11px 0;border-bottom:1px solid rgba(15,18,22,.08);font-size:15.5px;line-height:1.55}
+.who li:last-child{border-bottom:none}
+.who b{display:block;color:#0F1B2C;margin-bottom:1px}
+.vs{width:100%;border-collapse:collapse;font-size:14.5px;margin-top:4px}
+.vs th{text-align:left;font-size:11.5px;letter-spacing:.07em;text-transform:uppercase;color:#5B6470;
+  padding:0 8px 8px 0;font-weight:800}
+.vs td{padding:9px 8px 9px 0;border-top:1px solid rgba(15,18,22,.08);vertical-align:top;line-height:1.45}
+.vs td.y{color:#0F1B2C;font-weight:600}
+.vs td.n{color:#7A8494}
+.dollar{background:#F2F7FF;border:1.5px solid #C9DEFF;border-radius:11px;padding:15px 17px;font-size:15.5px;
+  line-height:1.55;color:#0F1B2C;margin-top:4px}
+.q{font-size:15.5px;font-weight:700;color:#0F1B2C;margin:16px 0 4px}
+.q:first-of-type{margin-top:0}
+.a{font-size:15px;line-height:1.6;color:#3C4655;margin:0}
 </style></head><body>
 <div class=hero>
   <div class=brand>&#9889; WeatherValet</div>
-  <h1>The robot that <em>rings your phone</em> when it matters.</h1>
-  <p>WeatherValet Sentry watches one exact address, yours, around the clock.
-  The moment the National Weather Service puts it inside a warning, you know.</p>
-  <div class=price>$12 a year</div>
+  <h1>Who are you going to <em>worry about</em> at 2 AM?</h1>
+  <p>Your phone warns you about where you are standing. Stormline watches the address
+  you care about even when you are nowhere near it, and calls the phone of whoever
+  is there. Mom's house. The kids' place. The house you just drove away from.</p>
+  <div class=price>$12 a year, one address</div>
 </div>
 <div class=wrap>
+
   <div class=card>
-    <h2>What Sentry does</h2>
-    <ul class=feat>
-      <li><b>Warning texts with the radar map</b> the moment a Severe Thunderstorm, Tornado, or Flash Flood Warning includes your address. Not your county. Your address.</li>
-      <li><b>The 2 AM tornado phone call.</b> A real phone call that says the warning twice. Texts get ignored at night; a ringing phone doesn't. (Your welcome text shows the one setting that lets our call ring even on Do Not Disturb.)</li>
-      <li><b>The all-clear</b> when the warning expires, so you're not guessing in the basement.</li>
-      <li><b>No app.</b> Works on every phone ever made, including your mom's flip phone.</li>
-      <li><b>Two phone numbers included.</b> Yours and your spouse's, or yours and Mom's.</li>
+    <h2>Who people put a Stormline on</h2>
+    <ul class=who>
+      <li><b>Mom, who is never going to download an app.</b> She does not have to.
+      Stormline calls her phone and says the warning out loud. Any phone, including a landline.</li>
+      <li><b>The kids, two states away at school.</b> You put their apartment address in.
+      They get the text and the call. You get to stop refreshing radar for a city you have never lived in.</li>
+      <li><b>The house you left this morning.</b> A tornado warning at home while you are
+      four hours down the road is exactly the thing nobody tells you about.</li>
+      <li><b>The shop, the barn, the rental, the lake place.</b> Places that are worth
+      money and have nobody standing in them.</li>
+      <li><b>And yes, your own house.</b> Especially at 2 AM.</li>
     </ul>
   </div>
+
   <div class=card>
-    <h2>Stand your Sentry up</h2>
+    <h2>&#34;My phone already does this for free&#34;</h2>
+    <p class=a style="margin-bottom:10px">Fair question, and mostly the honest answer is:
+    your phone does part of this. Here is the part it does not.</p>
+    <table class=vs>
+      <tr><th></th><th>Free phone alerts</th><th>Stormline</th></tr>
+      <tr><td class=y>Where it warns</td><td class=n>Wherever your phone is</td>
+          <td class=y>The exact address you chose, whether you are there or not</td></tr>
+      <tr><td class=y>How precise</td><td class=n>Broad area, often a whole county</td>
+          <td class=y>Inside the warning polygon or not. If your address is out, you stay quiet</td></tr>
+      <tr><td class=y>Wakes you up</td><td class=n>A notification you may have silenced</td>
+          <td class=y>An actual phone call for tornado warnings</td></tr>
+      <tr><td class=y>Works on Mom's flip phone</td><td class=n>No</td>
+          <td class=y>Yes. Any phone, including a landline</td></tr>
+      <tr><td class=y>Tells you it is over</td><td class=n>Rarely</td>
+          <td class=y>An all-clear text when the warning expires</td></tr>
+    </table>
+    <p class=a style="margin-top:12px">Keep your free alerts. They are good. Stormline is for
+    the address you cannot stand next to.</p>
+  </div>
+
+  <div class=card>
+    <h2>What actually arrives</h2>
+    <ul class=feat>
+      <li><b>A text with the radar map</b> the moment a Severe Thunderstorm, Tornado, or Flash
+      Flood Warning includes that address. Official National Weather Service warnings, relayed
+      straight through. No robot writing its own forecast.</li>
+      <li><b>The 2 AM tornado phone call.</b> A real call that says the warning twice. Texts get
+      ignored at night; a ringing phone does not. Your welcome text shows the one setting that
+      lets our call ring even on Do Not Disturb.</li>
+      <li><b>The all-clear</b> when the warning expires, so nobody is sitting in the basement guessing.</li>
+      <li><b>Two phone numbers per address.</b> Yours and your spouse's, or yours and Mom's.</li>
+      <li><b>No app, no login, nothing to check.</b> It only speaks when it has something to say.</li>
+    </ul>
+    <div class=dollar><b>$12 a year is a dollar a month.</b> One address, watched every hour of
+    every day, for less than a single cup of coffee a season. Cancel any time.</div>
+  </div>
+
+  <div class=card>
+    <h2>Put a Stormline on it</h2>
     <div id=err class=err></div>
     <label for=s-name>Your name</label><input id=s-name autocomplete=name>
     <label for=s-email>Email</label><input id=s-email type=email autocomplete=email>
     <label for=s-phone>Mobile phone (where alerts go)</label><input id=s-phone type=tel autocomplete=tel placeholder="317-555-0123">
     <label for=s-phone2>Second phone (optional, included): spouse, kid, anyone</label><input id=s-phone2 type=tel placeholder="Optional">
     <label for=s-address>The address to watch</label><input id=s-address autocomplete=street-address placeholder="123 Main St, Lebanon, IN">
+
+    <div class=addon-h>Add to this account</div>
+
+    <label class=addon id=ad-second for=s-second><input type=checkbox id=s-second>
+      <span style="flex:1"><b>Watch a second address</b>
+      <i>Mom's house, the lake place, the shop, a rental. Same warnings, same
+      tornado call, on the same bill. Most services charge full price again.</i></span>
+      <span class=amt>+$8/yr</span></label>
+
+    <div id=second-wrap style="display:none;margin:-2px 0 12px">
+      <label for=s-address2>Second address</label>
+      <input id=s-address2 placeholder="456 Oak St, Zionsville, IN">
+      <label for=s-label2>Call it what? (optional)</label>
+      <input id=s-label2 placeholder="Mom's house" maxlength=60>
+    </div>
+
+    <label class=addon id=ad-pack for=s-pack><input type=checkbox id=s-pack>
+      <span style="flex:1"><b>All-Season pack</b>
+      <i>Winter storm, ice, and blizzard warnings. Frost and freeze warnings for
+      the garden. Extreme heat and high wind. Same address, same phone, all year.</i></span>
+      <span class=amt>+$9/yr</span></label>
+
+    <label class=addon id=ad-daily for=s-daily><input type=checkbox id=s-daily>
+      <span style="flex:1"><b>Add the morning summary</b>
+      <i>Every morning, an automated summary of the National Weather Service
+      forecast for your address, at the hour you pick. Not written by a
+      Meteorologist, and it says so.</i></span>
+      <span class=amt>+$12/yr</span></label>
+
+    <div id=daily-wrap style="display:none;margin:-2px 0 12px">
+      <label for=s-hour>Send it at</label>
+      <select id=s-hour style="width:100%;box-sizing:border-box;padding:12px;
+        border:1px solid rgba(15,18,22,.18);border-radius:8px;font-size:16px;background:#fff">
+        <option value=5>5:00 AM</option><option value=6>6:00 AM</option>
+        <option value=7 selected>7:00 AM</option><option value=8>8:00 AM</option>
+        <option value=9>9:00 AM</option><option value=10>10:00 AM</option>
+      </select>
+      <div class=fine style="text-align:left;margin-top:7px">Local time at the address
+      we watch. You can change it any time from the link in your messages.</div>
+    </div>
+
+    <div class=total><span id=s-summary>Stormline, one address</span><b id=s-total>$12/yr</b></div>
     <button id=s-go>Protect this address &middot; $12/year</button>
     <div class=fine>Checkout is handled by Stripe. Cancel anytime. Alerts relay official National Weather Service warnings for your exact location.</div>
   </div>
+
+  <div class=card>
+    <h2>Straight answers</h2>
+    <p class=q>Will this tell me a tornado is coming before the Weather Service knows?</p>
+    <p class=a>No, and be suspicious of anyone who says otherwise. Stormline relays the official
+    National Weather Service warning the moment it is issued for your address. What you are
+    buying is that it reaches the right phone at the right address, out loud, at 2 AM.</p>
+    <p class=q>How many messages will I get?</p>
+    <p class=a>Only when a warning actually includes your address. In most of Indiana that is a
+    handful of times a year. Some years, once. It is quiet on purpose.</p>
+    <p class=q>Can texts fail?</p>
+    <p class=a>Yes. Cell coverage, a phone that is off, carrier filtering. We say so plainly in
+    our terms. Never treat any single service as your only source, including this one.</p>
+    <p class=q>Can I put someone else's phone on it?</p>
+    <p class=a>Yes, and people do. Just tell them it is coming so the first call is not a mystery.
+    Two numbers are included with every address.</p>
+    <p class=q>What if I move or change numbers?</p>
+    <p class=a>Email hello@weathervalet.ai and we change it same day. No portal to hunt through.</p>
+  </div>
+
 </div>
 <div class=ladder>Robots watch addresses. Meteorologists watch your plans.<br>
 Big day coming? A real Meteorologist will work your forecast for $19 at
@@ -13707,6 +13949,12 @@ Big day coming? A real Meteorologist will work your forecast for $19 at
 document.getElementById('s-go').addEventListener('click', function(){
   var btn = this; btn.disabled = true; btn.textContent = 'One moment...';
   var err = document.getElementById('err'); err.style.display = 'none';
+  if (document.getElementById('s-second').checked
+      && document.getElementById('s-address2').value.trim().length < 8) {
+    err.textContent = 'Add the second address, or uncheck it.';
+    err.style.display = 'block'; btn.disabled = false; btn.textContent = wvBtnLabel();
+    return;
+  }
   fetch('/api/v1/sentry/checkout', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
@@ -13714,17 +13962,58 @@ document.getElementById('s-go').addEventListener('click', function(){
       email: document.getElementById('s-email').value,
       phone: document.getElementById('s-phone').value,
       phone2: document.getElementById('s-phone2').value,
-      address: document.getElementById('s-address').value
+      address: document.getElementById('s-address').value,
+      address2: document.getElementById('s-second').checked
+        ? document.getElementById('s-address2').value : '',
+      label2: document.getElementById('s-second').checked
+        ? document.getElementById('s-label2').value : '',
+      pack_allseason: document.getElementById('s-pack').checked,
+      daily: document.getElementById('s-daily').checked,
+      send_hour: parseInt(document.getElementById('s-hour').value, 10)
     })
   }).then(function(r){ return r.json(); }).then(function(d){
     if (d.ok && d.url) { window.location.href = d.url; return; }
     err.textContent = d.error || 'Something went wrong. Check the fields and try again.';
-    err.style.display = 'block'; btn.disabled = false; btn.textContent = 'Protect this address \u00b7 $12/year';
+    err.style.display = 'block'; btn.disabled = false; btn.textContent = wvBtnLabel();
   }).catch(function(){
     err.textContent = 'Connection problem. Try again.';
-    err.style.display = 'block'; btn.disabled = false; btn.textContent = 'Protect this address \u00b7 $12/year';
+    err.style.display = 'block'; btn.disabled = false; btn.textContent = wvBtnLabel();
   });
 });
+
+function wvAddrCount(){ return document.getElementById('s-second').checked ? 2 : 1; }
+function wvTotal(){
+  var n = wvAddrCount();
+  var cents = 1200 + (n - 1) * 800
+    + (document.getElementById('s-pack').checked ? 900 * n : 0)
+    + (document.getElementById('s-daily').checked ? 1200 * n : 0);
+  return (cents / 100).toFixed(0);
+}
+function wvBtnLabel(){
+  var n = wvAddrCount();
+  return (n > 1 ? 'Protect these addresses' : 'Protect this address')
+    + ' · $' + wvTotal() + '/year';
+}
+function wvSync(){
+  var second = document.getElementById('s-second').checked;
+  var pack = document.getElementById('s-pack').checked;
+  var daily = document.getElementById('s-daily').checked;
+  document.getElementById('second-wrap').style.display = second ? 'block' : 'none';
+  document.getElementById('daily-wrap').style.display = daily ? 'block' : 'none';
+  document.getElementById('ad-second').className = 'addon' + (second ? ' on' : '');
+  document.getElementById('ad-pack').className = 'addon' + (pack ? ' on' : '');
+  document.getElementById('ad-daily').className = 'addon' + (daily ? ' on' : '');
+  var bits = [second ? 'Stormline, two addresses' : 'Stormline, one address'];
+  if (pack) { bits.push('All-Season pack'); }
+  if (daily) { bits.push('morning summary'); }
+  document.getElementById('s-summary').textContent = bits.join(' + ');
+  document.getElementById('s-total').textContent = '$' + wvTotal() + '/yr';
+  document.getElementById('s-go').textContent = wvBtnLabel();
+}
+document.getElementById('s-second').addEventListener('change', wvSync);
+document.getElementById('s-pack').addEventListener('change', wvSync);
+document.getElementById('s-daily').addEventListener('change', wvSync);
+wvSync();
 </script></body></html>"""
 
 
@@ -13759,6 +14048,7 @@ def healthz_deep():
                 for table, col in (("gameday_passes", "ref_code"),
                                    ("gameday_passes", "pass_type"),
                                    ("sentry_subscribers", "phone2"),
+                                   ("sentry_subscribers", "pack_allseason"),
                                    ("gameday_partners", "charity_name")):
                     try:
                         cur.execute(f"SELECT {col} FROM {table} LIMIT 1")
@@ -13785,9 +14075,604 @@ def _wv_error_reporter(err):
             "<p>The team has a way to see exactly what. Try again in a minute.</p>"), 500
 
 
+_WATCH_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>WeatherValet Watch - a Meteorologist on your event, start to finish</title><style>
+:root{--ink:#12161C;--gold:#C8892A}
+body{margin:0;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;background:#F7F6F3;color:var(--ink)}
+.hero{background:linear-gradient(160deg,#171C25,#2A2118);color:#fff;padding:44px 20px 34px;text-align:center}
+.hero .brand{font-weight:900;font-size:19px;margin-bottom:16px;letter-spacing:-.01em}
+.hero h1{font-size:clamp(25px,5vw,38px);margin:0 0 10px;line-height:1.16}
+.hero h1 em{color:var(--gold);font-style:normal}
+.hero p{color:#CDC6BB;max-width:560px;margin:0 auto;font-size:16.5px;line-height:1.55}
+.price{display:inline-block;background:var(--gold);color:#1B1509;border-radius:999px;padding:8px 22px;font-weight:800;margin-top:18px;font-size:18px}
+.wrap{max-width:620px;margin:0 auto;padding:26px 18px 60px}
+.card{background:#fff;border:1px solid rgba(18,22,28,.1);border-radius:14px;padding:22px;margin-bottom:18px}
+.card h2{margin:0 0 12px;font-size:17px}
+ul.feat{list-style:none;padding:0;margin:0}
+ul.feat li{padding:8px 0 8px 28px;position:relative;font-size:15px;line-height:1.55}
+ul.feat li:before{content:"\\2713";position:absolute;left:2px;color:var(--gold);font-weight:800}
+label{display:block;font-size:12.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:#5E5648;margin:14px 0 5px}
+input,select,textarea{width:100%;box-sizing:border-box;padding:12px;border:1px solid rgba(18,22,28,.18);border-radius:8px;font-size:16px;font-family:inherit;background:#fff}
+textarea{min-height:74px;resize:vertical}
+.row{display:flex;gap:10px}.row>div{flex:1}
+button{width:100%;margin-top:20px;background:var(--gold);color:#1B1509;border:none;border-radius:9px;padding:15px;font-size:17px;font-weight:800;cursor:pointer}
+button:disabled{opacity:.6}
+.err{display:none;background:#FDECEC;border:1px solid #F3B4B4;color:#8A1F1F;border-radius:8px;padding:10px 12px;margin-top:14px;font-size:14px}
+.consent{display:flex;gap:10px;align-items:flex-start;margin:16px 0 2px;font-size:12.8px;line-height:1.5;color:#4A4438;cursor:pointer}
+.consent input{width:auto;margin:2px 0 0;flex:0 0 auto;transform:scale(1.25);accent-color:var(--gold)}
+.consent a{color:#8A6318}
+.fine{font-size:12.5px;color:#5E5648;margin-top:12px;line-height:1.55;text-align:center}
+.foot{text-align:center;font-size:12.5px;color:#5E5648;padding:0 18px 40px}
+</style></head><body>
+<div class=hero>
+  <div class=brand>&#9889; WeatherValet</div>
+  <h1>One day. One Meteorologist. <em>Yours.</em></h1>
+  <p>Book a Meteorologist to stand guard over your event window, start to finish.
+  They send the outlook the evening before, then stay with your day and message
+  you as the sky actually changes.</p>
+  <div class=price>$49 per event day</div>
+</div>
+<div class=wrap>
+  <div class=card>
+    <h2>What you get</h2>
+    <ul class=feat>
+      <li><b>The outlook the evening before</b>, written by the Meteorologist working your day.</li>
+      <li><b>Messages during your window</b> whenever something changes that affects you.</li>
+      <li><b>Honest calls, not hedges.</b> If it looks fine, they tell you it looks fine.</li>
+      <li><b>The all clear</b> when whatever was coming has passed.</li>
+      <li><b>A person, not a model.</b> Never AI-written, and never signed by anyone who did not write it.</li>
+    </ul>
+  </div>
+  <div class=card>
+    <h2>Book your day</h2>
+    <div id=err class=err></div>
+    <label for=w-name>Your name</label><input id=w-name autocomplete=name>
+    <label for=w-email>Email</label><input id=w-email type=email autocomplete=email>
+    <label for=w-phone>Mobile (where your messages go)</label><input id=w-phone type=tel placeholder="317-555-0123">
+    <label for=w-place>Where is it?</label><input id=w-place placeholder="Fairgrounds, 1300 E 100 S, Lebanon, IN">
+    <label for=w-date>What day?</label><input id=w-date type=date>
+    <div class=row>
+      <div><label for=w-start>Window starts</label><select id=w-start></select></div>
+      <div><label for=w-end>Window ends</label><select id=w-end></select></div>
+    </div>
+    <label for=w-what>What is happening? (optional, but it helps)</label>
+    <textarea id=w-what placeholder="Outdoor wedding, 140 guests, ceremony at 4, tent on site"></textarea>
+    <label class=consent for=w-consent><input type=checkbox id=w-consent>
+      <span>I agree to receive WeatherValet Watch text messages at the number above for
+      this event: the outlook the evening before, updates during my window, and the all
+      clear. Frequency varies with the weather. Message and data rates may apply. Reply
+      STOP to cancel, HELP for help. Text delivery depends on my carrier and is not
+      guaranteed. I agree to the
+      <a href="/gameday/terms" target="_blank" rel=noopener>Terms</a> and
+      <a href="https://weathervalet.ai/?legal=privacy" target="_blank" rel=noopener>Privacy Policy</a>.</span></label>
+    <button id=w-go>Book this day &middot; $49</button>
+    <div class=fine>One-time payment via Stripe. Book at least a day ahead so your
+    Meteorologist has time to prepare. Full refund any time before your day starts.</div>
+  </div>
+</div>
+<p class=foot>WeatherValet Watch covers weather only. Decisions about your event stay yours,
+and official National Weather Service warnings always come first.</p>
+<script>
+(function(){
+  function label(h){
+    if (h === 0 || h === 24) { return 'Midnight'; }
+    if (h === 12) { return 'Noon'; }
+    return (h <= 12 ? h : h - 12) + ':00 ' + (h < 12 ? 'AM' : 'PM');
+  }
+  var st = document.getElementById('w-start'), en = document.getElementById('w-end');
+  for (var h = 0; h <= 23; h++) {
+    var o = document.createElement('option'); o.value = h; o.textContent = label(h);
+    if (h === 8) { o.selected = true; } st.appendChild(o);
+  }
+  for (var j = 1; j <= 24; j++) {
+    var p = document.createElement('option'); p.value = j; p.textContent = label(j);
+    if (j === 20) { p.selected = true; } en.appendChild(p);
+  }
+  var d = new Date(); d.setDate(d.getDate() + 2);
+  document.getElementById('w-date').value = d.toISOString().slice(0, 10);
+  d.setDate(d.getDate() - 1);
+  document.getElementById('w-date').min = d.toISOString().slice(0, 10);
+})();
+document.getElementById('w-go').addEventListener('click', function(){
+  var btn = this; var err = document.getElementById('err');
+  err.style.display = 'none';
+  if (!document.getElementById('w-consent').checked) {
+    err.textContent = 'Please check the box agreeing to receive Watch text messages.';
+    err.style.display = 'block'; return;
+  }
+  btn.disabled = true; btn.textContent = 'One moment...';
+  fetch('/api/v1/watch/checkout', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      name: document.getElementById('w-name').value,
+      email: document.getElementById('w-email').value,
+      phone: document.getElementById('w-phone').value,
+      place: document.getElementById('w-place').value,
+      event_date: document.getElementById('w-date').value,
+      start_hour: parseInt(document.getElementById('w-start').value, 10),
+      end_hour: parseInt(document.getElementById('w-end').value, 10),
+      what: document.getElementById('w-what').value,
+      consent: true
+    })
+  }).then(function(r){ return r.json(); }).then(function(j){
+    if (j && j.ok && j.url) { window.location = j.url; return; }
+    err.textContent = (j && j.error) || 'Something went wrong. Try again.';
+    err.style.display = 'block'; btn.disabled = false;
+    btn.textContent = 'Book this day \\u00b7 $49';
+  }).catch(function(){
+    err.textContent = 'Network problem. Try again.';
+    err.style.display = 'block'; btn.disabled = false;
+    btn.textContent = 'Book this day \\u00b7 $49';
+  });
+});
+</script></body></html>"""
+
+
+_WATCH_CONSOLE_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Watch console</title><style>
+body{margin:0;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;background:#12161C;color:#EDE7DD}
+.wrap{max-width:760px;margin:0 auto;padding:26px 16px 60px}
+h1{font-size:22px;margin:0 0 4px}
+.sub{color:#9A9184;font-size:14px;margin:0 0 22px}
+.o{background:#1B212B;border:1px solid rgba(255,255,255,.1);border-radius:12px;padding:16px;margin-bottom:14px}
+.o.mine{border-color:#C8892A}
+.when{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#C8892A;font-weight:800}
+.place{font-size:17px;font-weight:700;margin:3px 0 2px}
+.what{font-size:14px;color:#B6AE9F;line-height:1.5;margin:6px 0 0}
+.meta{font-size:12.5px;color:#8E8578;margin-top:7px}
+button{background:#C8892A;color:#1B1509;border:none;border-radius:8px;padding:11px 16px;
+  font-size:14.5px;font-weight:800;cursor:pointer;margin-top:12px}
+button.ghost{background:transparent;color:#C8892A;border:1px solid #C8892A}
+button:disabled{opacity:.5;cursor:default}
+textarea{width:100%;box-sizing:border-box;margin-top:10px;padding:11px;border-radius:8px;
+  border:1px solid rgba(255,255,255,.18);background:#141A22;color:#EDE7DD;font-size:15px;
+  font-family:inherit;min-height:80px;resize:vertical}
+.count{font-size:12px;color:#8E8578;margin-top:5px}
+.msg{font-size:13.5px;border-radius:8px;padding:9px 11px;margin-top:10px;display:none}
+.msg.ok{background:#16301E;border:1px solid #2F6B41;color:#A9E3BC}
+.msg.bad{background:#33191A;border:1px solid #7B3033;color:#F0B6B8}
+.empty{color:#8E8578;font-size:14.5px}
+</style></head><body><div class=wrap>
+<h1>Watch console</h1>
+<p class=sub>Booked event days. Claim one, then message the person who bought it.
+Plain text only, no links, and every message is signed with your name.</p>
+<div id=list class=empty>Loading...</div>
+</div>
+<script>
+function esc(t){ var d = document.createElement('div'); d.textContent = t || ''; return d.innerHTML; }
+function load(){
+  fetch('/api/v1/watch/orders').then(function(r){ return r.json(); }).then(function(j){
+    var el = document.getElementById('list');
+    if (!j || !j.ok) { el.textContent = 'Could not load. Are you signed in as a Meteorologist?'; return; }
+    if (!j.orders.length) { el.className = 'empty'; el.textContent = 'No booked Watch days yet.'; return; }
+    el.className = '';
+    el.innerHTML = j.orders.map(function(o){
+      var claim = (o.status === 'paid')
+        ? '<button onclick="claim(' + o.id + ')">Claim this day</button>'
+        : '';
+      var composer = o.mine
+        ? '<textarea id="t' + o.id + '" placeholder="What does the sky mean for their day right now?" ' +
+          'oninput="cnt(' + o.id + ')"></textarea>' +
+          '<div class=count id="c' + o.id + '">0 characters</div>' +
+          '<button onclick="sendMsg(' + o.id + ')">Send to the buyer</button>' +
+          '<div class=msg id="m' + o.id + '"></div>'
+        : '';
+      var who = o.met ? ('Claimed by ' + esc(o.met)) : 'Unclaimed';
+      return '<div class="o' + (o.mine ? ' mine' : '') + '">' +
+        '<div class=when>' + esc(o.date) + ' &middot; ' + esc(o.window) + '</div>' +
+        '<div class=place>' + esc(o.place) + '</div>' +
+        (o.what ? '<div class=what>' + esc(o.what) + '</div>' : '') +
+        '<div class=meta>' + esc(o.name) + ' &middot; ' + who + ' &middot; ' +
+        o.msgs + ' message' + (o.msgs === 1 ? '' : 's') + ' sent</div>' +
+        claim + composer + '</div>';
+    }).join('');
+  });
+}
+function cnt(id){
+  var n = document.getElementById('t' + id).value.length;
+  var c = document.getElementById('c' + id);
+  c.textContent = n + ' characters' + (n > 480 ? ' - too long' : '');
+  c.style.color = n > 480 ? '#F0B6B8' : '#8E8578';
+}
+function claim(id){
+  fetch('/api/v1/watch/claim', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({watch_id: id})}).then(function(r){ return r.json(); }).then(function(j){
+    if (j && j.ok) { load(); } else { alert((j && j.error) || 'Could not claim.'); }
+  });
+}
+function sendMsg(id){
+  var ta = document.getElementById('t' + id), box = document.getElementById('m' + id);
+  var body = ta.value.trim();
+  box.style.display = 'none';
+  if (body.length < 4) { box.className = 'msg bad'; box.textContent = 'Write the message first.';
+    box.style.display = 'block'; return; }
+  fetch('/api/v1/watch/message', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({watch_id: id, body: body})})
+    .then(function(r){ return r.json(); }).then(function(j){
+      if (j && j.ok) {
+        box.className = 'msg ok'; box.textContent = 'Sent.'; box.style.display = 'block';
+        ta.value = ''; cnt(id); load();
+      } else {
+        box.className = 'msg bad'; box.textContent = (j && j.error) || 'Send failed.';
+        box.style.display = 'block';
+      }
+    });
+}
+load();
+</script></body></html>"""
+
+
+@app.get("/watch/console")
+def watch_console():
+    """The Met's Watch screen: booked days, claim one, message the buyer."""
+    user = _require_met_or_admin()
+    if not user:
+        return ("<h3 style='font-family:sans-serif;padding:30px;'>Meteorologists only. "
+                "Sign in at weathervalet.ai first, then come back.</h3>", 403)
+    return _WATCH_CONSOLE_PAGE
+
+
+@app.get("/api/v1/watch/orders")
+def watch_orders_list():
+    user = _require_met_or_admin()
+    if not user:
+        return jsonify({"ok": False, "error": "not-authorized"}), 403
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT w.id, w.name, w.place, w.event_date, w.start_hour,
+                                  w.end_hour, w.what, w.status, w.met_user_id,
+                                  u.name AS met_name,
+                                  (SELECT count(*) FROM watch_messages m WHERE m.watch_id = w.id) AS msg_count
+                             FROM watch_orders w
+                             LEFT JOIN users u ON u.id = w.met_user_id
+                            WHERE w.status <> 'pending'
+                              AND w.event_date >= CURRENT_DATE - 1
+                         ORDER BY w.event_date, w.start_hour""")
+            rows = cur.fetchall() or []
+    out = []
+    for r in rows:
+        out.append({
+            "id": r["id"], "name": r.get("name") or "", "place": r["place"],
+            "date": r["event_date"].strftime("%a %b %d") if hasattr(r["event_date"], "strftime") else str(r["event_date"]),
+            "window": f"{_watch_hour_label(r['start_hour'])} to {_watch_hour_label(r['end_hour'])}",
+            "what": r.get("what") or "", "status": r["status"],
+            "met": r.get("met_name") or "", "mine": r.get("met_user_id") == user["id"],
+            "msgs": r.get("msg_count") or 0,
+        })
+    return jsonify({"ok": True, "orders": out})
+
+
+@app.post("/api/v1/watch/claim")
+def watch_claim():
+    user = _require_met_or_admin()
+    if not user:
+        return jsonify({"ok": False, "error": "not-authorized"}), 403
+    data = request.get_json(silent=True) or {}
+    try:
+        wid = int(data.get("watch_id") or 0)
+    except Exception:
+        return jsonify({"ok": False, "error": "bad-id"}), 400
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE watch_orders
+                              SET met_user_id = %s, claimed_at = %s, status = 'claimed',
+                                  updated_at = %s
+                            WHERE id = %s AND met_user_id IS NULL AND status = 'paid'
+                        RETURNING id""",
+                        (user["id"], now_ms, now_ms, wid))
+            got = cur.fetchone()
+    if not got:
+        return jsonify({"ok": False, "error": "Already claimed by another Meteorologist."}), 409
+    return jsonify({"ok": True})
+
+
+@app.post("/api/v1/watch/message")
+def watch_message():
+    """Send one message to the buyer of a Watch. Plain text only, and only
+    the Meteorologist who claimed it can send."""
+    user = _require_met_or_admin()
+    if not user:
+        return jsonify({"ok": False, "error": "not-authorized"}), 403
+    data = request.get_json(silent=True) or {}
+    try:
+        wid = int(data.get("watch_id") or 0)
+    except Exception:
+        return jsonify({"ok": False, "error": "bad-id"}), 400
+    body = (data.get("body") or "").strip()
+    if len(body) < 4:
+        return jsonify({"ok": False, "error": "Write the message first."}), 400
+    if len(body) > 480:
+        return jsonify({"ok": False, "error": f"Too long: {len(body)} characters. Keep it under 480."}), 400
+    if "http://" in body.lower() or "https://" in body.lower() or "www." in body.lower():
+        return jsonify({"ok": False,
+                        "error": "Links get filtered by carriers. Say it in words instead."}), 400
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT phone, met_user_id, status FROM watch_orders WHERE id = %s""", (wid,))
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "not-found"}), 404
+    if row.get("met_user_id") != user["id"] and "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "That Watch belongs to another Meteorologist."}), 403
+
+    signature = f" - {(user.get('name') or 'your Meteorologist')}, WeatherValet"
+    full = body + signature
+    ok = False
+    try:
+        ok = bool(send_sms(row["phone"], full))
+    except Exception as e:
+        print(f"[watch] message send failed: {e!r}", flush=True)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO watch_messages (watch_id, met_user_id, body, sent_ok, created_at)
+                           VALUES (%s,%s,%s,%s,%s)""",
+                        (wid, user["id"], full, ok, int(time.time() * 1000)))
+            if ok:
+                cur.execute("UPDATE watch_orders SET status = 'active', updated_at = %s WHERE id = %s",
+                            (int(time.time() * 1000), wid))
+    if not ok:
+        return jsonify({"ok": False, "error": "The carrier rejected that message. Try again."}), 502
+    return jsonify({"ok": True})
+
+
+@app.get("/watch")
+def watch_page():
+    return _WATCH_PAGE
+
+
+@app.get("/watch/booked")
+def watch_booked_page():
+    return """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Your Watch is booked</title><style>
+body{font-family:Inter,Arial,sans-serif;background:#171C25;color:#fff;display:flex;
+align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:center;padding:20px}
+.b{max-width:460px}h1{font-size:26px}p{color:#CDC6BB;line-height:1.6}
+</style></head><body><div class=b><div style="font-size:44px">&#9889;</div>
+<h1>Your Watch is booked.</h1>
+<p>Payment received. You'll get a text shortly confirming the day, the window, and the
+place. Your Meteorologist sends the outlook the evening before.</p></div></body></html>"""
+
+
+@app.post("/api/v1/watch/checkout")
+def watch_checkout():
+    """Buy one Meteorologist-watched event window."""
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()[:120]
+    email = (data.get("email") or "").strip()[:200]
+    phone = _normalize_phone((data.get("phone") or "").strip())
+    place = (data.get("place") or "").strip()[:300]
+    what = (data.get("what") or "").strip()[:400]
+    event_date = (data.get("event_date") or "").strip()[:10]
+    try:
+        start_hour = int(data.get("start_hour"))
+        end_hour = int(data.get("end_hour"))
+    except Exception:
+        return jsonify({"ok": False, "error": "Pick a start and end time."}), 400
+
+    if not email or not is_valid_email(email):
+        return jsonify({"ok": False, "error": "Enter a valid email."}), 400
+    if not phone:
+        return jsonify({"ok": False, "error": "Enter a valid mobile number."}), 400
+    if len(place) < 8:
+        return jsonify({"ok": False, "error": "Enter the full address or venue of your event."}), 400
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", event_date):
+        return jsonify({"ok": False, "error": "Pick the date of your event."}), 400
+    if not (0 <= start_hour <= 23) or not (1 <= end_hour <= 24) or end_hour <= start_hour:
+        return jsonify({"ok": False, "error": "The end time has to be after the start time."}), 400
+    if not bool(data.get("consent")):
+        return jsonify({"ok": False,
+                        "error": "Please check the box agreeing to receive Watch text messages."}), 400
+
+    # A Meteorologist has to be able to prepare. Same-day and past-day
+    # bookings are refused rather than sold and then apologised for.
+    try:
+        d = datetime.strptime(event_date, "%Y-%m-%d").date()
+    except Exception:
+        return jsonify({"ok": False, "error": "Pick the date of your event."}), 400
+    if d <= datetime.now(timezone.utc).date():
+        return jsonify({"ok": False,
+                        "error": "Watch has to be booked at least a day ahead so a Meteorologist can prepare."}), 400
+
+    geo = None
+    try:
+        geo = _geocode_address(place)
+    except Exception as e:
+        print(f"[watch] geocode error: {e!r}", flush=True)
+    if not geo or geo.get("lat") is None:
+        return jsonify({"ok": False,
+                        "error": "We couldn't pin that location. Add city and state, e.g. '123 Main St, Lebanon, IN'."}), 400
+
+    consent_ip = ((request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+                   or request.remote_addr or "")[:64])
+    consent_ua = (request.headers.get("User-Agent", "") or "")[:300]
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO watch_orders
+                     (name, email, phone, place, lat, lng, tz_name, event_date,
+                      start_hour, end_hour, what, amount_cents,
+                      consent_at, consent_ip, consent_version, consent_user_agent,
+                      created_at, updated_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   RETURNING id""",
+                (name, email, phone, place, geo["lat"], geo["lng"],
+                 _tz_for_point(geo["lat"], geo["lng"]), event_date,
+                 start_hour, end_hour, what, WATCH_CENTS,
+                 now_ms, consent_ip, WATCH_TERMS_VERSION, consent_ua, now_ms, now_ms))
+            watch_id = cur.fetchone()["id"]
+
+    if not stripe:
+        return jsonify({"ok": False, "error": "Payments aren't configured yet."}), 503
+    try:
+        session = stripe.checkout.Session.create(
+            mode="payment",
+            line_items=[{
+                "quantity": 1,
+                "price_data": {
+                    "currency": "usd",
+                    "unit_amount": WATCH_CENTS,
+                    "product_data": {
+                        "name": "WeatherValet Watch - one event day",
+                        "description": f"A Meteorologist watches {place[:80]} on {event_date} and messages you as conditions change."
+                    },
+                },
+            }],
+            customer_email=email,
+            metadata={"wv_product": "watch", "watch_id": str(watch_id)},
+            success_url=f"{PUBLIC_BASE_URL}/watch/booked",
+            cancel_url=f"{PUBLIC_BASE_URL}/watch",
+        )
+    except Exception as e:
+        print(f"[watch] stripe error: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "Payment setup failed. Try again in a moment."}), 502
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE watch_orders SET stripe_session_id = %s, updated_at = %s WHERE id = %s",
+                        (session.id, now_ms, watch_id))
+    return jsonify({"ok": True, "url": session.url})
+
+
+def _activate_watch(watch_id: int) -> None:
+    """Webhook target: mark paid, confirm to the buyer, page the Met team."""
+    try:
+        wid = int(watch_id)
+    except Exception:
+        return
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE watch_orders SET status = 'paid', updated_at = %s
+                   WHERE id = %s AND status = 'pending'
+                   RETURNING name, phone, email, place, event_date, start_hour, end_hour, what""",
+                (now_ms, wid))
+            row = cur.fetchone()
+    if not row:
+        return
+    first = (row.get("name") or "").split(" ")[0]
+    hello = f"Hi {first}, " if first else ""
+    when = row["event_date"].strftime("%b %d") if hasattr(row["event_date"], "strftime") else str(row["event_date"])
+    window = f"{_watch_hour_label(row['start_hour'])} to {_watch_hour_label(row['end_hour'])}"
+    try:
+        send_sms(row["phone"],
+                 f"{hello}your WeatherValet Watch is booked for {when}, {window}, at "
+                 f"{row['place']}. A Meteorologist will send your outlook the evening "
+                 f"before and stay with your window that day, messaging you here as "
+                 f"conditions change. Reply STOP to cancel messages. - WeatherValet")
+    except Exception as e:
+        print(f"[watch] confirm sms failed: {e!r}", flush=True)
+    try:
+        _send_team_notification(
+            subject=f"Watch booked: {row['place'][:60]} on {when}",
+            html_body=(f"<p><b>WeatherValet Watch booked.</b></p>"
+                       f"<p>{_html_escape(row.get('name') or '')} &middot; {_html_escape(row['place'])}<br>"
+                       f"{when}, {window}<br>{_html_escape(row.get('what') or '')}</p>"
+                       f"<p>Claim it in the Watch console.</p>"),
+            text_body=f"Watch booked: {row['place']} on {when}, {window}")
+    except Exception:
+        pass
+
+
+def _watch_hour_label(h) -> str:
+    try:
+        h = int(h)
+    except Exception:
+        return ""
+    if h == 0:
+        return "midnight"
+    if h == 12:
+        return "noon"
+    if h == 24:
+        return "midnight"
+    return f"{h if h <= 12 else h - 12} {'AM' if h < 12 else 'PM'}"
+
+
+@app.get("/stormline/manage/<token>")
+def stormline_manage_page(token: str):
+    """Self-serve settings, reached by a link in their texts. No password,
+    because the whole promise of this tier is that there is nothing to log
+    into. The token is the key: long, random, and per subscriber."""
+    tok = (token or "").strip()[:64]
+    if not tok:
+        return "<h1>That link is not valid.</h1>", 404
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id, name, address, label, daily, send_hour, status
+                           FROM sentry_subscribers
+                           WHERE manage_token = %s ORDER BY id""", (tok,))
+            rows = cur.fetchall() or []
+    if not rows:
+        return ("<h1>That link is not valid.</h1><p>Email hello@weathervalet.ai "
+                "and we will sort it out.</p>"), 404
+    r = rows[0]
+    cur_hour = int(r.get("send_hour") or 7)
+    hours = "".join(
+        "<option value=\"%d\"%s>%d:00 AM</option>" % (h, (" selected" if h == cur_hour else ""), h)
+        for h in range(4, 12))
+    addresses = "".join(
+        "<li>%s%s%s</li>" % (
+            _html_escape(x.get("label") or ""),
+            " &middot; " if x.get("label") else "",
+            _html_escape(x.get("address") or ""))
+        for x in rows)
+    first = ((r.get("name") or "").strip().split(" ") or [""])[0] or "Hello"
+    saved_note = ""
+    if request.args.get("saved"):
+        saved_note = "<div class=ok>Saved. Your next morning message uses the new time.</div>"
+
+    daily_block = ""
+    if any(x.get("daily") for x in rows):
+        daily_block = (
+            "<div class=card><h2>Morning message time</h2>"
+            "<form method=post action=\"/stormline/manage/" + _html_escape(tok) + "\">"
+            "<label for=h>Send my morning summary at</label>"
+            "<select id=h name=send_hour>" + hours + "</select>"
+            "<button type=submit>Save this time</button></form>"
+            "<p class=fine>Times are local to the address we watch. The summary is an "
+            "automated reformat of the National Weather Service forecast, not written "
+            "by a Meteorologist.</p></div>")
+
+    return (_STORMLINE_MANAGE_HEAD
+            + "<h1>Your Stormline</h1>"
+            + "<p class=sub>" + _html_escape(first) + ", everything on this account.</p>"
+            + saved_note
+            + "<div class=card><h2>Addresses being watched</h2><ul>" + addresses + "</ul></div>"
+            + daily_block
+            + "<div class=card><h2>Anything else</h2><p class=fine>To change a phone "
+              "number, add an address, or cancel, email "
+              "<a href=\"mailto:hello@weathervalet.ai\">hello@weathervalet.ai</a> and we "
+              "handle it the same day. Reply STOP to any message to stop texts "
+              "immediately.</p></div>"
+            + "</div></body></html>")
+
+
+@app.post("/stormline/manage/<token>")
+def stormline_manage_save(token: str):
+    tok = (token or "").strip()[:64]
+    try:
+        hour = int(request.form.get("send_hour") or 7)
+    except Exception:
+        hour = 7
+    if hour < 4 or hour > 11:
+        hour = 7
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE sentry_subscribers SET send_hour = %s, updated_at = %s
+                           WHERE manage_token = %s""",
+                        (hour, int(time.time() * 1000), tok))
+    return redirect("/stormline/manage/" + tok + "?saved=1", code=303)
+
+
+@app.get("/stormline")
 @app.get("/sentry")
 def sentry_page():
-    """The Sentry marketing + signup page."""
+    """The Stormline marketing + signup page."""
     return _SENTRY_PAGE
 
 
@@ -13801,6 +14686,64 @@ def _sentry_checkout_preflight():
     return ("", 204)
 
 
+def _sentry_line_items(address_count: int, pack_allseason: bool, daily: bool = False) -> list:
+    """One Stripe line per thing bought, so the customer's receipt reads like
+    an itemized bill instead of a lump sum they have to trust."""
+    items = [{
+        "quantity": 1,
+        "price_data": {
+            "currency": "usd",
+            "unit_amount": SENTRY_PRICE_CENTS,
+            "recurring": {"interval": "year"},
+            "product_data": {
+                "name": f"{SENTRY_NAME} - storm alerts for one address",
+                "description": "Warning texts with radar map, tornado voice call, all-clear. Official NWS warnings for your exact address."
+            },
+        },
+    }]
+    extra = max(0, int(address_count) - 1)
+    if extra:
+        items.append({
+            "quantity": extra,
+            "price_data": {
+                "currency": "usd",
+                "unit_amount": SENTRY_EXTRA_ADDRESS_CENTS,
+                "recurring": {"interval": "year"},
+                "product_data": {
+                    "name": f"{SENTRY_NAME} - additional watched address",
+                    "description": "Same warnings, same calls, for another address on the same account."
+                },
+            },
+        })
+    if daily:
+        items.append({
+            "quantity": int(address_count),
+            "price_data": {
+                "currency": "usd",
+                "unit_amount": SENTRY_DAILY_CENTS,
+                "recurring": {"interval": "year"},
+                "product_data": {
+                    "name": f"{SENTRY_NAME} Daily - morning forecast summary",
+                    "description": "An automated morning summary of the National Weather Service forecast for your address, at the hour you choose."
+                },
+            },
+        })
+    if pack_allseason:
+        items.append({
+            "quantity": int(address_count),
+            "price_data": {
+                "currency": "usd",
+                "unit_amount": SENTRY_ALLSEASON_CENTS,
+                "recurring": {"interval": "year"},
+                "product_data": {
+                    "name": f"{SENTRY_NAME} - All-Season pack",
+                    "description": "Adds winter storm, ice, blizzard, frost, freeze, extreme heat, and high wind alerts for your address."
+                },
+            },
+        })
+    return items
+
+
 @app.post("/api/v1/sentry/checkout")
 def sentry_checkout():
     """Validate, geocode the address, park a pending row, and hand the
@@ -13811,48 +14754,73 @@ def sentry_checkout():
     phone = _normalize_phone((data.get("phone") or "").strip())
     phone2 = _normalize_phone((data.get("phone2") or "").strip()) if (data.get("phone2") or "").strip() else ""
     address = (data.get("address") or "").strip()[:300]
+    address2 = (data.get("address2") or "").strip()[:300]
+    label = (data.get("label") or "").strip()[:60]
+    label2 = (data.get("label2") or "").strip()[:60]
+    pack_allseason = bool(data.get("pack_allseason"))
+    daily = bool(data.get("daily"))
+    try:
+        send_hour = int(data.get("send_hour") or 7)
+    except Exception:
+        send_hour = 7
+    if send_hour < 4 or send_hour > 11:
+        send_hour = 7
     if not email or not is_valid_email(email):
         return jsonify({"ok": False, "error": "Enter a valid email."}), 400
     if not phone:
         return jsonify({"ok": False, "error": "Enter a valid mobile number."}), 400
     if len(address) < 8:
         return jsonify({"ok": False, "error": "Enter the full street address to watch."}), 400
-    geo = None
-    try:
-        geo = _geocode_address(address)
-    except Exception as e:
-        print(f"[sentry] geocode error: {e!r}", flush=True)
-    if not geo or geo.get("lat") is None:
-        return jsonify({"ok": False, "error": "We couldn't pin that address. Add city and state, e.g. '123 Main St, Lebanon, IN'."}), 400
+    if address2 and len(address2) < 8:
+        return jsonify({"ok": False, "error": "The second address needs a full street address, or leave it blank."}), 400
+
+    # Geocode every address up front. A second address that cannot be pinned
+    # must fail the whole checkout, not silently vanish after payment.
+    wanted = [(address, label)] + ([(address2, label2)] if address2 else [])
+    pinned = []
+    for addr, lbl in wanted:
+        geo = None
+        try:
+            geo = _geocode_address(addr)
+        except Exception as e:
+            print(f"[sentry] geocode error: {e!r}", flush=True)
+        if not geo or geo.get("lat") is None:
+            which = "that address" if len(wanted) == 1 else f"'{addr[:40]}'"
+            return jsonify({"ok": False,
+                            "error": f"We couldn't pin {which}. Add city and state, e.g. '123 Main St, Lebanon, IN'."}), 400
+        pinned.append((addr, lbl, geo["lat"], geo["lng"]))
+
     now_ms = int(time.time() * 1000)
+    sentry_ids = []
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO sentry_subscribers
-                     (email, phone, phone2, name, address, lat, lng, status, created_at, updated_at)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s) RETURNING id""",
-                (email, phone, phone2, name, address, geo["lat"], geo["lng"], now_ms, now_ms))
-            sentry_id = cur.fetchone()["id"]
+            for addr, lbl, lat, lng in pinned:
+                cur.execute(
+                    """INSERT INTO sentry_subscribers
+                         (email, phone, phone2, name, address, label, lat, lng,
+                          pack_allseason, daily, send_hour, tz_name, manage_token,
+                          status, created_at, updated_at)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s) RETURNING id""",
+                    (email, phone, phone2, name, addr, (lbl or None), lat, lng,
+                     pack_allseason, daily, send_hour, _tz_for_point(lat, lng),
+                     secrets.token_urlsafe(12), now_ms, now_ms))
+                sentry_ids.append(cur.fetchone()["id"])
+            # Rows bought together share the first row's id as the group.
+            cur.execute("UPDATE sentry_subscribers SET group_id = %s WHERE id = ANY(%s)",
+                        (sentry_ids[0], sentry_ids))
+    sentry_id = sentry_ids[0]
     if not stripe:
         return jsonify({"ok": False, "error": "Payments aren't configured yet."}), 503
     try:
         session = stripe.checkout.Session.create(
             mode="subscription",
-            line_items=[{
-                "quantity": 1,
-                "price_data": {
-                    "currency": "usd",
-                    "unit_amount": SENTRY_PRICE_CENTS,
-                    "recurring": {"interval": "year"},
-                    "product_data": {
-                        "name": f"{SENTRY_NAME} - storm alerts for one address",
-                        "description": "Warning texts with radar map, tornado voice call, all-clear. Official NWS warnings for your exact address."
-                    },
-                },
-            }],
+            line_items=_sentry_line_items(len(pinned), pack_allseason, daily),
             customer_email=email,
-            metadata={"wv_product": "sentry", "sentry_id": str(sentry_id)},
-            subscription_data={"metadata": {"wv_product": "sentry", "sentry_id": str(sentry_id)}},
+            metadata={"wv_product": "sentry", "sentry_id": str(sentry_id),
+                      "sentry_ids": ",".join(str(i) for i in sentry_ids)},
+            subscription_data={"metadata": {"wv_product": "sentry",
+                                            "sentry_id": str(sentry_id),
+                                            "sentry_ids": ",".join(str(i) for i in sentry_ids)}},
             success_url=f"{PUBLIC_BASE_URL}/sentry/welcome?sid={sentry_id}",
             cancel_url=f"{PUBLIC_BASE_URL}/sentry",
         )
@@ -13861,54 +14829,101 @@ def sentry_checkout():
         return jsonify({"ok": False, "error": "Checkout couldn't start. Try again in a minute."}), 502
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE sentry_subscribers SET stripe_session_id = %s, updated_at = %s WHERE id = %s",
-                        (session.id, now_ms, sentry_id))
+            cur.execute("UPDATE sentry_subscribers SET stripe_session_id = %s, updated_at = %s WHERE id = ANY(%s)",
+                        (session.id, now_ms, sentry_ids))
     return jsonify({"ok": True, "url": session.url})
 
 
 @app.get("/sentry/welcome")
 def sentry_welcome_page():
     return """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Sentry is standing guard</title><style>body{font-family:Inter,Arial,sans-serif;background:#0A1422;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:center;padding:20px}
+<title>Your Stormline is up</title><style>body{font-family:Inter,Arial,sans-serif;background:#0A1422;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:center;padding:20px}
 .b{max-width:440px}h1{font-size:26px}p{color:#B9C7DC;line-height:1.6}</style></head>
-<body><div class=b><div style="font-size:44px">&#9889;</div><h1>Your Sentry is standing guard.</h1>
+<body><div class=b><div style="font-size:44px">&#9889;</div><h1>Your Stormline is up.</h1>
 <p>Payment received. You'll get a welcome text shortly confirming the address we're watching.
 From now on, if the National Weather Service puts your address inside a warning, you'll know.</p></div></body></html>"""
 
 
 def _activate_sentry(sentry_id: int, stripe_customer_id: str) -> None:
-    """Webhook target: flip pending -> active, welcome the subscriber."""
+    """Kept for older callers. One id, one activation."""
+    _activate_sentry_group([sentry_id], stripe_customer_id)
+
+
+def _activate_sentry_group(sentry_ids, stripe_customer_id: str) -> None:
+    """Webhook target: flip every address in the purchase to active and send
+    ONE welcome text covering all of them. Two addresses must not mean two
+    welcome texts to the same phone."""
+    ids = []
+    for raw in (sentry_ids or []):
+        try:
+            n = int(str(raw).strip())
+        except Exception:
+            continue
+        if n > 0 and n not in ids:
+            ids.append(n)
+    if not ids:
+        return
     now_ms = int(time.time() * 1000)
+    rows = []
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """UPDATE sentry_subscribers
-                   SET status = 'active', stripe_customer_id = %s, updated_at = %s
-                   WHERE id = %s AND status != 'active'
-                   RETURNING phone, address, name""",
-                (stripe_customer_id or "", now_ms, sentry_id))
-            row = cur.fetchone()
-    if not row:
-        print(f"[sentry] activate: id {sentry_id} not found or already active", flush=True)
+            for sid in ids:
+                cur.execute(
+                    """UPDATE sentry_subscribers
+                       SET status = 'active', stripe_customer_id = %s, updated_at = %s
+                       WHERE id = %s AND status != 'active'
+                       RETURNING phone, address, label, name, pack_allseason, daily""",
+                    (stripe_customer_id or "", now_ms, sid))
+                r = cur.fetchone()
+                if r:
+                    rows.append(r)
+    if not rows:
+        print(f"[sentry] activate: {ids} not found or already active", flush=True)
         return
+    row = rows[0]
     first = (row.get("name") or "").split(" ")[0]
     hello = f"Hi {first}, " if first else ""
+    manage = ""
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT manage_token FROM sentry_subscribers WHERE id = %s", (ids[0],))
+                mrow = cur.fetchone()
+        if mrow and mrow.get("manage_token"):
+            manage = f" Manage your settings any time: {PUBLIC_BASE_URL}/stormline/manage/{mrow['manage_token']}"
+    except Exception as e:
+        print(f"[stormline] manage link lookup failed: {e!r}", flush=True)
+    if len(rows) == 1:
+        where = f"at {row['address']}"
+    else:
+        named = []
+        for r in rows:
+            named.append(f"{r['label']} ({r['address']})" if r.get("label") else r["address"])
+        where = "at " + " and ".join([", ".join(named[:-1]), named[-1]]) if len(named) > 2 \
+            else "at " + " and ".join(named)
+    pack_bit = ""
+    if any(r.get("daily") for r in rows):
+        pack_bit += (" Your morning summary of the National Weather Service forecast "
+                     "starts tomorrow.")
+    if any(r.get("pack_allseason") for r in rows):
+        pack_bit = (" Your All-Season pack is on too, so winter storms, frost and "
+                    "freeze, extreme heat, and high wind alerts come through here as well.")
     try:
         send_sms(row["phone"],
-                 f"{hello}your WeatherValet Sentry is standing guard at {row['address']}. "
-                 f"If the National Weather Service puts this address inside a severe "
+                 f"{hello}your WeatherValet Stormline is up {where}. "
+                 f"If the National Weather Service puts it inside a severe "
                  f"thunderstorm, tornado, or flash flood warning, you'll hear from us "
                  f"here the moment it happens. Tornado warnings also ring your phone "
-                 f"with a voice call. One important step: save this number as "
+                 f"with a voice call.{pack_bit} One important step: save this number as "
                  f"WeatherValet and allow it in Do Not Disturb, so the 2 AM call "
-                 f"always rings. Welcome aboard. - WeatherValet")
+                 f"always rings.{manage} - WeatherValet")
     except Exception as e:
         print(f"[sentry] welcome sms failed: {e!r}", flush=True)
     try:
         _send_team_notification(
-            subject=f"Sentry signup: {row['address']}",
+            subject=f"Stormline signup: {row['address']}",
             html_body=f"<p>New {SENTRY_NAME} subscriber: {_html_escape(row.get('name') or 'name not given')}, {_html_escape(row['address'])}.</p>",
-            text_body=f"New Sentry subscriber: {row.get('name') or ''} {row['address']}")
+            text_body=f"New Stormline subscriber: {row.get('name') or ''} {row['address']}")
     except Exception:
         pass
 
@@ -28099,6 +29114,10 @@ def _brief_scheduler_loop() -> None:
             _process_rain_alerts()
         except Exception as e:
             print(f"[rain-alert] tick failed: {e!r}", flush=True)
+        try:
+            _stormline_daily_pass()
+        except Exception as e:
+            print(f"[stormline-daily] tick failed: {e!r}", flush=True)
 
         try:
             _dedupe_primary_locations_once()
@@ -29997,6 +31016,159 @@ def _severe_fallback_pages() -> list:
 _COUNTY_BACKFILL_LAST_RUN = {"ts": 0.0}
 
 
+def _tz_for_point(lat: float, lng: float) -> str:
+    """IANA timezone for a coordinate, so a 7 AM send means 7 AM where the
+    subscriber lives. Falls back to Indiana rather than UTC, because a UTC
+    fallback would wake somebody at 2 AM."""
+    try:
+        req = urllib.request.Request(
+            f"https://api.weather.gov/points/{lat:.4f},{lng:.4f}",
+            headers={"User-Agent": "WeatherValet/1.0 (+https://weathervalet.ai)",
+                     "Accept": "application/geo+json"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            props = (json.loads(resp.read().decode("utf-8")).get("properties") or {})
+        return (props.get("timeZone") or "").strip() or "America/Indiana/Indianapolis"
+    except Exception as e:
+        print(f"[stormline] tz lookup failed {lat},{lng}: {e!r}", flush=True)
+        return "America/Indiana/Indianapolis"
+
+
+def _nws_point_forecast(lat: float, lng: float) -> dict:
+    """Today's forecast for one point, straight from the NWS.
+
+    NWS content is public domain and NOAA encourages commercial use. The two
+    things we must not do are claim it as our own or let it look like an
+    official government message, so every field here is passed through
+    unaltered and the message that uses it is labeled automated.
+    Returns {} on any failure; callers must treat that as 'send nothing'.
+    """
+    ua = {"User-Agent": "WeatherValet/1.0 (+https://weathervalet.ai)",
+          "Accept": "application/geo+json"}
+    try:
+        req = urllib.request.Request(
+            f"https://api.weather.gov/points/{lat:.4f},{lng:.4f}", headers=ua)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            props = (json.loads(resp.read().decode("utf-8")).get("properties") or {})
+        furl = props.get("forecast")
+        tz = props.get("timeZone")
+        if not furl:
+            return {}
+        req2 = urllib.request.Request(furl, headers=ua)
+        with urllib.request.urlopen(req2, timeout=10) as resp:
+            periods = ((json.loads(resp.read().decode("utf-8")).get("properties") or {})
+                       .get("periods") or [])
+        if not periods:
+            return {}
+        day = periods[0]
+        nxt = periods[1] if len(periods) > 1 else {}
+        return {
+            "tz": tz,
+            "name": (day.get("name") or "").strip(),
+            "detailed": (day.get("detailedForecast") or "").strip(),
+            "short": (day.get("shortForecast") or "").strip(),
+            "temp": day.get("temperature"),
+            "temp_unit": day.get("temperatureUnit") or "F",
+            "is_daytime": bool(day.get("isDaytime")),
+            "wind": (day.get("windSpeed") or "").strip(),
+            "wind_dir": (day.get("windDirection") or "").strip(),
+            "precip": ((day.get("probabilityOfPrecipitation") or {}).get("value")),
+            "next_name": (nxt.get("name") or "").strip(),
+            "next_temp": nxt.get("temperature"),
+            "next_short": (nxt.get("shortForecast") or "").strip(),
+        }
+    except Exception as e:
+        print(f"[stormline-daily] forecast fetch failed {lat},{lng}: {e!r}", flush=True)
+        return {}
+
+
+def _stormline_daily_body(fc: dict, where: str) -> str:
+    """Build the morning message. Reformatted NWS wording, never rewritten,
+    always labeled so nobody mistakes it for a Meteorologist or for an
+    official government product."""
+    if not fc:
+        return ""
+    bits = []
+    if fc.get("short"):
+        bits.append(fc["short"] + ".")
+    if fc.get("temp") is not None:
+        word = "High" if fc.get("is_daytime") else "Low"
+        bits.append(f"{word} {fc['temp']}{fc.get('temp_unit') or 'F'}.")
+    p = fc.get("precip")
+    if isinstance(p, int) and p >= 20:
+        bits.append(f"{p}% chance of precipitation.")
+    if fc.get("wind"):
+        bits.append(f"Wind {fc.get('wind_dir') or ''} {fc['wind']}".strip() + ".")
+    if fc.get("next_name") and fc.get("next_temp") is not None:
+        bits.append(f"{fc['next_name']}: {fc.get('next_short') or ''} "
+                    f"{fc['next_temp']}{fc.get('temp_unit') or 'F'}.".replace("  ", " "))
+    line = " ".join(bits).strip()
+    if not line:
+        return ""
+    head = f"WeatherValet Stormline Daily for {where}:"
+    tail = ("Automated summary of the National Weather Service forecast. "
+            "Not written by a Meteorologist.")
+    return f"{head} {line} {tail}"
+
+
+def _stormline_daily_pass() -> int:
+    """Each tick: send the morning message to any Daily subscriber whose
+    chosen local hour has arrived and who has not been sent one today."""
+    sent = 0
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT id, phone, phone2, address, label, lat, lng,
+                                      send_hour, tz_name, last_daily_ymd
+                               FROM sentry_subscribers
+                               WHERE status = 'active' AND daily = TRUE
+                                 AND lat IS NOT NULL
+                               LIMIT 500""")
+                rows = cur.fetchall() or []
+    except Exception as e:
+        print(f"[stormline-daily] subscriber query failed: {e!r}", flush=True)
+        return 0
+
+    for r in rows:
+        try:
+            tzname = r.get("tz_name") or "America/Indiana/Indianapolis"
+            try:
+                now_local = datetime.now(ZoneInfo(tzname))
+            except Exception:
+                now_local = datetime.now(ZoneInfo("America/Indiana/Indianapolis"))
+            ymd = now_local.strftime("%Y-%m-%d")
+            if r.get("last_daily_ymd") == ymd:
+                continue
+            if now_local.hour < int(r.get("send_hour") or 7):
+                continue
+            fc = _nws_point_forecast(float(r["lat"]), float(r["lng"]))
+            where = r.get("label") or (r.get("address") or "").split(",")[0]
+            body = _stormline_daily_body(fc, where)
+            if not body:
+                # No forecast means no message. Never invent one.
+                continue
+            ok = False
+            for tphone in [r["phone"]] + ([r["phone2"]] if r.get("phone2") else []):
+                if send_sms(tphone, body):
+                    ok = True
+            if ok:
+                sent += 1
+            # Only mark the day done when it actually went out, so a transient
+            # carrier failure at 7:00 gets retried on the next tick instead of
+            # costing the subscriber their whole morning. After a two hour
+            # window we give up, so a permanently bad number cannot loop.
+            gave_up = now_local.hour >= int(r.get("send_hour") or 7) + 2
+            if ok or gave_up:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE sentry_subscribers SET last_daily_ymd = %s WHERE id = %s",
+                                    (ymd, r["id"]))
+        except Exception as e:
+            print(f"[stormline-daily] send failed for {r.get('id')}: {e!r}", flush=True)
+    if sent:
+        print(f"[stormline-daily] sent {sent}", flush=True)
+    return sent
+
+
 def _nws_county_state(lat: float, lng: float):
     """(county_name, state) for a point, from the NWS points API. Two
     requests: /points gives the county-zone URL, the zone gives its name
@@ -30406,10 +31578,30 @@ def _warning_map_for_alert(alert: dict):
 
 
 _SENTRY_EVENTS = ("Tornado Warning", "Severe Thunderstorm Warning", "Flash Flood Warning")
+
+# All-Season pack (Aug 18, 2026). Deliberately warnings plus the two frost
+# headlines gardeners actually act on. Advisories that fire dozens of times a
+# season were left out: a pack that cries wolf gets the whole service muted.
+_SENTRY_PACK_EVENTS = (
+    "Winter Storm Warning", "Ice Storm Warning", "Blizzard Warning",
+    "Freeze Warning", "Hard Freeze Warning", "Frost Advisory",
+    "Extreme Heat Warning", "Excessive Heat Warning", "High Wind Warning",
+)
+_SENTRY_ALL_EVENTS = _SENTRY_EVENTS + _SENTRY_PACK_EVENTS
+
 _SENTRY_SAFETY = {
     "Tornado Warning": "Take shelter now: interior room, lowest floor, away from windows.",
     "Severe Thunderstorm Warning": "Damaging wind and hail possible. Move indoors, away from windows.",
     "Flash Flood Warning": "Never walk or drive through floodwater. Move to higher ground if water rises.",
+    "Winter Storm Warning": "Travel will be difficult. Keep a charged phone and warm layers in the car.",
+    "Ice Storm Warning": "Ice brings down limbs and power lines. Avoid travel and expect outages.",
+    "Blizzard Warning": "Blowing snow will cut visibility to near zero. Do not travel.",
+    "Freeze Warning": "Cover or bring in tender plants and protect outdoor pipes and spigots.",
+    "Hard Freeze Warning": "A hard freeze kills unprotected plants. Bring in what you can and drain hoses.",
+    "Frost Advisory": "Frost is likely tonight. Cover tender plants or move pots under shelter.",
+    "Extreme Heat Warning": "Limit outdoor work, drink water early, and check on older neighbors.",
+    "Excessive Heat Warning": "Limit outdoor work, drink water early, and check on older neighbors.",
+    "High Wind Warning": "Secure trash cans, patio furniture, and anything that can become a projectile.",
 }
 
 
@@ -30420,8 +31612,9 @@ def _sentry_relay_warning(alert: dict) -> int:
     each tick, so the warning-map ledger is already populated. Official
     NWS relay language only; no machine-written forecast prose."""
     event = alert.get("event") or ""
-    if event not in _SENTRY_EVENTS:
+    if event not in _SENTRY_ALL_EVENTS:
         return 0
+    pack_only = event in _SENTRY_PACK_EVENTS
     geom = alert.get("geometry")
     if not geom:
         return 0
@@ -30429,9 +31622,14 @@ def _sentry_relay_warning(alert: dict) -> int:
     now_ms = int(time.time() * 1000)
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute("""SELECT id, phone, phone2, address, lat, lng, tornado_call
-                           FROM sentry_subscribers WHERE status = 'active'
-                           AND lat IS NOT NULL""")
+            if pack_only:
+                cur.execute("""SELECT id, phone, phone2, address, label, lat, lng, tornado_call
+                               FROM sentry_subscribers WHERE status = 'active'
+                               AND lat IS NOT NULL AND pack_allseason = TRUE""")
+            else:
+                cur.execute("""SELECT id, phone, phone2, address, label, lat, lng, tornado_call
+                               FROM sentry_subscribers WHERE status = 'active'
+                               AND lat IS NOT NULL""")
             subs = cur.fetchall()
     if not subs:
         return 0
@@ -30468,10 +31666,14 @@ def _sentry_relay_warning(alert: dict) -> int:
             if not claimed:
                 continue
             until = _relay_local_time(alert.get("expires_at"), None)
-            body = f"WeatherValet Sentry: A {event} includes your address ({sub['address']})"
+            where = sub.get("label") or sub["address"]
+            body = f"WeatherValet Stormline: A {event} includes your address ({where})"
             body += f" until {until}." if until else "."
             body += " " + _SENTRY_SAFETY.get(event, "")
-            body += " We'll text the all-clear."
+            # All-clear only follows the storm warnings. Nobody needs a 3 AM
+            # text saying the freeze warning ended.
+            if not pack_only:
+                body += " We'll text the all-clear."
             targets = [sub["phone"]] + ([sub["phone2"]] if sub.get("phone2") else [])
             delivered = False
             for tphone in targets:
@@ -30484,7 +31686,7 @@ def _sentry_relay_warning(alert: dict) -> int:
                     try:
                         place_voice_call(
                             tphone,
-                            f"This is WeatherValet Sentry. A tornado warning includes your "
+                            f"This is WeatherValet Stormline. A tornado warning includes your "
                             f"address{(' until ' + until) if until else ''}. Take shelter now "
                             f"in an interior room on the lowest floor, away from windows.")
                     except Exception as e:
@@ -30510,14 +31712,15 @@ def _sentry_allclear_pass() -> int:
                        WHERE l.allclear_at IS NULL
                          AND l.alert_expires_at IS NOT NULL
                          AND l.alert_expires_at < %s
-                       LIMIT 200""", (now_ms,))
+                         AND l.event = ANY(%s)
+                       LIMIT 200""", (now_ms, list(_SENTRY_EVENTS)))
                 rows = cur.fetchall()
         for r in rows:
             try:
                 ok = False
                 for tphone in [r["phone"]] + ([r["phone2"]] if r.get("phone2") else []):
                     if send_sms(tphone,
-                                f"WeatherValet Sentry: all clear. The {r['event']} that "
+                                f"WeatherValet Stormline: all clear. The {r['event']} that "
                                 f"included your address ({r['address']}) has expired."):
                         ok = True
                 with db() as conn:
