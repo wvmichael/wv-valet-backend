@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-131"
+BACKEND_BUILD = "0702-132"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -10091,7 +10091,9 @@ def stripe_webhook_v2():
             # the Met Review flow.
             if (session_metadata.get("wv_product") or "") == "gameday":
                 try:
-                    _activate_gameday_pass(int(session_metadata.get("gameday_pass_id") or 0))
+                    _ids = (session_metadata.get("gameday_pass_ids")
+                            or session_metadata.get("gameday_pass_id") or "")
+                    _activate_gameday_passes(str(_ids).split(","))
                 except Exception as e:
                     print(f"[stripe-webhook] gameday activation failed: {e!r}", flush=True)
                 _mark_stripe_event_processed(event_id)
@@ -12579,6 +12581,11 @@ h1 .pop{color:var(--bolt)}
 .t-head .tt{font-family:'Bebas Neue';font-size:33px;letter-spacing:.05em}
 .t-head .pr{font-family:'Bebas Neue';font-size:33px;color:var(--crim)}
 .t-sub{font-size:14px;color:#5B4A4E;margin:-8px 0 14px;letter-spacing:.05em;text-transform:uppercase;font-weight:600}
+.gp{display:flex;align-items:center;gap:10px;margin:0 0 7px;font-size:15px;font-weight:600;letter-spacing:0;
+  text-transform:none;color:#3A2A2E;cursor:pointer}
+.gp:last-child{margin-bottom:0}
+.gp input{width:auto;margin:0;flex:0 0 auto;transform:scale(1.3);accent-color:#A6192E}
+.gp-h{font-size:12.5px;font-weight:800;letter-spacing:.07em;text-transform:uppercase;color:#6E5A5F;margin:0 0 8px}
 label{display:block;font-size:12.5px;font-weight:800;letter-spacing:.07em;text-transform:uppercase;color:#6E5A5F;margin:12px 0 4px}
 input{width:100%;padding:13px;border:1.5px solid rgba(27,20,22,.25);border-radius:9px;font-size:17px;background:#FFFDF7;color:var(--ink)}
 input:focus{outline:2px solid var(--crim);outline-offset:1px;border-color:var(--crim)}
@@ -12662,13 +12669,18 @@ button:disabled{opacity:.6}
       <button type=button id=opt-season style="flex:1;margin-top:0;padding:11px;font-size:18px;background:#A6192E;">Season &middot; $16</button>
       <button type=button id=opt-single style="flex:1;margin-top:0;padding:11px;font-size:18px;background:#FFFDF7;color:#7E1322;border:1.5px solid #A6192E;">Next game &middot; $5</button>
     </div>
+    <div id=gamepick style="display:none;margin:10px 0 2px;border:1.5px solid rgba(27,20,22,.22);
+      border-radius:9px;padding:12px 13px;background:#FFFDF7">
+      <div class=gp-h>Pick your game or games &middot; $5 each</div>
+      <!--WV_GAMEPICKER-->
+    </div>
     <div id=err class=err></div>
     <label for=g-name>Name</label><input id=g-name autocomplete=name>
     <label for=g-email>Email</label><input id=g-email type=email autocomplete=email>
     <label for=g-phone>Mobile (where GameDay texts go)</label><input id=g-phone type=tel autocomplete=tel placeholder="812-555-0123">
     <button id=g-go>Claim my season pass</button>
     <div class=fine>Season covers all 8 home games starting with the opener (including the Friday
-    night game); single covers the next home game after you buy. One-time payment via Stripe.
+    night game); single passes cover only the games you check above. One-time payment via Stripe.
     Group of tailgaters? Everyone needs their own pass.</div>
   </div>
 
@@ -12691,6 +12703,12 @@ button:disabled{opacity:.6}
 <script>
 var PASS = { type: 'season' };
 try { PASS.ref = new URLSearchParams(location.search).get('ref') || ''; } catch (e) { PASS.ref = ''; }
+function gpBoxes(){ return Array.prototype.slice.call(document.querySelectorAll('.gpick')); }
+function gpChosen(){
+  var out = [];
+  gpBoxes().forEach(function(b){ if (b.checked) { out.push(parseInt(b.value, 10)); } });
+  return out;
+}
 function setType(t){
   PASS.type = t;
   var s = document.getElementById('opt-season'), g = document.getElementById('opt-single');
@@ -12699,18 +12717,31 @@ function setType(t){
   s.style.border = seasonOn ? 'none' : '1.5px solid #A6192E';
   g.style.background = seasonOn ? '#FFFDF7' : '#A6192E'; g.style.color = seasonOn ? '#7E1322' : '#fff';
   g.style.border = seasonOn ? '1.5px solid #A6192E' : 'none';
-  document.getElementById('t-title').textContent = seasonOn ? 'Season Pass' : 'Single Game';
-  document.getElementById('t-price').textContent = seasonOn ? '$16' : '$5';
+  var pick = document.getElementById('gamepick');
+  if (pick) { pick.style.display = seasonOn ? 'none' : 'block'; }
+  var n = seasonOn ? 0 : gpChosen().length;
+  var shown = n || 1;
+  document.getElementById('t-title').textContent = seasonOn
+    ? 'Season Pass' : (n > 1 ? (n + ' Single Games') : 'Single Game');
+  document.getElementById('t-price').textContent = seasonOn ? '$16' : ('$' + (5 * shown));
   document.getElementById('t-sub').textContent = seasonOn
     ? 'Bloomington \\u00b7 8 home games \\u00b7 one-time'
-    : 'Bloomington \\u00b7 next home game \\u00b7 one-time';
-  document.getElementById('g-go').textContent = seasonOn ? 'Claim my season pass' : 'Cover me for the next game';
+    : ('Bloomington \\u00b7 ' + shown + (shown > 1 ? ' home games' : ' home game') + ' \\u00b7 one-time');
+  document.getElementById('g-go').textContent = seasonOn
+    ? 'Claim my season pass'
+    : (n > 1 ? ('Cover me for these ' + n + ' games') : 'Cover me for this game');
 }
 document.getElementById('opt-season').addEventListener('click', function(){ setType('season'); });
 document.getElementById('opt-single').addEventListener('click', function(){ setType('single'); });
+gpBoxes().forEach(function(b){ b.addEventListener('change', function(){ setType('single'); }); });
 document.getElementById('g-go').addEventListener('click', function(){
   var btn = this; btn.disabled = true; btn.textContent = 'One moment...';
   var err = document.getElementById('err'); err.style.display = 'none';
+  var chosen = (PASS.type === 'single') ? gpChosen() : [];
+  if (PASS.type === 'single' && chosen.length === 0) {
+    err.textContent = 'Pick at least one home game above.';
+    err.style.display = 'block'; btn.disabled = false; setType('single'); return;
+  }
   fetch('/api/v1/gameday/checkout', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
@@ -12718,6 +12749,7 @@ document.getElementById('g-go').addEventListener('click', function(){
       email: document.getElementById('g-email').value,
       phone: document.getElementById('g-phone').value,
       pass_type: PASS.type,
+      game_ids: chosen,
       ref: PASS.ref,
       venue: 'iu'
     })
@@ -12736,7 +12768,7 @@ document.getElementById('g-go').addEventListener('click', function(){
 
 @app.get("/gameday/iu")
 def gameday_iu_page():
-    return _GAMEDAY_IU_PAGE
+    return _GAMEDAY_IU_PAGE.replace("<!--WV_GAMEPICKER-->", _gameday_picker_html())
 
 
 @app.route("/api/v1/gameday/checkout", methods=["OPTIONS"])
@@ -12751,7 +12783,6 @@ def gameday_checkout():
     email = (data.get("email") or "").strip()[:200]
     phone = _normalize_phone((data.get("phone") or "").strip())
     pass_type = "single" if (data.get("pass_type") or "") == "single" else "season"
-    amount = GAMEDAY_SINGLE_CENTS if pass_type == "single" else GAMEDAY_SEASON_CENTS
     ref_code = (data.get("ref") or "").strip().lower()[:40] or None
     if ref_code and not re.fullmatch(r"[a-z0-9_-]+", ref_code):
         ref_code = None
@@ -12759,35 +12790,72 @@ def gameday_checkout():
         return jsonify({"ok": False, "error": "Enter a valid email."}), 400
     if not phone:
         return jsonify({"ok": False, "error": "Enter a valid mobile number."}), 400
+
+    # Single-game buyers pick which games they want (Aug 17, 2026). Anything
+    # the buyer sends is checked against the real remaining schedule; an empty
+    # list falls back to the next home game, which is the old behavior.
+    game_rows = []
+    if pass_type == "single":
+        wanted = []
+        raw = data.get("game_ids")
+        if isinstance(raw, list):
+            for gid in raw[:8]:
+                try:
+                    n = int(gid)
+                except Exception:
+                    continue
+                if n > 0 and n not in wanted:
+                    wanted.append(n)
+        upcoming = _gameday_upcoming_games()
+        if wanted:
+            game_rows = [g for g in upcoming if int(g["id"]) in wanted]
+        elif upcoming:
+            game_rows = [upcoming[0]]
+        if not game_rows:
+            return jsonify({"ok": False, "error": "Pick at least one home game."}), 400
+
+    unit_amount = GAMEDAY_SINGLE_CENTS if pass_type == "single" else GAMEDAY_SEASON_CENTS
+    quantity = len(game_rows) if pass_type == "single" else 1
     now_ms = int(time.time() * 1000)
+    pass_ids = []
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO gameday_passes
-                     (venue, name, email, phone, pass_type, amount_cents, ref_code, game_id, created_at, updated_at)
-                   VALUES ('iu',%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
-                (name, email, phone, pass_type, amount, ref_code,
-                 (_next_gameday_game_id() if pass_type == "single" else None),
-                 now_ms, now_ms))
-            pass_id = cur.fetchone()["id"]
+            for game_id in ([int(g["id"]) for g in game_rows] if pass_type == "single" else [None]):
+                cur.execute(
+                    """INSERT INTO gameday_passes
+                         (venue, name, email, phone, pass_type, amount_cents, ref_code, game_id, created_at, updated_at)
+                       VALUES ('iu',%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                    (name, email, phone, pass_type, unit_amount, ref_code, game_id, now_ms, now_ms))
+                pass_ids.append(cur.fetchone()["id"])
+    pass_id = pass_ids[0]
+    if pass_type == "single":
+        picks = ["%s vs %s" % (g.get("d") or "", g.get("opponent") or "") for g in game_rows]
+        line_name = ("GameDay Weather - single home game" if quantity == 1
+                     else "GameDay Weather - %d single home games" % quantity)
+        line_desc = ("; ".join(picks) if quantity <= 4 else "%d home games" % quantity)
+    else:
+        line_name = "GameDay Weather - Bloomington season pass"
+        line_desc = "All 8 home football games"
     if not stripe:
         return jsonify({"ok": False, "error": "Payments aren't configured yet."}), 503
     try:
         session = stripe.checkout.Session.create(
             mode="payment",
             line_items=[{
-                "quantity": 1,
+                "quantity": quantity,
                 "price_data": {
                     "currency": "usd",
-                    "unit_amount": amount,
+                    "unit_amount": unit_amount,
                     "product_data": {
-                        "name": ("GameDay Weather - Bloomington season pass" if pass_type == "season" else "GameDay Weather - single home game"),
-                        "description": (("All 8 home football games" if pass_type == "season" else "The next home game") + ": Meteorologist gameday-morning outlook, live weather alerts during the game window, all-clear. Independent service; not affiliated with Indiana University.")
+                        "name": line_name,
+                        "description": (line_desc + ": Meteorologist gameday-morning outlook, live weather alerts during the game window, all-clear. Independent service; not affiliated with Indiana University.")
                     },
                 },
             }],
             customer_email=email,
-            metadata={"wv_product": "gameday", "gameday_pass_id": str(pass_id)},
+            metadata={"wv_product": "gameday",
+                      "gameday_pass_id": str(pass_id),
+                      "gameday_pass_ids": ",".join(str(i) for i in pass_ids)},
             success_url=f"{PUBLIC_BASE_URL}/gameday/welcome",
             cancel_url=f"{PUBLIC_BASE_URL}/gameday/iu",
         )
@@ -12796,8 +12864,8 @@ def gameday_checkout():
         return jsonify({"ok": False, "error": "Checkout couldn't start. Try again in a minute."}), 502
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE gameday_passes SET stripe_session_id = %s, updated_at = %s WHERE id = %s",
-                        (session.id, now_ms, pass_id))
+            cur.execute("UPDATE gameday_passes SET stripe_session_id = %s, updated_at = %s WHERE id = ANY(%s)",
+                        (session.id, now_ms, pass_ids))
     return jsonify({"ok": True, "url": session.url})
 
 
@@ -12936,6 +13004,42 @@ def _seed_gameday_games() -> None:
         print("[gameday] season seed pass complete", flush=True)
     except Exception as e:
         print(f"[gameday] season seed failed: {e!r}", flush=True)
+
+
+def _gameday_upcoming_games() -> list:
+    """Home games still ahead of us, soonest first. Drives the buyer's
+    game picker and the single-game validation."""
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT id, opponent, kickoff,
+                                      to_char(game_date, 'Mon FMDD') AS d
+                               FROM gameday_games
+                               WHERE venue = 'iu' AND game_date >= CURRENT_DATE
+                               ORDER BY game_date""")
+                return cur.fetchall() or []
+    except Exception as e:
+        print(f"[gameday] upcoming games lookup failed: {e!r}", flush=True)
+        return []
+
+
+def _gameday_picker_html() -> str:
+    """Checkbox list injected into the buy form. First remaining game is
+    pre-checked so the old one-click 'next game' path still works."""
+    games = _gameday_upcoming_games()
+    if not games:
+        return ('<div style="font-size:14.5px;color:#5B4A4E">The home schedule is finished for '
+                'this season. Season passes for next year open in the summer.</div>')
+    out = []
+    for i, g in enumerate(games):
+        out.append(
+            '<label class=gp><input type=checkbox class=gpick value="%d"%s>'
+            '<span>%s &middot; %s <span style="color:#7A6A6E">&middot; %s</span></span></label>'
+            % (int(g["id"]), (" checked" if i == 0 else ""),
+               _html_escape(g.get("d") or ""),
+               _html_escape(g.get("opponent") or ""),
+               _html_escape(g.get("kickoff") or "TBA")))
+    return "".join(out)
 
 
 def _next_gameday_game_id():
@@ -13278,32 +13382,61 @@ def _gameday_monday_reminder_pass() -> int:
 
 
 def _activate_gameday_pass(pass_id: int) -> None:
+    """Kept for older callers. One purchase, one pass."""
+    _activate_gameday_passes([pass_id])
+
+
+def _activate_gameday_passes(pass_ids) -> None:
+    """Activate every pass in one purchase and send exactly ONE welcome
+    text, no matter how many single games the buyer picked."""
+    ids = []
+    for raw in (pass_ids or []):
+        try:
+            n = int(str(raw).strip())
+        except Exception:
+            continue
+        if n > 0 and n not in ids:
+            ids.append(n)
+    if not ids:
+        return
     now_ms = int(time.time() * 1000)
+    rows = []
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """UPDATE gameday_passes SET status = 'active', updated_at = %s
-                   WHERE id = %s AND status != 'active' RETURNING name, phone, pass_type, game_id""",
-                (now_ms, pass_id))
-            row = cur.fetchone()
-    if not row:
+            for pid in ids:
+                cur.execute(
+                    """UPDATE gameday_passes SET status = 'active', updated_at = %s
+                       WHERE id = %s AND status != 'active' RETURNING name, phone, pass_type, game_id""",
+                    (now_ms, pid))
+                r = cur.fetchone()
+                if r:
+                    rows.append(r)
+    if not rows:
         return
+    row = rows[0]
     first = (row.get("name") or "").split(" ")[0]
     hello = f"{first}, you" if first else "You"
     try:
         if (row.get("pass_type") or "season") == "single":
             game_bit = "the next home game"
-            try:
-                with db() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute("""SELECT g.opponent, to_char(g.game_date, 'Mon FMDD') AS d
-                                       FROM gameday_passes p JOIN gameday_games g ON g.id = p.game_id
-                                       WHERE p.id = %s""", (pass_id,))
-                        gr = cur.fetchone()
-                        if gr:
-                            game_bit = f"Indiana vs {gr['opponent']} on {gr['d']}"
-            except Exception:
-                pass
+            labels = []
+            gids = [r["game_id"] for r in rows if r.get("game_id")]
+            if gids:
+                try:
+                    with db() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute("""SELECT opponent, to_char(game_date, 'Mon FMDD') AS d
+                                           FROM gameday_games WHERE id = ANY(%s)
+                                           ORDER BY game_date""", (gids,))
+                            labels = [f"{g['opponent']} on {g['d']}" for g in (cur.fetchall() or [])]
+                except Exception:
+                    labels = []
+            if len(labels) == 1:
+                game_bit = f"Indiana vs {labels[0]}"
+            elif 2 <= len(labels) <= 3:
+                game_bit = "Indiana vs " + ", and ".join([", ".join(labels[:-1]), labels[-1]])
+            elif len(labels) > 3:
+                game_bit = f"{len(labels)} home games, starting with {labels[0]}"
             body = (f"{hello}'re covered for {game_bit}. The Meteorologist's "
                     f"outlook lands the evening before, the morning brief on game day, "
                     f"and live alerts follow if weather threatens the window. - WeatherValet")
@@ -13316,10 +13449,13 @@ def _activate_gameday_pass(pass_id: int) -> None:
     except Exception as e:
         print(f"[gameday] welcome sms failed: {e!r}", flush=True)
     try:
+        sold = ("season pass" if (row.get("pass_type") or "season") != "single"
+                else ("single game pass" if len(rows) == 1 else f"{len(rows)} single game passes"))
+        who = row.get("name") or "name not given"
         _send_team_notification(
-            subject="GameDay season pass sold",
-            html_body=f"<p>New GameDay Weather season pass: {_html_escape(row.get('name') or 'name not given')}.</p>",
-            text_body=f"New GameDay season pass: {row.get('name') or ''}")
+            subject=f"GameDay {sold} sold",
+            html_body=f"<p>New GameDay Weather {sold}: {_html_escape(who)}.</p>",
+            text_body=f"New GameDay {sold}: {who}")
     except Exception:
         pass
 
