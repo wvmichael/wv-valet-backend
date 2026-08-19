@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-144"
+BACKEND_BUILD = "0702-145"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -13125,7 +13125,7 @@ def gameday_checkout():
             metadata={"wv_product": "gameday",
                       "gameday_pass_id": str(pass_id),
                       "gameday_pass_ids": ",".join(str(i) for i in pass_ids)},
-            success_url=f"{PUBLIC_BASE_URL}/gameday/welcome?s={{CHECKOUT_SESSION_ID}}",
+            success_url=f"{PUBLIC_BASE_URL}/onduty/welcome?s={{CHECKOUT_SESSION_ID}}",
             cancel_url=f"{PUBLIC_BASE_URL}/gameday/iu",
         )
     except Exception as e:
@@ -13138,6 +13138,7 @@ def gameday_checkout():
     return jsonify({"ok": True, "url": session.url})
 
 
+@app.get("/onduty/welcome")
 @app.get("/gameday/welcome")
 def gameday_welcome_page():
     """Confirmation after payment. Says what they actually bought: a series
