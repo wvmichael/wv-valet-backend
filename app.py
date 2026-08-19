@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-147"
+BACKEND_BUILD = "0702-148"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -12828,12 +12828,12 @@ button:disabled{opacity:.6}
   <div class=brand><span class=bolt>&#9889;</span> WeatherValet</div>
   <div class=pname>Sidekick</div>
   <h1>Rain or shine,<br>know before <span class=pop>kickoff.</span></h1>
-  <p class=sub>Your own certified Meteorologist for <b>every Indiana University Football
+  <p class=sub>A certified Meteorologist on your side for <b>every Indiana University Football
   home game</b>. Messaged to you live: tailgate outlook, storm alerts, radar updates, the all-clear.</p>
   <div class=kick>&#127944; Series pass: all 8 home games, $16 &middot; Single game, $5</div>
-  <p class=how>How it works: <b>GameDay forecast the day before</b>, a <b>morning brief</b> on gameday,
-  and <b>live alerts as needed</b> throughout the day. Hopefully we stay ALL CLEAR all day, but if the
-  sky has other plans, our team of certified Meteorologists will text you as it happens.</p>
+  <p class=how>How it works: <b>the Meteorologist's outlook the evening before</b>, a <b>morning brief</b>
+  on game day, and <b>live updates as needed</b> through the day. Hopefully it stays ALL CLEAR, but if the
+  sky has other plans, your Meteorologist messages you as it happens.</p>
 
   <div class=phone-wrap>
     <div class=phone aria-hidden=true>
@@ -12863,7 +12863,7 @@ button:disabled{opacity:.6}
     <div class=f>
       <svg viewBox="0 0 24 24" fill="none" stroke="#FFCE44" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4.4" fill="#FFCE44" stroke="none"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.2 5.2l2.1 2.1M16.7 16.7l2.1 2.1M18.8 5.2l-2.1 2.1M7.3 16.7l-2.1 2.1"/></svg>
       <span>Day-before + morning</span>
-      <small>The GameDay forecast the evening before, the brief that morning</small>
+      <small>The outlook the evening before, the brief that morning</small>
     </div>
     <div class=f>
       <svg viewBox="0 0 24 24" fill="#FFCE44"><path d="M13 2 4.5 13.5h5L10 22l8.5-11.5h-5L13 2z"/></svg>
@@ -12968,7 +12968,7 @@ document.getElementById('g-go').addEventListener('click', function(){
   var err = document.getElementById('err'); err.style.display = 'none';
   var consent = document.getElementById('g-consent');
   if (!consent || !consent.checked) {
-    err.textContent = 'Please check the box agreeing to receive GameDay text messages.';
+    err.textContent = 'Please check the box agreeing to receive Sidekick text messages.';
     err.style.display = 'block'; btn.disabled = false; setType(PASS.type); return;
   }
   var chosen = (PASS.type === 'single') ? gpChosen() : [];
