@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-143"
+BACKEND_BUILD = "0702-144"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -12741,7 +12741,9 @@ body{margin:0;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;backgrou
   repeating-linear-gradient(90deg,rgba(243,234,211,.05) 0 2px,transparent 2px 96px),
   linear-gradient(180deg,#5E0F1C,#7E1322 45%,#3A0910);
   padding:36px 18px 34px;text-align:center}
-.brand{font-weight:800;font-size:19px;color:var(--cream)}
+.brand{font-weight:800;font-size:19px;color:var(--cream);margin-bottom:4px}
+.pname{font-family:"Bebas Neue",Inter,Arial,sans-serif;font-size:clamp(44px,11vw,76px);
+  font-weight:400;letter-spacing:.02em;line-height:.95;margin:0 0 10px;color:var(--cream)}
 .brand .bolt{color:var(--bolt)}
 h1{font-family:'Bebas Neue',Inter,sans-serif;font-weight:400;letter-spacing:.015em;
    font-size:clamp(62px,13vw,128px);line-height:.88;margin:22px 0 8px;color:var(--cream);text-transform:uppercase}
@@ -12819,6 +12821,7 @@ button:disabled{opacity:.6}
 
 <div class=field>
   <div class=brand><span class=bolt>&#9889;</span> WeatherValet</div>
+  <div class=pname>On Duty</div>
   <h1>Rain or shine,<br>know before <span class=pop>kickoff.</span></h1>
   <p class=sub>Real, certified Meteorologists on duty for <b>every Indiana University Football
   home game</b>. Messaged to you live: tailgate outlook, storm alerts, radar updates, the all-clear.</p>
@@ -13804,7 +13807,9 @@ _SENTRY_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 :root{--blue:#1E7FFF;--navy:#0A1422;--ink:#0F1216}
 body{margin:0;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;background:#F6F7FB;color:var(--ink)}
 .hero{background:linear-gradient(160deg,#0A1422,#12233D);color:#fff;padding:44px 20px 36px;text-align:center}
-.hero .brand{font-weight:900;font-size:20px;letter-spacing:-.01em;margin-bottom:18px}
+.hero .brand{font-weight:900;font-size:20px;letter-spacing:-.01em;margin-bottom:6px}
+.hero .pname{font-size:clamp(40px,10vw,68px);font-weight:900;letter-spacing:-.025em;line-height:1;
+  margin:0 0 16px;color:#7EC2FF}
 .hero h1{font-size:clamp(26px,5vw,40px);margin:0 0 10px;line-height:1.15}
 .hero h1 em{color:#F5C31E;font-style:normal}
 .hero p{color:#B9C7DC;max-width:560px;margin:0 auto;font-size:16.5px;line-height:1.55}
@@ -13852,10 +13857,12 @@ button:disabled{opacity:.6}
 </style></head><body>
 <div class=hero>
   <div class=brand>&#9889; WeatherValet</div>
+  <div class=pname>Stormline</div>
   <h1>Who are you going to <em>worry about</em> at 2 AM?</h1>
   <p>Your phone warns you about where you are standing. Stormline watches the address
-  you care about even when you are nowhere near it, and calls the phone of whoever
-  is there. Mom's house. The kids' place. The house you just drove away from.</p>
+  you care about even when you are nowhere near it, and messages the numbers you choose.
+  Put Mom's number on Mom's house. Put yours on the lake place. Two numbers per address,
+  included.</p>
   <div class=price>$12 a year, one address</div>
 </div>
 <div class=wrap>
@@ -13863,10 +13870,12 @@ button:disabled{opacity:.6}
   <div class=card>
     <h2>Who people put a Stormline on</h2>
     <ul class=who>
-      <li><b>Mom, who is never going to download an app.</b> She does not have to.
-      Stormline calls her phone and says the warning out loud. Any phone, including a landline.</li>
-      <li><b>The kids, two states away at school.</b> You put their apartment address in.
-      They get the text and the call. You get to stop refreshing radar for a city you have never lived in.</li>
+      <li><b>Mom, who is never going to download an app.</b> She does not have to. Put her
+      number on her address and Stormline texts her, then calls and says a tornado warning
+      out loud. Nothing to install, nothing to log into.</li>
+      <li><b>The kids, two states away at school.</b> Put their apartment address in and
+      both numbers on it, theirs and yours. They get warned, you know they were warned, and
+      you stop refreshing radar for a city you have never lived in.</li>
       <li><b>The house you left this morning.</b> A tornado warning at home while you are
       four hours down the road is exactly the thing nobody tells you about.</li>
       <li><b>The shop, the barn, the rental, the lake place.</b> Places that are worth
@@ -13888,7 +13897,8 @@ button:disabled{opacity:.6}
       <tr><td class=y>Wakes you up</td><td class=n>A notification you may have silenced</td>
           <td class=y>An actual phone call for tornado warnings</td></tr>
       <tr><td class=y>Works on Mom's flip phone</td><td class=n>No</td>
-          <td class=y>Yes. Any phone, including a landline</td></tr>
+          <td class=y>Yes. Texts reach any phone that gets texts, and the tornado call
+          reaches a landline too</td></tr>
       <tr><td class=y>Tells you it is over</td><td class=n>Rarely</td>
           <td class=y>An all-clear text when the warning expires</td></tr>
     </table>
@@ -13899,12 +13909,12 @@ button:disabled{opacity:.6}
   <div class=card>
     <h2>What actually arrives</h2>
     <ul class=feat>
-      <li><b>A text with the radar map</b> the moment a Severe Thunderstorm, Tornado, or Flash
+      <li><b>A text with the radar map</b> as soon as a Severe Thunderstorm, Tornado, or Flash
       Flood Warning includes that address. Official National Weather Service warnings, relayed
       straight through. No robot writing its own forecast.</li>
       <li><b>The 2 AM tornado phone call.</b> A real call that says the warning twice. Texts get
-      ignored at night; a ringing phone does not. Your welcome text shows the one setting that
-      lets our call ring even on Do Not Disturb.</li>
+      ignored at night; a ringing phone does not. Your welcome text walks you through adding
+      us to your phone's Do Not Disturb exceptions, which is worth the thirty seconds.</li>
       <li><b>The all-clear</b> when the warning expires, so nobody is sitting in the basement guessing.</li>
       <li><b>Two phone numbers per address.</b> Yours and your spouse's, or yours and Mom's.</li>
       <li><b>No app, no login, nothing to check.</b> It only speaks when it has something to say.</li>
@@ -13918,8 +13928,9 @@ button:disabled{opacity:.6}
     <div id=err class=err></div>
     <label for=s-name>Your name</label><input id=s-name autocomplete=name>
     <label for=s-email>Email</label><input id=s-email type=email autocomplete=email>
-    <label for=s-phone>Mobile phone (where alerts go)</label><input id=s-phone type=tel autocomplete=tel placeholder="317-555-0123">
-    <label for=s-phone2>Second phone (optional, included): spouse, kid, anyone</label><input id=s-phone2 type=tel placeholder="Optional">
+    <label for=s-phone>Mobile phone <span style="text-transform:none;letter-spacing:0;font-weight:500;color:#7A8494">(texts go here)</span></label><input id=s-phone type=tel autocomplete=tel placeholder="317-555-0123">
+    <label for=s-phone2>Second phone <span style="text-transform:none;letter-spacing:0;font-weight:500;color:#7A8494">(included, and this is the one people forget)</span></label>
+    <input id=s-phone2 type=tel placeholder="Mom's number, if this is Mom's house">
     <label for=s-address>The address to watch <span style="text-transform:none;letter-spacing:0;font-weight:500;color:#7A8494">(street, city, state)</span></label><input id=s-address autocomplete=street-address placeholder="1205 Chestnut Lane, Lebanon, IN 46052">
 
     <div class=addon-h>Add to this account</div>
@@ -13964,7 +13975,7 @@ button:disabled{opacity:.6}
 
     <div class=total><span id=s-summary>Stormline, one address</span><b id=s-total>$12/yr</b></div>
     <button id=s-go>Protect this address &middot; $12/year</button>
-    <div class=fine>Checkout is handled by Stripe. Cancel anytime. Alerts relay official National Weather Service warnings for your exact location.</div>
+    <div class=fine>Checkout is handled by Stripe. Cancel anytime. Alerts relay official National Weather Service warnings for the exact address you enter.</div>
   </div>
 
   <div class=card>
@@ -13983,7 +13994,8 @@ button:disabled{opacity:.6}
     <p class=a>Yes, and people do. Just tell them it is coming so the first call is not a mystery.
     Two numbers are included with every address.</p>
     <p class=q>What if I move or change numbers?</p>
-    <p class=a>Email hello@weathervalet.ai and we change it same day. No portal to hunt through.</p>
+    <p class=a>Email hello@weathervalet.ai and we take care of it. If you added the morning
+    summary, the link in your messages also lets you change its send time yourself.</p>
   </div>
 
 </div>
@@ -14126,7 +14138,9 @@ _WATCH_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 :root{--ink:#12161C;--gold:#C8892A}
 body{margin:0;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;background:#F7F6F3;color:var(--ink)}
 .hero{background:linear-gradient(160deg,#171C25,#2A2118);color:#fff;padding:44px 20px 34px;text-align:center}
-.hero .brand{font-weight:900;font-size:19px;margin-bottom:16px;letter-spacing:-.01em}
+.hero .brand{font-weight:900;font-size:19px;margin-bottom:6px;letter-spacing:-.01em}
+.hero .pname{font-size:clamp(38px,9vw,64px);font-weight:900;letter-spacing:-.02em;line-height:1;
+  margin:0 0 14px;color:var(--gold)}
 .hero h1{font-size:clamp(25px,5vw,38px);margin:0 0 10px;line-height:1.16}
 .hero h1 em{color:var(--gold);font-style:normal}
 .hero p{color:#CDC6BB;max-width:560px;margin:0 auto;font-size:16.5px;line-height:1.55}
@@ -14152,6 +14166,7 @@ button:disabled{opacity:.6}
 </style></head><body>
 <div class=hero>
   <div class=brand>&#9889; WeatherValet</div>
+  <div class=pname>Watch</div>
   <h1>One day. One Meteorologist. <em>Yours.</em></h1>
   <p>Book a Meteorologist to stand guard over your event window, start to finish.
   They send the outlook the evening before, then stay with your day and message
