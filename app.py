@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-145"
+BACKEND_BUILD = "0702-147"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -881,6 +881,11 @@ ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS send_hour INTEGER NOT NU
 ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS tz_name TEXT;
 ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS last_daily_ymd TEXT;
 ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS manage_token TEXT;
+
+-- Gifting (Aug 19, 2026). When someone buys this for their mother, the
+-- welcome text has to say who it came from, or the first message she gets
+-- is a stranger telling her about her own house.
+ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS gift_from TEXT;
 
 CREATE TABLE IF NOT EXISTS sentry_relay_log (
     nws_alert_id     TEXT NOT NULL,
@@ -12603,7 +12608,7 @@ GAMEDAY_TERMS_VERSION = "gameday-2026-08-17"
 
 _GAMEDAY_TERMS_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>WeatherValet On Duty - Terms and Text Message Program</title><style>
+<title>WeatherValet Sidekick - Terms and Text Message Program</title><style>
 body{margin:0;background:#FFFDF7;color:#241A1C;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;
   font-size:16.5px;line-height:1.62}
 .wrap{max-width:720px;margin:0 auto;padding:34px 22px 70px}
@@ -12616,15 +12621,15 @@ ul{padding-left:20px}li{margin-bottom:7px}
 .back{display:inline-block;margin-bottom:22px;font-weight:700;text-decoration:none}
 .foot{margin-top:44px;padding-top:18px;border-top:1px solid rgba(36,26,28,.15);color:#6E5A5F;font-size:14px}
 </style></head><body><div class=wrap>
-<a class=back href="/gameday/iu">&larr; Back to WeatherValet On Duty</a>
-<h1>WeatherValet On Duty: Terms and Text Message Program</h1>
-<p class=eff>Effective August 17, 2026. These terms cover WeatherValet On Duty passes specifically and
+<a class=back href="/gameday/iu">&larr; Back to WeatherValet Sidekick</a>
+<h1>WeatherValet Sidekick: Terms and Text Message Program</h1>
+<p class=eff>Effective August 17, 2026. These terms cover WeatherValet Sidekick passes specifically and
 sit alongside the general <a href="https://weathervalet.ai/?legal=terms">WeatherValet Terms of Service</a>
 and <a href="https://weathervalet.ai/?legal=privacy">Privacy Policy</a>. Where they conflict, these
 GameDay terms control for your GameDay pass.</p>
 
 <h2>What you are buying</h2>
-<p>A WeatherValet On Duty pass is a text message service for days when you will be outside. This
+<p>A WeatherValet Sidekick pass is a text message service for days when you will be outside. This
 series covers Indiana Football home games in Bloomington, Indiana.
 For each game your pass covers, a certified WeatherValet Meteorologist reviews the forecast for the
 game window and messages the mobile number you gave us. A typical game brings a Meteorologist outlook
@@ -12634,11 +12639,11 @@ the games you selected at checkout.</p>
 
 <h2>Text message program terms</h2>
 <ul>
-<li><b>Program:</b> WeatherValet On Duty alerts.</li>
+<li><b>Program:</b> WeatherValet Sidekick alerts.</li>
 <li><b>Frequency:</b> varies with the weather. Expect roughly two to six messages per game you are
 covered for, and more during an active weather day.</li>
 <li><b>Cost:</b> message and data rates may apply. Those are charged by your mobile carrier, not by us.</li>
-<li><b>Opt out:</b> reply STOP to any message to stop all On Duty messages. Reply HELP for help, or
+<li><b>Opt out:</b> reply STOP to any message to stop all Sidekick messages. Reply HELP for help, or
 email hello@weathervalet.ai.</li>
 <li><b>Delivery of the service is the messages.</b> Because this product is delivered entirely by text,
 opting out ends the service. If you opt out before the first game your pass covers, email us and we
@@ -12664,7 +12669,7 @@ together. Buying a pass does not buy a correct forecast, and no refund is owed b
 turned out differently than the outlook described.</p>
 
 <h2>We are not an emergency service</h2>
-<p>WeatherValet On Duty does not replace the National Weather Service, local emergency management, or stadium
+<p>WeatherValet Sidekick does not replace the National Weather Service, local emergency management, or stadium
 public address instructions. If an official warning is issued or venue staff give you an instruction,
 follow it regardless of anything we have sent you. Do not wait on a WeatherValet message to take shelter.</p>
 
@@ -12694,13 +12699,13 @@ request, at our discretion.</li>
 
 <h2>Limitation of liability</h2>
 <p>To the maximum extent allowed by law, WeatherValet's total liability for any claim arising out of a
-On Duty pass is limited to the amount you paid for that pass. We are not liable for indirect,
+Sidekick pass is limited to the amount you paid for that pass. We are not liable for indirect,
 incidental, or consequential damages, including travel costs, lost tickets, missed events, property
 damage, or personal injury. Some states do not allow these limits, and in those states the limit is the
 smallest amount the law allows.</p>
 
 <h2>Acceptable use</h2>
-<p>Do not resell, republish, or redistribute our On Duty messages as your own. Do not sign up numbers you
+<p>Do not resell, republish, or redistribute our Sidekick messages as your own. Do not sign up numbers you
 do not control. We may cancel a pass and refund it if these terms are abused.</p>
 
 <h2>Not affiliated with the university</h2>
@@ -12727,7 +12732,7 @@ GAMEDAY_SINGLE_CENTS = 500
 
 _GAMEDAY_IU_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>WeatherValet On Duty - Indiana Football home games in Bloomington - $16 series pass</title>
+<title>WeatherValet Sidekick - Indiana Football home games in Bloomington - $16 series pass</title>
 <link rel=preconnect href=https://fonts.googleapis.com>
 <link rel=preconnect href=https://fonts.gstatic.com crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;600;800&display=swap" rel=stylesheet>
@@ -12821,9 +12826,9 @@ button:disabled{opacity:.6}
 
 <div class=field>
   <div class=brand><span class=bolt>&#9889;</span> WeatherValet</div>
-  <div class=pname>On Duty</div>
+  <div class=pname>Sidekick</div>
   <h1>Rain or shine,<br>know before <span class=pop>kickoff.</span></h1>
-  <p class=sub>Real, certified Meteorologists on duty for <b>every Indiana University Football
+  <p class=sub>Your own certified Meteorologist for <b>every Indiana University Football
   home game</b>. Messaged to you live: tailgate outlook, storm alerts, radar updates, the all-clear.</p>
   <div class=kick>&#127944; Series pass: all 8 home games, $16 &middot; Single game, $5</div>
   <p class=how>How it works: <b>GameDay forecast the day before</b>, a <b>morning brief</b> on gameday,
@@ -12835,7 +12840,7 @@ button:disabled{opacity:.6}
       <div class=notch></div>
       <div class=thread-head>
         <div class=avatar>&#9889;</div>
-        <div><b>WeatherValet On Duty</b><span>Bloomington</span></div>
+        <div><b>WeatherValet Sidekick</b><span>Bloomington</span></div>
       </div>
       <div class=msgs>
         <div class=stamp>Friday 4:30 PM</div>
@@ -12893,12 +12898,12 @@ button:disabled{opacity:.6}
     <label for=g-email>Email</label><input id=g-email type=email autocomplete=email>
     <label for=g-phone>Mobile (where your messages go)</label><input id=g-phone type=tel autocomplete=tel placeholder="812-555-0123">
     <label class=consent for=g-consent><input type=checkbox id=g-consent>
-      <span>I agree to receive WeatherValet On Duty text messages at the number above:
+      <span>I agree to receive WeatherValet Sidekick text messages at the number above:
       the Meteorologist's outlook the evening before, a game day morning brief, live updates if weather
       threatens the game window, and the all-clear. Frequency varies with the weather, usually two to six
       messages per game. Message and data rates may apply. Reply STOP to cancel, HELP for help. Text
       delivery depends on your carrier and is not guaranteed. I agree to the
-      <a href="/gameday/terms" target="_blank" rel=noopener>On Duty Terms</a> and
+      <a href="/gameday/terms" target="_blank" rel=noopener>Sidekick Terms</a> and
       <a href="https://weathervalet.ai/?legal=privacy" target="_blank" rel=noopener>Privacy Policy</a>.</span></label>
     <button id=g-go>Claim my series pass</button>
     <div class=fine>The series pass covers all 8 home games starting with the opener (including the Friday
@@ -12918,7 +12923,7 @@ button:disabled{opacity:.6}
     </ul>
   </div>
 
-  <p class=foot><a href="/gameday/terms" style="color:#C8A2A8">On Duty Terms and text message program</a>
+  <p class=foot><a href="/gameday/terms" style="color:#C8A2A8">Sidekick Terms and text message program</a>
   &middot; <a href="https://weathervalet.ai/?legal=privacy" style="color:#C8A2A8">Privacy</a><br>
   WeatherValet is an independent weather service, not affiliated with or endorsed by Indiana University.<br>
   Want weather for YOUR life, not just gamedays? <a href="https://weathervalet.ai">WeatherValet.ai</a></p>
@@ -13014,6 +13019,8 @@ def gameday_terms_page():
     return _GAMEDAY_TERMS_PAGE
 
 
+@app.get("/sidekick")
+@app.get("/sidekick/iu")
 @app.get("/onduty")
 @app.get("/onduty/iu")
 def _onduty_alias():
@@ -13099,11 +13106,11 @@ def gameday_checkout():
     pass_id = pass_ids[0]
     if pass_type == "single":
         picks = ["%s vs %s" % (g.get("d") or "", g.get("opponent") or "") for g in game_rows]
-        line_name = ("WeatherValet On Duty - single home game" if quantity == 1
-                     else "WeatherValet On Duty - %d single home games" % quantity)
+        line_name = ("WeatherValet Sidekick - single home game" if quantity == 1
+                     else "WeatherValet Sidekick - %d single home games" % quantity)
         line_desc = ("; ".join(picks) if quantity <= 4 else "%d home games" % quantity)
     else:
-        line_name = "WeatherValet On Duty - Bloomington series pass"
+        line_name = "WeatherValet Sidekick - Bloomington series pass"
         line_desc = "All 8 home football games"
     if not stripe:
         return jsonify({"ok": False, "error": "Payments aren't configured yet."}), 503
@@ -13125,7 +13132,7 @@ def gameday_checkout():
             metadata={"wv_product": "gameday",
                       "gameday_pass_id": str(pass_id),
                       "gameday_pass_ids": ",".join(str(i) for i in pass_ids)},
-            success_url=f"{PUBLIC_BASE_URL}/onduty/welcome?s={{CHECKOUT_SESSION_ID}}",
+            success_url=f"{PUBLIC_BASE_URL}/sidekick/welcome?s={{CHECKOUT_SESSION_ID}}",
             cancel_url=f"{PUBLIC_BASE_URL}/gameday/iu",
         )
     except Exception as e:
@@ -13138,6 +13145,7 @@ def gameday_checkout():
     return jsonify({"ok": True, "url": session.url})
 
 
+@app.get("/sidekick/welcome")
 @app.get("/onduty/welcome")
 @app.get("/gameday/welcome")
 def gameday_welcome_page():
@@ -13280,7 +13288,7 @@ h1{{font-size:20px;margin:0 0 4px}}
 .fine{{font-size:11.5px;color:#8A6F73;margin-top:20px;line-height:1.6}}
 </style></head><body><div class=b>
 <h1>&#9889; {name}</h1>
-<div class=sub>WeatherValet On Duty partner scoreboard &middot; live from the database, updated every refresh</div>
+<div class=sub>WeatherValet Sidekick partner scoreboard &middot; live from the database, updated every refresh</div>
 <div class=grid>
   <div class=tile><div class=n>{seasons}</div><div class=l>Series passes</div></div>
   <div class=tile><div class=n>{singles}</div><div class=l>Single games</div></div>
@@ -13681,7 +13689,7 @@ def _gameday_monday_reminder_pass() -> int:
                     kick = g["kickoff"] if g["kickoff"] and g["kickoff"] != "TBA" else "kickoff time TBA"
                     kick_part = f"kickoff {kick}" if kick != "kickoff time TBA" else kick
                     if send_sms(p["phone"],
-                                f"WeatherValet On Duty this week: Indiana vs {g['opponent']}, "
+                                f"WeatherValet Sidekick this week: Indiana vs {g['opponent']}, "
                                 f"{g['nice_date']}, {kick_part}. Your Meteorologist's outlook "
                                 f"lands the evening before, the morning brief on game day, and "
                                 f"live alerts if the sky acts up. - WeatherValet"):
@@ -13756,7 +13764,7 @@ def _activate_gameday_passes(pass_ids) -> None:
                     f"outlook lands the evening before, the morning brief on game day, "
                     f"and live alerts follow if weather threatens the window. - WeatherValet")
         else:
-            body = (f"{hello}'re on the WeatherValet On Duty roster for Indiana Football home "
+            body = (f"{hello}'ve got a WeatherValet Sidekick for Indiana Football home "
                     f"games in Bloomington. Every home game: the Meteorologist's morning outlook, "
                     f"live alerts if weather threatens the game window, and the all-clear. First "
                     f"outlook lands the evening before the home opener. - WeatherValet")
@@ -13768,9 +13776,9 @@ def _activate_gameday_passes(pass_ids) -> None:
                 else ("single game pass" if len(rows) == 1 else f"{len(rows)} single game passes"))
         who = row.get("name") or "name not given"
         _send_team_notification(
-            subject=f"On Duty {sold} sold",
-            html_body=f"<p>New WeatherValet On Duty {sold}: {_html_escape(who)}.</p>",
-            text_body=f"New On Duty {sold}: {who}")
+            subject=f"Sidekick {sold} sold",
+            html_body=f"<p>New WeatherValet Sidekick {sold}: {_html_escape(who)}.</p>",
+            text_body=f"New Sidekick {sold}: {who}")
     except Exception:
         pass
 
@@ -13801,6 +13809,52 @@ a{color:#1E7FFF}
 </style></head><body><div class=wrap>"""
 
 SENTRY_NAME = "WeatherValet Stormline"
+
+_STORMLINE_HERO = """<div class=hero>
+  <div class=brand>&#9889; WeatherValet</div>
+  <div class=pname>Stormline</div>
+  <h1>Who are you going to <em>worry about</em> at 2 AM?</h1>
+  <p>Your phone warns you about where you are standing. Stormline watches the address
+  you care about even when you are nowhere near it, and messages the numbers you choose.
+  Put Mom's number on Mom's house. Put yours on the lake place. Two numbers per address,
+  included.</p>
+  <div class=price>$12 a year, one address</div>
+</div>"""
+
+_STORMLINE_DAILY_HERO = """<div class=hero>
+  <div class=brand>&#9889; WeatherValet</div>
+  <div class=pname>Stormline Daily</div>
+  <h1>The forecast, <em>before you go looking for it.</em></h1>
+  <p>Every morning at the hour you pick, a plain summary of the National Weather Service
+  forecast for your address. Plus everything Stormline does the rest of the year: warning
+  texts with radar, a phone call for tornadoes, and the all clear. One message a day,
+  and a phone call on the day it matters.</p>
+  <div class=price>$24 a year, all in</div>
+</div>
+<div class=wrap style="padding-bottom:0">
+  <div class=card>
+    <h2>Two dollars a month, and here is exactly what you get</h2>
+    <ul class=feat>
+      <li><b>A morning message, every day.</b> High, low, chance of rain, wind, and what
+      tonight looks like. Reformatted from the Weather Service's own forecast for your
+      address, and labeled automated in every single message.</li>
+      <li><b>You pick the hour</b>, 5 AM to 10 AM, local to the address we watch. Change it
+      yourself any time from the link in your messages.</li>
+      <li><b>Warning texts with a radar map</b> when a severe thunderstorm, tornado, or
+      flash flood warning covers that exact address. Not your county. Your address.</li>
+      <li><b>A phone call for tornado warnings</b> that says the warning twice, because a
+      text at 2 AM gets slept through.</li>
+      <li><b>The all clear</b> when the warning expires.</li>
+      <li><b>No app, no login, nothing to check.</b> Works on any phone that gets texts.</li>
+    </ul>
+    <div class=dollar><b>Why a daily message and not another app?</b> Because you already
+    check the weather every morning. This just gets there first, and it comes from the
+    Weather Service rather than a model guessing. On the mornings nothing is happening it
+    takes you five seconds. On the mornings something is happening, you already know before
+    you have put your shoes on.</div>
+  </div>
+</div>"""
+
 
 _SENTRY_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
@@ -13856,16 +13910,7 @@ button:disabled{opacity:.6}
 .q:first-of-type{margin-top:0}
 .a{font-size:15px;line-height:1.6;color:#3C4655;margin:0}
 </style></head><body>
-<div class=hero>
-  <div class=brand>&#9889; WeatherValet</div>
-  <div class=pname>Stormline</div>
-  <h1>Who are you going to <em>worry about</em> at 2 AM?</h1>
-  <p>Your phone warns you about where you are standing. Stormline watches the address
-  you care about even when you are nowhere near it, and messages the numbers you choose.
-  Put Mom's number on Mom's house. Put yours on the lake place. Two numbers per address,
-  included.</p>
-  <div class=price>$12 a year, one address</div>
-</div>
+<!--WV_HERO-->
 <div class=wrap>
 
   <div class=card>
@@ -13933,6 +13978,17 @@ button:disabled{opacity:.6}
     <label for=s-phone2>Second phone <span style="text-transform:none;letter-spacing:0;font-weight:500;color:#7A8494">(included, and this is the one people forget)</span></label>
     <input id=s-phone2 type=tel placeholder="Mom's number, if this is Mom's house">
     <label for=s-address>The address to watch <span style="text-transform:none;letter-spacing:0;font-weight:500;color:#7A8494">(street, city, state)</span></label><input id=s-address autocomplete=street-address placeholder="1205 Chestnut Lane, Lebanon, IN 46052">
+
+    <label class=addon id=ad-gift for=s-gift><input type=checkbox id=s-gift>
+      <span style="flex:1"><b>This is a gift</b>
+      <i>Buying it for someone else? Put their address and their phone above, and
+      we will tell them who it is from so the first message is not a mystery.</i></span>
+      <span class=amt>Free</span></label>
+
+    <div id=gift-wrap style="display:none;margin:-2px 0 12px">
+      <label for=s-giftfrom>Your name, as they know you</label>
+      <input id=s-giftfrom placeholder="Sarah, your daughter" maxlength=60>
+    </div>
 
     <div class=addon-h>Add to this account</div>
 
@@ -14026,6 +14082,8 @@ document.getElementById('s-go').addEventListener('click', function(){
       label2: document.getElementById('s-second').checked
         ? document.getElementById('s-label2').value : '',
       pack_allseason: document.getElementById('s-pack').checked,
+      gift_from: document.getElementById('s-gift').checked
+        ? document.getElementById('s-giftfrom').value : '',
       daily: document.getElementById('s-daily').checked,
       send_hour: parseInt(document.getElementById('s-hour').value, 10)
     })
@@ -14056,6 +14114,9 @@ function wvSync(){
   var second = document.getElementById('s-second').checked;
   var pack = document.getElementById('s-pack').checked;
   var daily = document.getElementById('s-daily').checked;
+  var gift = document.getElementById('s-gift').checked;
+  document.getElementById('gift-wrap').style.display = gift ? 'block' : 'none';
+  document.getElementById('ad-gift').className = 'addon' + (gift ? ' on' : '');
   document.getElementById('second-wrap').style.display = second ? 'block' : 'none';
   document.getElementById('daily-wrap').style.display = daily ? 'block' : 'none';
   document.getElementById('ad-second').className = 'addon' + (second ? ' on' : '');
@@ -14071,6 +14132,9 @@ function wvSync(){
 document.getElementById('s-second').addEventListener('change', wvSync);
 document.getElementById('s-pack').addEventListener('change', wvSync);
 document.getElementById('s-daily').addEventListener('change', wvSync);
+document.getElementById('s-gift').addEventListener('change', wvSync);
+/*WV_PRESELECT*/
+if (window.WV_PRESELECT_DAILY) { document.getElementById('s-daily').checked = true; }
 wvSync();
 </script></body></html>"""
 
@@ -14731,11 +14795,24 @@ def stormline_manage_save(token: str):
     return redirect("/stormline/manage/" + tok + "?saved=1", code=303)
 
 
+@app.get("/stormlinedaily")
+@app.get("/stormline/daily")
+def stormline_daily_page():
+    """Same form, different front door. Leads with the morning summary and
+    pre-checks it, for people who came looking for a daily forecast rather
+    than for storm warnings."""
+    return (_SENTRY_PAGE
+            .replace("<!--WV_HERO-->", _STORMLINE_DAILY_HERO)
+            .replace("/*WV_PRESELECT*/", "window.WV_PRESELECT_DAILY = true;"))
+
+
 @app.get("/stormline")
 @app.get("/sentry")
 def sentry_page():
     """The Stormline marketing + signup page."""
-    return _SENTRY_PAGE
+    return (_SENTRY_PAGE
+            .replace("<!--WV_HERO-->", _STORMLINE_HERO)
+            .replace("/*WV_PRESELECT*/", ""))
 
 
 @app.get("/alerts")
@@ -14821,6 +14898,7 @@ def sentry_checkout():
     label2 = (data.get("label2") or "").strip()[:60]
     pack_allseason = bool(data.get("pack_allseason"))
     daily = bool(data.get("daily"))
+    gift_from = (data.get("gift_from") or "").strip()[:60]
     try:
         send_hour = int(data.get("send_hour") or 7)
     except Exception:
@@ -14867,11 +14945,11 @@ def sentry_checkout():
                     """INSERT INTO sentry_subscribers
                          (email, phone, phone2, name, address, label, lat, lng,
                           pack_allseason, daily, send_hour, tz_name, manage_token,
-                          status, created_at, updated_at)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s) RETURNING id""",
+                          gift_from, status, created_at, updated_at)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s) RETURNING id""",
                     (email, phone, phone2, name, addr, (lbl or None), lat, lng,
                      pack_allseason, daily, send_hour, _tz_for_point(lat, lng),
-                     secrets.token_urlsafe(12), now_ms, now_ms))
+                     secrets.token_urlsafe(12), (gift_from or None), now_ms, now_ms))
                 sentry_ids.append(cur.fetchone()["id"])
             # Rows bought together share the first row's id as the group.
             cur.execute("UPDATE sentry_subscribers SET group_id = %s WHERE id = ANY(%s)",
@@ -14940,7 +15018,7 @@ def _activate_sentry_group(sentry_ids, stripe_customer_id: str) -> None:
                     """UPDATE sentry_subscribers
                        SET status = 'active', stripe_customer_id = %s, updated_at = %s
                        WHERE id = %s AND status != 'active'
-                       RETURNING phone, address, label, name, pack_allseason, daily""",
+                       RETURNING phone, address, label, name, pack_allseason, daily, gift_from""",
                     (stripe_customer_id or "", now_ms, sid))
                 r = cur.fetchone()
                 if r:
@@ -14951,6 +15029,13 @@ def _activate_sentry_group(sentry_ids, stripe_customer_id: str) -> None:
     row = rows[0]
     first = (row.get("name") or "").split(" ")[0]
     hello = f"Hi {first}, " if first else ""
+    giver = (row.get("gift_from") or "").strip()
+    # A gift recipient never asked for this text, so the first thing it says
+    # has to be who sent it. Two different sentences, not one glued together.
+    opener = f"{hello}your WeatherValet Stormline is up"
+    if giver:
+        who = f"Hi {first}, " if first else ""
+        opener = f"{who}{giver} set up a WeatherValet Stormline for you"
     manage = ""
     try:
         with db() as conn:
@@ -14978,7 +15063,7 @@ def _activate_sentry_group(sentry_ids, stripe_customer_id: str) -> None:
                     "freeze, extreme heat, and high wind alerts come through here as well.")
     try:
         send_sms(row["phone"],
-                 f"{hello}your WeatherValet Stormline is up {where}. "
+                 f"{opener} {where}. "
                  f"If the National Weather Service puts it inside a severe "
                  f"thunderstorm, tornado, or flash flood warning, you'll hear from us "
                  f"here the moment it happens. Tornado warnings also ring your phone "
@@ -31249,7 +31334,11 @@ def _stormline_daily_pass() -> int:
             ymd = now_local.strftime("%Y-%m-%d")
             if r.get("last_daily_ymd") == ymd:
                 continue
-            if now_local.hour < int(r.get("send_hour") or 7):
+            # 0 is a valid hour, so a falsy check would silently move a
+            # midnight subscriber to 7 AM. Check for None explicitly.
+            _h = r.get("send_hour")
+            send_hour = 7 if _h is None else int(_h)
+            if now_local.hour < send_hour:
                 continue
             fc = _nws_point_forecast(float(r["lat"]), float(r["lng"]))
             where = r.get("label") or (r.get("address") or "").split(",")[0]
@@ -31267,7 +31356,7 @@ def _stormline_daily_pass() -> int:
             # carrier failure at 7:00 gets retried on the next tick instead of
             # costing the subscriber their whole morning. After a two hour
             # window we give up, so a permanently bad number cannot loop.
-            gave_up = now_local.hour >= int(r.get("send_hour") or 7) + 2
+            gave_up = now_local.hour >= send_hour + 2
             if ok or gave_up:
                 with db() as conn:
                     with conn.cursor() as cur:
