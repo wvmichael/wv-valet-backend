@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-148"
+BACKEND_BUILD = "0702-149"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -13977,7 +13977,15 @@ button:disabled{opacity:.6}
     <label for=s-phone>Mobile phone <span style="text-transform:none;letter-spacing:0;font-weight:500;color:#7A8494">(texts go here)</span></label><input id=s-phone type=tel autocomplete=tel placeholder="317-555-0123">
     <label for=s-phone2>Second phone <span style="text-transform:none;letter-spacing:0;font-weight:500;color:#7A8494">(included, and this is the one people forget)</span></label>
     <input id=s-phone2 type=tel placeholder="Mom's number, if this is Mom's house">
-    <label for=s-address>The address to watch <span style="text-transform:none;letter-spacing:0;font-weight:500;color:#7A8494">(street, city, state)</span></label><input id=s-address autocomplete=street-address placeholder="1205 Chestnut Lane, Lebanon, IN 46052">
+    <label for=s-address>The address to watch</label>
+    <input id=s-address autocomplete=street-address placeholder="1205 Chestnut Lane">
+    <div style="display:flex;gap:10px">
+      <div style="flex:2"><label for=s-city>City</label>
+        <input id=s-city autocomplete=address-level2 placeholder="Lebanon"></div>
+      <div style="flex:1"><label for=s-state>State</label>
+        <select id=s-state style="width:100%;box-sizing:border-box;padding:12px;
+          border:1px solid rgba(15,18,22,.18);border-radius:8px;font-size:16px;background:#fff"><option value="">State</option><option>AL</option><option>AK</option><option>AZ</option><option>AR</option><option>CA</option><option>CO</option><option>CT</option><option>DE</option><option>DC</option><option>FL</option><option>GA</option><option>HI</option><option>ID</option><option>IL</option><option>IN</option><option>IA</option><option>KS</option><option>KY</option><option>LA</option><option>ME</option><option>MD</option><option>MA</option><option>MI</option><option>MN</option><option>MS</option><option>MO</option><option>MT</option><option>NE</option><option>NV</option><option>NH</option><option>NJ</option><option>NM</option><option>NY</option><option>NC</option><option>ND</option><option>OH</option><option>OK</option><option>OR</option><option>PA</option><option>RI</option><option>SC</option><option>SD</option><option>TN</option><option>TX</option><option>UT</option><option>VT</option><option>VA</option><option>WA</option><option>WV</option><option>WI</option><option>WY</option></select></div>
+    </div>
 
     <label class=addon id=ad-gift for=s-gift><input type=checkbox id=s-gift>
       <span style="flex:1"><b>This is a gift</b>
@@ -13999,8 +14007,15 @@ button:disabled{opacity:.6}
       <span class=amt>+$8/yr</span></label>
 
     <div id=second-wrap style="display:none;margin:-2px 0 12px">
-      <label for=s-address2>Second address <span style="text-transform:none;letter-spacing:0;font-weight:500;color:#7A8494">(street, city, state)</span></label>
-      <input id=s-address2 placeholder="456 Oak St, Zionsville, IN 46077">
+      <label for=s-address2>Second address</label>
+      <input id=s-address2 placeholder="456 Oak St">
+      <div style="display:flex;gap:10px">
+        <div style="flex:2"><label for=s-city2>City</label>
+          <input id=s-city2 placeholder="Zionsville"></div>
+        <div style="flex:1"><label for=s-state2>State</label>
+          <select id=s-state2 style="width:100%;box-sizing:border-box;padding:12px;
+            border:1px solid rgba(15,18,22,.18);border-radius:8px;font-size:16px;background:#fff"><option value="">State</option><option>AL</option><option>AK</option><option>AZ</option><option>AR</option><option>CA</option><option>CO</option><option>CT</option><option>DE</option><option>DC</option><option>FL</option><option>GA</option><option>HI</option><option>ID</option><option>IL</option><option>IN</option><option>IA</option><option>KS</option><option>KY</option><option>LA</option><option>ME</option><option>MD</option><option>MA</option><option>MI</option><option>MN</option><option>MS</option><option>MO</option><option>MT</option><option>NE</option><option>NV</option><option>NH</option><option>NJ</option><option>NM</option><option>NY</option><option>NC</option><option>ND</option><option>OH</option><option>OK</option><option>OR</option><option>PA</option><option>RI</option><option>SC</option><option>SD</option><option>TN</option><option>TX</option><option>UT</option><option>VT</option><option>VA</option><option>WA</option><option>WV</option><option>WI</option><option>WY</option></select></div>
+      </div>
       <label for=s-label2>Call it what? (optional)</label>
       <input id=s-label2 placeholder="Mom's house" maxlength=60>
     </div>
@@ -14063,9 +14078,17 @@ Big day coming? A real Meteorologist will work your forecast for $19 at
 document.getElementById('s-go').addEventListener('click', function(){
   var btn = this; btn.disabled = true; btn.textContent = 'One moment...';
   var err = document.getElementById('err'); err.style.display = 'none';
+  if (!document.getElementById('s-city').value.trim()
+      || !document.getElementById('s-state').value) {
+    err.textContent = 'Add the city and state so we watch the right place.';
+    err.style.display = 'block'; btn.disabled = false; btn.textContent = wvBtnLabel();
+    return;
+  }
   if (document.getElementById('s-second').checked
-      && document.getElementById('s-address2').value.trim().length < 8) {
-    err.textContent = 'Add the second address, or uncheck it.';
+      && (document.getElementById('s-address2').value.trim().length < 5
+          || !document.getElementById('s-city2').value.trim()
+          || !document.getElementById('s-state2').value)) {
+    err.textContent = 'Fill in the second address, city and state, or uncheck it.';
     err.style.display = 'block'; btn.disabled = false; btn.textContent = wvBtnLabel();
     return;
   }
@@ -14076,9 +14099,15 @@ document.getElementById('s-go').addEventListener('click', function(){
       email: document.getElementById('s-email').value,
       phone: document.getElementById('s-phone').value,
       phone2: document.getElementById('s-phone2').value,
-      address: document.getElementById('s-address').value,
-      address2: document.getElementById('s-second').checked
+      street: document.getElementById('s-address').value,
+      city: document.getElementById('s-city').value,
+      state: document.getElementById('s-state').value,
+      street2: document.getElementById('s-second').checked
         ? document.getElementById('s-address2').value : '',
+      city2: document.getElementById('s-second').checked
+        ? document.getElementById('s-city2').value : '',
+      state2: document.getElementById('s-second').checked
+        ? document.getElementById('s-state2').value : '',
       label2: document.getElementById('s-second').checked
         ? document.getElementById('s-label2').value : '',
       pack_allseason: document.getElementById('s-pack').checked,
@@ -14255,7 +14284,13 @@ button:disabled{opacity:.6}
     <label for=w-name>Your name</label><input id=w-name autocomplete=name>
     <label for=w-email>Email</label><input id=w-email type=email autocomplete=email>
     <label for=w-phone>Mobile (where your messages go)</label><input id=w-phone type=tel placeholder="317-555-0123">
-    <label for=w-place>Where is it? <span style="text-transform:none;letter-spacing:0;font-weight:500;color:#8A8272">(include city and state)</span></label><input id=w-place placeholder="Boone County Fairgrounds, Lebanon, IN 46052">
+    <label for=w-place>Where is it?</label>
+    <input id=w-place placeholder="Boone County Fairgrounds">
+    <div class=row>
+      <div><label for=w-city>City</label><input id=w-city placeholder="Lebanon"></div>
+      <div><label for=w-state>State</label>
+        <select id=w-state><option value="">State</option><option>AL</option><option>AK</option><option>AZ</option><option>AR</option><option>CA</option><option>CO</option><option>CT</option><option>DE</option><option>DC</option><option>FL</option><option>GA</option><option>HI</option><option>ID</option><option>IL</option><option>IN</option><option>IA</option><option>KS</option><option>KY</option><option>LA</option><option>ME</option><option>MD</option><option>MA</option><option>MI</option><option>MN</option><option>MS</option><option>MO</option><option>MT</option><option>NE</option><option>NV</option><option>NH</option><option>NJ</option><option>NM</option><option>NY</option><option>NC</option><option>ND</option><option>OH</option><option>OK</option><option>OR</option><option>PA</option><option>RI</option><option>SC</option><option>SD</option><option>TN</option><option>TX</option><option>UT</option><option>VT</option><option>VA</option><option>WA</option><option>WV</option><option>WI</option><option>WY</option></select></div>
+    </div>
     <label for=w-date>What day?</label><input id=w-date type=date>
     <div class=row>
       <div><label for=w-start>Window starts</label><select id=w-start></select></div>
@@ -14306,6 +14341,11 @@ document.getElementById('w-go').addEventListener('click', function(){
     err.textContent = 'Please check the box agreeing to receive Watch text messages.';
     err.style.display = 'block'; return;
   }
+  if (!document.getElementById('w-city').value.trim()
+      || !document.getElementById('w-state').value) {
+    err.textContent = 'Add the city and state of your event.';
+    err.style.display = 'block'; return;
+  }
   btn.disabled = true; btn.textContent = 'One moment...';
   fetch('/api/v1/watch/checkout', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -14313,7 +14353,9 @@ document.getElementById('w-go').addEventListener('click', function(){
       name: document.getElementById('w-name').value,
       email: document.getElementById('w-email').value,
       phone: document.getElementById('w-phone').value,
-      place: document.getElementById('w-place').value,
+      venue: document.getElementById('w-place').value,
+      city: document.getElementById('w-city').value,
+      state: document.getElementById('w-state').value,
       event_date: document.getElementById('w-date').value,
       start_hour: parseInt(document.getElementById('w-start').value, 10),
       end_hour: parseInt(document.getElementById('w-end').value, 10),
@@ -14569,7 +14611,8 @@ def watch_checkout():
     name = (data.get("name") or "").strip()[:120]
     email = (data.get("email") or "").strip()[:200]
     phone = _normalize_phone((data.get("phone") or "").strip())
-    place = (data.get("place") or "").strip()[:300]
+    place = _compose_address(data.get("venue"), data.get("city"), data.get("state"),
+                             data.get("place"))[:300]
     what = (data.get("what") or "").strip()[:400]
     event_date = (data.get("event_date") or "").strip()[:10]
     try:
@@ -14892,8 +14935,10 @@ def sentry_checkout():
     email = (data.get("email") or "").strip()[:200]
     phone = _normalize_phone((data.get("phone") or "").strip())
     phone2 = _normalize_phone((data.get("phone2") or "").strip()) if (data.get("phone2") or "").strip() else ""
-    address = (data.get("address") or "").strip()[:300]
-    address2 = (data.get("address2") or "").strip()[:300]
+    address = _compose_address(data.get("street"), data.get("city"), data.get("state"),
+                               data.get("address"))[:300]
+    address2 = _compose_address(data.get("street2"), data.get("city2"), data.get("state2"),
+                                data.get("address2"))[:300]
     label = (data.get("label") or "").strip()[:60]
     label2 = (data.get("label2") or "").strip()[:60]
     pack_allseason = bool(data.get("pack_allseason"))
@@ -31185,6 +31230,20 @@ _US_STATE_NAMES = {
     "SOUTH CAROLINA","SOUTH DAKOTA","TENNESSEE","TEXAS","UTAH","VERMONT","VIRGINIA",
     "WASHINGTON","WEST VIRGINIA","WISCONSIN","WYOMING","PUERTO RICO",
 }
+
+
+def _compose_address(street: str, city: str, state: str, fallback: str = "") -> str:
+    """Build one address line from separate fields.
+
+    Splitting street/city/state on the form is the fix for people typing
+    '1205 Chestnut Lane' and nothing else. The API still accepts a single
+    `address` string so older callers keep working."""
+    street = (street or "").strip()
+    city = (city or "").strip()
+    state = (state or "").strip().upper()
+    if street and city and state:
+        return f"{street}, {city}, {state}"
+    return (fallback or "").strip()
 
 
 def _address_needs_more(addr: str) -> bool:
