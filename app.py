@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-162"
+BACKEND_BUILD = "0702-163"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -5157,6 +5157,7 @@ def sitemap_xml():
         ("/watch", "0.8"),
         ("/met-review", "0.8"),
         ("/pro", "0.9"),
+        ("/forecast", "1.0"),
         ("/pricing", "0.9"),
         ("/about", "0.6"),
         ("/contact", "0.5"),
@@ -12729,7 +12730,7 @@ WV_HEADER = """<header>
   <div class=nl>Products &#9662;
     <div class=dd>
       <h6>Robots watch addresses</h6>
-      <a href="https://weathervalet.ai"><b>AI Forecast</b><i>Free</i></a>
+      <a href="/forecast"><b>AI Forecast</b><i>Free</i></a>
       <a href="/stormline"><b>Stormline</b><i>$12/yr</i></a>
       <a href="/stormlinedaily"><b>Stormline Daily</b><i>$24/yr</i></a>
       <h6>Meteorologists watch your plans</h6>
@@ -12761,7 +12762,7 @@ WV_HEADER = """<header>
  </nav>
  <div id=mnav>
    <h6>Products</h6>
-   <a href="https://weathervalet.ai">AI Forecast &middot; Free</a>
+   <a href="/forecast">AI Forecast &middot; Free</a>
    <a href="/stormline">Stormline &middot; $12/yr</a>
    <a href="/stormlinedaily">Stormline Daily &middot; $24/yr</a>
    <a href="/gameday/iu">Sidekick &middot; $16/series</a>
@@ -12780,7 +12781,7 @@ WV_FOOTER = """<footer>
  <div class=wrap>
   <div class=fgrid>
    <div><h6>Products</h6>
-     <a href="https://weathervalet.ai">AI Forecast</a>
+     <a href="/forecast">AI Forecast</a>
      <a href="/stormline">Stormline</a>
      <a href="/stormlinedaily">Stormline Daily</a>
      <a href="/gameday/iu">Sidekick</a>
@@ -15793,7 +15794,7 @@ __WV_HEADER__
   <div class=tiers>
     <div class=tier><div class=t>AI Forecast</div><div class=p>Free</div>
       <p>Ask once. Get an answer in seconds. It's AI, and we'll never pretend otherwise.</p>
-      <a class=go href="/">Ask it now &rarr;</a></div>
+      <a class=go href="/forecast">Ask it now &rarr;</a></div>
     <div class=tier><div class=t>Stormline</div><div class=p>$12/year</div>
       <p>You don't watch the weather. Stormline watches your address.</p>
       <ul><li>Warning texts with a radar map</li><li>A phone call for tornado warnings</li>
@@ -15855,6 +15856,296 @@ __WV_HEADER__
   </div>
 </div></section>
 __WV_FOOTER__"""
+
+
+# ---------------------------------------------------------------------------
+# AI Forecast (Aug 19, 2026)
+#
+# The free tier and the top of the funnel. A visitor types a plan in plain
+# words; we geocode it, pull the forecast, decide a verdict, and let the
+# explainer write the paragraph. Everything here is labeled AI, because the
+# whole company rests on nobody mistaking this for a Meteorologist.
+# ---------------------------------------------------------------------------
+
+def _ai_pick_hour(hourly: dict, when_text: str):
+    """Choose the hour of the day the plan is about.
+
+    Crude on purpose: a few words people actually type, mapped to a local
+    hour. Wrong-but-reasonable beats a parser that fails on 'Saturday-ish'.
+    """
+    t = (when_text or "").lower()
+    for needle, hour in (("midnight", 0), ("sunrise", 7), ("breakfast", 8),
+                         ("morning", 9), ("noon", 12), ("lunch", 12),
+                         ("afternoon", 15), ("sunset", 19), ("evening", 19),
+                         ("dinner", 18), ("tonight", 20), ("night", 21)):
+        if needle in t:
+            return hour
+    m = re.search(r"(\d{1,2})\s*(?::(\d{2}))?\s*(am|pm)", t)
+    if m:
+        h = int(m.group(1)) % 12
+        if m.group(3) == "pm":
+            h += 12
+        return h
+    return 15
+
+
+def _ai_verdict(temp, precip_pct, wind, code):
+    """Clear, Caution or Risk. Deliberately conservative: this is free and
+    automated, so it should err toward telling someone to look closer."""
+    try:
+        p = int(precip_pct or 0)
+    except Exception:
+        p = 0
+    try:
+        w = float(wind or 0)
+    except Exception:
+        w = 0.0
+    try:
+        t = float(temp)
+    except Exception:
+        t = 60.0
+    severe = code in (95, 96, 99)
+    if severe or p >= 70 or w >= 30 or t <= 20 or t >= 100:
+        return "Risk"
+    if p >= 35 or w >= 20 or t <= 32 or t >= 92:
+        return "Caution"
+    return "Clear"
+
+
+@app.post("/api/v1/forecast/ticket")
+def forecast_ticket():
+    """Everything the free ticket needs, in one call: geocode, forecast,
+    verdict, and the AI paragraph."""
+    data = request.get_json(silent=True) or {}
+    plan = (data.get("plan") or "").strip()[:400]
+    place = (data.get("location") or "").strip()[:200]
+    when = (data.get("when") or "").strip()[:120]
+    if len(plan) < 4:
+        return jsonify({"ok": False, "error": "Tell us what you are planning."}), 400
+    if len(place) < 2:
+        return jsonify({"ok": False, "error": "Where is it? A city and state is enough."}), 400
+
+    geo = None
+    try:
+        geo = _geocode_address(place)
+    except Exception as e:
+        print(f"[ai-forecast] geocode failed: {e!r}", flush=True)
+    if not geo or geo.get("lat") is None:
+        return jsonify({"ok": False,
+                        "error": "We couldn't find that place. Try adding the state."}), 400
+
+    offset = 0
+    wl = (when or "").lower()
+    if "tomorrow" in wl:
+        offset = 1
+    fc = _fetch_forecast(float(geo["lat"]), float(geo["lng"]), offset)
+    if not fc:
+        return jsonify({"ok": False,
+                        "error": "The weather service didn't answer just now. Try again in a moment."}), 502
+
+    hourly = fc.get("hourly") or {}
+    daily = fc.get("daily") or {}
+    hour = _ai_pick_hour(hourly, when)
+    times = hourly.get("time") or []
+    idx = min(hour, len(times) - 1) if times else 0
+
+    def at(key, default=None):
+        arr = hourly.get(key) or []
+        return arr[idx] if idx < len(arr) else default
+
+    temp = at("temperature_2m")
+    precip = at("precipitation_probability", 0)
+    wind = at("windspeed_10m", 0)
+    code = at("weathercode", 0)
+    hi = (daily.get("temperature_2m_max") or [None])[0]
+    lo = (daily.get("temperature_2m_min") or [None])[0]
+    verdict = _ai_verdict(temp, precip, wind, code)
+
+    paragraph = ""
+    try:
+        msg = _build_explainer_user_message({
+            "plan": plan, "location": place, "when": when or "today",
+            "verdict": verdict,
+            "weather": {
+                "temperature_f": temp, "feels_like_f": temp,
+                "wind_mph": wind, "wind_gust_mph": wind,
+                "humidity_pct": None, "cloud_cover_pct": None,
+                "precip_probability_pct": precip, "precip_amount_in": None,
+                "rain_window": None,
+            },
+        })
+        raw = _call_gemini(EXPLAINER_SYSTEM_PROMPT, msg)
+        paragraph = _coerce_forecast_snapshot(raw) or (raw or "").strip()
+    except Exception as e:
+        print(f"[ai-forecast] explainer failed: {e!r}", flush=True)
+
+    if not paragraph:
+        # Never invent a forecast. Fall back to the numbers, plainly stated.
+        bits = []
+        if temp is not None:
+            bits.append(f"Around {round(float(temp))} degrees")
+        if isinstance(precip, (int, float)) and precip >= 20:
+            bits.append(f"a {int(precip)}% chance of precipitation")
+        if wind:
+            bits.append(f"wind near {round(float(wind))} mph")
+        paragraph = ", ".join(bits) + "." if bits else "Forecast data is thin right now."
+
+    return jsonify({"ok": True, "verdict": verdict, "paragraph": paragraph,
+                    "place": geo.get("label") or place,
+                    "temp": temp, "high": hi, "low": lo,
+                    "precip": precip, "wind": wind,
+                    "code_label": _weather_code_label(int(code or 0))})
+
+
+_AI_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Free AI weather forecast for your plan - WeatherValet</title>
+<meta name=description content="Type what you are planning and get an instant forecast ticket. Written by AI, and labeled AI. Free, nothing to download.">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+.head{padding:66px 0 20px;background:radial-gradient(130% 100% at 50% -30%,#12234A 0%,#0A1020 46%,#04070E 100%)}
+.eyebrow{font-size:12px;letter-spacing:.24em;text-transform:uppercase;color:var(--sky);font-weight:800;margin-bottom:12px}
+h1{font-size:clamp(31px,5.4vw,50px);font-weight:900;letter-spacing:-.03em;line-height:1.03;margin:0 0 12px;
+  background:linear-gradient(98deg,#fff 22%,#7EB6FF 92%);-webkit-background-clip:text;background-clip:text;color:transparent}
+.lede{color:#B9CAE4;font-size:17px;max-width:580px;margin:0 0 8px}
+.sec{padding:44px 0 66px}
+.s-black{background:#04070E}
+.s-blue{background:linear-gradient(180deg,#0B1428 0%,#123163 55%,#0C1D3E 100%);padding:64px 0}
+.inner{max-width:680px;margin:0 auto}
+label{display:block;font-size:12.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
+  color:#93A6C2;margin:16px 0 6px}
+input,textarea{width:100%;box-sizing:border-box;padding:13px;border-radius:9px;font-size:16px;
+  font-family:inherit;border:1px solid rgba(126,182,255,.28);background:#0C1424;color:#EAF1FF}
+textarea{min-height:74px;resize:vertical}
+.row{display:flex;gap:10px}.row>div{flex:1}
+button.go{width:100%;margin-top:20px;background:var(--accent);color:#fff;border:none;border-radius:10px;
+  padding:15px;font-size:17px;font-weight:800;cursor:pointer;transition:.18s}
+button.go:hover{filter:brightness(1.14);transform:translateY(-1px)}
+button.go:disabled{opacity:.6;transform:none}
+.err{display:none;background:#3A1220;border:1px solid #7C2740;color:#FFC2CE;border-radius:9px;
+  padding:11px 13px;margin-top:14px;font-size:14.5px}
+#ticket{display:none;margin-top:26px;border:1px solid rgba(126,182,255,.3);border-radius:16px;overflow:hidden;
+  background:linear-gradient(155deg,rgba(30,107,255,.14),rgba(10,16,32,.6))}
+.tk-top{display:flex;justify-content:space-between;align-items:center;gap:14px;padding:16px 20px;
+  border-bottom:1px dashed rgba(126,182,255,.3)}
+.tk-place{font-size:15px;color:#B9CAE4}
+.verdict{font-size:13px;font-weight:900;letter-spacing:.12em;text-transform:uppercase;
+  padding:7px 14px;border-radius:999px}
+.v-Clear{background:#12401F;color:#B7F0C4;border:1px solid rgba(52,199,89,.45)}
+.v-Caution{background:#43330E;color:#FFDFA0;border:1px solid rgba(255,190,60,.45)}
+.v-Risk{background:#4A0E19;color:#FFC9D0;border:1px solid rgba(224,36,60,.5)}
+.tk-body{padding:20px}
+.tk-body p{color:#DDE8FA;font-size:16.5px;line-height:1.7;margin:0 0 16px}
+.nums{display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:10px}
+.num{background:rgba(255,255,255,.05);border:1px solid rgba(126,182,255,.16);border-radius:10px;padding:11px 12px}
+.num b{display:block;font-size:19px;color:#fff}
+.num i{display:block;font-style:normal;font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;color:#8CA0C0;margin-top:2px}
+.ai-note{margin-top:16px;font-size:12.8px;color:#8CA0C0;line-height:1.6;border-top:1px solid rgba(126,182,255,.16);padding-top:14px}
+.ai-note b{color:#B9CAE4}
+h2{font-size:clamp(24px,4vw,34px);font-weight:900;letter-spacing:-.025em;color:#fff;margin:0 0 12px}
+.sub{color:#B9CAE4;font-size:16.5px;max-width:620px;margin:0 0 24px}
+.up{display:grid;grid-template-columns:1fr;gap:12px}
+@media(min-width:760px){.up{grid-template-columns:1fr 1fr}}
+.card{border:1px solid rgba(126,182,255,.16);border-radius:14px;padding:20px;
+  background:linear-gradient(168deg,rgba(255,255,255,.05),rgba(255,255,255,.012));transition:.22s}
+.card:hover{border-color:rgba(224,36,60,.5);transform:translateY(-3px)}
+.card b{display:block;font-size:17px;color:#fff}
+.card .p{color:var(--sky);font-weight:800;font-size:14.5px;margin:2px 0 8px}
+.card p{color:#B9CAE4;font-size:14.5px;line-height:1.6;margin:0 0 12px}
+.card a{color:var(--sky);font-weight:700;font-size:14px}
+</style></head><body>
+__WV_HEADER__
+<div class=head><div class=wrap>
+  <div class=eyebrow>&#9889; WeatherValet &middot; Free</div>
+  <h1>Tell us your plan. We'll tell you the weather.</h1>
+  <p class=lede>Type it the way you'd say it out loud. This one is written by AI, and we will
+  never pretend otherwise.</p>
+</div></div>
+
+<section class="sec s-black"><div class=wrap><div class=inner>
+  <label for=a-plan>What are you planning?</label>
+  <textarea id=a-plan placeholder="Tailgating before the game, setting up at 10 in the morning"></textarea>
+  <div class=row>
+    <div><label for=a-loc>Where</label><input id=a-loc placeholder="Bloomington, IN"></div>
+    <div><label for=a-when>When</label><input id=a-when placeholder="Saturday afternoon"></div>
+  </div>
+  <div id=err class=err></div>
+  <button class=go id=a-go>Get my forecast ticket</button>
+
+  <div id=ticket>
+    <div class=tk-top>
+      <div class=tk-place id=tk-place></div>
+      <div class=verdict id=tk-verdict></div>
+    </div>
+    <div class=tk-body>
+      <p id=tk-text></p>
+      <div class=nums id=tk-nums></div>
+      <div class=ai-note><b>Written by AI.</b> This ticket was generated by a language model
+      from National Weather Service and Open-Meteo data. No Meteorologist reviewed it. If the
+      day matters, a person should look at it.</div>
+    </div>
+  </div>
+</div></div></section>
+
+<section class="sec s-blue"><div class=wrap><div class=inner>
+  <h2>When free isn't enough</h2>
+  <p class=sub>This is a machine reading numbers. Everything below is a person reading the sky.</p>
+  <div class=up>
+    <div class=card><b>Met Review</b><div class=p>$19 once</div>
+      <p>A Meteorologist studies your exact date and place and writes you back. One answer,
+      from a human, about your day.</p>
+      <a href="/met-review">Get a review &rarr;</a></div>
+    <div class=card><b>Stormline</b><div class=p>$12/year</div>
+      <p>Official warnings for one exact address, all year. Texts with radar, a phone call for
+      tornadoes, and the all clear.</p>
+      <a href="/stormline">Put a Stormline on it &rarr;</a></div>
+  </div>
+</div></div></section>
+__WV_FOOTER__
+"""
+
+_AI_SCRIPT = """<script>
+document.getElementById('a-go').addEventListener('click', function(){
+  var btn=this, err=document.getElementById('err'), tk=document.getElementById('ticket');
+  err.style.display='none';
+  var plan=document.getElementById('a-plan').value.trim();
+  var loc=document.getElementById('a-loc').value.trim();
+  if(plan.length<4){ err.textContent='Tell us what you are planning.'; err.style.display='block'; return; }
+  if(loc.length<2){ err.textContent='Where is it? A city and state is enough.'; err.style.display='block'; return; }
+  btn.disabled=true; btn.textContent='Reading the sky...';
+  fetch('/api/v1/forecast/ticket',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({plan:plan,location:loc,when:document.getElementById('a-when').value})})
+   .then(function(r){return r.json();}).then(function(j){
+      btn.disabled=false; btn.textContent='Get my forecast ticket';
+      if(!j||!j.ok){ err.textContent=(j&&j.error)||'Something went wrong. Try again.';
+        err.style.display='block'; return; }
+      document.getElementById('tk-place').textContent=j.place||loc;
+      var v=document.getElementById('tk-verdict');
+      v.textContent=j.verdict; v.className='verdict v-'+j.verdict;
+      document.getElementById('tk-text').textContent=j.paragraph;
+      var n='';
+      function box(val,lab){ if(val===null||val===undefined||val==='')return'';
+        return '<div class=num><b>'+val+'</b><i>'+lab+'</i></div>'; }
+      n+=box(j.temp!==null&&j.temp!==undefined?Math.round(j.temp)+String.fromCharCode(176):'', 'At that hour');
+      n+=box(j.high!==null&&j.high!==undefined?Math.round(j.high)+String.fromCharCode(176):'', 'High');
+      n+=box(j.low!==null&&j.low!==undefined?Math.round(j.low)+String.fromCharCode(176):'', 'Low');
+      n+=box((j.precip||0)+'%','Precip');
+      n+=box(j.wind!==null&&j.wind!==undefined?Math.round(j.wind)+' mph':'', 'Wind');
+      document.getElementById('tk-nums').innerHTML=n;
+      tk.style.display='block';
+      tk.scrollIntoView({behavior:'smooth',block:'nearest'});
+   }).catch(function(){
+      btn.disabled=false; btn.textContent='Get my forecast ticket';
+      err.textContent='Network problem. Try again.'; err.style.display='block';
+   });
+});
+</script>"""
+
+
+@app.get("/forecast")
+def ai_forecast_page():
+    return wv_shell(_AI_PAGE.replace("__WV_FOOTER__", _AI_SCRIPT + "\n__WV_FOOTER__"))
 
 
 @app.get("/pricing")
@@ -16628,7 +16919,7 @@ __WV_HEADER__
   <div class=tiers style="margin-bottom:34px">
     <div class=tier><div class=t>AI Forecast</div><div class=p>Free</div>
       <p>Ask once. Get an answer in seconds. It's AI, and we'll never pretend otherwise.</p>
-      <a class=go href="https://weathervalet.ai">Ask it now &rarr;</a></div>
+      <a class=go href="/forecast">Ask it now &rarr;</a></div>
     <div class=tier><div class=t>Stormline</div><div class=p>$12/year</div>
       <p>You don't watch the weather. Stormline watches your address. Warning texts with radar,
       a phone call for tornadoes, the all clear.</p>
@@ -16690,7 +16981,7 @@ __WV_HEADER__
    {i:'\\uD83C\\uDF89',t:"It's my event, and I want a Meteorologist watching it",s:"My day, my window, my Meteorologist",go:"watch"},
    {i:'\\uD83C\\uDFDF',t:"It's a big day the whole town is out for",s:"Game day, fair, festival",go:"side"}]};
   var R={
-   ai:{n:"AI Forecast",p:"Free",k:"Ask once. Get an answer in seconds. It's AI, and we'll never pretend otherwise.",c:"Ask it now",u:"https://weathervalet.ai"},
+   ai:{n:"AI Forecast",p:"Free",k:"Ask once. Get an answer in seconds. It's AI, and we'll never pretend otherwise.",c:"Ask it now",u:"/forecast"},
    review:{n:"Met Review",p:"$19 once",k:"You have a decision to make. A Meteorologist studies your date and writes you back.",c:"Get a review",u:"/met-review"},
    storm:{n:"Stormline",p:"$12/year",k:"You don't watch the weather. Stormline watches your address.",c:"Put a Stormline on it",u:"/stormline"},
    daily:{n:"Stormline Daily",p:"$24/year",k:"The forecast finds you every morning. And the warning finds you at 2 AM.",c:"Start the morning message",u:"/stormlinedaily"},
