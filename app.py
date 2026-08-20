@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-156"
+BACKEND_BUILD = "0702-158"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -12911,9 +12911,34 @@ _GAMEDAY_IU_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <link rel=preconnect href=https://fonts.gstatic.com crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;600;800&display=swap" rel=stylesheet>
 <style>
-:root{--crim:#A6192E;--crim-deep:#7E1322;--night:#140A0C;--cream:#F3EAD3;--bolt:#FFCE44;--ink:#1B1416}
-*{box-sizing:border-box}
-body{margin:0;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;background:var(--night);color:var(--cream);font-size:17px}
+__WV_TOKENS__
+/* Sidekick keeps its crimson, but the header, footer and type come from the
+   shared shell so it belongs to the same company as everything else. */
+:root{--crim:#A6192E;--crim-deep:#7E1322;--night:#140A0C;--bolt:#FFCE44;
+  --accent:#A6192E;--cream:#F3EAD3}
+body{background:var(--night);color:var(--cream);font-size:17px}
+header{background:rgba(20,10,12,.85);border-bottom:1px solid rgba(243,234,211,.14)}
+header .logo span{color:var(--bolt)}
+.nl{color:#E6D8C4}
+.nl:hover{background:rgba(243,234,211,.09)}
+.dd{background:#1B0F12;border-color:rgba(243,234,211,.16)}
+.dd a{color:#EFE3CF}
+.dd a:hover{background:rgba(166,25,46,.3)}
+.dd h6,.dd a i{color:#B79A8E}
+.signin{color:#E6D8C4}
+.burger{border-color:rgba(243,234,211,.2)}
+#mnav{border-color:rgba(243,234,211,.14)}
+footer{background:#0E0709;border-color:rgba(243,234,211,.12);color:var(--cream)}
+footer h6{color:var(--bolt)}
+footer a{color:#B79A8E}
+.legal{border-color:rgba(243,234,211,.09);color:#8A6F73}
+.sec{padding:64px 0;border-top:1px solid rgba(243,234,211,.07)}
+.s-night{background:#140A0C}
+.s-crim{background:linear-gradient(180deg,#1B0D10 0%,#5A1220 55%,#2A0E14 100%)}
+.s-cream{background:linear-gradient(180deg,#F7F1E4 0%,#EDE2CD 100%);color:#231317}
+.s-cream h2,.s-cream h3,.s-cream b,.s-cream strong{color:#1B0F12}
+.s-cream p,.s-cream li{color:#5A4247}
+.inner{max-width:660px;margin:0 auto}
 .field{position:relative;overflow:hidden;background:
   linear-gradient(180deg,rgba(20,10,12,0) 55%,rgba(20,10,12,.92) 100%),
   radial-gradient(1200px 500px at 50% -180px,rgba(255,206,68,.20),rgba(255,206,68,0) 60%),
@@ -12989,6 +13014,10 @@ button:disabled{opacity:.6}
 .err{display:none;background:#FBE3E3;border:1px solid #E3A9A9;color:#7E1322;border-radius:8px;padding:10px 12px;margin-top:12px;font-size:15px}
 .why{max-width:560px;margin:36px auto 0;padding:0 6px}
 .why h2{font-family:'Bebas Neue';font-size:34px;letter-spacing:.05em;color:var(--cream);text-align:center;margin:0 0 16px}
+/* Inside the cream room, cream text would be invisible. The room wins. */
+.s-cream .why h2{color:#1B0F12}
+.s-cream .why li,.s-cream .why li b{color:#3A2429}
+.s-cream .why li b{font-weight:700}
 .why ul{list-style:none;padding:0;margin:0}
 .why li{padding:10px 0 10px 36px;position:relative;font-size:16.5px;line-height:1.55;color:#EDD3D3;border-bottom:1px solid rgba(243,234,211,.1)}
 .why li:last-child{border-bottom:none}
@@ -12997,6 +13026,7 @@ button:disabled{opacity:.6}
 .foot{text-align:center;font-size:13px;color:#8A6F73;padding:26px 18px 36px;line-height:1.7}
 .foot a{color:#C89AA1}
 </style></head><body>
+__WV_HEADER__
 
 <div class=field>
   <div class=brand><span class=bolt>&#9889;</span> WeatherValet</div>
@@ -13052,6 +13082,7 @@ button:disabled{opacity:.6}
   </div>
 </div>
 
+<section class="sec s-crim"><div class=wrap><div class=inner>
 <div class=ticketzone>
   <p class=pricing-line><b>Series pass: all 8 Indiana University Football home games for $16 total.</b><br>
   Or cover a single game for $5. That's it. No subscription, no app.</p>
@@ -13085,7 +13116,9 @@ button:disabled{opacity:.6}
     Group of tailgaters? Everyone needs their own pass.</div>
   </div>
 
-  <div class=why>
+  </div></div></div></section>
+<section class="sec s-cream"><div class=wrap><div class=inner>
+<div class=why>
     <h2>Why fans sign up</h2>
     <ul>
       <li><b>Plan the tailgate with confidence.</b> You'll know the dry window before you load the truck.</li>
@@ -13097,11 +13130,12 @@ button:disabled{opacity:.6}
     </ul>
   </div>
 
-  <p class=foot><a href="/gameday/terms" style="color:#C8A2A8">Sidekick Terms and text message program</a>
-  &middot; <a href="https://weathervalet.ai/?legal=privacy" style="color:#C8A2A8">Privacy</a><br>
-  WeatherValet is an independent weather service, not affiliated with or endorsed by Indiana University.<br>
-  Want weather for YOUR life, not just gamedays? <a href="https://weathervalet.ai">WeatherValet.ai</a></p>
-</div>
+    <p style="text-align:center;font-size:13px;color:#6B5257;margin:26px auto 0;max-width:560px;line-height:1.7">
+    <a href="/gameday/terms" style="color:#8A1F32">Sidekick Terms and text message program</a>
+    &middot; <a href="https://weathervalet.ai/?legal=privacy" style="color:#8A1F32">Privacy</a><br>
+    WeatherValet is an independent weather service, not affiliated with or endorsed by
+    Indiana University.</p>
+</div></div></section>
 
 <script>
 var PASS = { type: 'season' };
@@ -13172,8 +13206,9 @@ document.getElementById('g-go').addEventListener('click', function(){
     err.style.display = 'block'; btn.disabled = false; setType(PASS.type);
   });
 });
-</script></body></html>
-"""
+</script>
+
+__WV_FOOTER__"""
 
 
 @app.get("/terms")
@@ -13206,7 +13241,7 @@ def _onduty_alias():
 
 @app.get("/gameday/iu")
 def gameday_iu_page():
-    return _GAMEDAY_IU_PAGE.replace("<!--WV_GAMEPICKER-->", _gameday_picker_html())
+    return wv_shell(_GAMEDAY_IU_PAGE.replace("<!--WV_GAMEPICKER-->", _gameday_picker_html()))
 
 
 @app.route("/api/v1/gameday/checkout", methods=["OPTIONS"])
@@ -14057,6 +14092,33 @@ body{background:var(--ink);color:var(--cream)}
 .s-light p,.s-light li,.s-light .fine{color:#41536F}
 .s-deep{background:linear-gradient(180deg,#04070E 0%,#0A1533 60%,#04070E 100%)}
 .inner{max-width:660px;margin:0 auto}
+/* This page was originally light themed, so its text colours were dark. On the
+   dark rooms that reads as invisible, measured at 1.1 contrast. Dark rooms get
+   light text; the light room keeps the dark. Checked with a real contrast
+   ratio in the browser, not by eye. */
+.sec h2,.sec h3{color:#fff}
+.sec p,.sec li,.sec .a,.sec .q{color:#C4D3EC}
+.sec .q{color:#fff}
+.sec .fine{color:#8CA0C0}
+.sec .vs th{color:#8CA0C0}
+.sec .vs td{border-color:rgba(126,182,255,.16)}
+.sec .vs td.y{color:#EAF1FF}
+.sec .vs td.n{color:#93A6C2}
+.sec .who li{border-color:rgba(126,182,255,.14);color:#C4D3EC}
+.sec .who b{color:#fff}
+.sec ul.feat li{color:#C4D3EC}
+.sec ul.feat li b{color:#fff}
+.sec .dollar{background:rgba(30,107,255,.14);border-color:rgba(126,182,255,.3);color:#DDE8FA}
+.sec .dollar b{color:#fff}
+.sec label{color:#93A6C2}
+/* The one light room flips it all back. */
+.s-light h2,.s-light h3,.s-light .q,.s-light .who b,.s-light ul.feat li b,
+.s-light .vs td.y,.s-light .dollar b{color:#08101F}
+.s-light p,.s-light li,.s-light .a,.s-light ul.feat li,.s-light .who li{color:#41536F}
+.s-light .fine,.s-light .vs th,.s-light .vs td.n,.s-light label{color:#5F7192}
+.s-light .vs td{border-color:rgba(11,18,32,.14)}
+.s-light .dollar{background:#E6EEFC;border-color:#C3D7F5;color:#2B3B55}
+.s-light .who li{border-color:rgba(11,18,32,.12)}
 .card{background:transparent;border:none;border-radius:0;padding:0;margin:0;box-shadow:none}
 .s-light .card{color:#0B1220}
 .card h2{margin:0 0 12px;font-size:17px}
@@ -15163,7 +15225,8 @@ section{padding:82px 0;border-top:1px solid rgba(255,255,255,.05)}
 h2{font-size:clamp(27px,4.4vw,44px);line-height:1.06;margin:0 0 14px;font-weight:900;
   letter-spacing:-.03em;color:#fff}
 h3{font-size:clamp(20px,2.6vw,26px);margin:0 0 10px;font-weight:700;letter-spacing:-.02em;color:#fff}
-.sub{color:var(--mute);font-size:16.5px;max-width:600px;margin:0 0 34px}
+.sub{color:#B9CAE4;font-size:16.5px;max-width:600px;margin:0 0 34px}
+.s-light .sub,.s-light p{color:#41536F}
 .two{display:grid;grid-template-columns:1fr;gap:38px;align-items:center}
 @media(min-width:860px){.two{grid-template-columns:1.05fr .95fr;gap:56px}}
 .two.flip .art{order:-1}
@@ -15243,7 +15306,7 @@ h3{font-size:clamp(20px,2.6vw,26px);margin:0 0 10px;font-weight:700;letter-spaci
 .tier:hover{border-color:rgba(224,36,60,.55);transform:translateY(-3px)}
 .tier .t{font-size:19px;font-weight:800;color:#fff;letter-spacing:-.02em}
 .tier .p{color:var(--sky);font-weight:800;margin:3px 0 10px}
-.tier p{margin:0 0 14px;font-size:14.5px;color:var(--mute);line-height:1.6}
+.tier p{margin:0 0 14px;font-size:14.5px;color:#B9CAE4;line-height:1.6}
 .tier a.go{font-size:14px;color:var(--sky);font-weight:700}
 .robot{font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--mute);
   font-weight:800;margin:0 0 14px}
