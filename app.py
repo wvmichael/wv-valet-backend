@@ -106,7 +106,7 @@ import bcrypt
 import psycopg2
 import psycopg2.extras
 
-from flask import Flask, abort, jsonify, make_response, redirect, render_template_string, request
+from flask import Flask, Response, abort, jsonify, make_response, redirect, render_template_string, request
 
 # Stripe and Twilio are imported lazily so the file can be inspected without them
 try:
@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-160"
+BACKEND_BUILD = "0702-161"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -5102,23 +5102,70 @@ def _forecast_explain_preflight():
 
 
 @app.get("/")
-def _health_check():
-    """Health check / friendly landing page.
+def _root():
+    """The front door for people, and a health check for machines.
 
-    Render pings this to confirm the service is alive. Anyone who hits
-    this URL in a browser sees a brief explanation of what's running here.
-    Don't return sensitive details.
+    Render and uptime monitors ping this URL and only care about a 200, but
+    they do not ask for HTML. Browsers do. So: a browser gets the homepage,
+    anything else gets the same JSON this route always returned. Both are
+    200, so nothing that was watching this endpoint breaks.
     """
+    accept = (request.headers.get("Accept") or "")
+    if "text/html" in accept:
+        return wv_home_page()
     return jsonify({
         "service": "wv-valet-backend",
         "status": "ok",
         "endpoints": [
+            "GET /home",
+            "GET /api/v1/healthz",
             "POST /api/v1/forecast/explain",
             "POST /api/v1/verification/checkout",
-            "GET /meteorologist/home",
-            "GET /admin/dashboard",
         ],
     })
+
+
+@app.get("/robots.txt")
+def robots_txt():
+    """Let crawlers have the product pages, keep them out of consoles and
+    one-off tokenised links."""
+    body = (
+        "User-agent: *\n"
+        "Allow: /\n"
+        "Disallow: /gameday/console\n"
+        "Disallow: /watch/console\n"
+        "Disallow: /stormline/manage/\n"
+        "Disallow: /api/\n"
+        "Disallow: /admin\n"
+        "Disallow: /meteorologist\n"
+        "Disallow: /portal\n"
+        "\n"
+        f"Sitemap: {PUBLIC_BASE_URL}/sitemap.xml\n"
+    )
+    return Response(body, mimetype="text/plain")
+
+
+@app.get("/sitemap.xml")
+def sitemap_xml():
+    """Every page a stranger should be able to find from a search engine."""
+    paths = [
+        ("/", "1.0"),
+        ("/home", "1.0"),
+        ("/stormline", "0.9"),
+        ("/stormlinedaily", "0.8"),
+        ("/gameday/iu", "0.9"),
+        ("/watch", "0.8"),
+        ("/met-review", "0.8"),
+        ("/pro", "0.9"),
+        ("/gameday/terms", "0.3"),
+    ]
+    urls = "".join(
+        "<url><loc>%s%s</loc><priority>%s</priority></url>" % (PUBLIC_BASE_URL, path, pri)
+        for path, pri in paths)
+    xml = ('<?xml version="1.0" encoding="UTF-8"?>'
+           '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+           + urls + '</urlset>')
+    return Response(xml, mimetype="application/xml")
 
 
 @app.before_request
