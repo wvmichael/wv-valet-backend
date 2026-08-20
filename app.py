@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-159"
+BACKEND_BUILD = "0702-160"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -12684,15 +12684,15 @@ WV_HEADER = """<header>
       <a href="/gameday/iu"><b>Sidekick</b><i>$16/series</i></a>
       <a href="/met-review"><b>Met Review</b><i>$19</i></a>
       <a href="/watch"><b>Watch</b><i>$49/day</i></a>
-      <a href="https://weathervalet.ai/pricing"><b>Pro</b><i>from $99/mo</i></a>
+      <a href="/pro"><b>Pro</b><i>from $99/mo</i></a>
     </div></div>
   <div class=nl>Who it's for &#9662;
     <div class=dd>
       <a href="/stormline"><b>Families and homeowners</b></a>
       <a href="/watch"><b>Weddings and events</b></a>
-      <a href="https://weathervalet.ai/pricing"><b>Farms and growers</b></a>
-      <a href="https://weathervalet.ai/pricing"><b>Contractors and crews</b></a>
-      <a href="https://weathervalet.ai/pricing"><b>Public safety and schools</b></a>
+      <a href="/pro"><b>Farms and growers</b></a>
+      <a href="/pro"><b>Contractors and crews</b></a>
+      <a href="/pro"><b>Public safety and schools</b></a>
     </div></div>
   <div class=nl>Company &#9662;
     <div class=dd>
@@ -12715,7 +12715,7 @@ WV_HEADER = """<header>
    <a href="/gameday/iu">Sidekick &middot; $16/series</a>
    <a href="/met-review">Met Review &middot; $19</a>
    <a href="/watch">Watch &middot; $49/event day</a>
-   <a href="https://weathervalet.ai/pricing">Pro &middot; from $99/mo</a>
+   <a href="/pro">Pro &middot; from $99/mo</a>
    <h6>Company</h6>
    <a href="/home#mets">Our Meteorologists</a>
    <a href="https://weathervalet.ai/crew">Valet Crew</a>
@@ -12734,7 +12734,7 @@ WV_FOOTER = """<footer>
      <a href="/gameday/iu">Sidekick</a>
      <a href="/met-review">Met Review</a>
      <a href="/watch">Watch</a>
-     <a href="https://weathervalet.ai/pricing">Pro</a>
+     <a href="/pro">Pro</a>
      <a href="https://weathervalet.ai/crew">Valet Crew</a></div>
    <div><h6>Support</h6>
      <a href="mailto:hello@weathervalet.ai">Contact us</a>
@@ -15118,6 +15118,378 @@ document.getElementById('r-go').addEventListener('click', function(){
 __WV_FOOTER__"""
 
 
+# ---------------------------------------------------------------------------
+# WeatherValet Pro (Aug 19, 2026)
+#
+# Two rules, no exceptions: $99 base for one person at one location, $39 for
+# each additional person, $49 for each additional location. Prices live here
+# in code as inline Stripe price_data, so changing them never means touching
+# the Stripe dashboard or a Render env var.
+# ---------------------------------------------------------------------------
+PRO_BASE_CENTS = 9900
+PRO_USER_CENTS = 3900
+PRO_LOCATION_CENTS = 4900
+
+
+def pro_monthly_cents(users: int, locations: int) -> int:
+    u = max(1, int(users))
+    l = max(1, int(locations))
+    return PRO_BASE_CENTS + (u - 1) * PRO_USER_CENTS + (l - 1) * PRO_LOCATION_CENTS
+
+
+def _pro_line_items(users: int, locations: int) -> list:
+    """One Stripe line per thing, so the invoice reads like an itemised bill
+    instead of a lump sum the customer has to trust."""
+    u = max(1, int(users))
+    l = max(1, int(locations))
+    items = [{
+        "quantity": 1,
+        "price_data": {
+            "currency": "usd",
+            "unit_amount": PRO_BASE_CENTS,
+            "recurring": {"interval": "month"},
+            "product_data": {
+                "name": "WeatherValet Pro",
+                "description": "Your own Meteorologist team. Daily written briefs, questions any time, custom alerts. Includes 1 person and 1 location."
+            },
+        },
+    }]
+    if u > 1:
+        items.append({
+            "quantity": u - 1,
+            "price_data": {
+                "currency": "usd",
+                "unit_amount": PRO_USER_CENTS,
+                "recurring": {"interval": "month"},
+                "product_data": {"name": "WeatherValet Pro - additional person",
+                                 "description": "Their own briefs, and they can message a Meteorologist."},
+            },
+        })
+    if l > 1:
+        items.append({
+            "quantity": l - 1,
+            "price_data": {
+                "currency": "usd",
+                "unit_amount": PRO_LOCATION_CENTS,
+                "recurring": {"interval": "month"},
+                "product_data": {"name": "WeatherValet Pro - additional location",
+                                 "description": "Another job site, farm, shop, home or venue, watched separately."},
+            },
+        })
+    return items
+
+
+@app.post("/api/v1/pro/checkout")
+def pro_checkout():
+    """Start a Pro subscription. Provisioning happens in the existing
+    webhook account-creation flow, which sends the magic link."""
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()[:120]
+    email = (data.get("email") or "").strip()[:200]
+    company = (data.get("company") or "").strip()[:160]
+    phone = _normalize_phone((data.get("phone") or "").strip())
+    # `or 1` would quietly turn a 0 into a 1, so read the raw values and
+    # let the range check below do the refusing.
+    try:
+        users = int(data.get("users", 1))
+        locations = int(data.get("locations", 1))
+    except Exception:
+        return jsonify({"ok": False, "error": "Pick how many people and locations."}), 400
+    if not email or not is_valid_email(email):
+        return jsonify({"ok": False, "error": "Enter a valid work email."}), 400
+    if users < 1 or locations < 1:
+        return jsonify({"ok": False, "error": "Pick how many people and locations."}), 400
+    # Above five of either, a rep should be in the room rather than a form.
+    if users > 5 or locations > 5:
+        return jsonify({"ok": False,
+                        "error": "For a crew that size we'll build the number with you. Email hello@weathervalet.ai and we'll come back the same day."}), 400
+    if not stripe:
+        return jsonify({"ok": False, "error": "Payments aren't configured yet."}), 503
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=_pro_line_items(users, locations),
+            customer_email=email,
+            metadata={"wv_product": "pro", "pro_users": str(users),
+                      "pro_locations": str(locations), "pro_company": company,
+                      "pro_phone": phone or "", "pro_name": name},
+            subscription_data={"metadata": {"wv_product": "pro",
+                                            "pro_users": str(users),
+                                            "pro_locations": str(locations)}},
+            success_url=f"{PUBLIC_BASE_URL}/pro/welcome",
+            cancel_url=f"{PUBLIC_BASE_URL}/pro",
+        )
+    except Exception as e:
+        print(f"[pro] stripe error: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "Payment setup failed. Try again in a moment."}), 502
+    try:
+        _send_team_notification(
+            subject=f"Pro signup started: {company or name or email}",
+            html_body=(f"<p><b>Pro checkout started.</b></p><p>{_html_escape(name)} "
+                       f"{_html_escape(company)}<br>{_html_escape(email)} {_html_escape(phone or '')}<br>"
+                       f"{users} people, {locations} locations, "
+                       f"${pro_monthly_cents(users, locations)//100}/mo</p>"),
+            text_body=f"Pro checkout started: {email} {users}u {locations}L")
+    except Exception:
+        pass
+    return jsonify({"ok": True, "url": session.url})
+
+
+@app.get("/pro/welcome")
+def pro_welcome_page():
+    return wv_shell(_PRO_WELCOME_PAGE)
+
+
+_PRO_WELCOME_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Welcome to WeatherValet Pro</title><style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+.mid{max-width:620px;margin:0 auto;padding:90px 22px 80px;text-align:center}
+h1{font-size:clamp(28px,5vw,44px);font-weight:900;letter-spacing:-.03em;color:#fff;margin:0 0 14px}
+p{color:#B9CAE4;font-size:16.5px;line-height:1.65}
+</style></head><body>
+__WV_HEADER__
+<div class=mid>
+  <div style="font-size:44px">&#9889;</div>
+  <h1>Welcome to Pro.</h1>
+  <p>Payment received. Check your email in the next few minutes for a link to set your
+  password, then tell us your locations and we will get your first brief scheduled.</p>
+  <p>If anything looks wrong, email hello@weathervalet.ai and a person will answer.</p>
+</div>
+__WV_FOOTER__"""
+
+
+_PRO_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>WeatherValet Pro - your own Meteorologist, every day - from $99/month</title>
+<meta name=description content="A Meteorologist team for your work or your life. Daily written briefs, questions any time, custom alerts. From $99 a month.">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+.hero{position:relative;overflow:hidden;padding:66px 0 56px;
+  background:radial-gradient(130% 100% at 50% -25%,#12234A 0%,#0A1020 46%,#04070E 100%)}
+.hero:before{content:"";position:absolute;inset:-25%;pointer-events:none;opacity:.55;
+  background:radial-gradient(34% 30% at 30% 26%,rgba(30,107,255,.24),transparent 66%);
+  animation:drift 22s ease-in-out infinite alternate}
+@keyframes drift{from{transform:translate3d(-2%,-1%,0)}to{transform:translate3d(3%,2%,0) scale(1.08)}}
+.hero .wrap{position:relative}
+.eyebrow{font-size:12px;letter-spacing:.24em;text-transform:uppercase;color:var(--sky);font-weight:800;margin-bottom:12px}
+.pname{font-size:clamp(38px,9vw,62px);font-weight:900;letter-spacing:-.03em;line-height:1;margin:0 0 14px;color:#fff}
+h1{font-size:clamp(23px,3.4vw,32px);line-height:1.18;margin:0 0 12px;font-weight:800;letter-spacing:-.02em;color:#fff}
+h1 em{color:var(--sky);font-style:normal}
+.lede{font-size:16.5px;line-height:1.6;color:#B9CAE4;max-width:560px;margin:0 0 22px}
+.price{display:inline-block;background:var(--accent);color:#fff;border-radius:999px;padding:9px 24px;font-weight:800;font-size:18px}
+.sec{padding:64px 0;border-top:1px solid rgba(255,255,255,.06)}
+.s-black{background:#04070E}
+.s-blue{background:linear-gradient(180deg,#0B1428 0%,#123163 55%,#0C1D3E 100%)}
+.s-light{background:linear-gradient(180deg,#F2F6FD 0%,#E4EDFB 100%);color:#0B1220}
+.s-light h2,.s-light h3,.s-light b,.s-light strong{color:#08101F}
+.s-light p,.s-light li,.s-light label{color:#41536F}
+.inner{max-width:660px;margin:0 auto}
+h2{font-size:clamp(24px,4vw,36px);line-height:1.08;margin:0 0 14px;font-weight:900;letter-spacing:-.025em;color:#fff}
+.sub{font-size:16.5px;color:#B9CAE4;max-width:600px;margin:0 0 28px}
+ul.feat{list-style:none;padding:0;margin:0}
+ul.feat li{padding:10px 0 10px 28px;position:relative;font-size:15.5px;line-height:1.6;color:#C4D3EC}
+ul.feat li:before{content:"\\\\2713";position:absolute;left:2px;color:var(--sky);font-weight:800}
+ul.feat li b{color:#fff}
+.s-light ul.feat li{color:#41536F}
+.s-light ul.feat li b{color:#08101F}
+.s-light ul.feat li:before{color:#1E4FBF}
+label{display:block;font-size:12.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
+  color:#93A6C2;margin:16px 0 6px}
+input{width:100%;box-sizing:border-box;padding:12px;border-radius:8px;font-size:16px;font-family:inherit;
+  border:1px solid rgba(126,182,255,.28);background:#0C1424;color:#EAF1FF}
+.pick{display:grid;grid-template-columns:repeat(6,1fr);gap:8px}
+.pick button{padding:14px 4px;border-radius:10px;border:1px solid rgba(126,182,255,.22);
+  background:rgba(255,255,255,.04);color:#EAF1FF;font-size:17px;font-weight:700;cursor:pointer;transition:.18s}
+.pick button:hover{border-color:rgba(224,36,60,.6);transform:translateY(-2px)}
+.pick button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.bill{margin-top:22px;border-top:1px solid rgba(126,182,255,.2);padding-top:16px}
+.bill .row{display:flex;justify-content:space-between;gap:14px;padding:7px 0;font-size:14.5px;color:#B9CAE4}
+.bill .row b{color:#fff;font-weight:600}
+.bill .tot{display:flex;justify-content:space-between;align-items:baseline;margin-top:10px;
+  padding-top:14px;border-top:1px solid rgba(126,182,255,.2)}
+.bill .tot span{font-size:14.5px;color:#B9CAE4}
+.bill .tot b{font-size:30px;color:#fff;font-weight:800}
+button.go{width:100%;margin-top:20px;background:var(--accent);color:#fff;border:none;border-radius:10px;
+  padding:15px;font-size:17px;font-weight:800;cursor:pointer;transition:.18s}
+button.go:hover{filter:brightness(1.14);transform:translateY(-1px)}
+button.go:disabled{opacity:.6;transform:none}
+.err{display:none;background:#3A1220;border:1px solid #7C2740;color:#FFC2CE;border-radius:9px;
+  padding:11px 13px;margin-top:14px;font-size:14.5px}
+.fine{font-size:12.5px;color:#8CA0C0;margin-top:12px;line-height:1.6;text-align:center}
+.s-light .fine{color:#5F7192}
+</style></head><body>
+__WV_HEADER__
+
+<div class=hero>
+  <div class=wrap>
+    <div class=eyebrow>&#9889; WeatherValet</div>
+    <div class=pname>Pro</div>
+    <h1>Weather decides your money every week. <em>Put a Meteorologist on it.</em></h1>
+    <p class=lede>Not one date at a time. Your own Meteorologist team, every day, writing briefs
+    for your locations and answering your questions in plain language.</p>
+    <div class=price>From $99 a month</div>
+  </div>
+</div>
+
+<section class="sec s-black">
+ <div class=wrap><div class=inner>
+  <h2>What you actually get</h2>
+  <ul class=feat>
+    <li><b>A written brief every day</b> for each location you watch, by a Meteorologist who
+    knows what you do with it.</li>
+    <li><b>Message your Meteorologist any time.</b> Ask about Thursday. Ask about the whole week.
+    Ask whether to send the crew.</li>
+    <li><b>Custom alerts on your thresholds.</b> Tell me if wind tops 25 Thursday. Tell me if we
+    drop below freezing before Tuesday.</li>
+    <li><b>Priority during severe weather</b>, when everyone wants an answer at once.</li>
+    <li><b>Written by a person.</b> Never AI-written, never AI-signed. Same rule as everything
+    else we do.</li>
+  </ul>
+ </div></div>
+</section>
+
+<section class="sec s-light">
+ <div class=wrap><div class=inner>
+  <h2>Who runs on Pro</h2>
+  <ul class=feat>
+    <li><b>The concrete contractor.</b> Pours three days a week, eight months a year. One ruined
+    pour costs more than a year of this.</li>
+    <li><b>The farmer.</b> Irrigation, spray windows, harvest. Wants to ask a person, not read
+    a model.</li>
+    <li><b>The excavation outfit.</b> Schedules crews Sunday night for the whole week and eats
+    the cost of a wrong guess.</li>
+    <li><b>County dispatch and the sheriff.</b> Needs a Meteorologist on call, not an app, when
+    a warning is coming.</li>
+    <li><b>And plenty of people who just want it.</b> Forty acres, a boat, a hobby farm, and no
+    interest in guessing. Pro is not only for businesses.</li>
+  </ul>
+ </div></div>
+</section>
+
+<section class="sec s-blue">
+ <div class=wrap><div class=inner>
+  <h2>Build your plan</h2>
+  <p class=sub>Two rules. $39 for each person after the first, $49 for each location after the
+  first. Nothing else.</p>
+
+  <label>Who needs access?</label>
+  <div class=pick id=pick-u></div>
+  <div class=fine style="text-align:left;margin-top:8px">Each person gets their own weather
+  updates and can message a Meteorologist.</div>
+
+  <label>How many places should we watch?</label>
+  <div class=pick id=pick-l></div>
+  <div class=fine style="text-align:left;margin-top:8px">A job site, farm, home, shop or venue.
+  Each is watched separately.</div>
+
+  <div class=bill id=bill></div>
+
+  <div id=form>
+    <label for=p-name>Your name</label><input id=p-name autocomplete=name>
+    <label for=p-company>Company (optional)</label><input id=p-company>
+    <label for=p-email>Email</label><input id=p-email type=email autocomplete=email>
+    <label for=p-phone>Mobile</label><input id=p-phone type=tel placeholder="317-555-0123">
+    <div id=err class=err></div>
+    <button class=go id=p-go>Start Pro</button>
+    <div class=fine>Billed monthly through Stripe. Cancel any time. We will email you a link to
+    set your password and tell us your locations.</div>
+  </div>
+ </div></div>
+</section>
+
+<section class="sec s-black">
+ <div class=wrap><div class=inner>
+  <h2>Straight answers</h2>
+  <p class=sub style="margin-bottom:10px"><b style="color:#fff">How is this different from
+  Watch?</b><br>Watch is one day, yours alone, $49. Pro is every day. Two Watch days a month
+  already costs $98.</p>
+  <p class=sub style="margin-bottom:10px"><b style="color:#fff">What counts as a person?</b><br>
+  Anyone who gets their own briefs and can message a Meteorologist. If your foreman needs the
+  forecast, that is a person.</p>
+  <p class=sub style="margin-bottom:10px"><b style="color:#fff">More than five people or
+  places?</b><br>Then it is worth a conversation rather than a calculator. Email
+  hello@weathervalet.ai and we will come back the same day.</p>
+  <p class=sub style="margin-bottom:0"><b style="color:#fff">Will they always be right?</b><br>
+  No. You are buying a Meteorologist's honest judgment and their attention every day, not a
+  guarantee. Official National Weather Service warnings always come first.</p>
+ </div></div>
+</section>
+
+<script>
+(function(){
+  var BASE=99, USER=39, LOC=49, u=1, l=1;
+  function chips(el, sel, cur){
+    el.innerHTML='';
+    for(var i=1;i<=6;i++){
+      var b=document.createElement('button');
+      b.textContent = i===6 ? '5+' : String(i);
+      b.setAttribute('data-v', i);
+      if(i===cur) b.className='on';
+      b.addEventListener('click', (function(v){return function(){ sel(v); };})(i));
+      el.appendChild(b);
+    }
+  }
+  function money(n){ return '$'+n; }
+  function render(){
+    chips(document.getElementById('pick-u'), function(v){u=v;render();}, u);
+    chips(document.getElementById('pick-l'), function(v){l=v;render();}, l);
+    var big = (u===6 || l===6);
+    var bill=document.getElementById('bill'), form=document.getElementById('form');
+    if(big){
+      bill.innerHTML='<div class=row><b>Above five, we build the number with you.</b></div>'
+        +'<div class=row>Tell us the crew and the sites and we will come back the same day.</div>'
+        +'<div style="margin-top:14px"><a class=go style="display:block;text-align:center;text-decoration:none" '
+        +'href="mailto:hello@weathervalet.ai?subject=WeatherValet%20Pro%20quote">Get a quote &rarr;</a></div>';
+      form.style.display='none';
+      return;
+    }
+    form.style.display='block';
+    var rows='<div class=row><span><b>WeatherValet Pro</b> &middot; 1 person, 1 location</span><span>'+money(BASE)+'/mo</span></div>';
+    if(u>1) rows+='<div class=row><span><b>'+(u-1)+' more '+((u-1)===1?'person':'people')+'</b> &middot; '+money(USER)+' each</span><span>+'+money((u-1)*USER)+'/mo</span></div>';
+    if(l>1) rows+='<div class=row><span><b>'+(l-1)+' more '+((l-1)===1?'location':'locations')+'</b> &middot; '+money(LOC)+' each</span><span>+'+money((l-1)*LOC)+'/mo</span></div>';
+    var total=BASE+(u-1)*USER+(l-1)*LOC;
+    rows+='<div class=tot><span>Your total</span><b>'+money(total)+'/mo</b></div>';
+    bill.innerHTML=rows;
+    document.getElementById('p-go').textContent='Start Pro \\\\u00b7 '+money(total)+'/month';
+  }
+  render();
+  document.getElementById('p-go').addEventListener('click', function(){
+    var btn=this, err=document.getElementById('err');
+    err.style.display='none';
+    var email=document.getElementById('p-email').value.trim();
+    if(!email || email.indexOf('@')<1){
+      err.textContent='Enter the email we should send your account link to.';
+      err.style.display='block'; return;
+    }
+    btn.disabled=true; btn.textContent='One moment...';
+    fetch('/api/v1/pro/checkout',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:document.getElementById('p-name').value,
+        company:document.getElementById('p-company').value,
+        email:email, phone:document.getElementById('p-phone').value,
+        users:u, locations:l})})
+      .then(function(r){return r.json();}).then(function(j){
+        if(j && j.ok && j.url){ window.location=j.url; return; }
+        err.textContent=(j && j.error) || 'Something went wrong. Try again.';
+        err.style.display='block'; btn.disabled=false; render();
+      }).catch(function(){
+        err.textContent='Network problem. Try again.';
+        err.style.display='block'; btn.disabled=false; render();
+      });
+  });
+})();
+</script>
+
+__WV_FOOTER__"""
+
+
+@app.get("/pro")
+def pro_page():
+    return wv_shell(_PRO_PAGE)
+
+
 @app.get("/met-review")
 @app.get("/review")
 def met_review_page():
@@ -15759,7 +16131,7 @@ __WV_HEADER__
       <a class=go href="/watch">Book a day &rarr;</a></div>
     <div class=tier><div class=t>Pro</div><div class=p>from $99/month</div>
       <p>Your own Meteorologist, every day, whenever weather affects your plans.</p>
-      <a class=go href="https://weathervalet.ai/pricing">Build my plan &rarr;</a></div>
+      <a class=go href="/pro">Build my plan &rarr;</a></div>
     <div class=tier><div class=t>Valet Crew</div><div class=p>Free to join</div>
       <p>Not a product. Report what you see from your corner of the sky, and make everyone
       else's forecast better.</p>
@@ -15804,7 +16176,7 @@ __WV_HEADER__
    daily:{n:"Stormline Daily",p:"$24/year",k:"The forecast finds you every morning. And the warning finds you at 2 AM.",c:"Start the morning message",u:"/stormlinedaily"},
    side:{n:"Sidekick",p:"$16/series",k:"The Meteorologist is watching the big day. You're on the list.",c:"See the days covered",u:"/gameday/iu"},
    watch:{n:"Watch",p:"$49/event day",k:"One Meteorologist. One event. Nobody else on the thread.",c:"Book a day",u:"/watch"},
-   pro:{n:"Pro",p:"from $99/month",k:"Your own Meteorologist, every day, whenever weather affects your plans.",c:"Build my plan",u:"https://weathervalet.ai/pricing"}};
+   pro:{n:"Pro",p:"from $99/month",k:"Your own Meteorologist, every day, whenever weather affects your plans.",c:"Build my plan",u:"/pro"}};
   var trail=[];
   function esc(t){var d=document.createElement('div');d.textContent=t||'';return d.innerHTML;}
   function crumb(){return trail.length?'<div class=crumb>&#10003; '+esc(trail[trail.length-1])+'</div>':'';}
