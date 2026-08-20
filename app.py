@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-155"
+BACKEND_BUILD = "0702-156"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -14032,9 +14032,14 @@ _STORMLINE_DAILY_HERO = """<div class=hero>
 
 _SENTRY_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>WeatherValet Stormline - watch the address you cannot stand next to - $12/year</title><style>
-:root{--blue:#1E7FFF;--navy:#0A1422;--ink:#0F1216}
-body{margin:0;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;background:#F6F7FB;color:var(--ink)}
+<title>WeatherValet Stormline - watch the address you cannot stand next to - $12/year</title>
+<meta name=description content="Official National Weather Service warnings for one exact address. Texts with radar, a phone call for tornadoes, and the all clear. $12 a year.">
+<style>
+__WV_TOKENS__
+/* Stormline runs on the shared shell. Only the accent and the page-specific
+   pieces live here, so a nav or footer change never has to be made twice. */
+:root{--accent:#1E6BFF}
+body{background:var(--ink);color:var(--cream)}
 .hero{background:linear-gradient(160deg,#0A1422,#12233D);color:#fff;padding:44px 20px 36px;text-align:center}
 .hero .brand{font-weight:900;font-size:20px;letter-spacing:-.01em;margin-bottom:6px}
 .hero .pname{font-size:clamp(40px,10vw,68px);font-weight:900;letter-spacing:-.025em;line-height:1;
@@ -14043,8 +14048,17 @@ body{margin:0;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;backgrou
 .hero h1 em{color:#F5C31E;font-style:normal}
 .hero p{color:#B9C7DC;max-width:560px;margin:0 auto;font-size:16.5px;line-height:1.55}
 .price{display:inline-block;background:var(--blue);border-radius:999px;padding:8px 22px;font-weight:800;margin-top:18px;font-size:18px}
-.wrap{max-width:640px;margin:0 auto;padding:26px 18px 60px}
-.card{background:#fff;border:1px solid rgba(15,18,22,.09);border-radius:14px;padding:22px;margin-bottom:18px;box-shadow:0 2px 10px rgba(10,20,34,.05)}
+.wrap{max-width:1120px;margin:0 auto;padding:0 22px}
+.sec{padding:66px 0;border-top:1px solid rgba(255,255,255,.05)}
+.s-black{background:#04070E}
+.s-blue{background:linear-gradient(180deg,#0B1428 0%,#123163 55%,#0C1D3E 100%)}
+.s-light{background:linear-gradient(180deg,#F2F6FD 0%,#E4EDFB 100%);color:#0B1220}
+.s-light h2,.s-light h3,.s-light b,.s-light strong{color:#08101F}
+.s-light p,.s-light li,.s-light .fine{color:#41536F}
+.s-deep{background:linear-gradient(180deg,#04070E 0%,#0A1533 60%,#04070E 100%)}
+.inner{max-width:660px;margin:0 auto}
+.card{background:transparent;border:none;border-radius:0;padding:0;margin:0;box-shadow:none}
+.s-light .card{color:#0B1220}
 .card h2{margin:0 0 12px;font-size:17px}
 ul.feat{list-style:none;padding:0;margin:0}
 ul.feat li{padding:7px 0 7px 30px;position:relative;font-size:15px;line-height:1.5}
@@ -14084,10 +14098,10 @@ button:disabled{opacity:.6}
 .q:first-of-type{margin-top:0}
 .a{font-size:15px;line-height:1.6;color:#3C4655;margin:0}
 </style></head><body>
+__WV_HEADER__
 <!--WV_HERO-->
-<div class=wrap>
-
-  <div class=card>
+<section class="sec s-black">
+ <div class=wrap><div class=inner>
     <h2>Who people put a Stormline on</h2>
     <ul class=who>
       <li><b>Mom, who is never going to download an app.</b> She does not have to. Put her
@@ -14102,9 +14116,11 @@ button:disabled{opacity:.6}
       money and have nobody standing in them.</li>
       <li><b>And yes, your own house.</b> Especially at 2 AM.</li>
     </ul>
-  </div>
+  </div></div>
+</section>
 
-  <div class=card>
+<section class="sec s-blue">
+ <div class=wrap><div class=inner>
     <h2>&#34;My phone already does this for free&#34;</h2>
     <p class=a style="margin-bottom:10px">Fair question, and mostly the honest answer is:
     your phone does part of this. Here is the part it does not.</p>
@@ -14124,9 +14140,11 @@ button:disabled{opacity:.6}
     </table>
     <p class=a style="margin-top:12px">Keep your free alerts. They are good. Stormline is for
     the address you cannot stand next to.</p>
-  </div>
+  </div></div>
+</section>
 
-  <div class=card>
+<section class="sec s-light">
+ <div class=wrap><div class=inner>
     <h2>What actually arrives</h2>
     <ul class=feat>
       <li><b>A text with the radar map</b> as soon as a Severe Thunderstorm, Tornado, or Flash
@@ -14141,9 +14159,11 @@ button:disabled{opacity:.6}
     </ul>
     <div class=dollar><b>$12 a year is a dollar a month.</b> One address, watched every hour of
     every day, for less than a single cup of coffee a season. Cancel any time.</div>
-  </div>
+  </div></div>
+</section>
 
-  <div class=card>
+<section class="sec s-deep">
+ <div class=wrap><div class=inner>
     <h2>Put a Stormline on it</h2>
     <div id=err class=err></div>
     <label for=s-name>Your name</label><input id=s-name autocomplete=name>
@@ -14222,9 +14242,11 @@ button:disabled{opacity:.6}
     <div class=total><span id=s-summary>Stormline, one address</span><b id=s-total>$12/yr</b></div>
     <button id=s-go>Protect this address &middot; $12/year</button>
     <div class=fine>Checkout is handled by Stripe. Cancel anytime. Alerts relay official National Weather Service warnings for the exact address you enter.</div>
-  </div>
+  </div></div>
+</section>
 
-  <div class=card>
+<section class="sec s-black">
+ <div class=wrap><div class=inner>
     <h2>Straight answers</h2>
     <p class=q>Will this tell me a tornado is coming before the Weather Service knows?</p>
     <p class=a>No, and be suspicious of anyone who says otherwise. Stormline relays the official
@@ -14242,12 +14264,10 @@ button:disabled{opacity:.6}
     <p class=q>What if I move or change numbers?</p>
     <p class=a>Email hello@weathervalet.ai and we take care of it. If you added the morning
     summary, the link in your messages also lets you change its send time yourself.</p>
-  </div>
+  </div></div>
+</section>
 
-</div>
-<div class=ladder>Robots watch addresses. Meteorologists watch your plans.<br>
-Big day coming? A real Meteorologist will work your forecast for $19 at
-<a href="https://weathervalet.ai">WeatherValet.ai</a></div>
+__WV_FOOTER__
 <script>
 document.getElementById('s-go').addEventListener('click', function(){
   var btn = this; btn.disabled = true; btn.textContent = 'One moment...';
@@ -14339,7 +14359,7 @@ document.getElementById('s-gift').addEventListener('change', wvSync);
 /*WV_PRESELECT*/
 if (window.WV_PRESELECT_DAILY) { document.getElementById('s-daily').checked = true; }
 wvSync();
-</script></body></html>"""
+</script>"""
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -15531,23 +15551,25 @@ def stormline_daily_page():
     """Same form, different front door. Leads with the morning summary and
     pre-checks it, for people who came looking for a daily forecast rather
     than for storm warnings."""
-    return (_SENTRY_PAGE
-            .replace("<!--WV_HERO-->", _STORMLINE_DAILY_HERO)
-            .replace("/*WV_PRESELECT*/", "window.WV_PRESELECT_DAILY = true;"))
+    return wv_shell(_SENTRY_PAGE
+                    .replace("<!--WV_HERO-->", _STORMLINE_DAILY_HERO)
+                    .replace("/*WV_PRESELECT*/", "window.WV_PRESELECT_DAILY = true;"))
 
 
 @app.get("/stormline")
 @app.get("/sentry")
 def sentry_page():
     """The Stormline marketing + signup page."""
-    return (_SENTRY_PAGE
-            .replace("<!--WV_HERO-->", _STORMLINE_HERO)
-            .replace("/*WV_PRESELECT*/", ""))
+    return wv_shell(_SENTRY_PAGE
+                    .replace("<!--WV_HERO-->", _STORMLINE_HERO)
+                    .replace("/*WV_PRESELECT*/", ""))
 
 
 @app.get("/alerts")
 def sentry_page_alias():
-    return _SENTRY_PAGE
+    return wv_shell(_SENTRY_PAGE
+                    .replace("<!--WV_HERO-->", _STORMLINE_HERO)
+                    .replace("/*WV_PRESELECT*/", ""))
 
 
 @app.route("/api/v1/sentry/checkout", methods=["OPTIONS"])
