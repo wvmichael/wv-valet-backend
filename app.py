@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-158"
+BACKEND_BUILD = "0702-159"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -12682,7 +12682,7 @@ WV_HEADER = """<header>
       <a href="/stormlinedaily"><b>Stormline Daily</b><i>$24/yr</i></a>
       <h6>Meteorologists watch your plans</h6>
       <a href="/gameday/iu"><b>Sidekick</b><i>$16/series</i></a>
-      <a href="https://weathervalet.ai"><b>Met Review</b><i>$19</i></a>
+      <a href="/met-review"><b>Met Review</b><i>$19</i></a>
       <a href="/watch"><b>Watch</b><i>$49/day</i></a>
       <a href="https://weathervalet.ai/pricing"><b>Pro</b><i>from $99/mo</i></a>
     </div></div>
@@ -12713,6 +12713,7 @@ WV_HEADER = """<header>
    <a href="/stormline">Stormline &middot; $12/yr</a>
    <a href="/stormlinedaily">Stormline Daily &middot; $24/yr</a>
    <a href="/gameday/iu">Sidekick &middot; $16/series</a>
+   <a href="/met-review">Met Review &middot; $19</a>
    <a href="/watch">Watch &middot; $49/event day</a>
    <a href="https://weathervalet.ai/pricing">Pro &middot; from $99/mo</a>
    <h6>Company</h6>
@@ -12731,6 +12732,7 @@ WV_FOOTER = """<footer>
      <a href="/stormline">Stormline</a>
      <a href="/stormlinedaily">Stormline Daily</a>
      <a href="/gameday/iu">Sidekick</a>
+     <a href="/met-review">Met Review</a>
      <a href="/watch">Watch</a>
      <a href="https://weathervalet.ai/pricing">Pro</a>
      <a href="https://weathervalet.ai/crew">Valet Crew</a></div>
@@ -14485,8 +14487,43 @@ def _wv_error_reporter(err):
 _WATCH_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>WeatherValet Watch - a Meteorologist on your event, start to finish</title><style>
-:root{--ink:#12161C;--gold:#C8892A}
-body{margin:0;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;background:#F7F6F3;color:var(--ink)}
+__WV_TOKENS__
+/* Watch keeps its gold, on the shared shell. */
+:root{--gold:#C8892A;--accent:#C8892A}
+header{background:rgba(9,10,14,.85);border-bottom:1px solid rgba(200,137,42,.2)}
+header .logo span{color:var(--gold)}
+.nl{color:#E4DDCE}
+.nl:hover{background:rgba(200,137,42,.12)}
+.dd{background:#12141B;border-color:rgba(200,137,42,.22)}
+.dd a{color:#EDE6D8}
+.dd a:hover{background:rgba(200,137,42,.22)}
+.dd h6,.dd a i{color:#A9A08C}
+.signin{color:#E4DDCE}
+.burger{border-color:rgba(200,137,42,.28)}
+#mnav{border-color:rgba(200,137,42,.2)}
+footer{background:#090A0E;border-color:rgba(200,137,42,.18);color:#EDE6D8}
+footer h6{color:var(--gold)}
+footer a{color:#A9A08C}
+.legal{border-color:rgba(255,255,255,.07);color:#7C7565}
+.sec{padding:64px 0;border-top:1px solid rgba(255,255,255,.06)}
+.s-dark{background:#0B0D12}
+.s-gold{background:linear-gradient(180deg,#171310 0%,#3B2A12 55%,#1A150F 100%)}
+.s-paper{background:linear-gradient(180deg,#F8F5EE 0%,#EFE9DC 100%);color:#1B1710}
+.s-paper h2,.s-paper h3,.s-paper b,.s-paper strong{color:#14110B}
+.s-paper p,.s-paper li,.s-paper label{color:#4E463A}
+.inner{max-width:660px;margin:0 auto}
+/* Dark rooms need light text; this page was drawn light. */
+.sec h2,.sec h3{color:#fff}
+.sec p,.sec li{color:#D6CFC0}
+.sec ul.feat li b{color:#fff}
+.sec label{color:#A9A08C}
+.sec .fine{color:#A9A08C}
+/* The paper room flips it back. Without this the "What you get" list is
+   light text on light paper, measured at 1.4 contrast. */
+.s-paper h2,.s-paper h3,.s-paper ul.feat li b{color:#14110B}
+.s-paper p,.s-paper li,.s-paper ul.feat li,.s-paper label,.s-paper .fine{color:#4E463A}
+.s-paper ul.feat li:before{color:#8A5E15}
+body{background:#0B0D12;color:#EDE6D8}
 .hero{background:linear-gradient(160deg,#171C25,#2A2118);color:#fff;padding:44px 20px 34px;text-align:center}
 .hero .brand{font-weight:900;font-size:19px;margin-bottom:6px;letter-spacing:-.01em}
 .hero .pname{font-size:clamp(38px,9vw,64px);font-weight:900;letter-spacing:-.02em;line-height:1;
@@ -14495,8 +14532,8 @@ body{margin:0;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;backgrou
 .hero h1 em{color:var(--gold);font-style:normal}
 .hero p{color:#CDC6BB;max-width:560px;margin:0 auto;font-size:16.5px;line-height:1.55}
 .price{display:inline-block;background:var(--gold);color:#1B1509;border-radius:999px;padding:8px 22px;font-weight:800;margin-top:18px;font-size:18px}
-.wrap{max-width:620px;margin:0 auto;padding:26px 18px 60px}
-.card{background:#fff;border:1px solid rgba(18,22,28,.1);border-radius:14px;padding:22px;margin-bottom:18px}
+.wrap{max-width:1120px;margin:0 auto;padding:0 22px}
+.card{background:transparent;border:none;border-radius:0;padding:0;margin:0}
 .card h2{margin:0 0 12px;font-size:17px}
 ul.feat{list-style:none;padding:0;margin:0}
 ul.feat li{padding:8px 0 8px 28px;position:relative;font-size:15px;line-height:1.55}
@@ -14514,6 +14551,7 @@ button:disabled{opacity:.6}
 .fine{font-size:12.5px;color:#5E5648;margin-top:12px;line-height:1.55;text-align:center}
 .foot{text-align:center;font-size:12.5px;color:#5E5648;padding:0 18px 40px}
 </style></head><body>
+__WV_HEADER__
 <div class=hero>
   <div class=brand>&#9889; WeatherValet</div>
   <div class=pname>Watch</div>
@@ -14523,7 +14561,7 @@ button:disabled{opacity:.6}
   you as the sky actually changes.</p>
   <div class=price>$49 per event day</div>
 </div>
-<div class=wrap>
+<section class="sec s-paper"><div class=wrap><div class=inner>
   <div class=card>
     <h2>What you get</h2>
     <ul class=feat>
@@ -14534,6 +14572,8 @@ button:disabled{opacity:.6}
       <li><b>A person, not a model.</b> Never AI-written, and never signed by anyone who did not write it.</li>
     </ul>
   </div>
+  </div></div></section>
+<section class="sec s-gold"><div class=wrap><div class=inner>
   <div class=card>
     <h2>Book your day</h2>
     <div id=err class=err></div>
@@ -14566,9 +14606,13 @@ button:disabled{opacity:.6}
     <div class=fine>One-time payment via Stripe. Book at least a day ahead so your
     Meteorologist has time to prepare. Full refund any time before your day starts.</div>
   </div>
-</div>
-<p class=foot>WeatherValet Watch covers weather only. Decisions about your event stay yours,
-and official National Weather Service warnings always come first.</p>
+  </div></div></section>
+<section class="sec s-dark"><div class=wrap><div class=inner>
+  <p style="text-align:center;font-size:14px;color:#A9A08C;line-height:1.7;margin:0">
+  WeatherValet Watch covers weather only. Decisions about your event stay yours, and official
+  National Weather Service warnings always come first.</p>
+</div></div></section>
+
 <script>
 (function(){
   function label(h){
@@ -14629,7 +14673,9 @@ document.getElementById('w-go').addEventListener('click', function(){
     btn.textContent = 'Book this day \\u00b7 $49';
   });
 });
-</script></body></html>"""
+</script>
+
+__WV_FOOTER__"""
 
 
 _WATCH_CONSOLE_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
@@ -14841,9 +14887,248 @@ def watch_message():
     return jsonify({"ok": True})
 
 
+_MET_REVIEW_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Met Review - a Meteorologist studies your date and writes you back - $19</title>
+<meta name=description content="One date, one place, one written answer from a certified Meteorologist. Not a percentage, a judgment call. $19, one time.">
+<style>
+__WV_TOKENS__
+/* Met Review is the human tier at its smallest: one question, one answer.
+   Purple accent so it reads as its own thing beside Watch and Sidekick. */
+:root{--accent:#7C5CE0;--plum:#7C5CE0}
+body{background:#07060F;color:#EDEAFB}
+header{background:rgba(7,6,15,.85);border-bottom:1px solid rgba(160,140,240,.2)}
+header .logo span{color:#B9A6FF}
+.nl{color:#DCD5F5}
+.nl:hover{background:rgba(160,140,240,.12)}
+.dd{background:#100D1E;border-color:rgba(160,140,240,.22)}
+.dd a{color:#E7E1FA}
+.dd a:hover{background:rgba(124,92,224,.3)}
+.dd h6,.dd a i{color:#9A90BC}
+.signin{color:#DCD5F5}
+.burger{border-color:rgba(160,140,240,.3)}
+#mnav{border-color:rgba(160,140,240,.2)}
+footer{background:#07060F;border-color:rgba(160,140,240,.16);color:#EDEAFB}
+footer h6{color:#B9A6FF}
+footer a{color:#9A90BC}
+.legal{border-color:rgba(255,255,255,.07);color:#7A7295}
+.hero{position:relative;overflow:hidden;padding:64px 0 54px;
+  background:radial-gradient(130% 100% at 50% -25%,#2A1F55 0%,#120E26 48%,#07060F 100%)}
+.hero:before{content:"";position:absolute;inset:-25%;pointer-events:none;opacity:.55;
+  background:radial-gradient(34% 30% at 30% 26%,rgba(124,92,224,.28),transparent 66%);
+  animation:drift 22s ease-in-out infinite alternate}
+@keyframes drift{from{transform:translate3d(-2%,-1%,0)}to{transform:translate3d(3%,2%,0) scale(1.08)}}
+.hero .wrap{position:relative}
+.eyebrow{font-size:12px;letter-spacing:.24em;text-transform:uppercase;color:#B9A6FF;font-weight:800;margin-bottom:12px}
+.pname{font-size:clamp(38px,9vw,62px);font-weight:900;letter-spacing:-.03em;line-height:1;
+  margin:0 0 14px;color:#fff}
+h1{font-size:clamp(24px,3.6vw,34px);line-height:1.16;margin:0 0 12px;font-weight:800;letter-spacing:-.02em;color:#fff}
+h1 em{color:#B9A6FF;font-style:normal}
+.lede{font-size:16.5px;line-height:1.6;color:#B7AFD6;max-width:560px;margin:0 0 22px}
+.price{display:inline-block;background:var(--plum);color:#fff;border-radius:999px;
+  padding:9px 24px;font-weight:800;font-size:18px}
+.sec{padding:64px 0;border-top:1px solid rgba(255,255,255,.06)}
+.s-dark{background:#07060F}
+.s-plum{background:linear-gradient(180deg,#100C22 0%,#2E2160 55%,#150F2C 100%)}
+.s-paper{background:linear-gradient(180deg,#F6F4FD 0%,#EAE5FA 100%);color:#150F26}
+.s-paper h2,.s-paper h3,.s-paper b,.s-paper strong{color:#120C22}
+.s-paper p,.s-paper li,.s-paper label{color:#4A4266}
+.inner{max-width:660px;margin:0 auto}
+h2{font-size:clamp(24px,4vw,36px);line-height:1.08;margin:0 0 14px;font-weight:900;
+  letter-spacing:-.025em;color:#fff}
+.sub{font-size:16.5px;color:#B7AFD6;max-width:600px;margin:0 0 28px}
+ul.feat{list-style:none;padding:0;margin:0}
+ul.feat li{padding:10px 0 10px 28px;position:relative;font-size:15.5px;line-height:1.6;color:#CFC8E8}
+ul.feat li:before{content:"\\\\2713";position:absolute;left:2px;color:#B9A6FF;font-weight:800}
+ul.feat li b{color:#fff}
+.s-paper ul.feat li{color:#4A4266}
+.s-paper ul.feat li b{color:#120C22}
+.s-paper ul.feat li:before{color:#6B4FD0}
+label{display:block;font-size:12.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
+  color:#9A90BC;margin:14px 0 5px}
+input,textarea,select{width:100%;box-sizing:border-box;padding:12px;border-radius:8px;font-size:16px;
+  font-family:inherit;border:1px solid rgba(160,140,240,.28);background:#120D22;color:#EDEAFB}
+textarea{min-height:92px;resize:vertical}
+.row{display:flex;gap:10px}.row>div{flex:1}
+button.go{width:100%;margin-top:20px;background:var(--plum);color:#fff;border:none;border-radius:10px;
+  padding:15px;font-size:17px;font-weight:800;cursor:pointer;transition:.18s}
+button.go:hover{filter:brightness(1.12);transform:translateY(-1px)}
+button.go:disabled{opacity:.6;transform:none}
+.err{display:none;background:#3A1220;border:1px solid #7C2740;color:#FFC2CE;border-radius:9px;
+  padding:11px 13px;margin-top:14px;font-size:14.5px}
+.fine{font-size:12.5px;color:#8F87AE;margin-top:12px;line-height:1.6;text-align:center}
+.thread{max-width:360px;margin:0 auto;background:#0E0B1A;border:9px solid #241C3D;border-radius:34px;
+  padding:14px 12px 20px}
+.thread .bar{display:flex;gap:9px;align-items:center;padding:4px 6px 12px;
+  border-bottom:1px solid rgba(255,255,255,.08);margin-bottom:12px}
+.thread .who{font-size:13.5px;font-weight:700;color:#fff}
+.thread .sm{font-size:11px;color:#9A90BC}
+.ts{text-align:center;font-size:10.5px;color:#6B6390;letter-spacing:.08em;text-transform:uppercase;margin:12px 0 8px}
+.bub{background:#1C1733;border-radius:16px 16px 16px 5px;padding:12px 14px;font-size:13.8px;
+  line-height:1.55;color:#DDD6F5;margin-bottom:8px}
+.sig{display:flex;align-items:center;gap:8px;margin-top:9px;font-size:12px;color:#9A90BC}
+.av{border-radius:50%;object-fit:cover;display:block;flex:0 0 auto}
+.two{display:grid;grid-template-columns:1fr;gap:36px;align-items:center}
+@media(min-width:860px){.two{grid-template-columns:1fr 1fr;gap:52px}}
+</style></head><body>
+__WV_HEADER__
+
+<div class=hero>
+  <div class=wrap>
+    <div class=eyebrow>&#9889; WeatherValet</div>
+    <div class=pname>Met Review</div>
+    <h1>You have a decision to make. <em>Ask a Meteorologist.</em></h1>
+    <p class=lede>Tell us the date, the place, and what you are trying to do. A certified
+    Meteorologist studies it and writes you back. One answer, from a person, about your day.</p>
+    <div class=price>$19, one time</div>
+  </div>
+</div>
+
+<section class="sec s-dark">
+ <div class=wrap>
+  <div class=two>
+   <div>
+    <h2>Not a percentage. A judgment call.</h2>
+    <p class=sub>An app tells you there is a 40% chance of rain. That is true and it is useless
+    when you have to decide something. A Meteorologist tells you whether to rent the tent.</p>
+    <ul class=feat>
+      <li><b>One date, one place, one answer.</b> Nothing recurring, nothing to cancel.</li>
+      <li><b>Written by a person</b>, and signed by the person who wrote it. Never AI-written.</li>
+      <li><b>In plain language.</b> What is likely, what would change it, and what they would do.</li>
+      <li><b>Ask about anything outdoors.</b> A wedding, a pour, a harvest window, a long drive.</li>
+    </ul>
+   </div>
+   <div>
+    <div class=thread>
+      <div class=bar><span style="font-size:17px">&#9889;</span>
+        <div><div class=who>WeatherValet Met Review</div><div class=sm>Saturday, Sep 12</div></div></div>
+      <div class=ts>Your question</div>
+      <div class=bub style="background:#241C3D">Outdoor wedding in Zionsville on the 12th,
+        ceremony at 4. Deciding whether to pay $1,400 for a tent. Should I?</div>
+      <div class=ts>The answer</div>
+      <div class=bub>Short version: I would rent it, and I would be glad to be wrong.
+        The pattern that weekend has a front stalling somewhere between Lafayette and
+        Indianapolis, and where it stalls decides your afternoon. If it sits north, you get a
+        dry ceremony and a warm evening. If it sags south, scattered storms fire right in your
+        window. That is close to a coin flip six days out, and a coin flip is not what you want
+        with 140 guests. Rent the tent. I will send you a firmer read on Thursday.
+        <div class=sig>__AV_MET__ Joe Clauss, WeatherValet Meteorologist</div></div>
+    </div>
+   </div>
+  </div>
+ </div>
+</section>
+
+<section class="sec s-paper">
+ <div class=wrap><div class=inner>
+  <h2>Who asks for one</h2>
+  <ul class=feat>
+    <li><b>The bride, ten days out.</b> The tent costs $1,400. This costs $19.</li>
+    <li><b>The concrete guy on Thursday night.</b> Pour Friday or push to Monday.</li>
+    <li><b>The farmer deciding whether to cut.</b> Three dry days or two.</li>
+    <li><b>The family towing to Gatlinburg.</b> Leave Friday night or Saturday morning.</li>
+    <li><b>The roofer bidding a tear-off.</b> Whether the week holds before opening a house.</li>
+  </ul>
+  <p style="margin-top:22px"><b>Already have a Stormline?</b> Your first review is $10.
+  Mention it when you book and we will take care of it.</p>
+ </div></div>
+</section>
+
+<section class="sec s-plum">
+ <div class=wrap><div class=inner>
+  <h2>Ask your question</h2>
+  <p class=sub>The more you tell us about the day, the more useful the answer is.</p>
+  <div id=err class=err></div>
+  <label for=r-plan>What are you doing, and when?</label>
+  <textarea id=r-plan placeholder="Outdoor wedding in Zionsville, Indiana on Sep 12. Ceremony at 4 PM, 140 guests, deciding whether to rent a tent."></textarea>
+  <div class=row>
+    <div><label for=r-loc>Where</label><input id=r-loc placeholder="Zionsville, IN"></div>
+    <div><label for=r-when>When</label><input id=r-when placeholder="Sep 12, afternoon"></div>
+  </div>
+  <label for=r-email>Email (where your answer arrives)</label>
+  <input id=r-email type=email autocomplete=email>
+  <label for=r-phone>Mobile (optional, so we can reach you faster)</label>
+  <input id=r-phone type=tel placeholder="317-555-0123">
+  <button class=go id=r-go>Ask a Meteorologist &middot; $19</button>
+  <div class=fine>One-time payment via Stripe. A Meteorologist works your question and writes
+  back. If we cannot answer your question, we refund it.</div>
+ </div></div>
+</section>
+
+<section class="sec s-dark">
+ <div class=wrap><div class=inner>
+  <h2>Straight answers</h2>
+  <p class=sub style="margin-bottom:8px"><b style="color:#fff">Is this the same as the free
+  forecast?</b><br>No. The free tool on our site is AI and says so. This is a person reading the
+  models and telling you what they think.</p>
+  <p class=sub style="margin-bottom:8px"><b style="color:#fff">How far ahead can I ask?</b><br>
+  Ask any time, though a Meteorologist can say more inside about a week. Further out you will get
+  an honest "here is the pattern, ask me again closer."</p>
+  <p class=sub style="margin-bottom:8px"><b style="color:#fff">What if the forecast changes?</b><br>
+  It will. Weather is uncertain and a review is one honest read at one moment. If your day is big
+  enough to need someone watching it live, that is
+  <a href="/watch" style="color:#B9A6FF">WeatherValet Watch</a>.</p>
+  <p class=sub style="margin-bottom:0"><b style="color:#fff">Will you be right?</b><br>
+  Not always, and anyone who promises otherwise is selling something. You are buying a
+  Meteorologist's honest judgment, not a guarantee.</p>
+ </div></div>
+</section>
+
+<script>
+document.getElementById('r-go').addEventListener('click', function(){
+  var btn = this, err = document.getElementById('err');
+  err.style.display = 'none';
+  var plan = document.getElementById('r-plan').value.trim();
+  var loc = document.getElementById('r-loc').value.trim();
+  var when = document.getElementById('r-when').value.trim();
+  var email = document.getElementById('r-email').value.trim();
+  if (plan.length < 12) {
+    err.textContent = 'Tell us a bit more about the day so the Meteorologist can work it.';
+    err.style.display = 'block'; return;
+  }
+  if (!email || email.indexOf('@') < 1) {
+    err.textContent = 'Enter the email where your answer should arrive.';
+    err.style.display = 'block'; return;
+  }
+  btn.disabled = true; btn.textContent = 'One moment...';
+  fetch('/api/v1/verification/checkout', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      tier: 'single',
+      plan_text: plan,
+      plan_location: loc,
+      plan_window: when,
+      customer_email: email,
+      customer_phone: document.getElementById('r-phone').value
+    })
+  }).then(function(r){ return r.json(); }).then(function(j){
+    var url = j && (j.hosted_url || j.url);
+    if (url) { window.location = url; return; }
+    err.textContent = (j && (j.error || j.message)) || 'Something went wrong. Try again.';
+    err.style.display = 'block'; btn.disabled = false;
+    btn.textContent = 'Ask a Meteorologist \\\\u00b7 $19';
+  }).catch(function(){
+    err.textContent = 'Network problem. Try again.';
+    err.style.display = 'block'; btn.disabled = false;
+    btn.textContent = 'Ask a Meteorologist \\\\u00b7 $19';
+  });
+});
+</script>
+
+__WV_FOOTER__"""
+
+
+@app.get("/met-review")
+@app.get("/review")
+def met_review_page():
+    """Met Review finally has a page of its own instead of living inside
+    the old single-page app."""
+    return wv_shell(_MET_REVIEW_PAGE.replace("__AV_MET__", _met_img("joe", 22)))
+
+
 @app.get("/watch")
 def watch_page():
-    return _WATCH_PAGE
+    return wv_shell(_WATCH_PAGE)
 
 
 @app.get("/watch/booked")
@@ -15468,7 +15753,7 @@ __WV_HEADER__
       <a class=go href="/gameday/iu">See the days covered &rarr;</a></div>
     <div class=tier><div class=t>Met Review</div><div class=p>$19 once</div>
       <p>You have a decision to make. A Meteorologist studies your date and writes you back.</p>
-      <a class=go href="https://weathervalet.ai">Get a review &rarr;</a></div>
+      <a class=go href="/met-review">Get a review &rarr;</a></div>
     <div class=tier><div class=t>Watch</div><div class=p>$49/event day</div>
       <p>One Meteorologist. One event. Nobody else on the thread.</p>
       <a class=go href="/watch">Book a day &rarr;</a></div>
@@ -15514,7 +15799,7 @@ __WV_HEADER__
    {i:'\\uD83C\\uDFDF',t:"It's a big day the whole town is out for",s:"Game day, fair, festival",go:"side"}]};
   var R={
    ai:{n:"AI Forecast",p:"Free",k:"Ask once. Get an answer in seconds. It's AI, and we'll never pretend otherwise.",c:"Ask it now",u:"https://weathervalet.ai"},
-   review:{n:"Met Review",p:"$19 once",k:"You have a decision to make. A Meteorologist studies your date and writes you back.",c:"Get a review",u:"https://weathervalet.ai"},
+   review:{n:"Met Review",p:"$19 once",k:"You have a decision to make. A Meteorologist studies your date and writes you back.",c:"Get a review",u:"/met-review"},
    storm:{n:"Stormline",p:"$12/year",k:"You don't watch the weather. Stormline watches your address.",c:"Put a Stormline on it",u:"/stormline"},
    daily:{n:"Stormline Daily",p:"$24/year",k:"The forecast finds you every morning. And the warning finds you at 2 AM.",c:"Start the morning message",u:"/stormlinedaily"},
    side:{n:"Sidekick",p:"$16/series",k:"The Meteorologist is watching the big day. You're on the list.",c:"See the days covered",u:"/gameday/iu"},
