@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-175"
+BACKEND_BUILD = "0702-176"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -13099,8 +13099,21 @@ h1 .pop{color:var(--bolt)}
 .consent input{width:auto;margin:2px 0 0;flex:0 0 auto;transform:scale(1.25);accent-color:#A6192E}
 .consent a{color:#A6192E}
 label{display:block;font-size:12.5px;font-weight:800;letter-spacing:.07em;text-transform:uppercase;color:#6E5A5F;margin:12px 0 4px}
-input{width:100%;padding:13px;border:1.5px solid rgba(27,20,22,.25);border-radius:9px;font-size:17px;background:#FFFDF7;color:var(--ink)}
-input:focus{outline:2px solid var(--crim);outline-offset:1px;border-color:var(--crim)}
+/* Cream fields on the crimson page are deliberate; this is the one warm
+   product. They get the same hover and focus behaviour as the blue pages
+   so the whole family feels like one company. */
+input{width:100%;box-sizing:border-box;padding:14px 15px;border:1.5px solid rgba(27,20,22,.22);
+  border-radius:10px;font-size:17px;background:#FFFDF7;color:var(--ink);
+  transition:border-color .18s,box-shadow .18s}
+input::placeholder{color:#9B8E7E}
+input:hover{border-color:rgba(166,25,46,.45)}
+input:focus{outline:none;border-color:var(--crim);box-shadow:0 0 0 3px rgba(166,25,46,.25)}
+#g-go{box-shadow:0 12px 30px -12px rgba(166,25,46,.9);
+  transition:transform .18s,box-shadow .18s,filter .18s}
+#g-go:hover{filter:brightness(1.08);transform:translateY(-1px);
+  box-shadow:0 16px 38px -12px rgba(166,25,46,1)}
+#g-go:active{transform:translateY(0)}
+#g-go:disabled{opacity:.55;transform:none;box-shadow:none}
 button{width:100%;margin-top:18px;background:var(--crim);color:#fff;border:none;border-radius:10px;padding:16px;
   font-family:'Bebas Neue';font-size:26px;letter-spacing:.07em;cursor:pointer}
 button:hover{background:var(--crim-deep)}
@@ -14657,17 +14670,41 @@ body{background:#0B0D12;color:#EDE6D8}
 ul.feat{list-style:none;padding:0;margin:0}
 ul.feat li{padding:8px 0 8px 28px;position:relative;font-size:15px;line-height:1.55}
 ul.feat li:before{content:"✓";position:absolute;left:2px;color:var(--gold);font-weight:800}
-label{display:block;font-size:12.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:#5E5648;margin:14px 0 5px}
-input,select,textarea{width:100%;box-sizing:border-box;padding:12px;border:1px solid rgba(18,22,28,.18);border-radius:8px;font-size:16px;font-family:inherit;background:#fff}
-textarea{min-height:74px;resize:vertical}
+/* The booking form lives in the gold room, so it is styled for a dark
+   page. White boxes with black text on this background looked like a
+   default browser form on a $49 product. */
+label{display:block;font-size:12px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;
+  color:#B3A88F;margin:16px 0 7px}
+input,select,textarea{width:100%;box-sizing:border-box;padding:14px 15px;font-size:16px;
+  font-family:inherit;color:#F3EDE1;border-radius:10px;
+  background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.02));
+  border:1px solid rgba(200,137,42,.3);
+  transition:border-color .18s,box-shadow .18s,background .18s}
+input::placeholder,textarea::placeholder{color:#8C826D}
+input:hover,select:hover,textarea:hover{border-color:rgba(200,137,42,.55)}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--gold);
+  background:linear-gradient(180deg,rgba(200,137,42,.16),rgba(255,255,255,.02));
+  box-shadow:0 0 0 3px rgba(200,137,42,.26)}
+select option{background:#171310;color:#F3EDE1}
+textarea{min-height:86px;resize:vertical}
 .row{display:flex;gap:10px}.row>div{flex:1}
-button{width:100%;margin-top:20px;background:var(--gold);color:#1B1509;border:none;border-radius:9px;padding:15px;font-size:17px;font-weight:800;cursor:pointer}
-button:disabled{opacity:.6}
+button{width:100%;margin-top:22px;color:#1B1509;border:none;border-radius:11px;padding:17px;
+  font-size:17.5px;font-weight:800;cursor:pointer;letter-spacing:-.01em;
+  background:linear-gradient(160deg,#E0A445,#B87716);
+  box-shadow:0 12px 30px -12px rgba(200,137,42,.85);
+  transition:transform .18s,box-shadow .18s,filter .18s}
+button:hover{filter:brightness(1.07);transform:translateY(-1px);
+  box-shadow:0 16px 38px -12px rgba(200,137,42,.95)}
+button:active{transform:translateY(0)}
+button:disabled{opacity:.55;transform:none;box-shadow:none}
 .err{display:none;background:#FDECEC;border:1px solid #F3B4B4;color:#8A1F1F;border-radius:8px;padding:10px 12px;margin-top:14px;font-size:14px}
-.consent{display:flex;gap:10px;align-items:flex-start;margin:16px 0 2px;font-size:12.8px;line-height:1.5;color:#4A4438;cursor:pointer}
-.consent input{width:auto;margin:2px 0 0;flex:0 0 auto;transform:scale(1.25);accent-color:var(--gold)}
-.consent a{color:#8A6318}
-.fine{font-size:12.5px;color:#5E5648;margin-top:12px;line-height:1.55;text-align:center}
+.consent{display:flex;gap:12px;align-items:flex-start;margin:20px 0 2px;font-size:12.8px;
+  line-height:1.55;color:#B3A88F;cursor:pointer;padding:14px 15px;border-radius:11px;
+  background:rgba(255,255,255,.035);border:1px solid rgba(200,137,42,.2);transition:border-color .2s}
+.consent:hover{border-color:rgba(200,137,42,.42)}
+.consent input{width:auto;margin:2px 0 0;flex:0 0 auto;transform:scale(1.3);accent-color:var(--gold)}
+.consent a{color:var(--gold)}
+.fine{font-size:12.5px;color:#8C826D;margin-top:14px;line-height:1.55;text-align:center}
 .foot{text-align:center;font-size:12.5px;color:#5E5648;padding:0 18px 40px}
 </style></head><body>
 __WV_HEADER__
@@ -15091,6 +15128,22 @@ button.go:disabled{opacity:.6;transform:none}
 .av{border-radius:50%;object-fit:cover;display:block;flex:0 0 auto}
 .two{display:grid;grid-template-columns:1fr;gap:36px;align-items:center}
 @media(min-width:860px){.two{grid-template-columns:1fr 1fr;gap:52px}}
+
+/* Interaction polish. Every field tells you when you are in it, and the
+   primary action has weight. Applied on every page that takes money or a
+   signup, so they all feel like the same product. */
+input:hover,select:hover,textarea:hover{border-color:rgba(124,92,224,.5)}
+input:focus,select:focus,textarea:focus{outline:none;border-color:#7C5CE0;
+  box-shadow:0 0 0 3px rgba(124,92,224,.26)}
+select option{background:#120D22}
+button.go,button#c-go,button#r-go,button#p-go,button#go-pw,button#go-link{
+  box-shadow:0 12px 30px -12px rgba(124,92,224,.8);
+  transition:transform .18s,box-shadow .18s,filter .18s}
+button.go:hover,button#c-go:hover,button#r-go:hover,button#p-go:hover,
+button#go-pw:hover,button#go-link:hover{filter:brightness(1.09);transform:translateY(-1px);
+  box-shadow:0 16px 38px -12px rgba(124,92,224,.95)}
+button.go:active{transform:translateY(0)}
+button.go:disabled{opacity:.55;transform:none;box-shadow:none}
 </style></head><body>
 __WV_HEADER__
 
@@ -15441,6 +15494,22 @@ button.go:disabled{opacity:.6;transform:none}
   padding:11px 13px;margin-top:14px;font-size:14.5px}
 .fine{font-size:12.5px;color:#8CA0C0;margin-top:12px;line-height:1.6;text-align:center}
 .s-light .fine{color:#5F7192}
+
+/* Interaction polish. Every field tells you when you are in it, and the
+   primary action has weight. Applied on every page that takes money or a
+   signup, so they all feel like the same product. */
+input:hover,select:hover,textarea:hover{border-color:rgba(30,107,255,.5)}
+input:focus,select:focus,textarea:focus{outline:none;border-color:#1E6BFF;
+  box-shadow:0 0 0 3px rgba(30,107,255,.26)}
+select option{background:#0C1424}
+button.go,button#c-go,button#r-go,button#p-go,button#go-pw,button#go-link{
+  box-shadow:0 12px 30px -12px rgba(30,107,255,.8);
+  transition:transform .18s,box-shadow .18s,filter .18s}
+button.go:hover,button#c-go:hover,button#r-go:hover,button#p-go:hover,
+button#go-pw:hover,button#go-link:hover{filter:brightness(1.09);transform:translateY(-1px);
+  box-shadow:0 16px 38px -12px rgba(30,107,255,.95)}
+button.go:active{transform:translateY(0)}
+button.go:disabled{opacity:.55;transform:none;box-shadow:none}
 </style></head><body>
 __WV_HEADER__
 
@@ -16375,6 +16444,22 @@ button.go:disabled{opacity:.6;transform:none}
 .fine{font-size:12.5px;color:#93A6C2;margin-top:12px;line-height:1.6;text-align:center}
 .quote{border-left:3px solid var(--grass);padding:4px 0 4px 18px;margin:22px 0;color:#C4D3EC;
   font-size:17px;line-height:1.65}
+
+/* Interaction polish. Every field tells you when you are in it, and the
+   primary action has weight. Applied on every page that takes money or a
+   signup, so they all feel like the same product. */
+input:hover,select:hover,textarea:hover{border-color:rgba(30,107,255,.5)}
+input:focus,select:focus,textarea:focus{outline:none;border-color:#1E6BFF;
+  box-shadow:0 0 0 3px rgba(30,107,255,.26)}
+select option{background:#0C1424}
+button.go,button#c-go,button#r-go,button#p-go,button#go-pw,button#go-link{
+  box-shadow:0 12px 30px -12px rgba(30,107,255,.8);
+  transition:transform .18s,box-shadow .18s,filter .18s}
+button.go:hover,button#c-go:hover,button#r-go:hover,button#p-go:hover,
+button#go-pw:hover,button#go-link:hover{filter:brightness(1.09);transform:translateY(-1px);
+  box-shadow:0 16px 38px -12px rgba(30,107,255,.95)}
+button.go:active{transform:translateY(0)}
+button.go:disabled{opacity:.55;transform:none;box-shadow:none}
 </style></head><body>
 __WV_HEADER__
 <div class=head><div class=wrap>
@@ -16940,6 +17025,22 @@ button.go:disabled{opacity:.6;transform:none}
 .ws a:hover{border-color:var(--accent);transform:translateY(-2px)}
 .ws b{color:#fff;font-size:16px}
 .ws i{font-style:normal;color:#8CA0C0;font-size:13.5px}
+
+/* Interaction polish. Every field tells you when you are in it, and the
+   primary action has weight. Applied on every page that takes money or a
+   signup, so they all feel like the same product. */
+input:hover,select:hover,textarea:hover{border-color:rgba(30,107,255,.5)}
+input:focus,select:focus,textarea:focus{outline:none;border-color:#1E6BFF;
+  box-shadow:0 0 0 3px rgba(30,107,255,.26)}
+select option{background:#0C1424}
+button.go,button#c-go,button#r-go,button#p-go,button#go-pw,button#go-link{
+  box-shadow:0 12px 30px -12px rgba(30,107,255,.8);
+  transition:transform .18s,box-shadow .18s,filter .18s}
+button.go:hover,button#c-go:hover,button#r-go:hover,button#p-go:hover,
+button#go-pw:hover,button#go-link:hover{filter:brightness(1.09);transform:translateY(-1px);
+  box-shadow:0 16px 38px -12px rgba(30,107,255,.95)}
+button.go:active{transform:translateY(0)}
+button.go:disabled{opacity:.55;transform:none;box-shadow:none}
 </style></head><body>
 __WV_HEADER__
 <div class=mid>
