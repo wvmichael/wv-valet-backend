@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-173"
+BACKEND_BUILD = "0702-174"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -13116,7 +13116,7 @@ button:disabled{opacity:.6}
 .why ul{list-style:none;padding:0;margin:0}
 .why li{padding:10px 0 10px 36px;position:relative;font-size:16.5px;line-height:1.55;color:#EDD3D3;border-bottom:1px solid rgba(243,234,211,.1)}
 .why li:last-child{border-bottom:none}
-.why li:before{content:"\\26A1";position:absolute;left:4px;color:var(--bolt)}
+.why li:before{content:"⚡";position:absolute;left:4px;color:var(--bolt)}
 .why li b{color:var(--cream)}
 .foot{text-align:center;font-size:13px;color:#8A6F73;padding:26px 18px 36px;line-height:1.7}
 .foot a{color:#C89AA1}
@@ -14623,7 +14623,7 @@ body{background:#0B0D12;color:#EDE6D8}
 .card h2{margin:0 0 12px;font-size:17px}
 ul.feat{list-style:none;padding:0;margin:0}
 ul.feat li{padding:8px 0 8px 28px;position:relative;font-size:15px;line-height:1.55}
-ul.feat li:before{content:"\\2713";position:absolute;left:2px;color:var(--gold);font-weight:800}
+ul.feat li:before{content:"✓";position:absolute;left:2px;color:var(--gold);font-weight:800}
 label{display:block;font-size:12.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:#5E5648;margin:14px 0 5px}
 input,select,textarea{width:100%;box-sizing:border-box;padding:12px;border:1px solid rgba(18,22,28,.18);border-radius:8px;font-size:16px;font-family:inherit;background:#fff}
 textarea{min-height:74px;resize:vertical}
@@ -15027,7 +15027,7 @@ h2{font-size:clamp(24px,4vw,36px);line-height:1.08;margin:0 0 14px;font-weight:9
 .sub{font-size:16.5px;color:#B7AFD6;max-width:600px;margin:0 0 28px}
 ul.feat{list-style:none;padding:0;margin:0}
 ul.feat li{padding:10px 0 10px 28px;position:relative;font-size:15.5px;line-height:1.6;color:#CFC8E8}
-ul.feat li:before{content:"\\\\2713";position:absolute;left:2px;color:#B9A6FF;font-weight:800}
+ul.feat li:before{content:"✓";position:absolute;left:2px;color:#B9A6FF;font-weight:800}
 ul.feat li b{color:#fff}
 .s-paper ul.feat li{color:#4A4266}
 .s-paper ul.feat li b{color:#120C22}
@@ -15379,7 +15379,7 @@ h2{font-size:clamp(24px,4vw,36px);line-height:1.08;margin:0 0 14px;font-weight:9
 .sub{font-size:16.5px;color:#B9CAE4;max-width:600px;margin:0 0 28px}
 ul.feat{list-style:none;padding:0;margin:0}
 ul.feat li{padding:10px 0 10px 28px;position:relative;font-size:15.5px;line-height:1.6;color:#C4D3EC}
-ul.feat li:before{content:"\\\\2713";position:absolute;left:2px;color:var(--sky);font-weight:800}
+ul.feat li:before{content:"✓";position:absolute;left:2px;color:var(--sky);font-weight:800}
 ul.feat li b{color:#fff}
 .s-light ul.feat li{color:#41536F}
 .s-light ul.feat li b{color:#08101F}
@@ -16315,7 +16315,7 @@ h2{font-size:clamp(24px,4vw,34px);font-weight:900;letter-spacing:-.025em;color:#
 .sub{color:#B9CAE4;font-size:16.5px;max-width:620px;margin:0 0 26px}
 ul.feat{list-style:none;padding:0;margin:0}
 ul.feat li{padding:10px 0 10px 28px;position:relative;font-size:15.5px;line-height:1.6;color:#C4D3EC}
-ul.feat li:before{content:"\\\\2713";position:absolute;left:2px;color:#7EB6FF;font-weight:800}
+ul.feat li:before{content:"✓";position:absolute;left:2px;color:#7EB6FF;font-weight:800}
 ul.feat li b{color:#fff}
 .s-paper ul.feat li{color:#41536F}
 .s-paper ul.feat li b{color:#08101F}
