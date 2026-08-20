@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-163"
+BACKEND_BUILD = "0702-164"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -5158,6 +5158,7 @@ def sitemap_xml():
         ("/met-review", "0.8"),
         ("/pro", "0.9"),
         ("/forecast", "1.0"),
+        ("/crew", "0.7"),
         ("/pricing", "0.9"),
         ("/about", "0.6"),
         ("/contact", "0.5"),
@@ -12751,7 +12752,7 @@ WV_HEADER = """<header>
     <div class=dd>
       <a href="/home#mets"><b>Our Meteorologists</b></a>
       <a href="/about"><b>About WeatherValet</b></a>
-      <a href="https://weathervalet.ai/crew"><b>Valet Crew</b></a>
+      <a href="/crew"><b>Valet Crew</b></a>
       <a href="/contact"><b>Contact</b></a>
     </div></div>
   <a class=nl href="/pricing">Pricing</a>
@@ -12771,7 +12772,7 @@ WV_HEADER = """<header>
    <a href="/pro">Pro &middot; from $99/mo</a>
    <h6>Company</h6>
    <a href="/home#mets">Our Meteorologists</a>
-   <a href="https://weathervalet.ai/crew">Valet Crew</a>
+   <a href="/crew">Valet Crew</a>
    <a href="https://weathervalet.ai/portal">Sign in</a>
  </div>
  </div>
@@ -12788,7 +12789,7 @@ WV_FOOTER = """<footer>
      <a href="/met-review">Met Review</a>
      <a href="/watch">Watch</a>
      <a href="/pro">Pro</a>
-     <a href="https://weathervalet.ai/crew">Valet Crew</a></div>
+     <a href="/crew">Valet Crew</a></div>
    <div><h6>Support</h6>
      <a href="/contact">Contact us</a>
      <a href="/contact">Manage your Stormline</a>
@@ -12797,7 +12798,7 @@ WV_FOOTER = """<footer>
    <div><h6>Company</h6>
      <a href="/home#mets">Our Meteorologists</a>
      <a href="/about">About</a>
-     <a href="https://weathervalet.ai/crew">Become a Meteorologist</a>
+     <a href="/crew">Become a Meteorologist</a>
      <a href="https://weathervalet.ai/portal">Sign in</a></div>
    <div><h6>Legal</h6>
      <a href="/terms">Terms of Service</a>
@@ -16141,6 +16142,233 @@ document.getElementById('a-go').addEventListener('click', function(){
    });
 });
 </script>"""
+
+
+# ---------------------------------------------------------------------------
+# Valet Crew, the public page (Aug 20, 2026)
+#
+# Two Crew surfaces on purpose. This one is marketing: a stranger lands here,
+# learns what the Crew is, and applies. The workspace (map, feed, posting) is
+# a separate logged-in application and is not this page.
+# ---------------------------------------------------------------------------
+
+_CREW_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Valet Crew - report what you see from your corner of the sky</title>
+<meta name=description content="Free to join. Report real conditions from where you are and help our Meteorologists see the ground. No cost, no obligation.">
+<style>
+__WV_TOKENS__
+:root{--accent:#2FA36B;--grass:#2FA36B}
+header{background:rgba(4,10,8,.85);border-bottom:1px solid rgba(120,220,170,.18)}
+header .logo span{color:#7FE3B4}
+.nl:hover{background:rgba(120,220,170,.1)}
+.dd{background:#08140F;border-color:rgba(120,220,170,.2)}
+.dd a:hover{background:rgba(47,163,107,.28)}
+footer{background:#040907;border-color:rgba(120,220,170,.16)}
+footer h6{color:#7FE3B4}
+.head{padding:66px 0 22px;
+  background:radial-gradient(130% 100% at 50% -30%,#123829 0%,#0A1810 46%,#040907 100%)}
+body{background:#040907}
+.eyebrow{font-size:12px;letter-spacing:.24em;text-transform:uppercase;color:#7FE3B4;font-weight:800;margin-bottom:12px}
+h1{font-size:clamp(32px,5.6vw,52px);font-weight:900;letter-spacing:-.03em;line-height:1.03;margin:0 0 14px;
+  background:linear-gradient(98deg,#fff 22%,#7FE3B4 92%);-webkit-background-clip:text;background-clip:text;color:transparent}
+.lede{color:#B4CFC1;font-size:17px;max-width:600px;margin:0 0 10px}
+.free{display:inline-block;background:var(--grass);color:#04160E;border-radius:999px;
+  padding:9px 22px;font-weight:800;font-size:17px;margin-top:14px}
+.sec{padding:64px 0;border-top:1px solid rgba(255,255,255,.06)}
+.s-night{background:#040907}
+.s-green{background:linear-gradient(180deg,#08160F 0%,#17452F 55%,#0B1F16 100%)}
+.s-paper{background:linear-gradient(180deg,#F3F8F4 0%,#E6F0E9 100%);color:#0E1A13}
+.s-paper h2,.s-paper h3,.s-paper b,.s-paper strong{color:#0A1610}
+.s-paper p,.s-paper li,.s-paper label{color:#3E5449}
+.inner{max-width:680px;margin:0 auto}
+h2{font-size:clamp(24px,4vw,34px);font-weight:900;letter-spacing:-.025em;color:#fff;margin:0 0 14px}
+.sub{color:#B4CFC1;font-size:16.5px;max-width:620px;margin:0 0 26px}
+ul.feat{list-style:none;padding:0;margin:0}
+ul.feat li{padding:10px 0 10px 28px;position:relative;font-size:15.5px;line-height:1.6;color:#C3DACD}
+ul.feat li:before{content:"\\\\2713";position:absolute;left:2px;color:#7FE3B4;font-weight:800}
+ul.feat li b{color:#fff}
+.s-paper ul.feat li{color:#3E5449}
+.s-paper ul.feat li b{color:#0A1610}
+.s-paper ul.feat li:before{color:#1E7A4F}
+label{display:block;font-size:12.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
+  color:#8FAE9D;margin:16px 0 6px}
+input,select{width:100%;box-sizing:border-box;padding:12px;border-radius:9px;font-size:16px;
+  font-family:inherit;border:1px solid rgba(120,220,170,.26);background:#08150F;color:#E6F5EC}
+.row{display:flex;gap:10px}.row>div{flex:1}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
+.chip{border:1px solid rgba(120,220,170,.28);background:rgba(255,255,255,.04);color:#D6EDE0;
+  border-radius:999px;padding:9px 15px;font-size:14.5px;cursor:pointer;transition:.16s}
+.chip:hover{border-color:#7FE3B4}
+.chip.on{background:var(--grass);border-color:var(--grass);color:#04160E;font-weight:700}
+button.go{width:100%;margin-top:22px;background:var(--grass);color:#04160E;border:none;border-radius:10px;
+  padding:15px;font-size:17px;font-weight:800;cursor:pointer;transition:.18s}
+button.go:hover{filter:brightness(1.1);transform:translateY(-1px)}
+button.go:disabled{opacity:.6;transform:none}
+.err{display:none;background:#3A1220;border:1px solid #7C2740;color:#FFC2CE;border-radius:9px;
+  padding:11px 13px;margin-top:14px;font-size:14.5px}
+.ok{display:none;background:#0F3423;border:1px solid #2FA36B;color:#B7F0CE;border-radius:11px;
+  padding:18px 20px;margin-top:18px;font-size:16px;line-height:1.6}
+.ok b{color:#fff}
+.fine{font-size:12.5px;color:#8FAE9D;margin-top:12px;line-height:1.6;text-align:center}
+.quote{border-left:3px solid var(--grass);padding:4px 0 4px 18px;margin:22px 0;color:#C3DACD;
+  font-size:17px;line-height:1.65}
+</style></head><body>
+__WV_HEADER__
+<div class=head><div class=wrap>
+  <div class=eyebrow>&#9889; WeatherValet</div>
+  <h1>You already watch the sky. Tell us what you see.</h1>
+  <p class=lede>The Valet Crew is people all over the country reporting real conditions from
+  where they actually are. Radar guesses. You know.</p>
+  <div class=free>Free to join, always</div>
+</div></div>
+
+<section class="sec s-night"><div class=wrap><div class=inner>
+  <h2>Why the ground matters</h2>
+  <p class=sub>Radar sees a signature seven thousand feet up and infers what is happening
+  underneath it. That inference is usually close and sometimes badly wrong.</p>
+  <div class=quote>The rain stopped at my fence line. Radar had the whole township covered.</div>
+  <p class=sub style="margin-bottom:0">One person standing in it beats a model every single
+  time. That is the whole idea. Our Meteorologists use Crew reports while they are writing to
+  paying subscribers, which means what you saw in your driveway can change what somebody a
+  county over gets told.</p>
+</div></div></section>
+
+<section class="sec s-paper"><div class=wrap><div class=inner>
+  <h2>What being on the Crew is like</h2>
+  <ul class=feat>
+    <li><b>Report when you feel like it.</b> No quota, no schedule, no obligation. Quiet weeks
+    are fine.</li>
+    <li><b>It takes seconds.</b> Hail the size of a nickel. Water over the road at County Line.
+    Wind took a limb down. That is a report.</li>
+    <li><b>See what everyone else is seeing.</b> The Crew map and feed show live reports from
+    around you.</li>
+    <li><b>A Meteorologist may thank you by name</b> or cite your report in a brief that goes
+    out to subscribers.</li>
+    <li><b>It costs nothing, ever.</b> This is not a trial and there is no upsell waiting at
+    the end.</li>
+  </ul>
+</div></div></section>
+
+<section class="sec s-green"><div class=wrap><div class=inner>
+  <h2>Join the Crew</h2>
+  <p class=sub>Tell us where you are and what you are willing to watch for. We will email you
+  when you are in.</p>
+  <div id=ok class=ok></div>
+  <div id=form>
+    <div class=row>
+      <div><label for=c-name>Your name</label><input id=c-name autocomplete=name></div>
+      <div><label for=c-handle>Handle (optional)</label><input id=c-handle placeholder="@yourname"></div>
+    </div>
+    <label for=c-email>Email</label><input id=c-email type=email autocomplete=email>
+    <label for=c-phone>Mobile (optional)</label><input id=c-phone type=tel placeholder="317-555-0123">
+    <div class=row>
+      <div><label for=c-county>County</label><input id=c-county placeholder="Boone County"></div>
+      <div><label for=c-state>State</label><input id=c-state placeholder="Indiana"></div>
+    </div>
+    <label for=c-zip>Zip (optional, helps us place you)</label><input id=c-zip placeholder="46052">
+    <label>What are you willing to report on?</label>
+    <div class=chips id=chips></div>
+    <label for=c-hours>When are you usually around?</label>
+    <select id=c-hours>
+      <option value=all>Any time</option>
+      <option value=weekdays-day>Weekdays, daytime</option>
+      <option value=weekdays-evening>Weekdays, evenings</option>
+      <option value=weekends>Weekends</option>
+    </select>
+    <div id=err class=err></div>
+    <button class=go id=c-go>Join the Valet Crew</button>
+    <div class=fine>Free forever. We review applications by hand, so it may take a day or two.
+    We never sell your information.</div>
+  </div>
+</div></div></section>
+
+<section class="sec s-night"><div class=wrap><div class=inner>
+  <h2>Straight answers</h2>
+  <p class=sub style="margin-bottom:10px"><b style="color:#fff">Do I need equipment?</b><br>
+  No. Your eyes and your phone. A rain gauge is a bonus, not a requirement.</p>
+  <p class=sub style="margin-bottom:10px"><b style="color:#fff">Do I need to be a
+  spotter?</b><br>No. Trained spotters are welcome and so is anyone who pays attention. If you
+  are trained, say so in your application.</p>
+  <p class=sub style="margin-bottom:10px"><b style="color:#fff">Am I on the hook during
+  storms?</b><br>Never. Report if you are safe and want to. Take shelter first, always. Nothing
+  you report to us is worth standing outside for.</p>
+  <p class=sub style="margin-bottom:0"><b style="color:#fff">Will you try to sell me
+  something?</b><br>No. Crew is free and stays free. If you want a paid product you will have to
+  go find it yourself.</p>
+</div></div></section>
+__WV_FOOTER__"""
+
+_CREW_SCRIPT = """<script>
+(function(){
+  var INTERESTS=[['storms','Storms'],['hail','Hail'],['wind','Wind'],
+                 ['rain','Rain and flooding'],['winter','Winter weather'],['general','Anything']];
+  var picked={};
+  var box=document.getElementById('chips');
+  INTERESTS.forEach(function(pair){
+    var b=document.createElement('button');
+    b.className='chip'; b.type='button'; b.textContent=pair[1];
+    b.addEventListener('click',function(){
+      picked[pair[0]]=!picked[pair[0]];
+      b.className='chip'+(picked[pair[0]]?' on':'');
+    });
+    box.appendChild(b);
+  });
+  document.getElementById('c-go').addEventListener('click',function(){
+    var btn=this, err=document.getElementById('err');
+    err.style.display='none';
+    var name=document.getElementById('c-name').value.trim();
+    var email=document.getElementById('c-email').value.trim();
+    if(name.length<2){ err.textContent='Tell us your name.'; err.style.display='block'; return; }
+    if(!email||email.indexOf('@')<1){ err.textContent='Enter an email we can reach you at.';
+      err.style.display='block'; return; }
+    var list=[]; for(var k in picked){ if(picked[k]) list.push(k); }
+    btn.disabled=true; btn.textContent='Sending...';
+    fetch('/api/v1/crew/apply',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:name,email:email,
+        handle:document.getElementById('c-handle').value,
+        phone:document.getElementById('c-phone').value,
+        county:document.getElementById('c-county').value,
+        state:document.getElementById('c-state').value,
+        zip:document.getElementById('c-zip').value,
+        mission_interests:list,
+        hours:document.getElementById('c-hours').value,
+        notify:'email'})})
+     .then(function(r){ return r.json().then(function(j){ return {s:r.status,j:j}; }); })
+     .then(function(res){
+        if(res.j&&res.j.ok){
+          document.getElementById('form').style.display='none';
+          var ok=document.getElementById('ok');
+          // The API updates an existing application rather than refusing it,
+          // so say that plainly instead of pretending it is a new one.
+          ok.innerHTML = res.j.updated
+            ? '<b>We updated your application.</b><br>You already had one in with that email, so '
+              + 'we replaced it with what you just sent. Nothing else to do; we will email you '
+              + 'when you are approved.'
+            : '<b>You are in the queue.</b><br>A person reviews every application, so '
+              + 'give us a day or two. We will email you when you are approved, and that email '
+              + 'has the link to the Crew workspace.';
+          ok.style.display='block';
+          ok.scrollIntoView({behavior:'smooth',block:'center'});
+          return;
+        }
+        var e=(res.j&&res.j.error)||'';
+        if(e==='valid-email-required'){ err.textContent='That email does not look right.'; }
+        else if(e==='name-required'){ err.textContent='Tell us your name.'; }
+        else { err.textContent='Something went wrong. Try again, or email hello@weathervalet.ai.'; }
+        err.style.display='block'; btn.disabled=false; btn.textContent='Join the Valet Crew';
+     }).catch(function(){
+        err.textContent='Network problem. Try again.';
+        err.style.display='block'; btn.disabled=false; btn.textContent='Join the Valet Crew';
+     });
+  });
+})();
+</script>"""
+
+
+@app.get("/crew")
+def crew_page():
+    return wv_shell(_CREW_PAGE.replace("__WV_FOOTER__", _CREW_SCRIPT + "\n__WV_FOOTER__"))
 
 
 @app.get("/forecast")
