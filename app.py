@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-165"
+BACKEND_BUILD = "0702-166"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -5159,6 +5159,11 @@ def sitemap_xml():
         ("/pro", "0.9"),
         ("/forecast", "1.0"),
         ("/crew", "0.7"),
+        ("/for/families", "0.8"),
+        ("/for/weddings", "0.8"),
+        ("/for/farms", "0.8"),
+        ("/for/contractors", "0.8"),
+        ("/for/public-safety", "0.7"),
         ("/pricing", "0.9"),
         ("/about", "0.6"),
         ("/contact", "0.5"),
@@ -12742,11 +12747,11 @@ WV_HEADER = """<header>
     </div></div>
   <div class=nl>Who it's for &#9662;
     <div class=dd>
-      <a href="/stormline"><b>Families and homeowners</b></a>
-      <a href="/watch"><b>Weddings and events</b></a>
-      <a href="/pro"><b>Farms and growers</b></a>
-      <a href="/pro"><b>Contractors and crews</b></a>
-      <a href="/pro"><b>Public safety and schools</b></a>
+      <a href="/for/families"><b>Families and homeowners</b></a>
+      <a href="/for/weddings"><b>Weddings and events</b></a>
+      <a href="/for/farms"><b>Farms and growers</b></a>
+      <a href="/for/contractors"><b>Contractors and crews</b></a>
+      <a href="/for/public-safety"><b>Public safety and schools</b></a>
     </div></div>
   <div class=nl>Company &#9662;
     <div class=dd>
@@ -16474,6 +16479,257 @@ def crew_signup():
     return jsonify({"ok": True, "user_id": user_id})
 
 
+# ---------------------------------------------------------------------------
+# Audience pages (Aug 20, 2026)
+#
+# Product pages answer "what is this." These answer "is this for someone like
+# me," and their real job is routing: most audiences need more than one tier.
+# They are also the only pages that can rank for the phrases people actually
+# search, like weather alerts for concrete contractors.
+#
+# One template, five sets of content, so they cannot drift apart.
+# ---------------------------------------------------------------------------
+
+WV_TIERS = {
+    "forecast": ("AI Forecast", "Free", "/forecast",
+                 "Ask once, get an answer in seconds. It's AI, and we'll never pretend otherwise."),
+    "stormline": ("Stormline", "$12/year", "/stormline",
+                  "Official warnings for one exact address. Texts with radar, a phone call for tornadoes, the all clear."),
+    "daily": ("Stormline Daily", "$24/year", "/stormlinedaily",
+              "Everything Stormline does, plus a plain forecast every morning at the hour you pick."),
+    "sidekick": ("Sidekick", "$16/series", "/gameday/iu",
+                 "A Meteorologist covering a whole town on a busy day, and you're on the list."),
+    "review": ("Met Review", "$19 once", "/met-review",
+               "A Meteorologist studies your date and writes you back. One answer, from a person."),
+    "watch": ("Watch", "$49/event day", "/watch",
+              "A Meteorologist assigned to your event alone. Your day, your window, nobody else on the thread."),
+    "pro": ("Pro", "from $99/month", "/pro",
+            "Your own Meteorologist team, every day. Daily briefs, questions any time, custom alerts."),
+}
+
+AUDIENCES = {
+    "families": {
+        "eyebrow": "Families and homeowners",
+        "h1": "The people you'd worry about at 2 AM.",
+        "lede": "Your phone warns you about where you're standing. It says nothing about your "
+                "mother's house, your kid's apartment, or your own roof while you're asleep under it.",
+        "scenarios_title": "Sound familiar?",
+        "scenarios": [
+            ("Mom lives alone and won't download anything.",
+             "She doesn't have to. Put her address in and her number on it. She gets the text, "
+             "then a phone call that says the tornado warning out loud."),
+            ("Your kid is at school two states away.",
+             "Put their apartment in and both numbers on it. They get warned, and you know they "
+             "were warned, without refreshing radar for a city you've never lived in."),
+            ("You sleep through your phone.",
+             "Most people do. A text at 2 AM gets slept through and a ringing phone doesn't. "
+             "That's the whole reason tornado warnings call instead of text."),
+            ("You've got a place nobody's standing in.",
+             "The lake house, the rental, the shop, the barn. Anywhere valuable and empty."),
+        ],
+        "picks_title": "What most families end up with",
+        "picks": ["stormline", "daily", "review"],
+        "close_title": "One dollar a month",
+        "close": "Stormline is $12 a year for one address, and $8 more for a second. Most "
+                 "services charge full price again for the second one. Keep your free phone "
+                 "alerts too. They're good at what they do. This is for the address you can't "
+                 "stand next to.",
+    },
+    "weddings": {
+        "eyebrow": "Weddings and events",
+        "h1": "One day. No rain date.",
+        "lede": "An app tells you there's a 40% chance of rain. That's true, and it's useless "
+                "when you have 140 guests, a rented tent, and a ceremony at four.",
+        "scenarios_title": "The two decisions that matter",
+        "scenarios": [
+            ("Ten days out: do we rent the tent?",
+             "That's a $1,400 question and you want a person to answer it. A Meteorologist reads "
+             "the pattern and tells you what they'd do, in plain language."),
+            ("On the day: do we move the ceremony up?",
+             "Nobody can answer that in advance. Watch puts a Meteorologist on your window, start "
+             "to finish, messaging you as the sky actually changes."),
+            ("What about the rehearsal, the setup, the drive?",
+             "Tell your Meteorologist what the day looks like when you book. They watch it with "
+             "that in mind, not as a generic forecast for your county."),
+        ],
+        "picks_title": "How the day usually gets covered",
+        "picks": ["review", "watch", "forecast"],
+        "close_title": "Photographers, planners, venues and caterers",
+        "close": "If a rained-out event costs you money more than once a year, Pro is cheaper "
+                 "than booking Watch every time. Two Watch days a month already costs $98.",
+    },
+    "farms": {
+        "eyebrow": "Farms and growers",
+        "h1": "Three dry days, or two?",
+        "lede": "Nobody needs to explain to you what a wrong forecast costs. Hay on the ground "
+                "in a rain, a spray window that closes, a freeze you didn't cover for.",
+        "scenarios_title": "The calls you're already making",
+        "scenarios": [
+            ("Cut today, or wait?",
+             "You need someone who'll commit to an answer and say how confident they are, not a "
+             "percentage that hedges both ways."),
+            ("Is the spray window real?",
+             "Wind, temperature inversion, and the rain behind it. A Meteorologist who knows your "
+             "market will tell you when it actually closes."),
+            ("How cold does it get tonight?",
+             "Frost and freeze warnings on the exact address, not the county seat forty miles "
+             "away where the airport sits."),
+            ("Should I shut the pivot off?",
+             "That's a conversation with a person, not a lookup."),
+        ],
+        "picks_title": "What growers use",
+        "picks": ["pro", "stormline", "review"],
+        "close_title": "Your Meteorologist should know your market",
+        "close": "Nowcasting is local. Somebody who's never worked western Kansas will give you "
+                 "a competent regional forecast and blow the timing. We staff Meteorologists who "
+                 "know the ground they're forecasting for, which is also why we don't pretend to "
+                 "cover everywhere at once.",
+    },
+    "contractors": {
+        "eyebrow": "Contractors and crews",
+        "h1": "One rained-out crew day costs more than a year of this.",
+        "lede": "Concrete, roofing, excavation, paving, framing. You schedule people Sunday night "
+                "and eat the cost when the week doesn't hold.",
+        "scenarios_title": "Where it actually costs you",
+        "scenarios": [
+            ("Pour Friday, or push to Monday?",
+             "A bad call ruins a slab. A Meteorologist will tell you what they'd do and what "
+             "would change their mind."),
+            ("Open a roof, or don't?",
+             "Once it's off, it's off. You need to know whether the week holds before you start."),
+            ("Is the lift happening?",
+             "Wind above 25 and it doesn't. Set that as a threshold and get told, instead of "
+             "checking all morning."),
+            ("Do I call the crew off tonight or at 5 AM?",
+             "Either way, somebody's paying. Better to decide with a person's read than a "
+             "notification."),
+        ],
+        "picks_title": "What crews run on",
+        "picks": ["pro", "review", "stormline"],
+        "close_title": "The math, plainly",
+        "close": "Pro is $99 a month for one person and one location, $39 for each person after "
+                 "and $49 for each location. A five-person crew works out to $255. One ruined "
+                 "pour costs more than that.",
+    },
+    "public-safety": {
+        "eyebrow": "Public safety and schools",
+        "h1": "When people are asking you what to do.",
+        "lede": "Dispatch, emergency management, schools, parks, public works. You're the one "
+                "everybody calls, and an app is not a good enough answer.",
+        "scenarios_title": "What you're actually deciding",
+        "scenarios": [
+            ("Do we call off practice, or the game?",
+             "You need a person who'll give you a real read and stay with you as it changes, not "
+             "a radar loop you're interpreting yourself."),
+            ("Do we run buses early?",
+             "A decision that has to be made hours before the weather arrives, with real "
+             "consequences either way."),
+            ("Is this the night we open the shelter?",
+             "You want a Meteorologist you can ask directly, not a feed you're monitoring."),
+            ("Where is it actually going to hit?",
+             "Warnings for your exact facilities, each one watched separately."),
+        ],
+        "picks_title": "What agencies use",
+        "picks": ["pro", "watch", "stormline"],
+        "close_title": "One thing we will always say",
+        "close": "WeatherValet is never a replacement for the National Weather Service. If an "
+                 "official warning is issued, that comes first, every time. What we add is a "
+                 "Meteorologist you can ask a direct question and get a direct answer from, "
+                 "before and during the event.",
+    },
+}
+
+_AUD_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>__TITLE__</title><meta name=description content="__DESC__">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+.head{padding:66px 0 26px;background:radial-gradient(130% 100% at 50% -30%,#12234A 0%,#0A1020 46%,#04070E 100%)}
+.eyebrow{font-size:12px;letter-spacing:.24em;text-transform:uppercase;color:var(--sky);font-weight:800;margin-bottom:12px}
+h1{font-size:clamp(31px,5.4vw,50px);font-weight:900;letter-spacing:-.03em;line-height:1.04;margin:0 0 14px;
+  background:linear-gradient(98deg,#fff 22%,#7EB6FF 92%);-webkit-background-clip:text;background-clip:text;color:transparent}
+.lede{color:#B9CAE4;font-size:17px;line-height:1.6;max-width:620px;margin:0}
+.sec{padding:64px 0;border-top:1px solid rgba(255,255,255,.06)}
+.s-black{background:#04070E}
+.s-light{background:linear-gradient(180deg,#F2F6FD 0%,#E4EDFB 100%);color:#0B1220}
+.s-light h2,.s-light h3,.s-light b,.s-light strong{color:#08101F}
+.s-light p,.s-light li{color:#41536F}
+.s-deep{background:linear-gradient(180deg,#04070E 0%,#0A1533 60%,#04070E 100%)}
+.inner{max-width:720px;margin:0 auto}
+h2{font-size:clamp(24px,4vw,34px);font-weight:900;letter-spacing:-.025em;color:#fff;margin:0 0 22px}
+.sc{border-bottom:1px solid rgba(11,18,32,.12);padding:18px 0}
+.sc:last-child{border-bottom:none}
+.sc b{display:block;font-size:17.5px;color:#08101F;margin-bottom:5px;letter-spacing:-.01em}
+.sc p{margin:0;font-size:15.5px;line-height:1.65;color:#41536F}
+.picks{display:grid;grid-template-columns:1fr;gap:14px}
+@media(min-width:820px){.picks{grid-template-columns:1fr 1fr 1fr}}
+.pick{border:1px solid rgba(126,182,255,.18);border-radius:15px;padding:22px;
+  background:linear-gradient(168deg,rgba(255,255,255,.05),rgba(255,255,255,.012));transition:.22s}
+.pick:hover{border-color:rgba(224,36,60,.5);transform:translateY(-3px)}
+.pick .t{font-size:18.5px;font-weight:800;color:#fff;letter-spacing:-.02em}
+.pick .p{color:var(--sky);font-weight:800;font-size:14.5px;margin:2px 0 10px}
+.pick p{margin:0 0 14px;font-size:14.5px;color:#B9CAE4;line-height:1.6}
+.pick a{font-size:14px;color:var(--sky);font-weight:700}
+.close p{color:#B9CAE4;font-size:16.5px;line-height:1.7;max-width:680px;margin:0}
+.cta{display:inline-block;margin-top:26px;background:var(--accent);color:#fff;font-weight:800;
+  font-size:16px;padding:14px 26px;border-radius:10px;transition:.18s}
+.cta:hover{filter:brightness(1.14);transform:translateY(-1px)}
+</style></head><body>
+__WV_HEADER__
+<div class=head><div class=wrap>
+  <div class=eyebrow>__EYEBROW__</div>
+  <h1>__H1__</h1>
+  <p class=lede>__LEDE__</p>
+</div></div>
+
+<section class="sec s-light"><div class=wrap><div class=inner>
+  <h2>__SCENARIOS_TITLE__</h2>
+  __SCENARIOS__
+</div></div></section>
+
+<section class="sec s-deep"><div class=wrap>
+  <h2>__PICKS_TITLE__</h2>
+  <div class=picks>__PICKS__</div>
+</div></section>
+
+<section class="sec s-black"><div class=wrap><div class=inner class=close>
+  <h2>__CLOSE_TITLE__</h2>
+  <div class=close><p>__CLOSE__</p></div>
+  <a class=cta href="/home">Not sure which one? Start here &rarr;</a>
+</div></div></section>
+__WV_FOOTER__"""
+
+
+@app.get("/for/<slug>")
+def audience_page(slug: str):
+    a = AUDIENCES.get((slug or "").strip().lower())
+    if not a:
+        return ("<h1>Not found</h1><p><a href=\"/home\">Back to WeatherValet</a></p>", 404)
+    scen = "".join(
+        "<div class=sc><b>%s</b><p>%s</p></div>" % (_html_escape(t), _html_escape(d))
+        for t, d in a["scenarios"])
+    picks = "".join(
+        '<div class=pick><div class=t>%s</div><div class=p>%s</div><p>%s</p>'
+        '<a href="%s">See %s &rarr;</a></div>'
+        % (_html_escape(WV_TIERS[k][0]), _html_escape(WV_TIERS[k][1]),
+           _html_escape(WV_TIERS[k][3]), WV_TIERS[k][2], _html_escape(WV_TIERS[k][0]))
+        for k in a["picks"])
+    page = (_AUD_PAGE
+            .replace("__TITLE__", _html_escape(a["eyebrow"] + " - WeatherValet"))
+            .replace("__DESC__", _html_escape(a["lede"][:180]))
+            .replace("__EYEBROW__", _html_escape(a["eyebrow"]))
+            .replace("__H1__", _html_escape(a["h1"]))
+            .replace("__LEDE__", _html_escape(a["lede"]))
+            .replace("__SCENARIOS_TITLE__", _html_escape(a["scenarios_title"]))
+            .replace("__SCENARIOS__", scen)
+            .replace("__PICKS_TITLE__", _html_escape(a["picks_title"]))
+            .replace("__PICKS__", picks)
+            .replace("__CLOSE_TITLE__", _html_escape(a["close_title"]))
+            .replace("__CLOSE__", _html_escape(a["close"])))
+    return wv_shell(page)
+
+
 @app.get("/crew")
 def crew_page():
     return wv_shell(_CREW_PAGE.replace("__WV_FOOTER__", _CREW_SCRIPT + "\n__WV_FOOTER__"))
@@ -17282,7 +17538,7 @@ __WV_HEADER__
     <div class=tier><div class=t>Valet Crew</div><div class=p>Free to join</div>
       <p>Not a product. Report what you see from your corner of the sky, and make everyone
       else's forecast better.</p>
-      <a class=go href="https://weathervalet.ai/crew">Join the Crew &rarr;</a></div>
+      <a class=go href="/crew">Join the Crew &rarr;</a></div>
   </div>
  </div>
 </section>
