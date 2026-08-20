@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-164"
+BACKEND_BUILD = "0702-165"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -16158,60 +16158,60 @@ _CREW_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=description content="Free to join. Report real conditions from where you are and help our Meteorologists see the ground. No cost, no obligation.">
 <style>
 __WV_TOKENS__
-:root{--accent:#2FA36B;--grass:#2FA36B}
-header{background:rgba(4,10,8,.85);border-bottom:1px solid rgba(120,220,170,.18)}
-header .logo span{color:#7FE3B4}
-.nl:hover{background:rgba(120,220,170,.1)}
-.dd{background:#08140F;border-color:rgba(120,220,170,.2)}
-.dd a:hover{background:rgba(47,163,107,.28)}
-footer{background:#040907;border-color:rgba(120,220,170,.16)}
-footer h6{color:#7FE3B4}
+:root{--accent:#1E6BFF;--grass:#1E6BFF}
+header{background:rgba(4,7,14,.85);border-bottom:1px solid rgba(126,182,255,.18)}
+header .logo span{color:#7EB6FF}
+.nl:hover{background:rgba(126,182,255,.1)}
+.dd{background:#080D18;border-color:rgba(126,182,255,.2)}
+.dd a:hover{background:rgba(30,107,255,.28)}
+footer{background:#04070E;border-color:rgba(126,182,255,.16)}
+footer h6{color:#7EB6FF}
 .head{padding:66px 0 22px;
-  background:radial-gradient(130% 100% at 50% -30%,#123829 0%,#0A1810 46%,#040907 100%)}
-body{background:#040907}
-.eyebrow{font-size:12px;letter-spacing:.24em;text-transform:uppercase;color:#7FE3B4;font-weight:800;margin-bottom:12px}
+  background:radial-gradient(130% 100% at 50% -30%,#12234A 0%,#0A1020 46%,#04070E 100%)}
+body{background:#04070E}
+.eyebrow{font-size:12px;letter-spacing:.24em;text-transform:uppercase;color:#7EB6FF;font-weight:800;margin-bottom:12px}
 h1{font-size:clamp(32px,5.6vw,52px);font-weight:900;letter-spacing:-.03em;line-height:1.03;margin:0 0 14px;
-  background:linear-gradient(98deg,#fff 22%,#7FE3B4 92%);-webkit-background-clip:text;background-clip:text;color:transparent}
-.lede{color:#B4CFC1;font-size:17px;max-width:600px;margin:0 0 10px}
-.free{display:inline-block;background:var(--grass);color:#04160E;border-radius:999px;
+  background:linear-gradient(98deg,#fff 22%,#7EB6FF 92%);-webkit-background-clip:text;background-clip:text;color:transparent}
+.lede{color:#B9CAE4;font-size:17px;max-width:600px;margin:0 0 10px}
+.free{display:inline-block;background:var(--grass);color:#fff;border-radius:999px;
   padding:9px 22px;font-weight:800;font-size:17px;margin-top:14px}
 .sec{padding:64px 0;border-top:1px solid rgba(255,255,255,.06)}
-.s-night{background:#040907}
-.s-green{background:linear-gradient(180deg,#08160F 0%,#17452F 55%,#0B1F16 100%)}
-.s-paper{background:linear-gradient(180deg,#F3F8F4 0%,#E6F0E9 100%);color:#0E1A13}
-.s-paper h2,.s-paper h3,.s-paper b,.s-paper strong{color:#0A1610}
-.s-paper p,.s-paper li,.s-paper label{color:#3E5449}
+.s-night{background:#04070E}
+.s-green{background:linear-gradient(180deg,#0B1428 0%,#123163 55%,#0C1D3E 100%)}
+.s-paper{background:linear-gradient(180deg,#F2F6FD 0%,#E4EDFB 100%);color:#0B1220}
+.s-paper h2,.s-paper h3,.s-paper b,.s-paper strong{color:#08101F}
+.s-paper p,.s-paper li,.s-paper label{color:#41536F}
 .inner{max-width:680px;margin:0 auto}
 h2{font-size:clamp(24px,4vw,34px);font-weight:900;letter-spacing:-.025em;color:#fff;margin:0 0 14px}
-.sub{color:#B4CFC1;font-size:16.5px;max-width:620px;margin:0 0 26px}
+.sub{color:#B9CAE4;font-size:16.5px;max-width:620px;margin:0 0 26px}
 ul.feat{list-style:none;padding:0;margin:0}
-ul.feat li{padding:10px 0 10px 28px;position:relative;font-size:15.5px;line-height:1.6;color:#C3DACD}
-ul.feat li:before{content:"\\\\2713";position:absolute;left:2px;color:#7FE3B4;font-weight:800}
+ul.feat li{padding:10px 0 10px 28px;position:relative;font-size:15.5px;line-height:1.6;color:#C4D3EC}
+ul.feat li:before{content:"\\\\2713";position:absolute;left:2px;color:#7EB6FF;font-weight:800}
 ul.feat li b{color:#fff}
-.s-paper ul.feat li{color:#3E5449}
-.s-paper ul.feat li b{color:#0A1610}
-.s-paper ul.feat li:before{color:#1E7A4F}
+.s-paper ul.feat li{color:#41536F}
+.s-paper ul.feat li b{color:#08101F}
+.s-paper ul.feat li:before{color:#1E4FBF}
 label{display:block;font-size:12.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
-  color:#8FAE9D;margin:16px 0 6px}
+  color:#93A6C2;margin:16px 0 6px}
 input,select{width:100%;box-sizing:border-box;padding:12px;border-radius:9px;font-size:16px;
-  font-family:inherit;border:1px solid rgba(120,220,170,.26);background:#08150F;color:#E6F5EC}
+  font-family:inherit;border:1px solid rgba(126,182,255,.26);background:#0C1424;color:#EAF1FF}
 .row{display:flex;gap:10px}.row>div{flex:1}
 .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
-.chip{border:1px solid rgba(120,220,170,.28);background:rgba(255,255,255,.04);color:#D6EDE0;
+.chip{border:1px solid rgba(126,182,255,.28);background:rgba(255,255,255,.04);color:#D6E4FA;
   border-radius:999px;padding:9px 15px;font-size:14.5px;cursor:pointer;transition:.16s}
-.chip:hover{border-color:#7FE3B4}
-.chip.on{background:var(--grass);border-color:var(--grass);color:#04160E;font-weight:700}
-button.go{width:100%;margin-top:22px;background:var(--grass);color:#04160E;border:none;border-radius:10px;
+.chip:hover{border-color:#7EB6FF}
+.chip.on{background:var(--grass);border-color:var(--grass);color:#fff;font-weight:700}
+button.go{width:100%;margin-top:22px;background:var(--grass);color:#fff;border:none;border-radius:10px;
   padding:15px;font-size:17px;font-weight:800;cursor:pointer;transition:.18s}
 button.go:hover{filter:brightness(1.1);transform:translateY(-1px)}
 button.go:disabled{opacity:.6;transform:none}
 .err{display:none;background:#3A1220;border:1px solid #7C2740;color:#FFC2CE;border-radius:9px;
   padding:11px 13px;margin-top:14px;font-size:14.5px}
-.ok{display:none;background:#0F3423;border:1px solid #2FA36B;color:#B7F0CE;border-radius:11px;
+.ok{display:none;background:#0F2A4A;border:1px solid #1E6BFF;color:#BBD8FF;border-radius:11px;
   padding:18px 20px;margin-top:18px;font-size:16px;line-height:1.6}
 .ok b{color:#fff}
-.fine{font-size:12.5px;color:#8FAE9D;margin-top:12px;line-height:1.6;text-align:center}
-.quote{border-left:3px solid var(--grass);padding:4px 0 4px 18px;margin:22px 0;color:#C3DACD;
+.fine{font-size:12.5px;color:#93A6C2;margin-top:12px;line-height:1.6;text-align:center}
+.quote{border-left:3px solid var(--grass);padding:4px 0 4px 18px;margin:22px 0;color:#C4D3EC;
   font-size:17px;line-height:1.65}
 </style></head><body>
 __WV_HEADER__
@@ -16252,8 +16252,8 @@ __WV_HEADER__
 
 <section class="sec s-green"><div class=wrap><div class=inner>
   <h2>Join the Crew</h2>
-  <p class=sub>Tell us where you are and what you are willing to watch for. We will email you
-  when you are in.</p>
+  <p class=sub>Tell us where you are and what you are willing to watch for. You are in as soon
+  as you hit the button.</p>
   <div id=ok class=ok></div>
   <div id=form>
     <div class=row>
@@ -16277,8 +16277,8 @@ __WV_HEADER__
       <option value=weekends>Weekends</option>
     </select>
     <div id=err class=err></div>
-    <button class=go id=c-go>Join the Valet Crew</button>
-    <div class=fine>Free forever. We review applications by hand, so it may take a day or two.
+    <button class=go id=c-go>Join the Crew</button>
+    <div class=fine>Free forever, and you are in the moment you hit the button.
     We never sell your information.</div>
   </div>
 </div></div></section>
@@ -16289,7 +16289,7 @@ __WV_HEADER__
   No. Your eyes and your phone. A rain gauge is a bonus, not a requirement.</p>
   <p class=sub style="margin-bottom:10px"><b style="color:#fff">Do I need to be a
   spotter?</b><br>No. Trained spotters are welcome and so is anyone who pays attention. If you
-  are trained, say so in your application.</p>
+  are trained, tell us when you sign up.</p>
   <p class=sub style="margin-bottom:10px"><b style="color:#fff">Am I on the hook during
   storms?</b><br>Never. Report if you are safe and want to. Take shelter first, always. Nothing
   you report to us is worth standing outside for.</p>
@@ -16324,7 +16324,7 @@ _CREW_SCRIPT = """<script>
       err.style.display='block'; return; }
     var list=[]; for(var k in picked){ if(picked[k]) list.push(k); }
     btn.disabled=true; btn.textContent='Sending...';
-    fetch('/api/v1/crew/apply',{method:'POST',headers:{'Content-Type':'application/json'},
+    fetch('/api/v1/crew/signup',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({name:name,email:email,
         handle:document.getElementById('c-handle').value,
         phone:document.getElementById('c-phone').value,
@@ -16339,15 +16339,11 @@ _CREW_SCRIPT = """<script>
         if(res.j&&res.j.ok){
           document.getElementById('form').style.display='none';
           var ok=document.getElementById('ok');
-          // The API updates an existing application rather than refusing it,
-          // so say that plainly instead of pretending it is a new one.
-          ok.innerHTML = res.j.updated
-            ? '<b>We updated your application.</b><br>You already had one in with that email, so '
-              + 'we replaced it with what you just sent. Nothing else to do; we will email you '
-              + 'when you are approved.'
-            : '<b>You are in the queue.</b><br>A person reviews every application, so '
-              + 'give us a day or two. We will email you when you are approved, and that email '
-              + 'has the link to the Crew workspace.';
+          // Signing up twice just refreshes the same account, so this is
+          // safe to show either way.
+          ok.innerHTML = '<b>Welcome to the Crew.</b><br>You are in. Check your email for a '
+            + 'link to set a password and open your Crew workspace, where you can see the map, '
+            + 'the feed, and post your first report.';
           ok.style.display='block';
           ok.scrollIntoView({behavior:'smooth',block:'center'});
           return;
@@ -16356,14 +16352,126 @@ _CREW_SCRIPT = """<script>
         if(e==='valid-email-required'){ err.textContent='That email does not look right.'; }
         else if(e==='name-required'){ err.textContent='Tell us your name.'; }
         else { err.textContent='Something went wrong. Try again, or email hello@weathervalet.ai.'; }
-        err.style.display='block'; btn.disabled=false; btn.textContent='Join the Valet Crew';
+        err.style.display='block'; btn.disabled=false; btn.textContent='Join the Crew';
      }).catch(function(){
         err.textContent='Network problem. Try again.';
-        err.style.display='block'; btn.disabled=false; btn.textContent='Join the Valet Crew';
+        err.style.display='block'; btn.disabled=false; btn.textContent='Join the Crew';
      });
   });
 })();
 </script>"""
+
+
+@app.post("/api/v1/crew/signup")
+def crew_signup():
+    """Join the Valet Crew. No application, no approval, no waiting.
+
+    The old flow created a crew_applications row that an admin had to approve.
+    That made sense when Crew was invite-only; it does not make sense for a
+    free community anyone should be able to walk into. This creates the
+    account, grants the crew role immediately, and emails a sign-in link.
+
+    The application row is still written so admin tooling and the existing
+    reports keep working, but it is created already approved.
+    """
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()[:120]
+    email = (data.get("email") or "").strip().lower()[:200]
+    if len(name) < 2:
+        return jsonify({"ok": False, "error": "name-required"}), 400
+    if not email or not is_valid_email(email):
+        return jsonify({"ok": False, "error": "valid-email-required"}), 400
+
+    handle = (data.get("handle") or "").strip()[:60] or None
+    phone_raw = (data.get("phone") or "").strip()
+    phone = normalize_phone(phone_raw) if phone_raw else None
+    county = (data.get("county") or "").strip()[:120] or None
+    state = (data.get("state") or "").strip()[:60] or None
+    zip_code = (data.get("zip") or "").strip()[:10] or None
+    if zip_code:
+        m = re.match(r"^(\d{5})", zip_code)
+        zip_code = m.group(1) if m else None
+
+    interests = data.get("mission_interests") or []
+    if isinstance(interests, str):
+        interests = [x.strip() for x in interests.split(",") if x.strip()]
+    valid = {"storms", "hail", "wind", "rain", "winter", "general"}
+    mission_interests = ",".join(x for x in interests if x in valid) or None
+    hours = (data.get("hours") or "all").strip()
+    if hours not in ("all", "weekdays-day", "weekdays-evening", "weekends", "custom"):
+        hours = "all"
+
+    now_ms = int(time.time() * 1000)
+    try:
+        with db() as conn:
+            user_id = _get_or_create_user(email, conn)
+            with conn.cursor() as cur:
+                if name:
+                    cur.execute("""UPDATE users SET name = %s
+                                   WHERE id = %s AND (name IS NULL OR name = '')""",
+                                (name, user_id))
+                if phone:
+                    cur.execute("UPDATE users SET phone = %s WHERE id = %s", (phone, user_id))
+                cur.execute("""INSERT INTO user_roles (user_id, role, granted_at)
+                               VALUES (%s, 'crew', %s)
+                               ON CONFLICT (user_id, role) DO NOTHING""",
+                            (user_id, now_ms))
+                # Keep a row for the admin tooling, already approved.
+                cur.execute("""SELECT id FROM crew_applications WHERE lower(email) = %s""",
+                            (email,))
+                existing = cur.fetchone()
+                # crew_applications has no state or zip column, so fold them
+                # into county rather than writing to fields that do not exist.
+                where = ", ".join(x for x in (county, state, zip_code) if x) or None
+                if existing:
+                    cur.execute("""UPDATE crew_applications
+                                   SET name=%s, handle=%s, phone=%s, county=%s,
+                                       mission_interests=%s, hours=%s,
+                                       status='approved', created_user_id=%s, updated_at=%s
+                                   WHERE id=%s""",
+                                (name, handle, phone, where,
+                                 mission_interests, hours, user_id, now_ms, existing["id"]))
+                else:
+                    cur.execute("""INSERT INTO crew_applications
+                                   (name, handle, email, phone, county,
+                                    mission_interests, hours, notify, status,
+                                    created_user_id, created_at, updated_at)
+                                   VALUES (%s,%s,%s,%s,%s,%s,%s,'email','approved',%s,%s,%s)""",
+                                (name, handle, email, phone, where,
+                                 mission_interests, hours, user_id, now_ms, now_ms))
+    except Exception as e:
+        print(f"[crew-signup] failed for {email}: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "server"}), 500
+
+    # Sign-in link so they can set a password and reach the workspace.
+    try:
+        base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai")
+        raw_token = new_secure_token()
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""INSERT INTO magic_link_tokens
+                               (token_hash, user_id, created_at, expires_at, ip_requested)
+                               VALUES (%s,%s,%s,%s,%s)""",
+                            (hash_token(raw_token), user_id, now_ts(),
+                             now_ts() + MAGIC_LINK_TTL_SECONDS, "crew-signup"))
+        _send_magic_link_email(email,
+                               f"{base}/?auth=verify&token={raw_token}&intent=new-account",
+                               intent="new-account")
+    except Exception as e:
+        print(f"[crew-signup] magic link failed for {email}: {e!r}", flush=True)
+
+    try:
+        _send_team_notification(
+            subject=f"New Valet Crew member: {name}",
+            html_body=(f"<p><b>{_html_escape(name)}</b> joined the Crew.</p>"
+                       f"<p>{_html_escape(email)}<br>{_html_escape(county or '')} "
+                       f"{_html_escape(state or '')}</p>"),
+            text_body=f"New Crew member: {name} {email}")
+    except Exception:
+        pass
+
+    print(f"[crew-signup] user={user_id} joined", flush=True)
+    return jsonify({"ok": True, "user_id": user_id})
 
 
 @app.get("/crew")
