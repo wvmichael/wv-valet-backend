@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-166"
+BACKEND_BUILD = "0702-167"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -5139,6 +5139,7 @@ def robots_txt():
         "Disallow: /admin\n"
         "Disallow: /meteorologist\n"
         "Disallow: /portal\n"
+        "Disallow: /signin\n"
         "\n"
         f"Sitemap: {PUBLIC_BASE_URL}/sitemap.xml\n"
     )
@@ -12762,7 +12763,7 @@ WV_HEADER = """<header>
     </div></div>
   <a class=nl href="/pricing">Pricing</a>
   <div class=spacer></div>
-  <a class=signin href="https://weathervalet.ai/portal">Sign in</a>
+  <a class=signin href="/signin">Sign in</a>
   <a class=btn href="/home">Get started</a>
   <button class=burger id=burger aria-label="Menu">&#9776;</button>
  </nav>
@@ -12778,7 +12779,7 @@ WV_HEADER = """<header>
    <h6>Company</h6>
    <a href="/home#mets">Our Meteorologists</a>
    <a href="/crew">Valet Crew</a>
-   <a href="https://weathervalet.ai/portal">Sign in</a>
+   <a href="/signin">Sign in</a>
  </div>
  </div>
 </header>"""
@@ -12804,7 +12805,7 @@ WV_FOOTER = """<footer>
      <a href="/home#mets">Our Meteorologists</a>
      <a href="/about">About</a>
      <a href="/crew">Become a Meteorologist</a>
-     <a href="https://weathervalet.ai/portal">Sign in</a></div>
+     <a href="/signin">Sign in</a></div>
    <div><h6>Legal</h6>
      <a href="/terms">Terms of Service</a>
      <a href="/privacy">Privacy Policy</a>
@@ -16728,6 +16729,176 @@ def audience_page(slug: str):
             .replace("__CLOSE_TITLE__", _html_escape(a["close_title"]))
             .replace("__CLOSE__", _html_escape(a["close"])))
     return wv_shell(page)
+
+
+# ---------------------------------------------------------------------------
+# Sign in (Aug 20, 2026)
+#
+# The last thing linking out to the old site. Everything behind this already
+# exists: password login, magic links, verify, sessions, and a workspaces
+# list. This is the door, not the machinery.
+#
+# Two ways in on purpose. Meteorologists and Pro subscribers have passwords.
+# Crew members usually arrive from an email link and never set one, so
+# "email me a link" has to be first-class rather than a footnote.
+# ---------------------------------------------------------------------------
+
+_SIGNIN_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Sign in - WeatherValet</title>
+<meta name=robots content="noindex">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+.mid{max-width:460px;margin:0 auto;padding:70px 22px 90px}
+h1{font-size:clamp(28px,4.6vw,40px);font-weight:900;letter-spacing:-.03em;color:#fff;margin:0 0 8px}
+.lede{color:#B9CAE4;font-size:16px;line-height:1.6;margin:0 0 30px}
+.tabs{display:flex;gap:8px;margin-bottom:22px}
+.tab{flex:1;padding:11px 8px;text-align:center;border-radius:9px;font-size:14.5px;font-weight:700;
+  border:1px solid rgba(126,182,255,.22);background:rgba(255,255,255,.04);color:#B9CAE4;cursor:pointer}
+.tab.on{background:var(--accent);border-color:var(--accent);color:#fff}
+label{display:block;font-size:12.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
+  color:#93A6C2;margin:16px 0 6px}
+input{width:100%;box-sizing:border-box;padding:13px;border-radius:9px;font-size:16px;font-family:inherit;
+  border:1px solid rgba(126,182,255,.28);background:#0C1424;color:#EAF1FF}
+button.go{width:100%;margin-top:22px;background:var(--accent);color:#fff;border:none;border-radius:10px;
+  padding:15px;font-size:16.5px;font-weight:800;cursor:pointer;transition:.18s}
+button.go:hover{filter:brightness(1.14);transform:translateY(-1px)}
+button.go:disabled{opacity:.6;transform:none}
+.err{display:none;background:#3A1220;border:1px solid #7C2740;color:#FFC2CE;border-radius:9px;
+  padding:11px 13px;margin-top:16px;font-size:14.5px;line-height:1.5}
+.ok{display:none;background:#0F2A4A;border:1px solid #1E6BFF;color:#BBD8FF;border-radius:11px;
+  padding:18px 20px;margin-top:18px;font-size:15.5px;line-height:1.6}
+.ok b{color:#fff}
+.hint{font-size:13px;color:#8CA0C0;margin-top:16px;line-height:1.6;text-align:center}
+.hint a{color:var(--sky)}
+.ws{display:none;margin-top:22px}
+.ws a{display:flex;justify-content:space-between;align-items:center;gap:12px;
+  border:1px solid rgba(126,182,255,.22);border-radius:11px;padding:15px 17px;margin-bottom:10px;
+  background:rgba(255,255,255,.04);transition:.18s}
+.ws a:hover{border-color:var(--accent);transform:translateY(-2px)}
+.ws b{color:#fff;font-size:16px}
+.ws i{font-style:normal;color:#8CA0C0;font-size:13.5px}
+</style></head><body>
+__WV_HEADER__
+<div class=mid>
+  <h1>Sign in</h1>
+  <p class=lede>Meteorologists, Pro subscribers, and Valet Crew all sign in here.</p>
+
+  <div class=tabs>
+    <div class="tab on" id=tab-pw>Password</div>
+    <div class=tab id=tab-link>Email me a link</div>
+  </div>
+
+  <div id=pane-pw>
+    <label for=s-email>Email</label><input id=s-email type=email autocomplete=email>
+    <label for=s-pass>Password</label><input id=s-pass type=password autocomplete=current-password>
+    <button class=go id=go-pw>Sign in</button>
+  </div>
+
+  <div id=pane-link style="display:none">
+    <label for=s-email2>Email</label><input id=s-email2 type=email autocomplete=email>
+    <button class=go id=go-link>Email me a sign-in link</button>
+    <p class=hint>No password needed. We'll send a link that signs you in.</p>
+  </div>
+
+  <div id=err class=err></div>
+  <div id=ok class=ok></div>
+  <div id=ws class=ws></div>
+
+  <p class=hint>Trouble getting in? <a href="/contact">Tell us</a> and a person will sort it out.<br>
+  Not on the Crew yet? <a href="/crew">Join free</a>.</p>
+</div>
+__WV_FOOTER__"""
+
+_SIGNIN_SCRIPT = """<script>
+(function(){
+  var err=document.getElementById('err'), ok=document.getElementById('ok'), ws=document.getElementById('ws');
+  function show(el,msg){ el.innerHTML=msg; el.style.display='block'; }
+  function hideAll(){ err.style.display='none'; ok.style.display='none'; ws.style.display='none'; }
+  document.getElementById('tab-pw').addEventListener('click',function(){
+    this.className='tab on'; document.getElementById('tab-link').className='tab';
+    document.getElementById('pane-pw').style.display='block';
+    document.getElementById('pane-link').style.display='none'; hideAll();
+  });
+  document.getElementById('tab-link').addEventListener('click',function(){
+    this.className='tab on'; document.getElementById('tab-pw').className='tab';
+    document.getElementById('pane-link').style.display='block';
+    document.getElementById('pane-pw').style.display='none'; hideAll();
+  });
+  function route(j){
+    var list=(j && j.workspaces) || [];
+    if(list.length===1 && list[0].url){ window.location=list[0].url; return; }
+    if(list.length>1){
+      ws.innerHTML=list.map(function(w){
+        return '<a href="'+(w.url||'#')+'"><span><b>'+(w.name||w.role||'Workspace')+'</b><br>'
+          +'<i>'+(w.description||w.role||'')+'</i></span><span>&rarr;</span></a>';
+      }).join('');
+      ws.style.display='block';
+      show(ok,'<b>You are signed in.</b><br>Pick where you want to go.');
+      return;
+    }
+    show(ok,'<b>You are signed in.</b><br>Your account is not attached to a workspace yet. '
+      +'<a href="/contact" style="color:#7EB6FF">Tell us</a> and we will finish setting it up.');
+  }
+  document.getElementById('go-pw').addEventListener('click',function(){
+    var btn=this; hideAll();
+    var email=document.getElementById('s-email').value.trim();
+    var pass=document.getElementById('s-pass').value;
+    if(!email||!pass){ show(err,'Enter your email and password.'); return; }
+    btn.disabled=true; btn.textContent='Signing in...';
+    fetch('/api/v1/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},
+      credentials:'include',body:JSON.stringify({email:email,password:pass})})
+     .then(function(r){ return r.json().then(function(j){ return {s:r.status,j:j}; }); })
+     .then(function(res){
+        btn.disabled=false; btn.textContent='Sign in';
+        if(res.j&&res.j.ok){ route(res.j); return; }
+        if(res.s===429){ show(err,'Too many tries. Wait a few minutes, or use the email link instead.'); return; }
+        show(err,'That email and password did not match. If you have never set a password, '
+          +'use <b>Email me a link</b> above.');
+     }).catch(function(){
+        btn.disabled=false; btn.textContent='Sign in';
+        show(err,'Network problem. Try again.');
+     });
+  });
+  document.getElementById('go-link').addEventListener('click',function(){
+    var btn=this; hideAll();
+    var email=document.getElementById('s-email2').value.trim();
+    if(!email||email.indexOf('@')<1){ show(err,'Enter the email on your account.'); return; }
+    btn.disabled=true; btn.textContent='Sending...';
+    fetch('/api/v1/auth/request-magic-link',{method:'POST',headers:{'Content-Type':'application/json'},
+      credentials:'include',body:JSON.stringify({email:email})})
+     .then(function(r){ return r.json().then(function(j){ return {s:r.status,j:j}; }); })
+     .then(function(res){
+        btn.disabled=false; btn.textContent='Email me a sign-in link';
+        if(res.s===429){ show(err,'That is a lot of links. Give it a few minutes.'); return; }
+        // The API answers the same way whether or not the account exists, so
+        // we say the same thing. Confirming an address exists would let
+        // anyone check who has an account.
+        document.getElementById('pane-link').style.display='none';
+        show(ok,'<b>Check your email.</b><br>If that address has an account, a sign-in link is '
+          +'on its way. It is good for a limited time and can only be used once.');
+     }).catch(function(){
+        btn.disabled=false; btn.textContent='Email me a sign-in link';
+        show(err,'Network problem. Try again.');
+     });
+  });
+  // Enter submits whichever pane is showing.
+  document.addEventListener('keydown',function(e){
+    if(e.key!=='Enter')return;
+    var linkPane=document.getElementById('pane-link');
+    if(linkPane.style.display!=='none'){ document.getElementById('go-link').click(); }
+    else { document.getElementById('go-pw').click(); }
+  });
+})();
+</script>"""
+
+
+@app.get("/signin")
+@app.get("/login")
+@app.get("/portal")
+def signin_page():
+    return wv_shell(_SIGNIN_PAGE.replace("__WV_FOOTER__", _SIGNIN_SCRIPT + "\n__WV_FOOTER__"))
 
 
 @app.get("/crew")
