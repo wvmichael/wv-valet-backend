@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-161"
+BACKEND_BUILD = "0702-162"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -5157,6 +5157,11 @@ def sitemap_xml():
         ("/watch", "0.8"),
         ("/met-review", "0.8"),
         ("/pro", "0.9"),
+        ("/pricing", "0.9"),
+        ("/about", "0.6"),
+        ("/contact", "0.5"),
+        ("/terms", "0.3"),
+        ("/privacy", "0.3"),
         ("/gameday/terms", "0.3"),
     ]
     urls = "".join(
@@ -12744,11 +12749,11 @@ WV_HEADER = """<header>
   <div class=nl>Company &#9662;
     <div class=dd>
       <a href="/home#mets"><b>Our Meteorologists</b></a>
-      <a href="https://weathervalet.ai/?page=about"><b>About WeatherValet</b></a>
+      <a href="/about"><b>About WeatherValet</b></a>
       <a href="https://weathervalet.ai/crew"><b>Valet Crew</b></a>
-      <a href="mailto:hello@weathervalet.ai"><b>Contact</b></a>
+      <a href="/contact"><b>Contact</b></a>
     </div></div>
-  <a class=nl href="https://weathervalet.ai/pricing">Pricing</a>
+  <a class=nl href="/pricing">Pricing</a>
   <div class=spacer></div>
   <a class=signin href="https://weathervalet.ai/portal">Sign in</a>
   <a class=btn href="/home">Get started</a>
@@ -12784,18 +12789,18 @@ WV_FOOTER = """<footer>
      <a href="/pro">Pro</a>
      <a href="https://weathervalet.ai/crew">Valet Crew</a></div>
    <div><h6>Support</h6>
-     <a href="mailto:hello@weathervalet.ai">Contact us</a>
-     <a href="mailto:hello@weathervalet.ai?subject=Manage%20my%20Stormline">Manage your Stormline</a>
+     <a href="/contact">Contact us</a>
+     <a href="/contact">Manage your Stormline</a>
      <a href="/gameday/terms">How to stop messages</a>
-     <a href="mailto:hello@weathervalet.ai?subject=Refund">Refunds</a></div>
+     <a href="/contact">Refunds</a></div>
    <div><h6>Company</h6>
      <a href="/home#mets">Our Meteorologists</a>
-     <a href="https://weathervalet.ai/?page=about">About</a>
+     <a href="/about">About</a>
      <a href="https://weathervalet.ai/crew">Become a Meteorologist</a>
      <a href="https://weathervalet.ai/portal">Sign in</a></div>
    <div><h6>Legal</h6>
-     <a href="https://weathervalet.ai/terms">Terms of Service</a>
-     <a href="https://weathervalet.ai/privacy">Privacy Policy</a>
+     <a href="/terms">Terms of Service</a>
+     <a href="/privacy">Privacy Policy</a>
      <a href="/gameday/terms">Text message terms</a></div>
   </div>
   <div class=legal>
@@ -12847,8 +12852,8 @@ ul{padding-left:20px}li{margin-bottom:7px}
 <a class=back href="/gameday/iu">&larr; Back to WeatherValet Sidekick</a>
 <h1>WeatherValet Sidekick: Terms and Text Message Program</h1>
 <p class=eff>Effective August 17, 2026. These terms cover WeatherValet Sidekick passes specifically and
-sit alongside the general <a href="https://weathervalet.ai/?legal=terms">WeatherValet Terms of Service</a>
-and <a href="https://weathervalet.ai/?legal=privacy">Privacy Policy</a>. Where they conflict, these
+sit alongside the general <a href="/terms">WeatherValet Terms of Service</a>
+and <a href="/privacy">Privacy Policy</a>. Where they conflict, these
 GameDay terms control for your GameDay pass.</p>
 
 <h2>What you are buying</h2>
@@ -13158,7 +13163,7 @@ __WV_HEADER__
       messages per game. Message and data rates may apply. Reply STOP to cancel, HELP for help. Text
       delivery depends on your carrier and is not guaranteed. I agree to the
       <a href="/gameday/terms" target="_blank" rel=noopener>Sidekick Terms</a> and
-      <a href="https://weathervalet.ai/?legal=privacy" target="_blank" rel=noopener>Privacy Policy</a>.</span></label>
+      <a href="/privacy" target="_blank" rel=noopener>Privacy Policy</a>.</span></label>
     <button id=g-go>Claim my series pass</button>
     <div class=fine>The series pass covers all 8 home games starting with the opener (including the Friday
     night game); single passes cover only the games you check above. One-time payment via Stripe.
@@ -13181,7 +13186,7 @@ __WV_HEADER__
 
     <p style="text-align:center;font-size:13px;color:#6B5257;margin:26px auto 0;max-width:560px;line-height:1.7">
     <a href="/gameday/terms" style="color:#8A1F32">Sidekick Terms and text message program</a>
-    &middot; <a href="https://weathervalet.ai/?legal=privacy" style="color:#8A1F32">Privacy</a><br>
+    &middot; <a href="/privacy" style="color:#8A1F32">Privacy</a><br>
     WeatherValet is an independent weather service, not affiliated with or endorsed by
     Indiana University.</p>
 </div></div></section>
@@ -13258,18 +13263,6 @@ document.getElementById('g-go').addEventListener('click', function(){
 </script>
 
 __WV_FOOTER__"""
-
-
-@app.get("/terms")
-def _legal_terms_redirect():
-    """Carrier audits and older SMS disclosures point at the bare paths.
-    Send them to the real pages instead of a 404."""
-    return redirect("https://weathervalet.ai/?legal=terms", code=302)
-
-
-@app.get("/privacy")
-def _legal_privacy_redirect():
-    return redirect("https://weathervalet.ai/?legal=privacy", code=302)
 
 
 @app.get("/gameday/terms")
@@ -14648,7 +14641,7 @@ __WV_HEADER__
       STOP to cancel, HELP for help. Text delivery depends on my carrier and is not
       guaranteed. I agree to the
       <a href="/gameday/terms" target="_blank" rel=noopener>Terms</a> and
-      <a href="https://weathervalet.ai/?legal=privacy" target="_blank" rel=noopener>Privacy Policy</a>.</span></label>
+      <a href="/privacy" target="_blank" rel=noopener>Privacy Policy</a>.</span></label>
     <button id=w-go>Book this day &middot; $49</button>
     <div class=fine>One-time payment via Stripe. Book at least a day ahead so your
     Meteorologist has time to prepare. Full refund any time before your day starts.</div>
@@ -15530,6 +15523,486 @@ __WV_HEADER__
 </script>
 
 __WV_FOOTER__"""
+
+
+TERMS_BODY = """<h1>Terms of Service</h1>
+    <p>Effective May 14, 2026</p>
+    <p>
+      By using WeatherValet, you agree to these terms. We&rsquo;ve kept them plain
+      and short. If anything seems off, email
+      <a href="mailto:hello@weathervalet.ai">hello@weathervalet.ai</a>.
+    </p>
+    <h2>What WeatherValet is</h2>
+    <p>
+      WeatherValet provides weather forecasting, daily briefs, meteorologist
+      consultations, and severe weather notifications for businesses and
+      individuals. We combine National Weather Service data with our own
+      decision rules and human meteorologist review.
+    </p>
+    <h2>Your account</h2>
+    <ul>
+      <li>You are responsible for keeping your password secure.</li>
+      <li>You agree to provide accurate contact information so we can deliver the service.</li>
+      <li>One account per person or business. Don&rsquo;t share credentials.</li>
+      <li>If you suspect unauthorized access, email us immediately.</li>
+    </ul>
+    <h2>Payment and refunds</h2>
+    <ul>
+      <li><strong>$19 reviews</strong> are charged at the time of purchase. If your meteorologist does not deliver the review within the stated service window, contact us within 7 days for a refund.</li>
+      <li><strong>Subscription plans</strong> (Stormline, Pro) are billed on their stated cycle (Stormline annually, Pro monthly). You can cancel any time via the Stripe portal in your subscriber settings. Cancellation stops future billing; no partial-month refunds are issued for the current period unless required by law.</li>
+      <li><strong>Tips</strong> to meteorologists are non-refundable except in cases of clear customer error (e.g., extra zero on the amount). Email us within 24 hours.</li>
+      <li>All payments are processed by Stripe. We do not store credit card numbers.</li>
+    </ul>
+    <h2>What we promise</h2>
+    <ul>
+      <li>We will make our best effort to deliver accurate forecasts and timely briefs.</li>
+      <li>We will respond to support requests within 1 business day.</li>
+      <li>Pro tier customers get 30-minute meteorologist response during business hours.</li>
+      <li>We will protect your data according to our <a href="?legal=privacy">Privacy Policy</a>.</li>
+    </ul>
+    <h2>What we cannot promise</h2>
+    <p>
+      <strong>Weather forecasts are inherently uncertain.</strong> No service can guarantee
+      what the atmosphere will do. We provide our best professional judgment, but
+      you are the one making the operational decision. WeatherValet is not
+      responsible for outcomes resulting from weather events (including but not
+      limited to property damage, business losses, event cancellations, or
+      personal injury), whether or not those events were correctly forecasted.
+    </p>
+    <p>
+      <strong>Life-safety decisions.</strong> WeatherValet is not a replacement for official
+      National Weather Service warnings or local emergency management. If the NWS
+      issues a tornado warning, take shelter regardless of what our briefs say.
+      We are a decision-support service, not a sole-source authority.
+    </p>
+    <h2>Acceptable use</h2>
+    <ul>
+      <li>Don&rsquo;t use WeatherValet for illegal purposes.</li>
+      <li>Don&rsquo;t resell our forecasts as your own without a partnership agreement.</li>
+      <li>Don&rsquo;t attempt to access other users&rsquo; data or circumvent our security.</li>
+      <li>Be respectful in Pro Threads and Crew responses. Abuse will result in account suspension.</li>
+    </ul>
+    <h2>Termination</h2>
+    <p>
+      You can cancel anytime via your subscriber portal or by emailing us. We
+      can terminate accounts for violation of these terms, abuse of meteorologists
+      or Crew members, fraudulent payments, or extended non-payment. We will
+      typically give notice and an opportunity to correct except in cases of
+      serious abuse.
+    </p>
+    <h2>Limitation of liability</h2>
+    <p>
+      To the maximum extent allowed by law, WeatherValet&rsquo;s liability for any
+      claim related to the service is limited to the amount you paid us in the
+      12 months prior to the claim. We are not liable for indirect, consequential,
+      or incidental damages. Some jurisdictions don&rsquo;t allow these limits; in
+      those jurisdictions, the limit is the smallest amount allowed by law.
+    </p>
+    <h2>Governing law</h2>
+    <p>
+      These terms are governed by the laws of the State of Indiana, United
+      States. Any disputes will be resolved in the state or federal courts
+      located in Marion County, Indiana, unless you have a right under
+      consumer protection law to litigate in your own jurisdiction.
+    </p>
+    <h2>Changes to these terms</h2>
+    <p>
+      If we make material changes, we&rsquo;ll email account holders at least 14
+      days before the change takes effect. Continued use after that constitutes
+      acceptance.
+    </p>
+    <h2>Contact</h2>
+    <p>
+      <strong>WeatherValet</strong><br>
+      Indianapolis, IN<br>
+      <a href="mailto:hello@weathervalet.ai">hello@weathervalet.ai</a>
+    </p>"""
+
+PRIVACY_BODY = """<h1>Privacy Policy</h1>
+    <p>Effective May 14, 2026</p>
+    <p>
+      WeatherValet (&ldquo;we,&rdquo; &ldquo;us&rdquo;) provides decision-grade weather verification
+      services. This policy explains what we collect, why, and what choices you have.
+      We wrote it in plain English. If anything is unclear, email
+      <a href="mailto:hello@weathervalet.ai">hello@weathervalet.ai</a> and a person
+      will answer.
+    </p>
+    <h2>What we collect</h2>
+    <ul>
+      <li><strong>Account information</strong>: your email, name, and (if you choose) phone number.</li>
+      <li><strong>Locations you save</strong>: addresses and coordinates of places you want forecasts for.</li>
+      <li><strong>Payment information</strong>: processed entirely by <a href="https://stripe.com">Stripe</a>. We don&rsquo;t store credit card numbers on our servers. We retain a Stripe customer ID linking you to your billing.</li>
+      <li><strong>Service usage</strong>: which features you use, when you sign in, and which briefs you receive. Used for product improvement and accountability.</li>
+      <li><strong>Crew location</strong>: if you&rsquo;re a Valet Crew member, the static &ldquo;home base&rdquo; you set so we can route mission notifications to you.</li>
+      <li><strong>Communications</strong>: messages you send via Pro Threads or replies to mission text messages. We keep these so meteorologists can reference your conversation history.</li>
+    </ul>
+    <h2>How we use it</h2>
+    <ul>
+      <li>To deliver the service you signed up for (forecasts, briefs, verifications, mission coordination).</li>
+      <li>To notify you when severe weather threatens a saved location.</li>
+      <li>To process your payments and provide receipts.</li>
+      <li>To improve our forecast accuracy and meteorologist workflows.</li>
+      <li>To respond to support requests and resolve account issues.</li>
+    </ul>
+    <h2>Who we share it with</h2>
+    <p>
+      We only share data with service providers necessary to operate WeatherValet:
+    </p>
+    <ul>
+      <li><strong>Stripe</strong>: payment processing</li>
+      <li><strong>Resend</strong>: email delivery</li>
+      <li><strong>Twilio</strong>: SMS delivery</li>
+      <li><strong>Render</strong>: web hosting and database</li>
+      <li><strong>National Weather Service (NWS)</strong>: weather data source (public API; no personal data flows to NWS)</li>
+    </ul>
+    <p>
+      We do not sell your personal information. We do not share it for advertising
+      purposes. If law enforcement requests data with a valid legal order, we will
+      comply as required by law, but we will challenge overly broad requests where
+      we can.
+    </p>
+    <h2>Your rights</h2>
+    <ul>
+      <li><strong>See your data.</strong> Email us at <a href="mailto:hello@weathervalet.ai">hello@weathervalet.ai</a> and we&rsquo;ll send you a copy of everything we have linked to your account.</li>
+      <li><strong>Correct your data.</strong> Most fields are editable in your subscriber portal. For others, email us.</li>
+      <li><strong>Delete your account.</strong> Email us with the subject &ldquo;Delete my account.&rdquo; We will deactivate immediately and purge personal data within 30 days, except where retention is required by law (e.g., financial records for tax purposes).</li>
+      <li><strong>Opt out of marketing.</strong> All marketing emails include an unsubscribe link. Transactional emails (account verification, payment receipts) cannot be opted out of while your account is active.</li>
+    </ul>
+    <h2>Cookies and tracking</h2>
+    <p>
+      We use a session cookie to keep you signed in. We do not use third-party
+      tracking cookies. We do not run advertising trackers. We do not embed
+      social media trackers.
+    </p>
+    <h2>Children</h2>
+    <p>
+      WeatherValet is not directed at children under 13. We do not knowingly
+      collect personal information from children under 13. If you believe a
+      child has provided us information, email us and we will delete it.
+    </p>
+    <h2>Changes to this policy</h2>
+    <p>
+      If we make material changes, we&rsquo;ll email account holders and post a
+      banner on the homepage at least 14 days before the change takes effect.
+      Minor edits (typo fixes, clarifications) may happen without notice but
+      will be reflected in the &ldquo;Effective&rdquo; date above.
+    </p>
+    <h2>Contact</h2>
+    <p>
+      <strong>WeatherValet</strong><br>
+      Indianapolis, IN<br>
+      <a href="mailto:hello@weathervalet.ai">hello@weathervalet.ai</a>
+    </p>"""
+
+# ---------------------------------------------------------------------------
+# Legal, pricing, about and contact (Aug 19, 2026)
+#
+# Ported off the single-page app so weathervalet.ai can eventually point here
+# without the header and footer linking back to pages that no longer exist.
+# The legal wording is carried over as written; only the wrapper changed.
+# ---------------------------------------------------------------------------
+
+_DOC_HEAD = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>__TITLE__</title><meta name=description content="__DESC__">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+.doc{max-width:760px;margin:0 auto;padding:54px 22px 80px}
+.doc h1{font-size:clamp(30px,5vw,44px);font-weight:900;letter-spacing:-.03em;color:#fff;margin:0 0 8px}
+.doc h2{font-size:20px;margin:34px 0 8px;color:#7EB6FF;font-weight:800}
+.doc p,.doc li{color:#C4D3EC;font-size:16px;line-height:1.7}
+.doc ul{padding-left:20px}
+.doc li{margin-bottom:7px}
+.doc a{color:#7EB6FF}
+.doc strong,.doc b{color:#fff}
+.eff{color:#8CA0C0;font-size:14px}
+.note{background:rgba(30,107,255,.10);border:1px solid rgba(126,182,255,.28);border-radius:11px;
+  padding:15px 17px;margin:22px 0;font-size:15px;line-height:1.6;color:#DDE8FA}
+.note b{color:#fff}
+</style></head><body>
+__WV_HEADER__
+<div class=doc>"""
+
+
+def _doc(title: str, desc: str, body: str) -> str:
+    return wv_shell(_DOC_HEAD.replace("__TITLE__", title).replace("__DESC__", desc)
+                    + body + "</div>\n__WV_FOOTER__")
+
+
+@app.get("/terms")
+def terms_page():
+    return _doc("Terms of Service - WeatherValet",
+                "The plain-language terms for using WeatherValet.",
+                """""" + TERMS_BODY + """
+<div class=note><b>Buying a specific product?</b> Stormline, Sidekick and Watch each have
+their own text message terms, including message frequency, STOP and HELP, and what happens
+when a carrier does not deliver.
+<a href="/gameday/terms">Read the text message terms</a>.</div>""")
+
+
+@app.get("/privacy")
+def privacy_page():
+    return _doc("Privacy Policy - WeatherValet",
+                "What WeatherValet collects, why, and what choices you have.",
+                """""" + PRIVACY_BODY + """
+<div class=note><b>About your phone number.</b> We do not sell or share your mobile number,
+or your consent to be messaged, with anyone for their own marketing. Reply STOP to any
+message to stop them.</div>""")
+
+
+_PRICING_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Pricing - WeatherValet</title>
+<meta name=description content="Free AI forecasts, $12 a year for warnings on one address, $16 for a series with a Meteorologist, $19 for one answer, $49 for an event day, or $99 a month for your own Meteorologist.">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+.sec{padding:64px 0;border-top:1px solid rgba(255,255,255,.06)}
+.s-black{background:#04070E}
+.s-deep{background:linear-gradient(180deg,#04070E 0%,#0A1533 60%,#04070E 100%)}
+.head{padding:60px 0 10px;background:radial-gradient(130% 100% at 50% -30%,#12234A 0%,#0A1020 46%,#04070E 100%)}
+h1{font-size:clamp(32px,5.6vw,52px);font-weight:900;letter-spacing:-.03em;color:#fff;margin:0 0 12px}
+.lede{color:#B9CAE4;font-size:17px;max-width:600px;margin:0 0 34px}
+.robot{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:#8CA0C0;font-weight:800;margin:0 0 14px}
+.tiers{display:grid;grid-template-columns:1fr;gap:14px}
+@media(min-width:700px){.tiers{grid-template-columns:1fr 1fr}}
+@media(min-width:1020px){.tiers{grid-template-columns:1fr 1fr 1fr}}
+.tier{border:1px solid rgba(126,182,255,.16);border-radius:15px;padding:22px;
+  background:linear-gradient(168deg,rgba(255,255,255,.05),rgba(255,255,255,.012));transition:.25s}
+.tier:hover{border-color:rgba(224,36,60,.55);transform:translateY(-3px)}
+.tier .t{font-size:19px;font-weight:800;color:#fff;letter-spacing:-.02em}
+.tier .p{color:#7EB6FF;font-weight:800;margin:3px 0 10px}
+.tier p{margin:0 0 14px;font-size:14.5px;color:#B9CAE4;line-height:1.6}
+.tier ul{margin:0 0 14px;padding-left:18px;color:#B9CAE4;font-size:14px;line-height:1.7}
+.tier a.go{font-size:14px;color:#7EB6FF;font-weight:700}
+h2{font-size:clamp(24px,4vw,34px);font-weight:900;letter-spacing:-.025em;color:#fff;margin:0 0 14px}
+.sub{color:#B9CAE4;font-size:16.5px;max-width:640px;margin:0 0 26px}
+.faq b{color:#fff}
+.faq p{color:#B9CAE4;font-size:16px;line-height:1.65;margin:0 0 16px;max-width:660px}
+</style></head><body>
+__WV_HEADER__
+<div class=head><div class=wrap>
+  <h1>Pricing</h1>
+  <p class=lede>Under $99, robots relay and Meteorologists help one date at a time.
+  At $99, your Meteorologist never stops.</p>
+</div></div>
+
+<section class="sec s-black"><div class=wrap>
+  <p class=robot>Robots watch addresses</p>
+  <div class=tiers>
+    <div class=tier><div class=t>AI Forecast</div><div class=p>Free</div>
+      <p>Ask once. Get an answer in seconds. It's AI, and we'll never pretend otherwise.</p>
+      <a class=go href="/">Ask it now &rarr;</a></div>
+    <div class=tier><div class=t>Stormline</div><div class=p>$12/year</div>
+      <p>You don't watch the weather. Stormline watches your address.</p>
+      <ul><li>Warning texts with a radar map</li><li>A phone call for tornado warnings</li>
+      <li>All clear when it expires</li><li>Two phone numbers per address</li>
+      <li>+$8/yr another address &middot; +$9/yr All-Season pack</li></ul>
+      <a class=go href="/stormline">Put a Stormline on it &rarr;</a></div>
+    <div class=tier><div class=t>Stormline Daily</div><div class=p>$24/year</div>
+      <p>The forecast finds you every morning. And the warning finds you at 2 AM.</p>
+      <ul><li>Everything in Stormline</li><li>A morning summary at the hour you pick</li>
+      <li>Labeled automated in every message</li></ul>
+      <a class=go href="/stormlinedaily">Start the morning message &rarr;</a></div>
+  </div>
+</div></section>
+
+<section class="sec s-deep"><div class=wrap>
+  <p class=robot>Meteorologists watch your plans</p>
+  <div class=tiers>
+    <div class=tier><div class=t>Sidekick</div><div class=p>$16/series &middot; $5/day</div>
+      <p>The Meteorologist is watching the big day. You're on the list.</p>
+      <ul><li>Shared coverage, which is why it is $2 a day</li>
+      <li>Outlook the evening before, morning brief, live updates, all clear</li>
+      <li>First series: 8 Indiana Football home game days</li></ul>
+      <a class=go href="/gameday/iu">See the days covered &rarr;</a></div>
+    <div class=tier><div class=t>Met Review</div><div class=p>$19 once</div>
+      <p>You have a decision to make. A Meteorologist studies your date and writes you back.</p>
+      <ul><li>One date, one place, one written answer</li><li>Nothing recurring</li>
+      <li>Stormline subscribers: first review $10</li></ul>
+      <a class=go href="/met-review">Get a review &rarr;</a></div>
+    <div class=tier><div class=t>Watch</div><div class=p>$49/event day</div>
+      <p>One Meteorologist. One event. Nobody else on the thread.</p>
+      <ul><li>Your day, your window, your venue</li>
+      <li>Outlook the night before, live messages through the window</li>
+      <li>Book at least a day ahead</li></ul>
+      <a class=go href="/watch">Book a day &rarr;</a></div>
+    <div class=tier><div class=t>Pro</div><div class=p>from $99/month</div>
+      <p>Your own Meteorologist, every day, whenever weather affects your plans.</p>
+      <ul><li>Daily written briefs for each location</li><li>Message a Meteorologist any time</li>
+      <li>+$39/mo each additional person</li><li>+$49/mo each additional location</li></ul>
+      <a class=go href="/pro">Build my plan &rarr;</a></div>
+    <div class=tier><div class=t>Valet Crew</div><div class=p>Free to join</div>
+      <p>Not a product. Report what you see from your corner of the sky.</p>
+      <a class=go href="/crew">Join the Crew &rarr;</a></div>
+  </div>
+</div></section>
+
+<section class="sec s-black"><div class=wrap>
+  <h2>Straight answers about price</h2>
+  <div class=faq>
+  <p><b>Why is Stormline cheap and Watch expensive?</b><br>Stormline is software relaying
+  official warnings, so it costs the same whether ten people use it or ten thousand. Watch is
+  one Meteorologist's whole day, for one buyer.</p>
+  <p><b>Why is Sidekick $2 a day when Watch is $49?</b><br>Because you are sharing the
+  Meteorologist. One person covers the whole town that day and everyone who bought in gets the
+  same messages. Watch is yours alone.</p>
+  <p><b>Do prices renew?</b><br>Stormline and Stormline Daily renew yearly. Pro is monthly.
+  Sidekick, Met Review and Watch are one-time. Cancel any time.</p>
+  <p><b>Is there a contract?</b><br>No. Everything is cancel-any-time and refundable before
+  coverage begins.</p>
+  </div>
+</div></section>
+__WV_FOOTER__"""
+
+
+@app.get("/pricing")
+def pricing_page():
+    return wv_shell(_PRICING_PAGE)
+
+
+_ABOUT_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>About WeatherValet</title>
+<meta name=description content="Real Meteorologists, real texts, nothing AI-written. Why WeatherValet exists and the rules we hold ourselves to.">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+.sec{padding:64px 0;border-top:1px solid rgba(255,255,255,.06)}
+.s-black{background:#04070E}
+.s-blue{background:linear-gradient(180deg,#0B1428 0%,#123163 55%,#0C1D3E 100%)}
+.s-light{background:linear-gradient(180deg,#F2F6FD 0%,#E4EDFB 100%);color:#0B1220}
+.s-light h2,.s-light b,.s-light strong{color:#08101F}
+.s-light p,.s-light li{color:#41536F}
+.head{padding:64px 0 14px;background:radial-gradient(130% 100% at 50% -30%,#12234A 0%,#0A1020 46%,#04070E 100%)}
+h1{font-size:clamp(32px,5.6vw,52px);font-weight:900;letter-spacing:-.03em;color:#fff;margin:0 0 12px}
+h2{font-size:clamp(24px,4vw,34px);font-weight:900;letter-spacing:-.025em;color:#fff;margin:0 0 14px}
+p{color:#B9CAE4;font-size:16.5px;line-height:1.7;max-width:680px}
+.inner{max-width:700px;margin:0 auto}
+ul{color:#B9CAE4;font-size:16px;line-height:1.75;padding-left:20px;max-width:680px}
+ul b{color:#fff}
+.mets{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:18px;margin-top:26px}
+.met{text-align:center}
+.met img{width:96px;height:96px;border-radius:50%;border:2px solid rgba(126,182,255,.35);margin:0 auto 9px;display:block}
+.met b{display:block;font-size:14.5px;color:#fff}
+.met i{display:block;font-style:normal;font-size:12.5px;color:#8CA0C0}
+</style></head><body>
+__WV_HEADER__
+<div class=head><div class=wrap>
+  <h1>Real people. Real weather.</h1>
+  <p>WeatherValet is a weather service built on one rule: no AI-written weather text ever
+  reaches you signed by a human.</p>
+</div></div>
+
+<section class="sec s-black"><div class=wrap><div class=inner>
+  <h2>Why we exist</h2>
+  <p>Weather apps are very good at telling you a number and very bad at telling you what to do.
+  A 40% chance of rain is true and useless when you have 140 guests, a rented tent, and a
+  ceremony at four.</p>
+  <p>So we built two things. Software that relays official National Weather Service warnings to
+  one exact address, quietly, until the moment it matters. And a way to hire an actual
+  Meteorologist for a day, a series, or every day, who writes to you in plain language and signs
+  their name to it.</p>
+</div></div></section>
+
+<section class="sec s-light"><div class=wrap><div class=inner>
+  <h2>The rules we hold ourselves to</h2>
+  <ul>
+    <li><b>No AI-written weather text signed by a person.</b> Our free forecast is AI and says
+    so. Our automated summaries say so. Everything else is written by a Meteorologist.</li>
+    <li><b>We relay official warnings, we do not rewrite them.</b> National Weather Service text
+    goes through unchanged.</li>
+    <li><b>We never predict what a venue will do.</b> Delays, evacuations and resumptions are
+    decided by the people running the event. We report weather.</li>
+    <li><b>We never promise a message will arrive.</b> Carriers, coverage and congestion are
+    outside anyone's control, and our terms say so plainly.</li>
+    <li><b>We are not a replacement for official warnings.</b> If the Weather Service issues one,
+    that comes first, always.</li>
+  </ul>
+</div></div></section>
+
+<section class="sec s-black"><div class=wrap><div class=inner>
+  <h2>The Meteorologists</h2>
+  <p>Not a stock photo, not a model, not a name we made up. When a message is signed, one of
+  these people wrote it.</p>
+  <div class=mets>__MET_WALL__</div>
+</div></div></section>
+
+<section class="sec s-blue"><div class=wrap><div class=inner>
+  <h2>Where we are</h2>
+  <p>WeatherValet is based in Indiana and watches addresses anywhere in the country. Our
+  Meteorologist coverage starts where our Meteorologists live, because nowcasting is local and a
+  stranger to your market will get the timing wrong.</p>
+  <p>Want us covering your town? <a href="mailto:hello@weathervalet.ai" style="color:#7EB6FF">Tell
+  us where</a>, and if you are a certified Meteorologist who knows a market,
+  <a href="/crew" style="color:#7EB6FF">we would like to hear from you</a>.</p>
+</div></div></section>
+__WV_FOOTER__"""
+
+
+@app.get("/about")
+def about_page():
+    wall = "".join(
+        '<div class=met>%s<b>%s</b><i>Meteorologist</i></div>'
+        % (_met_img(slug, 96), _html_escape(name))
+        for slug, (name, _b64) in MET_AVATARS.items())
+    return wv_shell(_ABOUT_PAGE.replace("__MET_WALL__", wall))
+
+
+_CONTACT_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Contact WeatherValet</title>
+<meta name=description content="How to reach WeatherValet, change your settings, stop messages, or ask for a refund.">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+.doc{max-width:760px;margin:0 auto;padding:54px 22px 80px}
+h1{font-size:clamp(30px,5vw,44px);font-weight:900;letter-spacing:-.03em;color:#fff;margin:0 0 10px}
+h2{font-size:20px;margin:34px 0 8px;color:#7EB6FF;font-weight:800}
+p,li{color:#C4D3EC;font-size:16px;line-height:1.7}
+a{color:#7EB6FF}
+b{color:#fff}
+.box{background:rgba(30,107,255,.10);border:1px solid rgba(126,182,255,.28);border-radius:12px;
+  padding:18px 20px;margin:20px 0}
+.big{font-size:19px;font-weight:700;color:#fff}
+</style></head><body>
+__WV_HEADER__
+<div class=doc>
+  <h1>Contact us</h1>
+  <p>A person answers. Not a bot, not a ticket queue.</p>
+
+  <div class=box>
+    <div class=big><a href="mailto:hello@weathervalet.ai">hello@weathervalet.ai</a></div>
+    <p style="margin:6px 0 0">Weekdays, and during severe weather whenever we are awake.</p>
+  </div>
+
+  <h2>Stop receiving messages</h2>
+  <p>Reply <b>STOP</b> to any message from us and they stop immediately. Reply <b>HELP</b> for
+  help. You can also email us and we will take care of it.</p>
+
+  <h2>Change your address, phone number or send time</h2>
+  <p>If you have Stormline Daily, the link in your messages lets you change the send time
+  yourself. For anything else, email us and we handle it the same day.</p>
+
+  <h2>Refunds</h2>
+  <p>Full refund on request any time before coverage begins. After that, email us and we will
+  sort it out. If we failed to send anything at all for a day you paid for, tell us and we
+  refund that day.</p>
+
+  <h2>Meteorologists and partners</h2>
+  <p>If you are a certified Meteorologist who knows a market well, or you run an event and want
+  coverage for your crowd, email us and say so in the subject line.</p>
+
+  <h2>Press</h2>
+  <p>Same address. We will get you a real person quickly.</p>
+</div>
+__WV_FOOTER__"""
+
+
+@app.get("/contact")
+def contact_page():
+    return wv_shell(_CONTACT_PAGE)
 
 
 @app.get("/pro")
