@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-167"
+BACKEND_BUILD = "0702-169"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -5908,7 +5908,7 @@ def auth_login():
         raw_session_id = _create_session(user_row["id"], conn)
 
     roles = [r["role"] for r in role_rows]
-    workspaces = _roles_to_workspaces(roles)
+    workspaces = _roles_to_workspaces(roles, email)
 
     response = jsonify({
         "ok": True,
@@ -6118,7 +6118,7 @@ def auth_verify():
 
     # Build response with user info and workspace list
     roles = [r["role"] for r in role_rows]
-    workspaces = _roles_to_workspaces(roles)
+    workspaces = _roles_to_workspaces(roles, row.get("email") or "")
 
     response = jsonify({
         "ok": True,
@@ -6274,7 +6274,7 @@ def auth_set_password():
     return jsonify(response_payload), 200
 
 
-def _roles_to_workspaces(roles: list) -> list:
+def _roles_to_workspaces(roles: list, email: str = "") -> list:
     """Convert a list of role names into workspace metadata for the frontend.
 
     Each workspace dict has:
@@ -6287,22 +6287,38 @@ def _roles_to_workspaces(roles: list) -> list:
     the real auth-gated pages. For v1 they're the same as the prototype
     simulation routes.
     """
+    # These URLs are where a person actually lands after signing in, so every
+    # one of them has to resolve. Two traps to avoid:
+    #   - /portal and /crew are now public marketing pages on this host, so
+    #     routing a signed-in user there would either loop them back to sign
+    #     in or show them a signup page they already completed.
+    #   - /meteorologist/home is a v1 relic behind HTTP Basic operator
+    #     credentials, from the single-Met era. A magic-link Met account
+    #     cannot authenticate to it at all; Timmy would hit a password prompt
+    #     for a password he does not have. The real Met portal is the SPA's
+    #     met screen, which holds the post queue, Pro briefs, suppressed list
+    #     and subscriber threads.
+    # Subscriber, Crew, Met and Sales all still live in the single-page app,
+    # so they point at it by absolute URL until those are ported. The GameDay
+    # and Watch consoles are deliberately separate server-rendered tools and
+    # are not part of this map.
+    _spa = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
     workspace_map = {
         "subscriber": {
-            "label": "Subscriber",
-            "url": "/portal",
+            "label": "My WeatherValet",
+            "url": f"{_spa}/?portal=1",
         },
         "crew": {
             "label": "Valet Crew",
-            "url": "/crew",
+            "url": f"{_spa}/crew/workspace",
         },
         "met": {
             "label": "Meteorologist",
-            "url": "/meteorologist",
+            "url": f"{_spa}/workspace",
         },
         "admin": {
             "label": "Command Center",
-            "url": "/admin/dashboard",
+            "url": f"{_spa}/admin",
         },
     }
     workspaces = []
@@ -6317,15 +6333,30 @@ def _roles_to_workspaces(roles: list) -> list:
     # the active sales_reps roster (matched by email upstream, so here we
     # only handle the admin case; rep users reach /sales via their rep
     # login flow and get the entry below when the caller passes email).
-    if "admin" in roles and not any(w["role"] == "sales" for w in workspaces):
-        workspaces.append({"role": "sales", "label": "Sales", "url": "/sales"})
+    # Sales reps are not a role; they are a row in sales_reps matched by email.
+    # Without this lookup a rep signs in and sees no Sales workspace at all.
+    is_rep = False
+    if email:
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""SELECT 1 FROM sales_reps
+                                   WHERE LOWER(email) = LOWER(%s) AND is_active = TRUE""",
+                                (email,))
+                    is_rep = cur.fetchone() is not None
+        except Exception as e:
+            print(f"[workspaces] sales rep lookup failed: {e!r}", flush=True)
+    if ("admin" in roles or is_rep) and not any(w["role"] == "sales" for w in workspaces):
+        workspaces.append({"role": "sales", "label": "Sales",
+                           "url": f"{_spa}/sales"})
     # Met View for admins (July 18, 2026): opens the Met portal, where the
     # Today board's admin branch shows EVERY subscriber's watch cards
     # company-wide, and the composer sends as the admin. Deliberately not
     # tied to granting the met role (which would scope the board to the
     # admin's own empty coverage instead).
     if "admin" in roles and not any(w["role"] == "met" for w in workspaces):
-        workspaces.append({"role": "met", "label": "Met View", "url": "/meteorologist"})
+        workspaces.append({"role": "met", "label": "Met View",
+                           "url": f"{_spa}/workspace"})
     return workspaces
 
 
@@ -6354,7 +6385,7 @@ def auth_session():
     if user is None:
         return jsonify({"ok": False, "error": "not-authenticated"}), 401
 
-    workspaces = _roles_to_workspaces(user["roles"])
+    workspaces = _roles_to_workspaces(user["roles"], user.get("email") or "")
     return jsonify({
         "ok": True,
         "user": {
@@ -6393,7 +6424,7 @@ def api_me():
     if user is None:
         return jsonify({"ok": False}), 200
 
-    workspaces = _roles_to_workspaces(user["roles"])
+    workspaces = _roles_to_workspaces(user["roles"], user.get("email") or "")
     return jsonify({
         "ok": True,
         "user": {
@@ -16896,7 +16927,6 @@ _SIGNIN_SCRIPT = """<script>
 
 @app.get("/signin")
 @app.get("/login")
-@app.get("/portal")
 def signin_page():
     return wv_shell(_SIGNIN_PAGE.replace("__WV_FOOTER__", _SIGNIN_SCRIPT + "\n__WV_FOOTER__"))
 
