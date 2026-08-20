@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-174"
+BACKEND_BUILD = "0702-175"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -14213,23 +14213,56 @@ body{background:var(--ink);color:var(--cream)}
 ul.feat{list-style:none;padding:0;margin:0}
 ul.feat li{padding:7px 0 7px 30px;position:relative;font-size:15px;line-height:1.5}
 ul.feat li:before{content:"⚡";position:absolute;left:2px}
-label{display:block;font-size:12.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:#5B6470;margin:14px 0 5px}
-input{width:100%;box-sizing:border-box;padding:12px;border:1px solid rgba(15,18,22,.18);border-radius:8px;font-size:16px}
-button{width:100%;margin-top:20px;background:var(--blue);color:#fff;border:none;border-radius:9px;padding:15px;font-size:17px;font-weight:800;cursor:pointer}
-button:disabled{opacity:.6}
-.fine{font-size:12.5px;color:#5B6470;margin-top:12px;line-height:1.5;text-align:center}
+/* The signup form sits in a dark room, so it is styled for one. White
+   boxes on midnight blue read as a form pasted onto a page; these read as
+   part of it. Focus gets a real glow so the field you are in is obvious. */
+label{display:block;font-size:12px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;
+  color:#8FA6C6;margin:16px 0 7px}
+input,select{width:100%;box-sizing:border-box;padding:14px 15px;font-size:16px;font-family:inherit;
+  color:#EAF1FF;border-radius:10px;
+  background:linear-gradient(180deg,rgba(255,255,255,.055),rgba(255,255,255,.02));
+  border:1px solid rgba(126,182,255,.24);
+  transition:border-color .18s,box-shadow .18s,background .18s}
+input::placeholder{color:#6C82A4}
+input:hover,select:hover{border-color:rgba(126,182,255,.45)}
+input:focus,select:focus{outline:none;border-color:var(--blue);
+  background:linear-gradient(180deg,rgba(30,107,255,.14),rgba(255,255,255,.02));
+  box-shadow:0 0 0 3px rgba(30,107,255,.22)}
+select option{background:#0B1424;color:#EAF1FF}
+button{width:100%;margin-top:22px;color:#fff;border:none;border-radius:11px;padding:17px;
+  font-size:17.5px;font-weight:800;cursor:pointer;letter-spacing:-.01em;
+  background:linear-gradient(160deg,#3D8BFF,#1E5FE0);
+  box-shadow:0 12px 30px -12px rgba(30,107,255,.85);
+  transition:transform .18s,box-shadow .18s,filter .18s}
+button:hover{filter:brightness(1.08);transform:translateY(-1px);
+  box-shadow:0 16px 38px -12px rgba(30,107,255,.95)}
+button:active{transform:translateY(0)}
+button:disabled{opacity:.55;transform:none;box-shadow:none}
+.fine{font-size:12.5px;color:#7F94B4;margin-top:14px;line-height:1.55;text-align:center}
 .err{display:none;background:#FDECEC;border:1px solid #F3B4B4;color:#8A1F1F;border-radius:8px;padding:10px 12px;margin-top:14px;font-size:14px}
-.addon{display:flex;gap:11px;align-items:flex-start;margin:0 0 10px;padding:13px 14px;border:1.5px solid #D5DCE6;
-  border-radius:10px;background:#fff;cursor:pointer}
-.addon.on{border-color:var(--blue);background:#F2F7FF}
-.addon input{width:auto;margin:2px 0 0;flex:0 0 auto;transform:scale(1.3);accent-color:var(--blue)}
-.addon b{display:block;font-size:15.5px;color:#0F1B2C}
-.addon i{display:block;font-style:normal;font-size:13.5px;color:#5B6470;line-height:1.5;margin-top:2px}
-.addon .amt{font-weight:800;font-size:15.5px;color:var(--blue);white-space:nowrap}
-.addon-h{font-size:12.5px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#5B6470;margin:22px 0 9px}
-.total{display:flex;justify-content:space-between;align-items:baseline;margin:16px 0 0;padding-top:14px;
-  border-top:1.5px solid #D5DCE6;font-size:15px;color:#5B6470}
-.total b{font-size:25px;color:#0F1B2C}
+.addon{position:relative;display:flex;gap:13px;align-items:flex-start;margin:0 0 11px;
+  padding:16px 17px;border-radius:13px;cursor:pointer;overflow:hidden;
+  background:linear-gradient(165deg,rgba(255,255,255,.055),rgba(255,255,255,.015));
+  border:1px solid rgba(126,182,255,.2);
+  transition:transform .2s cubic-bezier(.2,.7,.3,1),border-color .2s,box-shadow .2s,background .2s}
+/* A quiet blue wash that only wakes up when the row is chosen. */
+.addon:before{content:"";position:absolute;inset:0;opacity:0;transition:opacity .25s;
+  background:radial-gradient(70% 160% at 6% 50%,rgba(30,107,255,.22),transparent 72%)}
+.addon:hover{transform:translateY(-2px);border-color:rgba(126,182,255,.5)}
+.addon.on{border-color:var(--blue);box-shadow:0 10px 30px -14px rgba(30,107,255,.9),
+  inset 0 0 0 1px rgba(30,107,255,.35)}
+.addon.on:before{opacity:1}
+.addon>*{position:relative}
+.addon input{width:auto;margin:3px 0 0;flex:0 0 auto;transform:scale(1.35);accent-color:var(--blue)}
+.addon b{display:block;font-size:15.5px;color:#fff;letter-spacing:-.01em}
+.addon i{display:block;font-style:normal;font-size:13.5px;color:#A9BDD8;line-height:1.55;margin-top:3px}
+.addon .amt{font-weight:800;font-size:15.5px;color:#7EB6FF;white-space:nowrap}
+.addon.on .amt{color:#fff}
+.addon-h{font-size:11.5px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;
+  color:#8FA6C6;margin:26px 0 11px}
+.total{display:flex;justify-content:space-between;align-items:baseline;margin:20px 0 0;padding-top:18px;
+  border-top:1px solid rgba(126,182,255,.24);font-size:15px;color:#A9BDD8}
+.total b{font-size:30px;color:#fff;font-weight:800;letter-spacing:-.02em}
 .ladder{text-align:center;font-size:13.5px;color:#5B6470;padding:0 18px 40px;max-width:640px;margin:0 auto}
 .ladder a{color:var(--blue);font-weight:700;text-decoration:none}
 .who{list-style:none;padding:0;margin:0}
