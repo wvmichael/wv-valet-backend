@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-176"
+BACKEND_BUILD = "0702-177"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -17657,13 +17657,21 @@ h1{font-size:clamp(38px,6.6vw,68px);line-height:.98;margin:0 0 14px;font-weight:
 .lede{font-size:clamp(16px,2vw,18.5px);color:var(--mute);max-width:590px;margin:0 0 34px}
 
 /* ---------------------------------------------------------------- chooser */
-.grid{display:grid;grid-template-columns:1fr;gap:13px}
-@media(min-width:760px){.grid{grid-template-columns:1fr 1fr;gap:15px}}
+.grid{display:grid;grid-template-columns:1fr;gap:20px}
+@media(min-width:760px){.grid{grid-template-columns:1fr 1fr;gap:24px}}
+/* These are the only thing on the first screen you are meant to press, so
+   they need to look pressable: real separation between them, a defined
+   edge, a resting shadow, and an arrow that says "this goes somewhere". */
 .box{position:relative;overflow:hidden;isolation:isolate;text-align:left;cursor:pointer;
-  background:linear-gradient(168deg,rgba(255,255,255,.055),rgba(255,255,255,.012));
-  border:1px solid var(--line);border-radius:16px;padding:24px 22px 22px;min-height:142px;
+  background:linear-gradient(168deg,rgba(255,255,255,.075),rgba(255,255,255,.02));
+  border:1px solid rgba(126,182,255,.28);border-radius:18px;
+  padding:26px 54px 24px 24px;min-height:154px;
+  box-shadow:0 10px 30px -18px rgba(0,0,0,.9);
   display:flex;flex-direction:column;justify-content:flex-end;color:inherit;font:inherit;
   transition:transform .3s cubic-bezier(.2,.7,.3,1),border-color .3s,box-shadow .3s,opacity .3s}
+.box:after{content:"→";position:absolute;right:22px;bottom:22px;font-size:22px;
+  color:var(--sky);opacity:.5;transition:transform .3s cubic-bezier(.2,.7,.3,1),opacity .3s}
+.box:hover:after{opacity:1;transform:translateX(5px)}
 .box .aura{position:absolute;inset:-45%;z-index:-1;opacity:.34;
   background:radial-gradient(44% 40% at 24% 18%,rgba(30,107,255,.42),transparent 68%);
   animation:pulse 10s ease-in-out infinite alternate}
@@ -17677,8 +17685,8 @@ h1{font-size:clamp(38px,6.6vw,68px);line-height:.98;margin:0 0 14px;font-weight:
 .box .ico{position:absolute;top:20px;left:22px;font-size:20px;opacity:.85}
 .grid.hovering .box{opacity:.42}
 .grid.hovering .box:hover{opacity:1}
-.box:hover{transform:translateY(-4px);border-color:rgba(224,36,60,.65);
-  box-shadow:0 18px 52px -22px rgba(224,36,60,.7),0 0 0 1px rgba(224,36,60,.25) inset}
+.box:hover{transform:translateY(-6px);border-color:rgba(224,36,60,.75);
+  box-shadow:0 26px 60px -22px rgba(224,36,60,.8),0 0 0 1px rgba(224,36,60,.3) inset}
 .box:hover .aura{opacity:.85;animation-play-state:paused}
 .box:focus-visible{outline:2px solid var(--sky);outline-offset:3px}
 .explore{display:inline-block;margin-top:22px;color:var(--mute);font-size:14px;
