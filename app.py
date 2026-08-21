@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-177"
+BACKEND_BUILD = "0702-178"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -6311,19 +6311,19 @@ def _roles_to_workspaces(roles: list, email: str = "") -> list:
     workspace_map = {
         "subscriber": {
             "label": "My WeatherValet",
-            "url": f"{_spa}/?portal=1",
+            "url": f"{_spa}/",
         },
         "crew": {
             "label": "Valet Crew",
-            "url": f"{_spa}/crew/workspace",
+            "url": f"{_spa}/",
         },
         "met": {
             "label": "Meteorologist",
-            "url": f"{_spa}/workspace",
+            "url": f"{_spa}/",
         },
         "admin": {
             "label": "Command Center",
-            "url": f"{_spa}/admin",
+            "url": f"{_spa}/",
         },
     }
     workspaces = []
@@ -6353,7 +6353,7 @@ def _roles_to_workspaces(roles: list, email: str = "") -> list:
             print(f"[workspaces] sales rep lookup failed: {e!r}", flush=True)
     if ("admin" in roles or is_rep) and not any(w["role"] == "sales" for w in workspaces):
         workspaces.append({"role": "sales", "label": "Sales",
-                           "url": f"{_spa}/sales"})
+                           "url": f"{_spa}/"})
     # Met View for admins (July 18, 2026): opens the Met portal, where the
     # Today board's admin branch shows EVERY subscriber's watch cards
     # company-wide, and the composer sends as the admin. Deliberately not
@@ -6361,7 +6361,7 @@ def _roles_to_workspaces(roles: list, email: str = "") -> list:
     # admin's own empty coverage instead).
     if "admin" in roles and not any(w["role"] == "met" for w in workspaces):
         workspaces.append({"role": "met", "label": "Met View",
-                           "url": f"{_spa}/workspace"})
+                           "url": f"{_spa}/"})
     return workspaces
 
 
@@ -12791,8 +12791,12 @@ WV_HEADER = """<header>
     </div></div>
   <a class=nl href="/pricing">Pricing</a>
   <div class=spacer></div>
-  <a class=signin href="/signin">Sign in</a>
-  <a class=btn href="/home">Get started</a>
+  <a class=signin id=wv-signin href="/signin">Sign in</a>
+  <a class=btn id=wv-cta href="/home">Get started</a>
+  <div class=nl id=wv-me style="display:none">
+    <span id=wv-name></span> &#9662;
+    <div class=dd id=wv-me-dd></div>
+  </div>
   <button class=burger id=burger aria-label="Menu">&#9776;</button>
  </nav>
  <div id=mnav>
@@ -12852,11 +12856,45 @@ WV_FOOTER = """<footer>
 <script>
 (function(){
   var b=document.getElementById('burger');
-  if(!b)return;
-  b.addEventListener('click',function(){
+  if(b) b.addEventListener('click',function(){
     var m=document.getElementById('mnav');
     m.style.display = m.style.display==='block' ? 'none' : 'block';
   });
+
+  // Ask who is signed in. If somebody is, replace "Sign in / Get started"
+  // with their name and a menu straight into their workspaces, the way the
+  // old site did. Fails silently for signed-out visitors, which is most.
+  fetch('/api/v1/auth/session',{credentials:'include'})
+   .then(function(r){ return r.ok ? r.json() : null; })
+   .then(function(j){
+      if(!j || !j.ok || !j.user) return;
+      var me=document.getElementById('wv-me'), nm=document.getElementById('wv-name');
+      var si=document.getElementById('wv-signin'), cta=document.getElementById('wv-cta');
+      if(!me) return;
+      var who=(j.user.name||j.user.email||'My account').split(' ')[0];
+      nm.textContent=who;
+      var ws=(j.workspaces||[]);
+      var html='';
+      if(ws.length){
+        html+='<h6>Your workspaces</h6>';
+        html+=ws.map(function(w){
+          return '<a href="'+(w.url||'#')+'"><b>'+(w.label||w.role||'Workspace')+'</b></a>';
+        }).join('');
+      }
+      html+='<h6>Account</h6><a href="/contact"><b>Get help</b></a>'
+        +'<a href="#" id="wv-out"><b>Sign out</b></a>';
+      document.getElementById('wv-me-dd').innerHTML=html;
+      me.style.display='block';
+      if(si) si.style.display='none';
+      if(cta) cta.style.display='none';
+      var out=document.getElementById('wv-out');
+      if(out) out.addEventListener('click',function(e){
+        e.preventDefault();
+        fetch('/api/v1/auth/logout',{method:'POST',credentials:'include'})
+          .then(function(){ window.location.reload(); })
+          .catch(function(){ window.location.reload(); });
+      });
+   }).catch(function(){});
 })();
 </script>
 </body></html>"""
@@ -17088,13 +17126,17 @@ _SIGNIN_SCRIPT = """<script>
     document.getElementById('pane-link').style.display='block';
     document.getElementById('pane-pw').style.display='none'; hideAll();
   });
+  var WS_HINT={met:'Post queue, briefs and subscriber threads',
+    admin:'Command Center', sales:'Prospects and your pipeline',
+    crew:'The map, the feed and your reports',
+    subscriber:'Your addresses and settings'};
   function route(j){
     var list=(j && j.workspaces) || [];
     if(list.length===1 && list[0].url){ window.location=list[0].url; return; }
     if(list.length>1){
       ws.innerHTML=list.map(function(w){
-        return '<a href="'+(w.url||'#')+'"><span><b>'+(w.name||w.role||'Workspace')+'</b><br>'
-          +'<i>'+(w.description||w.role||'')+'</i></span><span>&rarr;</span></a>';
+        return '<a href="'+(w.url||'#')+'"><span><b>'+(w.label||w.name||'Workspace')+'</b><br>'
+          +'<i>'+(WS_HINT[w.role]||'')+'</i></span><span>&rarr;</span></a>';
       }).join('');
       ws.style.display='block';
       show(ok,'<b>You are signed in.</b><br>Pick where you want to go.');
