@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-179"
+BACKEND_BUILD = "0702-180"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -12721,8 +12721,10 @@ a{color:inherit;text-decoration:none}
 header{position:sticky;top:0;z-index:60;backdrop-filter:blur(14px);
   background:rgba(0,0,0,.86);border-bottom:1px solid var(--line)}
 .nav{display:flex;align-items:center;gap:8px;height:64px}
-.logo{font-weight:900;font-size:19px;letter-spacing:-.02em;margin-right:14px;white-space:nowrap}
-.logo span{color:var(--sky)}
+.logo{display:inline-flex;align-items:center;gap:7px;font-weight:900;font-size:19px;
+  letter-spacing:-.02em;margin-right:14px;white-space:nowrap;color:#fff}
+.logo .bolt{width:14px;height:19px;flex:0 0 auto}
+.logo span{color:var(--blue)}
 .nl{position:relative;padding:10px 12px;font-size:14.5px;color:#C6D6F0;border-radius:8px;
   cursor:pointer;white-space:nowrap}
 .nl:hover{background:rgba(126,182,255,.09);color:#fff}
@@ -12763,7 +12765,7 @@ footer a:hover{color:#fff}
 
 WV_HEADER = """<header>
  <div class=wrap><nav class=nav>
-  <a class=logo href="/home">&#9889; Weather<span>Valet</span></a>
+  <a class=logo href="/home"><svg class=bolt viewBox="0 0 24 32" aria-hidden=true><path d="M15.5 0 3 18h7.2L8.5 32 21 13h-7.2z" fill="currentColor"/></svg>Weather<span>Valet</span></a>
   <div class=nl>Products &#9662;
     <div class=dd>
       <h6>Robots watch addresses</h6>
@@ -17200,6 +17202,146 @@ _SIGNIN_SCRIPT = """<script>
 </script>"""
 
 
+# ---------------------------------------------------------------------------
+# The portal (Aug 21, 2026)
+#
+# One address every signed-in person can bookmark, whatever their role. It
+# lists the tools they actually have and nothing else.
+#
+# The tools themselves are being rebuilt one at a time under /portal/*. Until
+# each one exists here, its card links to the version still running in the
+# single-page app, so nobody loses access mid-migration. Cards say plainly
+# which is which.
+# ---------------------------------------------------------------------------
+
+PORTAL_TOOLS = {
+    # role: (label, path, blurb, built_yet)
+    "met": ("Met Portal", "/portal/met",
+            "Your post queue, Pro briefs, the suppressed list and subscriber threads.", False),
+    "sales": ("Sales Portal", "/portal/sales",
+              "Your prospects, your pipeline and the letters going out.", False),
+    "admin": ("Command Center", "/portal/admin",
+              "Everything: people, payments, alerts and the whole operation.", False),
+    "crew": ("Valet Crew", "/portal/crew",
+             "The map, the live feed, and your own reports.", False),
+    "subscriber": ("My WeatherValet", "/portal/account",
+                   "Your addresses, your phone numbers and your settings.", False),
+}
+
+# Consoles that already exist as their own pages rather than screens in the
+# single-page app. These are real and can move first.
+PORTAL_CONSOLES = [
+    ("met", "Sidekick Console", "/portal/sidekick", "/gameday/console",
+     "Claim game days and message everyone covered that day."),
+    ("met", "Watch Console", "/portal/watch", "/watch/console",
+     "Claim a booked event and message the person who booked it."),
+]
+
+
+_PORTAL_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Your portal - WeatherValet</title>
+<meta name=robots content="noindex">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+.wrapx{max-width:900px;margin:0 auto;padding:54px 22px 80px}
+h1{font-size:clamp(28px,4.6vw,42px);font-weight:900;letter-spacing:-.03em;color:#fff;margin:0 0 8px}
+.sub{color:#C9D3E2;font-size:16.5px;line-height:1.6;margin:0 0 34px}
+.grid{display:grid;grid-template-columns:1fr;gap:16px}
+@media(min-width:760px){.grid{grid-template-columns:1fr 1fr;gap:18px}}
+.tool{position:relative;display:block;border:1px solid var(--line);border-radius:16px;
+  padding:24px 54px 22px 24px;
+  background:linear-gradient(168deg,rgba(255,255,255,.07),rgba(255,255,255,.02));
+  box-shadow:0 10px 30px -18px rgba(0,0,0,.9);
+  transition:transform .25s cubic-bezier(.2,.7,.3,1),border-color .25s,box-shadow .25s}
+.tool:hover{transform:translateY(-4px);border-color:rgba(224,36,60,.7);
+  box-shadow:0 22px 52px -22px rgba(224,36,60,.75)}
+.tool:after{content:"\u2192";position:absolute;right:22px;top:26px;font-size:20px;
+  color:var(--blue);opacity:.6;transition:transform .25s,opacity .25s}
+.tool:hover:after{opacity:1;transform:translateX(5px)}
+.tool b{display:block;font-size:19px;color:#fff;letter-spacing:-.015em}
+.tool i{display:block;font-style:normal;font-size:14.5px;color:#A9B4C6;line-height:1.55;margin-top:6px}
+.tag{display:inline-block;font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;
+  font-weight:800;padding:4px 9px;border-radius:999px;margin-top:12px}
+.tag.live{background:rgba(30,107,255,.16);color:#7FB0FF;border:1px solid rgba(30,107,255,.4)}
+.tag.old{background:rgba(255,255,255,.06);color:#A9B4C6;border:1px solid rgba(255,255,255,.14)}
+.head{font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:#A9B4C6;
+  font-weight:800;margin:34px 0 14px}
+.empty{border:1px solid var(--line);border-radius:14px;padding:24px;color:#C9D3E2;
+  background:rgba(255,255,255,.03);line-height:1.65}
+.empty a{color:var(--blue);font-weight:700}
+</style></head><body>
+__WV_HEADER__
+<div class=wrapx>
+  <h1>__GREETING__</h1>
+  <p class=sub>__SUB__</p>
+  __BODY__
+</div>
+__WV_FOOTER__"""
+
+
+@app.get("/portal")
+def portal_home():
+    """One address for everyone signed in. Shows the tools you actually have."""
+    user = _get_current_user()
+    if not user:
+        return redirect("/signin", code=302)
+
+    roles = set(user.get("roles") or [])
+    email = (user.get("email") or "").lower()
+
+    # Sales reps are a row in sales_reps, not a role.
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT 1 FROM sales_reps
+                               WHERE LOWER(email) = %s AND is_active = TRUE""", (email,))
+                if cur.fetchone():
+                    roles.add("sales")
+    except Exception as e:
+        print(f"[portal] sales lookup failed: {e!r}", flush=True)
+
+    spa = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+
+    cards = []
+    for role, (label, path, blurb, built) in PORTAL_TOOLS.items():
+        if role not in roles and "admin" not in roles:
+            continue
+        href = path if built else (spa + "/")
+        tag = ('<span class="tag live">Here</span>' if built
+               else '<span class="tag old">Opens the old portal</span>')
+        cards.append('<a class=tool href="%s"><b>%s</b><i>%s</i>%s</a>'
+                     % (href, _html_escape(label), _html_escape(blurb), tag))
+
+    consoles = []
+    for role, label, path, legacy, blurb in PORTAL_CONSOLES:
+        if role not in roles and "admin" not in roles:
+            continue
+        consoles.append('<a class=tool href="%s"><b>%s</b><i>%s</i>'
+                        '<span class="tag live">Here</span></a>'
+                        % (path, _html_escape(label), _html_escape(blurb)))
+
+    body = ""
+    if cards:
+        body += '<div class=grid>' + "".join(cards) + '</div>'
+    if consoles:
+        body += '<div class=head>Consoles</div><div class=grid>' + "".join(consoles) + '</div>'
+    if not body:
+        body = ('<div class=empty>Your account is not attached to a workspace yet. '
+                '<a href="/contact">Tell us</a> and we will finish setting it up, '
+                'usually the same day.</div>')
+
+    first = ((user.get("name") or "").strip().split(" ") or [""])[0]
+    greeting = ("Welcome back, %s." % _html_escape(first)) if first else "Your portal."
+    sub = ("Everything you have access to, in one place."
+           if (cards or consoles) else "")
+    return wv_shell(_PORTAL_PAGE
+                    .replace("__GREETING__", greeting)
+                    .replace("__SUB__", sub)
+                    .replace("__BODY__", body))
+
+
 @app.get("/signin")
 @app.get("/login")
 def signin_page():
@@ -17717,11 +17859,14 @@ body.returning .wb{display:flex}
 /* One WeatherValet on the page, not two. The nav has the small one; this
    is the real mark, and it earns its place by being a mark rather than a
    repeat of the word above it. */
-.mark{display:flex;align-items:center;gap:14px;margin-bottom:22px}
-.mark svg{width:46px;height:54px;flex:0 0 auto}
-.mark span{font-size:clamp(24px,3.2vw,34px);font-weight:800;letter-spacing:-.025em;color:#fff}
-.mark span b{color:var(--blue);font-weight:800}
-@media(max-width:600px){.mark svg{width:38px;height:45px}}
+/* The logo as it actually is: a bolt and the wordmark, one colour, no
+   shield and no two-tone word. Sized to be the largest thing above the
+   headline so it reads as a brand rather than a label. */
+.mark{display:flex;align-items:center;gap:12px;margin-bottom:24px;color:#fff}
+.mark .bolt{width:30px;height:40px;flex:0 0 auto}
+.mark span{font-size:clamp(30px,4vw,44px);font-weight:800;letter-spacing:-.03em;
+  line-height:1;color:#fff}
+@media(max-width:600px){.mark .bolt{width:24px;height:32px}}
 h1{font-size:clamp(38px,6.6vw,68px);line-height:.98;margin:0 0 14px;font-weight:900;
   letter-spacing:-.035em;background:linear-gradient(98deg,#fff 22%,#7EB6FF 92%);
   -webkit-background-clip:text;background-clip:text;color:transparent}
@@ -17896,17 +18041,7 @@ __WV_HEADER__
     <div class=sweep></div><div class=poly></div><div class=pin></div>
   </div>
   <div class=wrap>
-    <div class=mark>
-      <svg viewBox="0 0 44 52" aria-hidden=true>
-        <path d="M22 1 41 9v18c0 12-8 20-19 24C11 47 3 39 3 27V9z"
-              fill="none" stroke="url(#wvg)" stroke-width="2.5" stroke-linejoin="round"/>
-        <path d="M24 13l-9 15h7l-2 11 9-15h-7z" fill="url(#wvg)"/>
-        <defs><linearGradient id="wvg" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0" stop-color="#fff"/><stop offset="1" stop-color="#1E6BFF"/>
-        </linearGradient></defs>
-      </svg>
-      <span>Weather<b>Valet</b></span>
-    </div>
+    <div class=mark><svg class=bolt viewBox="0 0 24 32" aria-hidden=true><path d="M15.5 0 3 18h7.2L8.5 32 21 13h-7.2z" fill="currentColor"/></svg><span>WeatherValet</span></div>
     <h1 id=h1>Your Weather. Your Way.</h1>
     <p class=lede id=lede>From a quick AI forecast to your own Meteorologist, we'll handle
     as much, or as little, of the weather as you want.</p>
