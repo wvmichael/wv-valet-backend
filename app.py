@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-188"
+BACKEND_BUILD = "0702-189"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -5138,12 +5138,12 @@ def robots_txt():
         "User-agent: *\n"
         "Allow: /\n"
         "Disallow: /gameday/console\n"
+        "Disallow: /portal\n"
         "Disallow: /watch/console\n"
         "Disallow: /stormline/manage/\n"
         "Disallow: /api/\n"
         "Disallow: /admin\n"
         "Disallow: /meteorologist\n"
-        "Disallow: /portal\n"
         "Disallow: /signin\n"
         "\n"
         f"Sitemap: {PUBLIC_BASE_URL}/sitemap.xml\n"
@@ -13749,6 +13749,7 @@ def _require_met_or_admin():
     return None
 
 
+@app.get("/portal/sidekick")
 @app.get("/gameday/console")
 def gameday_console():
     """The Met's GameDay screen: all 8 games, claim yours, see who's
@@ -13756,7 +13757,7 @@ def gameday_console():
     user = _require_met_or_admin()
     if not user:
         return ("<h3 style='font-family:sans-serif;padding:30px;'>Meteorologists only. "
-                "Sign in at weathervalet.ai first, then come back.</h3>", 403)
+                "<a href='/signin'>Sign in</a>, then come back.</h3>", 403)
     return """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>GameDay Console - WeatherValet</title><style>
@@ -13779,6 +13780,7 @@ textarea{width:100%;box-sizing:border-box;margin-top:10px;background:#0D0D10;col
 .ok{color:#8FD8A0}.bad{color:#F2A6A6}
 .note{font-size:15px;color:#B08A90;margin:8px 0 20px;line-height:1.55}
 </style></head><body>
+<div style="max-width:760px;margin:0 auto;padding:14px 16px 0"><a href="/portal" style="color:#7EB6FF;font-size:14px;font-weight:700;text-decoration:none">&larr; Your portal</a></div>
 <div class=top>&#9889; GameDay Console <small>Plain-text broadcasts to everyone covered for each game. No links, under 480 characters. Sends run in the background; counts land in a minute.</small></div>
 <div class=wrap>
 <div class=note>Claim your game so the team knows who owns the window. Kickoff TBA? Update it when the TV window firms up; the Monday reminder texts use it.</div>
@@ -14902,6 +14904,7 @@ textarea{width:100%;box-sizing:border-box;margin-top:10px;padding:11px;border-ra
 .msg.bad{background:#33191A;border:1px solid #7B3033;color:#F0B6B8}
 .empty{color:#8E8578;font-size:14.5px}
 </style></head><body>
+<div style="max-width:760px;margin:0 auto;padding:14px 16px 0"><a href="/portal" style="color:#7EB6FF;font-size:14px;font-weight:700;text-decoration:none">&larr; Your portal</a></div>
 __WV_HEADER__
 <div class=wrap>
 <h1>Watch console</h1>
@@ -14973,13 +14976,14 @@ load();
 </script></body></html>"""
 
 
+@app.get("/portal/watch")
 @app.get("/watch/console")
 def watch_console():
     """The Met's Watch screen: booked days, claim one, message the buyer."""
     user = _require_met_or_admin()
     if not user:
         return ("<h3 style='font-family:sans-serif;padding:30px;'>Meteorologists only. "
-                "Sign in at weathervalet.ai first, then come back.</h3>", 403)
+                "<a href='/signin'>Sign in</a>, then come back.</h3>", 403)
     return _WATCH_CONSOLE_PAGE
 
 
