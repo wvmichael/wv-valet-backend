@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-178"
+BACKEND_BUILD = "0702-179"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -12708,8 +12708,10 @@ GAMEDAY_TERMS_VERSION = "gameday-2026-08-17"
 # ---------------------------------------------------------------------------
 
 WV_TOKENS = """
-:root{--ink:#04070E;--navy:#0A1020;--blue:#1E6BFF;--sky:#7EB6FF;--red:#E0243C;
-  --cream:#EAF1FF;--mute:#8CA0C0;--line:rgba(126,182,255,.16);--accent:#1E6BFF}
+/* Black, royal blue, white, and red used sparingly. The earlier palette
+   drifted to navy and grey, which reads softer and less like the brand. */
+:root{--ink:#000000;--navy:#080A0F;--blue:#1E6BFF;--sky:#4D8FFF;--red:#E0243C;
+  --cream:#FFFFFF;--mute:#A9B4C6;--line:rgba(30,107,255,.28);--accent:#1E6BFF}
 *{box-sizing:border-box}
 body{margin:0;background:var(--ink);color:var(--cream);
   font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;line-height:1.55;
@@ -12717,14 +12719,14 @@ body{margin:0;background:var(--ink);color:var(--cream);
 a{color:inherit;text-decoration:none}
 .wrap{max-width:1120px;margin:0 auto;padding:0 22px}
 header{position:sticky;top:0;z-index:60;backdrop-filter:blur(14px);
-  background:rgba(4,7,14,.82);border-bottom:1px solid var(--line)}
+  background:rgba(0,0,0,.86);border-bottom:1px solid var(--line)}
 .nav{display:flex;align-items:center;gap:8px;height:64px}
 .logo{font-weight:900;font-size:19px;letter-spacing:-.02em;margin-right:14px;white-space:nowrap}
 .logo span{color:var(--sky)}
 .nl{position:relative;padding:10px 12px;font-size:14.5px;color:#C6D6F0;border-radius:8px;
   cursor:pointer;white-space:nowrap}
 .nl:hover{background:rgba(126,182,255,.09);color:#fff}
-.dd{position:absolute;top:44px;left:0;min-width:268px;background:#080D18;
+.dd{position:absolute;top:44px;left:0;min-width:268px;background:#0A0D14;
   border:1px solid var(--line);border-radius:13px;padding:10px;opacity:0;visibility:hidden;
   transform:translateY(-6px);transition:.18s;box-shadow:0 26px 60px -20px rgba(0,0,0,.9)}
 .nl:hover .dd,.dd:hover{opacity:1;visibility:visible;transform:none}
@@ -12747,7 +12749,7 @@ header{position:sticky;top:0;z-index:60;backdrop-filter:blur(14px);
 #mnav h6{margin:14px 0 4px;font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--mute)}
 #mnav a{display:block;padding:10px 2px;font-size:15.5px;border-bottom:1px solid rgba(255,255,255,.05)}
 @media(max-width:900px){.nl,.signin{display:none}.burger{display:block}}
-footer{border-top:1px solid var(--line);background:#04070E;padding:54px 0 34px;font-size:14px;
+footer{border-top:1px solid var(--line);background:#000;padding:54px 0 34px;font-size:14px;
   color:var(--cream)}
 .fgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:30px;margin-bottom:34px}
 footer h6{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--sky);
@@ -17681,22 +17683,49 @@ body.returning .wb{display:flex}
 .wb .go:hover{text-decoration:underline}
 .wb .alt{color:var(--mute);background:none;border:none;cursor:pointer;font-size:14px}
 .wb .alt:hover{color:#fff}
+/* Black base with a blue glow, not navy. */
 .hero{position:relative;overflow:hidden;padding:76px 0 60px;
   min-height:100svh;display:flex;align-items:center;
-  background:radial-gradient(130% 100% at 50% -30%,#122murder 0%,#0A1020 46%,#04070E 100%)}
-.hero{background:radial-gradient(130% 100% at 50% -30%,#12234A 0%,#0A1020 46%,#04070E 100%)}
-.hero:before{content:"";position:absolute;inset:-25%;pointer-events:none;opacity:.6;
-  background:radial-gradient(36% 32% at 28% 26%,rgba(30,107,255,.22),transparent 66%),
-             radial-gradient(30% 28% at 76% 70%,rgba(224,36,60,.10),transparent 66%);
+  background:radial-gradient(120% 90% at 22% 18%,#0B1B3D 0%,#05070C 52%,#000 100%)}
+.hero:before{content:"";position:absolute;inset:-25%;pointer-events:none;opacity:.55;
+  background:radial-gradient(34% 30% at 26% 24%,rgba(30,107,255,.30),transparent 66%),
+             radial-gradient(28% 26% at 80% 74%,rgba(224,36,60,.12),transparent 66%);
   animation:drift 24s ease-in-out infinite alternate}
+/* Radar rings sweeping slowly. Pure CSS, so there is no image to load and
+   nothing to go stale. The dashed box is a warning polygon and the dot is
+   the watched address inside it: the product, in one picture. */
+.radar{position:absolute;right:-14%;top:50%;transform:translateY(-50%);
+  width:min(72vw,780px);aspect-ratio:1;pointer-events:none;opacity:.5}
+@media(max-width:900px){.radar{right:-40%;opacity:.3}}
+.radar .ring{position:absolute;inset:0;border-radius:50%;border:1px solid rgba(30,107,255,.22)}
+.radar .ring:nth-child(2){inset:14%}
+.radar .ring:nth-child(3){inset:28%}
+.radar .ring:nth-child(4){inset:42%}
+.radar .sweep{position:absolute;inset:0;border-radius:50%;
+  background:conic-gradient(from 0deg,rgba(30,107,255,.34),rgba(30,107,255,0) 32%);
+  animation:spin 7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.radar .poly{position:absolute;left:26%;top:30%;width:44%;height:40%;
+  border:1.5px dashed rgba(224,36,60,.55);border-radius:6px;animation:breathe 5s ease-in-out infinite}
+.radar .pin{position:absolute;left:46%;top:47%;width:11px;height:11px;border-radius:50%;
+  background:var(--red);animation:ping 2.8s ease-out infinite}
+@keyframes breathe{0%,100%{opacity:.5}50%{opacity:.95}}
+@keyframes ping{0%{box-shadow:0 0 0 0 rgba(224,36,60,.55)}
+  70%{box-shadow:0 0 0 18px rgba(224,36,60,0)}100%{box-shadow:0 0 0 0 rgba(224,36,60,0)}}
 @keyframes drift{from{transform:translate3d(-2%,-1%,0)}to{transform:translate3d(3%,2%,0) scale(1.09)}}
 .hero .wrap{position:relative}
-.eyebrow{font-size:12px;letter-spacing:.24em;text-transform:uppercase;color:var(--sky);
-  font-weight:800;margin-bottom:14px}
+/* One WeatherValet on the page, not two. The nav has the small one; this
+   is the real mark, and it earns its place by being a mark rather than a
+   repeat of the word above it. */
+.mark{display:flex;align-items:center;gap:14px;margin-bottom:22px}
+.mark svg{width:46px;height:54px;flex:0 0 auto}
+.mark span{font-size:clamp(24px,3.2vw,34px);font-weight:800;letter-spacing:-.025em;color:#fff}
+.mark span b{color:var(--blue);font-weight:800}
+@media(max-width:600px){.mark svg{width:38px;height:45px}}
 h1{font-size:clamp(38px,6.6vw,68px);line-height:.98;margin:0 0 14px;font-weight:900;
   letter-spacing:-.035em;background:linear-gradient(98deg,#fff 22%,#7EB6FF 92%);
   -webkit-background-clip:text;background-clip:text;color:transparent}
-.lede{font-size:clamp(16px,2vw,18.5px);color:var(--mute);max-width:590px;margin:0 0 34px}
+.lede{font-size:clamp(16px,2vw,18.5px);color:#C9D3E2;max-width:590px;margin:0 0 34px}
 
 /* ---------------------------------------------------------------- chooser */
 .grid{display:grid;grid-template-columns:1fr;gap:20px}
@@ -17862,8 +17891,22 @@ h3{font-size:clamp(20px,2.6vw,26px);margin:0 0 10px;font-weight:700;letter-spaci
 __WV_HEADER__
 
 <div class=hero id=chooser>
+  <div class=radar aria-hidden=true>
+    <div class=ring></div><div class=ring></div><div class=ring></div><div class=ring></div>
+    <div class=sweep></div><div class=poly></div><div class=pin></div>
+  </div>
   <div class=wrap>
-    <div class=eyebrow>&#9889; WeatherValet</div>
+    <div class=mark>
+      <svg viewBox="0 0 44 52" aria-hidden=true>
+        <path d="M22 1 41 9v18c0 12-8 20-19 24C11 47 3 39 3 27V9z"
+              fill="none" stroke="url(#wvg)" stroke-width="2.5" stroke-linejoin="round"/>
+        <path d="M24 13l-9 15h7l-2 11 9-15h-7z" fill="url(#wvg)"/>
+        <defs><linearGradient id="wvg" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#fff"/><stop offset="1" stop-color="#1E6BFF"/>
+        </linearGradient></defs>
+      </svg>
+      <span>Weather<b>Valet</b></span>
+    </div>
     <h1 id=h1>Your Weather. Your Way.</h1>
     <p class=lede id=lede>From a quick AI forecast to your own Meteorologist, we'll handle
     as much, or as little, of the weather as you want.</p>
