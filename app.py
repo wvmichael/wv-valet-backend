@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-203"
+BACKEND_BUILD = "0702-204"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -6314,22 +6314,26 @@ def _roles_to_workspaces(roles: list, email: str = "") -> list:
     # and Watch consoles are deliberately separate server-rendered tools and
     # are not part of this map.
     _spa = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+    # Rebuilt tools point at their own page here; the ones still living in
+    # the single-page app point at its root, because deep links into it
+    # land before it has confirmed the session and bounce you somewhere
+    # generic. As each is rebuilt, its entry moves from _spa to /portal.
     workspace_map = {
         "subscriber": {
             "label": "My WeatherValet",
-            "url": f"{_spa}/",
+            "url": "/portal/account",
         },
         "crew": {
             "label": "Valet Crew",
-            "url": f"{_spa}/",
+            "url": "/portal/crew",
         },
         "met": {
             "label": "Meteorologist",
-            "url": f"{_spa}/",
+            "url": f"{_spa}/",          # not rebuilt yet
         },
         "admin": {
             "label": "Command Center",
-            "url": f"{_spa}/",
+            "url": "/portal/admin",
         },
     }
     workspaces = []
@@ -6344,6 +6348,14 @@ def _roles_to_workspaces(roles: list, email: str = "") -> list:
     # the active sales_reps roster (matched by email upstream, so here we
     # only handle the admin case; rep users reach /sales via their rep
     # login flow and get the entry below when the caller passes email).
+    # The two consoles are rebuilt and live here, so a Meteorologist should
+    # be able to reach them from the menu rather than hunting for the URL.
+    if "met" in roles or "admin" in roles:
+        workspaces.append({"role": "sidekick", "label": "Sidekick Console",
+                           "url": "/portal/sidekick"})
+        workspaces.append({"role": "watch", "label": "Watch Console",
+                           "url": "/portal/watch"})
+
     # Sales reps are not a role; they are a row in sales_reps matched by email.
     # Without this lookup a rep signs in and sees no Sales workspace at all.
     is_rep = False
@@ -6367,7 +6379,7 @@ def _roles_to_workspaces(roles: list, email: str = "") -> list:
     # admin's own empty coverage instead).
     if "admin" in roles and not any(w["role"] == "met" for w in workspaces):
         workspaces.append({"role": "met", "label": "Met View",
-                           "url": f"{_spa}/"})
+                           "url": f"{_spa}/"})          # not rebuilt yet
     return workspaces
 
 
@@ -17304,9 +17316,11 @@ _SIGNIN_SCRIPT = """<script>
     document.getElementById('pane-pw').style.display='none'; hideAll();
   });
   var WS_HINT={met:'Post queue, briefs and subscriber threads',
-    admin:'Command Center', sales:'Prospects and your pipeline',
-    crew:'The map, the feed and your reports',
-    subscriber:'Your addresses and settings'};
+    admin:'Find any customer, run a test', sales:'Prospects and your pipeline',
+    crew:'File a report, read the feed',
+    subscriber:'Everything you have bought',
+    sidekick:'Claim game days, message buyers',
+    watch:'Claim a booked event'};
   function route(j){
     var list=(j && j.workspaces) || [];
     if(list.length===1 && list[0].url){ window.location=list[0].url; return; }
