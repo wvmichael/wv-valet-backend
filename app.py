@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-196"
+BACKEND_BUILD = "0702-198"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -886,6 +886,12 @@ ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS manage_token TEXT;
 -- welcome text has to say who it came from, or the first message she gets
 -- is a stranger telling her about her own house.
 ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS gift_from TEXT;
+
+-- Internal test rows (Aug 21, 2026). Addresses we put in ourselves, in
+-- severe-weather corridors, to prove the Weather Service fetch is working.
+-- They must behave exactly like a real subscriber for alerting, and count
+-- as nothing at all for revenue and subscriber numbers.
+ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS is_internal BOOLEAN NOT NULL DEFAULT FALSE;
 
 CREATE TABLE IF NOT EXISTS sentry_relay_log (
     nws_alert_id     TEXT NOT NULL,
@@ -17777,6 +17783,131 @@ _CREW_WS_SCRIPT = """<script>
 # every product rather than four separate lists.
 # ---------------------------------------------------------------------------
 
+@app.post("/api/v1/admin/stormline/mark-internal")
+def admin_stormline_mark_internal():
+    """Flag a Stormline row as one of ours, or clear the flag.
+
+    Internal rows still receive every warning exactly like a customer,
+    because that is the whole point of them. They just stop counting as
+    customers in the numbers.
+    """
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "not-authorized"}), 403
+    data = request.get_json(silent=True) or {}
+    try:
+        sid = int(data.get("sentry_id"))
+    except Exception:
+        return jsonify({"ok": False, "error": "Which row?"}), 400
+    flag = bool(data.get("internal", True))
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE sentry_subscribers SET is_internal = %s, updated_at = %s
+                            WHERE id = %s RETURNING address, is_internal""",
+                        (flag, int(time.time() * 1000), sid))
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "No such row."}), 404
+    print(f"[stormline] row {sid} internal={row['is_internal']} by {user.get('email')}", flush=True)
+    return jsonify({"ok": True, "sentry_id": sid, "internal": row["is_internal"],
+                    "address": row["address"]})
+
+
+@app.post("/api/v1/admin/stormline/test-alert")
+def admin_stormline_test_alert():
+    """Fire a rehearsal warning at ONE Stormline address.
+
+    This runs the real relay, not a copy of it: the same polygon match, the
+    same message builder, the same tornado voice call, the same once-per
+    subscriber ledger. The only differences are that the polygon is drawn
+    around the chosen address instead of arriving from the Weather Service,
+    and every message says REHEARSAL first.
+
+    Why it exists: the alert path is the whole product, and until now the
+    only way to test it was to wait for a real tornado warning over a
+    subscriber's house.
+    """
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "not-authorized"}), 403
+
+    data = request.get_json(silent=True) or {}
+    sid = data.get("sentry_id")
+    event = (data.get("event") or "Severe Thunderstorm Warning").strip()
+    if event not in _SENTRY_ALL_EVENTS:
+        return jsonify({"ok": False,
+                        "error": "Pick one of: " + ", ".join(sorted(_SENTRY_ALL_EVENTS))}), 400
+    try:
+        sid = int(sid)
+    except Exception:
+        return jsonify({"ok": False, "error": "Pick which address to test."}), 400
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id, name, phone, phone2, address, label, lat, lng,
+                                  status, pack_allseason
+                             FROM sentry_subscribers WHERE id = %s""", (sid,))
+            sub = cur.fetchone()
+    if not sub:
+        return jsonify({"ok": False, "error": "No such address."}), 404
+    if sub["status"] != "active":
+        return jsonify({"ok": False,
+                        "error": "That address is %s, so a real warning would not reach it "
+                                 "either. Activate it first." % sub["status"]}), 400
+    if sub["lat"] is None:
+        return jsonify({"ok": False,
+                        "error": "That address never geocoded, so no warning can ever match "
+                                 "it. That is a real bug worth fixing."}), 400
+    if event in _SENTRY_PACK_EVENTS and not sub["pack_allseason"]:
+        return jsonify({"ok": False,
+                        "error": "%s is an All-Season event and this address does not have "
+                                 "the pack, so a real one would not reach it either." % event}), 400
+
+    # A small box around the address: big enough to contain it, small enough
+    # that it cannot accidentally contain anybody else's.
+    lat, lng = float(sub["lat"]), float(sub["lng"])
+    d = 0.02  # roughly a mile
+    ring = [[lng - d, lat - d], [lng + d, lat - d],
+            [lng + d, lat + d], [lng - d, lat + d], [lng - d, lat - d]]
+    nws_id = "REHEARSAL-%d-%d" % (sub["id"], int(time.time()))
+    ends = datetime.now(timezone.utc) + timedelta(minutes=30)
+
+    alert = {
+        "nws_id": nws_id,
+        "event": event,
+        "geometry": {"type": "Polygon", "coordinates": [ring]},
+        "headline": "REHEARSAL. This is a test of your WeatherValet Stormline.",
+        "description": ("REHEARSAL ONLY. No warning is in effect. This message was sent "
+                        "deliberately to confirm your Stormline reaches this phone."),
+        "ends": ends.isoformat(),
+        "expires": ends.isoformat(),
+        "areaDesc": sub.get("label") or sub.get("address") or "",
+        "is_rehearsal": True,
+    }
+
+    sent = 0
+    err = None
+    try:
+        sent = _sentry_relay_warning(alert)
+    except Exception as e:
+        err = repr(e)
+        print(f"[stormline-test] relay failed: {e!r}", flush=True)
+
+    print(f"[stormline-test] admin={user.get('email')} sentry_id={sid} event={event} "
+          f"sent={sent} err={err}", flush=True)
+
+    if err:
+        return jsonify({"ok": False, "error": "The relay threw an error: %s" % err}), 500
+    if not sent:
+        return jsonify({"ok": False,
+                        "error": "The relay matched nobody. The address is active and has "
+                                 "coordinates, so this points at a real problem in the "
+                                 "matching, not at your test."}), 500
+    return jsonify({"ok": True, "sent": sent, "event": event,
+                    "to": [p for p in (sub["phone"], sub["phone2"]) if p],
+                    "note": "Every message is prefixed REHEARSAL."})
+
+
 @app.get("/api/v1/admin/support/lookup")
 def admin_support_lookup():
     """Find a customer across every product by email, phone or name."""
@@ -17803,7 +17934,8 @@ def admin_support_lookup():
 
     grab("stormline", r"""
         SELECT id, name, email, phone, phone2, address, label, status, daily,
-               send_hour, pack_allseason, manage_token, gift_from, created_at
+               send_hour, pack_allseason, manage_token, gift_from, created_at,
+               is_internal
           FROM sentry_subscribers
          WHERE lower(email) LIKE %s OR lower(name) LIKE %s
                OR regexp_replace(coalesce(phone,''),'\D','','g') LIKE %s
@@ -17940,6 +18072,7 @@ _ADMIN_SCRIPT = """<script>
         if(r.daily) extras.push('Morning summary at '+hour(r.send_hour));
         if(r.pack_allseason) extras.push('All-Season pack');
         if(r.gift_from) extras.push('Gift from '+esc(r.gift_from));
+        if(r.is_internal) extras.push('<b style="color:#FFD37E">Internal test row, not a customer</b>');
         h+='<div class=card><b>'+esc(r.name||'(no name)')+pill(r.status==='active', r.status||'')+'</b>'
           +'<div class=row><span>Watching</span> '+esc(r.address||'')+(r.label?' ('+esc(r.label)+')':'')+'</div>'
           +'<div class=row><span>Texts to</span> '+esc(r.phone||'')+(r.phone2?' and '+esc(r.phone2):'')+'</div>'
@@ -19512,7 +19645,8 @@ def admin_sentry_summary():
         return jsonify({"ok": False, "error": "admin-only"}), 403
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT status, COUNT(*) AS n FROM sentry_subscribers GROUP BY status")
+            cur.execute("SELECT status, COUNT(*) AS n FROM sentry_subscribers "
+                            "WHERE is_internal = FALSE GROUP BY status")
             counts = {r["status"]: int(r["n"]) for r in cur.fetchall()}
             cur.execute("""SELECT name, address, created_at FROM sentry_subscribers
                            WHERE status = 'active' ORDER BY created_at DESC LIMIT 10""")
@@ -36284,7 +36418,10 @@ def _sentry_relay_warning(alert: dict) -> int:
                 continue
             until = _relay_local_time(alert.get("expires_at"), None)
             where = sub.get("label") or sub["address"]
-            body = f"WeatherValet Stormline: A {event} includes your address ({where})"
+            # A rehearsal must say so in the message itself, or somebody
+            # takes shelter for a warning that does not exist.
+            prefix = "REHEARSAL, no warning is in effect. " if alert.get("is_rehearsal") else ""
+            body = f"{prefix}WeatherValet Stormline: A {event} includes your address ({where})"
             body += f" until {until}." if until else "."
             body += " " + _SENTRY_SAFETY.get(event, "")
             # All-clear only follows the storm warnings. Nobody needs a 3 AM
@@ -36303,6 +36440,8 @@ def _sentry_relay_warning(alert: dict) -> int:
                     try:
                         place_voice_call(
                             tphone,
+                            (("This is a rehearsal. No warning is in effect. " )
+                             if alert.get("is_rehearsal") else "") +
                             f"This is WeatherValet Stormline. A tornado warning includes your "
                             f"address{(' until ' + until) if until else ''}. Take shelter now "
                             f"in an interior room on the lowest floor, away from windows.")
