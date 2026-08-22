@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-191"
+BACKEND_BUILD = "0702-192"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -17450,6 +17450,10 @@ button.go:disabled{opacity:.55;transform:none;box-shadow:none}
   background:rgba(30,107,255,.18);color:#7FB0FF;border:1px solid rgba(30,107,255,.45)}
 .empty{border:1px dashed rgba(126,182,255,.3);border-radius:13px;padding:20px;color:#B8C7DE;font-size:15px}
 .fine{font-size:12.5px;color:#8FA6C6;margin-top:12px;line-height:1.6}
+.note{border:1px solid rgba(30,107,255,.35);background:rgba(30,107,255,.08);border-radius:13px;
+  padding:18px 20px;margin-top:28px;color:#D5E2F5;font-size:15px;line-height:1.65}
+.note b{color:#fff}
+.note a{color:var(--sky);font-weight:700}
 </style></head><body>
 __WV_HEADER__
 <div class=wrapx>
@@ -17475,6 +17479,10 @@ __WV_HEADER__
 
   <div class=head>Recent reports</div>
   <div id=feed><div class=empty>Loading the feed...</div></div>
+
+  <div class=note><b>Looking for the map?</b> The live Crew map is still on the old
+  workspace while we rebuild it here. <a href="__SPA__/crew/workspace">Open the map</a>.
+  Everything you file on this page shows up there too; it is the same feed.</div>
 </div>
 __WV_FOOTER__"""
 
@@ -17596,8 +17604,10 @@ def portal_crew():
     roles = user.get("roles") or []
     if "crew" not in roles and "admin" not in roles:
         return redirect("/crew", code=302)
-    return wv_shell(_CREW_WS_PAGE.replace("__WV_FOOTER__",
-                                          _CREW_WS_SCRIPT + "\n__WV_FOOTER__"))
+    spa = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+    return wv_shell(_CREW_WS_PAGE
+                    .replace("__SPA__", spa)
+                    .replace("__WV_FOOTER__", _CREW_WS_SCRIPT + "\n__WV_FOOTER__"))
 
 
 @app.get("/portal/account")
