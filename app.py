@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-192"
+BACKEND_BUILD = "0702-194"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -13758,7 +13758,8 @@ def gameday_console():
     if not user:
         return ("<h3 style='font-family:sans-serif;padding:30px;'>Meteorologists only. "
                 "<a href='/signin'>Sign in</a>, then come back.</h3>", 403)
-    return """<!doctype html><html lang=en><head><meta charset=utf-8>
+    spa = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+    return ("""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>GameDay Console - WeatherValet</title><style>
 body{margin:0;font-family:Inter,-apple-system,Segoe UI,Arial,sans-serif;background:#140A0C;color:#F3EAD3;font-size:18px}
@@ -13780,7 +13781,7 @@ textarea{width:100%;box-sizing:border-box;margin-top:10px;background:#0D0D10;col
 .ok{color:#8FD8A0}.bad{color:#F2A6A6}
 .note{font-size:15px;color:#B08A90;margin:8px 0 20px;line-height:1.55}
 </style></head><body>
-<div style="max-width:760px;margin:0 auto;padding:14px 16px 0"><a href="/portal" style="color:#7EB6FF;font-size:14px;font-weight:700;text-decoration:none">&larr; Your portal</a></div>
+<div style="max-width:760px;margin:0 auto;padding:14px 16px 0;display:flex;justify-content:space-between;gap:14px;flex-wrap:wrap"><a href="/portal" style="color:#7EB6FF;font-size:14px;font-weight:700;text-decoration:none">&larr; Your portal</a><a href="__SPA__/" style="color:#8FA6C6;font-size:13.5px;text-decoration:none">Old portal</a></div>
 <div class=top>&#9889; GameDay Console <small>Plain-text broadcasts to everyone covered for each game. No links, under 480 characters. Sends run in the background; counts land in a minute.</small></div>
 <div class=wrap>
 <div class=note>Claim your game so the team knows who owns the window. Kickoff TBA? Update it when the TV window firms up; the Monday reminder texts use it.</div>
@@ -13859,7 +13860,7 @@ document.getElementById('comp-send').addEventListener('click', function(){
   }).catch(function(){st.textContent='Connection problem.';st.className='status bad';});
 });
 load();
-</script></body></html>"""
+</script></body></html>""").replace("__SPA__", spa)
 
 
 @app.post("/api/v1/met/gameday/comp")
@@ -14904,7 +14905,7 @@ textarea{width:100%;box-sizing:border-box;margin-top:10px;padding:11px;border-ra
 .msg.bad{background:#33191A;border:1px solid #7B3033;color:#F0B6B8}
 .empty{color:#8E8578;font-size:14.5px}
 </style></head><body>
-<div style="max-width:760px;margin:0 auto;padding:14px 16px 0"><a href="/portal" style="color:#7EB6FF;font-size:14px;font-weight:700;text-decoration:none">&larr; Your portal</a></div>
+<div style="max-width:760px;margin:0 auto;padding:14px 16px 0;display:flex;justify-content:space-between;gap:14px;flex-wrap:wrap"><a href="/portal" style="color:#7EB6FF;font-size:14px;font-weight:700;text-decoration:none">&larr; Your portal</a><a href="__SPA__/" style="color:#8FA6C6;font-size:13.5px;text-decoration:none">Old portal</a></div>
 __WV_HEADER__
 <div class=wrap>
 <h1>Watch console</h1>
@@ -14984,7 +14985,8 @@ def watch_console():
     if not user:
         return ("<h3 style='font-family:sans-serif;padding:30px;'>Meteorologists only. "
                 "<a href='/signin'>Sign in</a>, then come back.</h3>", 403)
-    return _WATCH_CONSOLE_PAGE
+    spa = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+    return _WATCH_CONSOLE_PAGE.replace("__SPA__", spa)
 
 
 @app.get("/api/v1/watch/orders")
@@ -17225,7 +17227,7 @@ PORTAL_TOOLS = {
     "sales": ("Sales Portal", "/portal/sales",
               "Your prospects, your pipeline and the letters going out.", False),
     "admin": ("Command Center", "/portal/admin",
-              "Everything: people, payments, alerts and the whole operation.", False),
+              "Find any customer and see everything they bought.", True),
     "crew": ("Valet Crew", "/portal/crew",
              "File a report and read what everyone else is seeing.", True),
     "subscriber": ("My WeatherValet", "/portal/account",
@@ -17281,6 +17283,10 @@ __WV_HEADER__
   <h1>__GREETING__</h1>
   <p class=sub>__SUB__</p>
   __BODY__
+  <div class=empty style="margin-top:30px;border-style:solid;border-color:rgba(30,107,255,.35);
+    background:rgba(30,107,255,.08)"><b style="color:#fff">Cannot find what you need?</b>
+    Some tools are still being rebuilt here. Everything is on the old portal.
+    <a href="__SPA__/">Open the old portal</a>.</div>
 </div>
 __WV_FOOTER__"""
 
@@ -17386,6 +17392,7 @@ __WV_HEADER__
   number, or cancel, email <a href="mailto:hello@weathervalet.ai">hello@weathervalet.ai</a>
   and a person handles it the same day. Reply STOP to any message to stop texts
   immediately.</div>
+  <div class=note style="margin-top:18px"><b>Cannot find what you need?</b> Everything is still on the old portal while we rebuild it here. <a href="__SPA__/">Open the old portal</a>.</div>
 </div>
 __WV_FOOTER__"""
 
@@ -17596,6 +17603,252 @@ _CREW_WS_SCRIPT = """<script>
 </script>"""
 
 
+# ---------------------------------------------------------------------------
+# Command Center (Aug 21, 2026)
+#
+# The old Command Center has roughly sixty endpoints behind it: payroll,
+# commissions, coverage, accuracy grading, missions, audits. All of that
+# still works on the old site and is linked from here.
+#
+# What this rebuilds first is the thing needed daily once Stormline and
+# Sidekick are selling: somebody texts or emails, and you need to find them
+# and see everything they bought, fast, from a phone. One search box across
+# every product rather than four separate lists.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/admin/support/lookup")
+def admin_support_lookup():
+    """Find a customer across every product by email, phone or name."""
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "not-authorized"}), 403
+    q = (request.args.get("q") or "").strip()
+    if len(q) < 3:
+        return jsonify({"ok": False, "error": "Type at least three characters."}), 400
+
+    like = "%" + q.lower() + "%"
+    digits = re.sub(r"\D", "", q)
+    phone_like = "%" + digits + "%" if len(digits) >= 4 else "%__nomatch__%"
+    out = {"stormline": [], "sidekick": [], "watch": [], "accounts": []}
+
+    def grab(key, sql, params):
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, params)
+                    out[key] = [dict(r) for r in (cur.fetchall() or [])]
+        except Exception as e:
+            print(f"[support] {key} lookup failed: {e!r}", flush=True)
+
+    grab("stormline", r"""
+        SELECT id, name, email, phone, phone2, address, label, status, daily,
+               send_hour, pack_allseason, manage_token, gift_from, created_at
+          FROM sentry_subscribers
+         WHERE lower(email) LIKE %s OR lower(name) LIKE %s
+               OR regexp_replace(coalesce(phone,''),'\D','','g') LIKE %s
+               OR regexp_replace(coalesce(phone2,''),'\D','','g') LIKE %s
+               OR lower(address) LIKE %s
+         ORDER BY id DESC LIMIT 20""",
+         (like, like, phone_like, phone_like, like))
+
+    grab("sidekick", r"""
+        SELECT p.id, p.name, p.email, p.phone, p.pass_type, p.status, p.created_at,
+               g.opponent, to_char(g.game_date,'FMMon FMDD') AS d
+          FROM gameday_passes p
+     LEFT JOIN gameday_games g ON g.id = p.game_id
+         WHERE lower(p.email) LIKE %s OR lower(p.name) LIKE %s
+               OR regexp_replace(coalesce(p.phone,''),'\D','','g') LIKE %s
+         ORDER BY p.id DESC LIMIT 20""",
+         (like, like, phone_like))
+
+    grab("watch", r"""
+        SELECT id, name, email, phone, place, event_date, start_hour, end_hour,
+               status, what, created_at
+          FROM watch_orders
+         WHERE lower(email) LIKE %s OR lower(name) LIKE %s
+               OR regexp_replace(coalesce(phone,''),'\D','','g') LIKE %s
+               OR lower(place) LIKE %s
+         ORDER BY id DESC LIMIT 20""",
+         (like, like, phone_like, like))
+
+    grab("accounts", r"""
+        SELECT u.id, u.name, u.email, u.phone,
+               coalesce(string_agg(ur.role, ', ' ORDER BY ur.role), '') AS roles
+          FROM users u
+     LEFT JOIN user_roles ur ON ur.user_id = u.id
+         WHERE lower(u.email) LIKE %s OR lower(coalesce(u.name,'')) LIKE %s
+               OR regexp_replace(coalesce(u.phone,''),'\D','','g') LIKE %s
+         GROUP BY u.id ORDER BY u.id DESC LIMIT 20""",
+         (like, like, phone_like))
+
+    total = sum(len(v) for v in out.values())
+    return jsonify({"ok": True, "q": q, "total": total, **out})
+
+
+_ADMIN_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Command Center</title><meta name=robots content="noindex">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+.wrapx{max-width:900px;margin:0 auto;padding:48px 22px 80px}
+h1{font-size:clamp(27px,4.4vw,40px);font-weight:900;letter-spacing:-.03em;color:#fff;margin:0 0 6px}
+.sub{color:#B8C7DE;font-size:16px;line-height:1.6;margin:0 0 26px}
+.back{display:inline-block;color:var(--sky);font-size:14px;font-weight:700;margin-bottom:18px}
+.searchbar{display:flex;gap:10px}
+input{flex:1;box-sizing:border-box;padding:16px 17px;font-size:17px;font-family:inherit;
+  color:#EAF1FF;border-radius:12px;background:rgba(255,255,255,.06);
+  border:1.5px solid rgba(126,182,255,.3)}
+input:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 3px rgba(30,107,255,.24)}
+button.go{background:var(--blue);color:#fff;border:none;border-radius:12px;padding:0 26px;
+  font-size:16px;font-weight:800;cursor:pointer;white-space:nowrap;
+  box-shadow:0 12px 30px -12px rgba(30,107,255,.8)}
+button.go:hover{filter:brightness(1.1)}
+button.go:disabled{opacity:.55}
+.hint{font-size:13px;color:#8FA6C6;margin-top:10px}
+.head{font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:#A9B4C6;
+  font-weight:800;margin:30px 0 12px}
+.card{border:1.5px solid rgba(30,107,255,.45);border-radius:14px;padding:18px 20px;margin-bottom:11px;
+  background:linear-gradient(168deg,#18213A 0%,#0E1526 100%)}
+.card b{display:block;font-size:16.5px;color:#fff}
+.card .row{font-size:14.5px;color:#C3D2E6;line-height:1.7;margin-top:6px}
+.card .row span{color:#8FA6C6}
+.card a{color:var(--sky);font-weight:700}
+.pill{display:inline-block;font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;
+  font-weight:800;padding:4px 10px;border-radius:999px;margin-left:8px;
+  background:rgba(30,107,255,.18);color:#7FB0FF;border:1px solid rgba(30,107,255,.45)}
+.pill.off{background:rgba(255,255,255,.06);color:#A9B4C6;border-color:rgba(255,255,255,.16)}
+.empty{border:1px dashed rgba(126,182,255,.3);border-radius:13px;padding:22px;color:#B8C7DE;font-size:15px;line-height:1.65}
+.note{border:1px solid rgba(30,107,255,.35);background:rgba(30,107,255,.08);border-radius:13px;
+  padding:18px 20px;margin-top:32px;color:#D5E2F5;font-size:15px;line-height:1.7}
+.note b{color:#fff}
+.note a{color:var(--sky);font-weight:700}
+.tools{display:grid;grid-template-columns:1fr;gap:9px;margin-top:12px}
+@media(min-width:640px){.tools{grid-template-columns:1fr 1fr}}
+.tools a{display:block;border:1px solid rgba(126,182,255,.22);border-radius:11px;padding:13px 15px;
+  background:rgba(255,255,255,.035);color:#D6E4FA;font-size:14.5px;font-weight:600}
+.tools a:hover{border-color:var(--blue)}
+</style></head><body>
+__WV_HEADER__
+<div class=wrapx>
+  <a class=back href="/portal">&larr; Your portal</a>
+  <h1>Command Center</h1>
+  <p class=sub>Somebody texted and you need to know who they are. Search by email,
+  phone number, name, or address.</p>
+
+  <div class=searchbar>
+    <input id=q placeholder="dana@example.com, 3175550111, Chestnut Lane" autocomplete=off>
+    <button class=go id=go>Find</button>
+  </div>
+  <div class=hint>Searches Stormline, Sidekick, Watch and accounts at once.</div>
+
+  <div id=results></div>
+
+  <div class=note><b>Everything else is still on the old Command Center</b> while we
+  rebuild it here: payroll, commissions, coverage, accuracy grading, missions, audits,
+  refunds and Crew approvals. <a href="__SPA__/admin">Open the old Command Center</a>.
+  <div class=tools>
+    <a href="__SPA__/admin">Payments and refunds</a>
+    <a href="__SPA__/admin">Payroll and commissions</a>
+    <a href="__SPA__/admin">Coverage and accuracy</a>
+    <a href="__SPA__/admin">People and roles</a>
+  </div></div>
+</div>
+__WV_FOOTER__"""
+
+_ADMIN_SCRIPT = """<script>
+(function(){
+  function esc(t){var d=document.createElement('div');d.textContent=(t===null||t===undefined)?'':t;return d.innerHTML;}
+  function when(ms){ if(!ms) return ''; var d=new Date(Number(ms));
+    return d.toLocaleDateString(undefined,{month:'short',day:'numeric',year:'numeric'}); }
+  function hour(h){ if(h===null||h===undefined) return '';
+    h=Number(h); if(h===0||h===24) return 'midnight'; if(h===12) return 'noon';
+    return (h<=12?h:h-12)+(h<12?' AM':' PM'); }
+  function pill(ok,label){ return '<span class="pill'+(ok?'':' off')+'">'+esc(label)+'</span>'; }
+
+  function render(j){
+    var el=document.getElementById('results');
+    if(!j||!j.ok){ el.innerHTML='<div class=empty>'+esc((j&&j.error)||'Search failed.')+'</div>'; return; }
+    if(!j.total){ el.innerHTML='<div class=empty>Nothing found for <b>'+esc(j.q)+'</b>. '
+      +'Try just the digits of a phone number, or part of an email.</div>'; return; }
+    var h='';
+    if(j.stormline.length){
+      h+='<div class=head>Stormline</div>';
+      j.stormline.forEach(function(r){
+        var extras=[];
+        if(r.daily) extras.push('Morning summary at '+hour(r.send_hour));
+        if(r.pack_allseason) extras.push('All-Season pack');
+        if(r.gift_from) extras.push('Gift from '+esc(r.gift_from));
+        h+='<div class=card><b>'+esc(r.name||'(no name)')+pill(r.status==='active', r.status||'')+'</b>'
+          +'<div class=row><span>Watching</span> '+esc(r.address||'')+(r.label?' ('+esc(r.label)+')':'')+'</div>'
+          +'<div class=row><span>Texts to</span> '+esc(r.phone||'')+(r.phone2?' and '+esc(r.phone2):'')+'</div>'
+          +'<div class=row><span>Email</span> '+esc(r.email||'')+'</div>'
+          +(extras.length?'<div class=row>'+extras.join(' &middot; ')+'</div>':'')
+          +'<div class=row><span>Since</span> '+when(r.created_at)
+          +(r.manage_token?' &middot; <a href="/stormline/manage/'+esc(r.manage_token)+'">their settings link</a>':'')
+          +'</div></div>';
+      });
+    }
+    if(j.sidekick.length){
+      h+='<div class=head>Sidekick</div>';
+      j.sidekick.forEach(function(r){
+        h+='<div class=card><b>'+esc(r.name||'(no name)')+pill(r.status==='active', r.status||'')+'</b>'
+          +'<div class=row><span>Pass</span> '+esc(r.pass_type==='season'?'Series pass, all 8 days':(r.opponent?('Single: '+r.opponent+' on '+r.d):'Single day'))+'</div>'
+          +'<div class=row><span>Contact</span> '+esc(r.phone||'')+' &middot; '+esc(r.email||'')+'</div>'
+          +'<div class=row><span>Bought</span> '+when(r.created_at)+'</div></div>';
+      });
+    }
+    if(j.watch.length){
+      h+='<div class=head>Watch</div>';
+      j.watch.forEach(function(r){
+        h+='<div class=card><b>'+esc(r.name||'(no name)')+pill(['paid','claimed','active'].indexOf(r.status)>=0, r.status||'')+'</b>'
+          +'<div class=row><span>Event</span> '+esc(r.place||'')+'</div>'
+          +'<div class=row><span>When</span> '+esc(r.event_date||'')+', '+hour(r.start_hour)+' to '+hour(r.end_hour)+'</div>'
+          +(r.what?'<div class=row><span>What it is</span> '+esc(r.what)+'</div>':'')
+          +'<div class=row><span>Contact</span> '+esc(r.phone||'')+' &middot; '+esc(r.email||'')+'</div></div>';
+      });
+    }
+    if(j.accounts.length){
+      h+='<div class=head>Accounts</div>';
+      j.accounts.forEach(function(r){
+        h+='<div class=card><b>'+esc(r.name||'(no name)')+'</b>'
+          +'<div class=row><span>Email</span> '+esc(r.email||'')+'</div>'
+          +(r.phone?'<div class=row><span>Phone</span> '+esc(r.phone)+'</div>':'')
+          +'<div class=row><span>Roles</span> '+esc(r.roles||'none')+'</div></div>';
+      });
+    }
+    el.innerHTML=h;
+  }
+
+  function search(){
+    var q=document.getElementById('q').value.trim();
+    if(q.length<3){ document.getElementById('results').innerHTML=
+      '<div class=empty>Type at least three characters.</div>'; return; }
+    var btn=document.getElementById('go');
+    btn.disabled=true; btn.textContent='...';
+    fetch('/api/v1/admin/support/lookup?q='+encodeURIComponent(q),{credentials:'include'})
+      .then(function(r){return r.json();})
+      .then(function(j){ btn.disabled=false; btn.textContent='Find'; render(j); })
+      .catch(function(){ btn.disabled=false; btn.textContent='Find';
+        document.getElementById('results').innerHTML='<div class=empty>Network problem.</div>'; });
+  }
+  document.getElementById('go').addEventListener('click',search);
+  document.getElementById('q').addEventListener('keydown',function(e){ if(e.key==='Enter') search(); });
+})();
+</script>"""
+
+
+@app.get("/portal/admin")
+def portal_admin():
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return redirect("/signin", code=302)
+    spa = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+    return wv_shell(_ADMIN_PAGE
+                    .replace("__SPA__", spa)
+                    .replace("__WV_FOOTER__", _ADMIN_SCRIPT + "\n__WV_FOOTER__"))
+
+
 @app.get("/portal/crew")
 def portal_crew():
     user = _get_current_user()
@@ -17686,7 +17939,9 @@ def portal_account():
 
     first = ((user.get("name") or "").strip().split(" ") or [""])[0]
     greeting = ("Hello, %s." % _html_escape(first)) if first else "My WeatherValet."
+    spa = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
     return wv_shell(_ACCOUNT_PAGE
+                    .replace("__SPA__", spa)
                     .replace("__GREETING__", greeting)
                     .replace("__BODY__", body))
 
@@ -17747,6 +18002,7 @@ def portal_home():
     sub = ("Everything you have access to, in one place."
            if (cards or consoles) else "")
     return wv_shell(_PORTAL_PAGE
+                    .replace("__SPA__", spa)
                     .replace("__GREETING__", greeting)
                     .replace("__SUB__", sub)
                     .replace("__BODY__", body))
