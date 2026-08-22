@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-190"
+BACKEND_BUILD = "0702-191"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -17227,7 +17227,7 @@ PORTAL_TOOLS = {
     "admin": ("Command Center", "/portal/admin",
               "Everything: people, payments, alerts and the whole operation.", False),
     "crew": ("Valet Crew", "/portal/crew",
-             "The map, the live feed, and your own reports.", False),
+             "File a report and read what everyone else is seeing.", True),
     "subscriber": ("My WeatherValet", "/portal/account",
                    "Everything you have bought: addresses, passes and bookings.", True),
 }
@@ -17388,6 +17388,216 @@ __WV_HEADER__
   immediately.</div>
 </div>
 __WV_FOOTER__"""
+
+
+# ---------------------------------------------------------------------------
+# Valet Crew workspace (Aug 21, 2026)
+#
+# The feed, and the form for adding to it. Built on the crew reports API that
+# already backs the old workspace, so a report filed here is the same row a
+# Meteorologist sees while writing to paying subscribers.
+#
+# No map in this first version. The old workspace has one, and it stays
+# available until this covers it. Reporting is the part that matters: a Crew
+# member standing in the weather needs to file in seconds, and a map is the
+# slowest way to do that on a phone.
+# ---------------------------------------------------------------------------
+
+_CREW_WS_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Valet Crew workspace</title><meta name=robots content="noindex">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+.wrapx{max-width:820px;margin:0 auto;padding:50px 22px 80px}
+h1{font-size:clamp(27px,4.4vw,40px);font-weight:900;letter-spacing:-.03em;color:#fff;margin:0 0 6px}
+.sub{color:#B8C7DE;font-size:16px;line-height:1.6;margin:0 0 30px}
+.back{display:inline-block;color:var(--sky);font-size:14px;font-weight:700;margin-bottom:18px}
+.head{font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:#A9B4C6;
+  font-weight:800;margin:34px 0 12px}
+.panel{border:1.5px solid rgba(30,107,255,.5);border-radius:16px;padding:22px;
+  background:linear-gradient(168deg,#18213A 0%,#0E1526 100%);
+  box-shadow:0 14px 38px -18px rgba(0,0,0,.9)}
+label{display:block;font-size:12px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;
+  color:#8FA6C6;margin:16px 0 7px}
+textarea,input{width:100%;box-sizing:border-box;padding:14px 15px;font-size:16px;font-family:inherit;
+  color:#EAF1FF;border-radius:10px;background:rgba(255,255,255,.05);
+  border:1px solid rgba(126,182,255,.26)}
+textarea{min-height:78px;resize:vertical}
+textarea:focus,input:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 3px rgba(30,107,255,.24)}
+.types{display:flex;flex-wrap:wrap;gap:8px}
+.type{border:1px solid rgba(126,182,255,.3);background:rgba(255,255,255,.04);color:#D6E4FA;
+  border-radius:999px;padding:10px 16px;font-size:14.5px;cursor:pointer;transition:.16s}
+.type:hover{border-color:var(--blue)}
+.type.on{background:var(--blue);border-color:var(--blue);color:#fff;font-weight:700}
+button.go{width:100%;margin-top:20px;background:var(--blue);color:#fff;border:none;border-radius:11px;
+  padding:16px;font-size:16.5px;font-weight:800;cursor:pointer;
+  box-shadow:0 12px 30px -12px rgba(30,107,255,.8);transition:.18s}
+button.go:hover{filter:brightness(1.1);transform:translateY(-1px)}
+button.go:disabled{opacity:.55;transform:none;box-shadow:none}
+.msg{display:none;border-radius:10px;padding:12px 14px;margin-top:14px;font-size:14.5px;line-height:1.55}
+.msg.bad{background:#3A1220;border:1px solid #7C2740;color:#FFC2CE}
+.msg.good{background:#0F2A4A;border:1px solid var(--blue);color:#BBD8FF}
+.rep{border:1px solid rgba(126,182,255,.2);border-radius:13px;padding:16px 18px;margin-bottom:10px;
+  background:rgba(255,255,255,.035)}
+.rep .top{display:flex;justify-content:space-between;gap:12px;align-items:baseline}
+.rep .kind{font-size:11px;letter-spacing:.13em;text-transform:uppercase;font-weight:800;color:#7FB0FF}
+.rep .when{font-size:12.5px;color:#8FA6C6;white-space:nowrap}
+.rep p{margin:7px 0 0;color:#D6E1F0;font-size:15px;line-height:1.6}
+.rep .who{margin-top:9px;font-size:13px;color:#8FA6C6}
+.rep .cited{display:inline-block;margin-top:9px;font-size:11px;letter-spacing:.1em;
+  text-transform:uppercase;font-weight:800;padding:4px 9px;border-radius:999px;
+  background:rgba(30,107,255,.18);color:#7FB0FF;border:1px solid rgba(30,107,255,.45)}
+.empty{border:1px dashed rgba(126,182,255,.3);border-radius:13px;padding:20px;color:#B8C7DE;font-size:15px}
+.fine{font-size:12.5px;color:#8FA6C6;margin-top:12px;line-height:1.6}
+</style></head><body>
+__WV_HEADER__
+<div class=wrapx>
+  <a class=back href="/portal">&larr; Your portal</a>
+  <h1>Valet Crew</h1>
+  <p class=sub>What you see from where you are. Our Meteorologists read these while
+  they are writing to paying subscribers.</p>
+
+  <div class=panel>
+    <label>What are you seeing?</label>
+    <div class=types id=types></div>
+    <label for=r-notes>Tell us about it</label>
+    <textarea id=r-notes placeholder="Nickel-sized hail, coming down hard, about 5 minutes so far"></textarea>
+    <label for=r-where>Where are you?</label>
+    <input id=r-where placeholder="Lebanon, IN">
+    <div class=fine id=geo>We will use your phone's location if you allow it, which is more
+    accurate than a town name. Otherwise type where you are.</div>
+    <div id=msg class=msg></div>
+    <button class=go id=r-go>File this report</button>
+    <div class=fine><b style="color:#fff">Take shelter first, always.</b> Nothing you report
+    to us is worth standing outside for.</div>
+  </div>
+
+  <div class=head>Recent reports</div>
+  <div id=feed><div class=empty>Loading the feed...</div></div>
+</div>
+__WV_FOOTER__"""
+
+_CREW_WS_SCRIPT = """<script>
+(function(){
+  var TYPES=[['storm','Storm'],['hail','Hail'],['wind','Wind'],['rain','Rain'],
+             ['flood','Flooding'],['snow','Snow'],['fog','Fog'],['tornado','Tornado'],
+             ['other','Something else']];
+  var chosen=null, coords=null;
+  var box=document.getElementById('types');
+  TYPES.forEach(function(t){
+    var b=document.createElement('button');
+    b.type='button'; b.className='type'; b.textContent=t[1];
+    b.addEventListener('click',function(){
+      chosen=t[0];
+      Array.prototype.forEach.call(box.children,function(c){c.className='type';});
+      b.className='type on';
+    });
+    box.appendChild(b);
+  });
+
+  // A phone's own position beats a typed town name, so ask for it, but
+  // never require it: plenty of people will decline and should still be
+  // able to file.
+  if(navigator.geolocation){
+    navigator.geolocation.getCurrentPosition(function(p){
+      coords={lat:p.coords.latitude,lng:p.coords.longitude};
+      document.getElementById('geo').innerHTML='Using your location. Accurate to about '
+        +Math.round(p.coords.accuracy)+' metres.';
+    },function(){},{timeout:8000});
+  }
+
+  function show(kind,text){
+    var m=document.getElementById('msg');
+    m.className='msg '+kind; m.innerHTML=text; m.style.display='block';
+  }
+  function ago(ms){
+    var s=Math.round((Date.now()-ms)/1000);
+    if(s<90) return 'just now';
+    if(s<3600) return Math.round(s/60)+' min ago';
+    if(s<86400) return Math.round(s/3600)+' hr ago';
+    return Math.round(s/86400)+' d ago';
+  }
+  function esc(t){var d=document.createElement('div');d.textContent=t||'';return d.innerHTML;}
+
+  function loadFeed(){
+    fetch('/api/v1/crew/reports?minutes=1440&limit=40',{credentials:'include'})
+     .then(function(r){return r.json();}).then(function(j){
+        var el=document.getElementById('feed');
+        var list=(j&&j.reports)||[];
+        if(!list.length){
+          el.innerHTML='<div class=empty>Nothing reported in the last day. '
+            +'If you are seeing something, you would be the first.</div>';
+          return;
+        }
+        el.innerHTML=list.map(function(r){
+          return '<div class=rep><div class=top>'
+            +'<span class=kind>'+esc(r.report_type)+'</span>'
+            +'<span class=when>'+ago(r.created_at)+'</span></div>'
+            +(r.notes?'<p>'+esc(r.notes)+'</p>':'')
+            +'<div class=who>'+esc(r.user_name||'Anonymous')+'</div>'
+            +(r.cited?'<span class=cited>Used by a Meteorologist</span>':'')
+            +'</div>';
+        }).join('');
+     }).catch(function(){
+        document.getElementById('feed').innerHTML=
+          '<div class=empty>Could not load the feed just now.</div>';
+     });
+  }
+  loadFeed();
+
+  document.getElementById('r-go').addEventListener('click',function(){
+    var btn=this;
+    document.getElementById('msg').style.display='none';
+    if(!chosen){ show('bad','Pick what you are seeing first.'); return; }
+    var notes=document.getElementById('r-notes').value.trim();
+    if(notes.length<4){ show('bad','Tell us a little about it.'); return; }
+    if(!coords){
+      show('bad','We need your location to place this report. Allow location in your '
+        +'browser, or open this page on the phone you are standing with.');
+      return;
+    }
+    btn.disabled=true; btn.textContent='Filing...';
+    fetch('/api/v1/crew/reports',{method:'POST',credentials:'include',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({report_type:chosen,lat:coords.lat,lng:coords.lng,notes:notes})})
+     .then(function(r){return r.json().then(function(j){return {s:r.status,j:j};});})
+     .then(function(res){
+        btn.disabled=false; btn.textContent='File this report';
+        if(res.j&&res.j.ok){
+          show('good','<b>Filed. Thank you.</b><br>It is in the feed now, and a '
+            +'Meteorologist may use it while writing today.');
+          document.getElementById('r-notes').value='';
+          chosen=null;
+          Array.prototype.forEach.call(box.children,function(c){c.className='type';});
+          loadFeed();
+          return;
+        }
+        var e=(res.j&&res.j.error)||'';
+        if(e==='not-crew'){ show('bad','This account is not on the Crew yet. '
+          +'<a href="/crew" style="color:#7FB0FF">Join free</a>.'); }
+        else if(e==='not-authenticated'){ show('bad','Your session expired. '
+          +'<a href="/signin" style="color:#7FB0FF">Sign in again</a>.'); }
+        else { show('bad','Could not file that. Try again in a moment.'); }
+     }).catch(function(){
+        btn.disabled=false; btn.textContent='File this report';
+        show('bad','Network problem. Try again.');
+     });
+  });
+})();
+</script>"""
+
+
+@app.get("/portal/crew")
+def portal_crew():
+    user = _get_current_user()
+    if not user:
+        return redirect("/signin", code=302)
+    roles = user.get("roles") or []
+    if "crew" not in roles and "admin" not in roles:
+        return redirect("/crew", code=302)
+    return wv_shell(_CREW_WS_PAGE.replace("__WV_FOOTER__",
+                                          _CREW_WS_SCRIPT + "\n__WV_FOOTER__"))
 
 
 @app.get("/portal/account")
