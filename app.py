@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-201"
+BACKEND_BUILD = "0702-202"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -36999,12 +36999,27 @@ def _process_severe_alerts() -> None:
         # its own per-(alert, subscriber) ledger, which means a warning
         # already paged by an older build still relays after a deploy,
         # and a subscriber added mid-warning still gets their text.
+        # ── Stormline FIRST, and unconditionally (Aug 22, 2026). ──
+        # This used to sit below the Pro-subscriber check, so a warning with
+        # no Pro subscriber inside it hit the `continue` below and Stormline
+        # was never considered at all. A $12 customer's tornado warning
+        # silently depended on a $99 customer happening to live nearby.
+        # Found by putting a watcher address in Wayland, KY, watching a real
+        # severe thunderstorm warning cover it, and getting nothing.
+        # Stormline matches its own addresses and has its own ledger, so it
+        # neither needs nor should wait for anything above it.
+        try:
+            _sentry_relay_warning(alert)
+        except Exception as e:
+            print(f"[nws-process] sentry relay failed: {e!r}", flush=True)
+
         if alert.get("match_mode") == "county" or not alert.get("geometry"):
             affected = _find_pro_subscribers_by_county(alert)
         else:
             affected = _find_pro_subscribers_in_polygon(alert["geometry"])
         if not affected:
-            # No subscribers in this alert's area; don't relay, don't page.
+            # No Pro subscribers in this alert's area; nothing more to do
+            # for this alert. Stormline has already been handled above.
             continue
 
         # ── Option A relay (July 29, 2026): subscribers hear the factual
@@ -37014,13 +37029,6 @@ def _process_severe_alerts() -> None:
             _auto_relay_warning(alert, affected)
         except Exception as e:
             print(f"[nws-process] auto-relay failed: {e!r}", flush=True)
-
-        # Sentry relay (Aug 15, 2026): $12/yr consumer addresses, after
-        # the Pro relay so the warning-map ledger is warm. Self-deduped.
-        try:
-            _sentry_relay_warning(alert)
-        except Exception as e:
-            print(f"[nws-process] sentry relay failed: {e!r}", flush=True)
 
         # Dedupe — have we already paged for this alert?
         try:
