@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-202"
+BACKEND_BUILD = "0702-203"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -14461,8 +14461,8 @@ __WV_HEADER__
         <div class=ts>Tuesday 6:42 PM</div>
         <div class="bub warn"><span class=hd>Severe Thunderstorm Warning</span>
           A Severe Thunderstorm Warning includes your address (418 Prairie Rose Dr,
-          Norman, OK) until 7:15 PM. Damaging wind and hail possible. Move indoors,
-          away from windows. We'll text the all clear.</div>
+          Norman, OK) until 7:15 PM. The Weather Service lists wind to 60 mph and hail
+          up to 1 inch. Move indoors, away from windows. We'll text the all clear.</div>
         <div class=ts>Tuesday 7:19 PM</div>
         <div class="bub ok"><span class=hd>All clear</span>
           All clear. The Severe Thunderstorm Warning that included your address has
@@ -19341,8 +19341,8 @@ __WV_HEADER__
       <div class=tstamp>Tuesday 6:42 PM</div>
       <div class="bub warn"><span class=hd>Severe Thunderstorm Warning</span>
         A Severe Thunderstorm Warning includes your address (2140 Cypress Bend, Tupelo, MS)
-        until 7:15 PM. Damaging wind and hail possible. Move indoors, away from windows.
-        We'll text the all-clear.</div>
+        until 7:15 PM. The Weather Service lists wind to 60 mph and hail up to 1 inch.
+        Move indoors, away from windows. We'll text the all-clear.</div>
       <div class=tstamp>Tuesday 7:19 PM</div>
       <div class="bub ok"><span class=hd>All clear</span>
         WeatherValet Stormline: all clear. The Severe Thunderstorm Warning that included your
@@ -36621,7 +36621,7 @@ _SENTRY_ALL_EVENTS = _SENTRY_EVENTS + _SENTRY_PACK_EVENTS
 
 _SENTRY_SAFETY = {
     "Tornado Warning": "Take shelter now: interior room, lowest floor, away from windows.",
-    "Severe Thunderstorm Warning": "Damaging wind and hail possible. Move indoors, away from windows.",
+    "Severe Thunderstorm Warning": "Move indoors, away from windows.",
     "Flash Flood Warning": "Never walk or drive through floodwater. Move to higher ground if water rises.",
     "Winter Storm Warning": "Travel will be difficult. Keep a charged phone and warm layers in the car.",
     "Ice Storm Warning": "Ice brings down limbs and power lines. Avoid travel and expect outages.",
@@ -36633,6 +36633,40 @@ _SENTRY_SAFETY = {
     "Excessive Heat Warning": "Limit outdoor work, drink water early, and check on older neighbors.",
     "High Wind Warning": "Secure trash cans, patio furniture, and anything that can become a projectile.",
 }
+
+
+def _sentry_hazard_line(alert: dict) -> str:
+    """State the hazards the Weather Service actually gave, or say nothing.
+
+    Every severe thunderstorm warning used to carry "Damaging wind and hail
+    possible" whether or not either was mentioned, which is us writing
+    weather rather than relaying it. The real numbers are in the alert's
+    own parameters, so use those and stay quiet when they are absent.
+    """
+    params = alert.get("parameters") or {}
+
+    def first(key):
+        v = params.get(key)
+        if isinstance(v, list) and v:
+            return str(v[0]).strip()
+        if isinstance(v, str):
+            return v.strip()
+        return ""
+
+    bits = []
+    gust = first("maxWindGust")          # e.g. "60 mph"
+    hail = first("maxHailSize")          # e.g. "1.00" (inches)
+    if gust:
+        bits.append("wind to %s" % gust)
+    if hail:
+        try:
+            h = float(hail)
+            bits.append("hail up to %g inch%s" % (h, "" if h == 1 else "es"))
+        except ValueError:
+            bits.append("hail up to %s" % hail)
+    if not bits:
+        return ""
+    return "The Weather Service lists " + " and ".join(bits) + ". "
 
 
 def _sentry_relay_warning(alert: dict) -> int:
@@ -36700,9 +36734,11 @@ def _sentry_relay_warning(alert: dict) -> int:
             # A rehearsal must say so in the message itself, or somebody
             # takes shelter for a warning that does not exist.
             prefix = "REHEARSAL, no warning is in effect. " if alert.get("is_rehearsal") else ""
+            hazard = _sentry_hazard_line(alert)
             body = f"{prefix}WeatherValet Stormline: A {event} includes your address ({where})"
             body += f" until {until}." if until else "."
-            body += " " + _SENTRY_SAFETY.get(event, "")
+            # Facts first, from the alert itself, then the safety line.
+            body += " " + hazard + _SENTRY_SAFETY.get(event, "")
             # All-clear only follows the storm warnings. Nobody needs a 3 AM
             # text saying the freeze warning ended.
             if not pack_only:
