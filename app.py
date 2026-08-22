@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-199"
+BACKEND_BUILD = "0702-200"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -17783,6 +17783,121 @@ _CREW_WS_SCRIPT = """<script>
 # every product rather than four separate lists.
 # ---------------------------------------------------------------------------
 
+@app.post("/api/v1/admin/stormline/add-watcher")
+def admin_stormline_add_watcher():
+    """Create a Stormline row without a payment.
+
+    For watcher addresses: places in severe-weather country with our own
+    phone number on them, so a real Weather Service warning proves the whole
+    chain works. Created active and flagged internal, so they behave exactly
+    like a customer for alerting and count as nothing for revenue.
+    """
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "not-authorized"}), 403
+
+    data = request.get_json(silent=True) or {}
+    label = (data.get("label") or "").strip()[:80] or "Watcher"
+    address = _compose_address(data.get("street"), data.get("city"), data.get("state"))
+    if not address:
+        return jsonify({"ok": False, "error": "Street, city and state are all needed."}), 400
+    phone = _normalize_phone((data.get("phone") or "").strip())
+    if not phone:
+        return jsonify({"ok": False, "error": "A phone number to send to."}), 400
+
+    geo = None
+    try:
+        geo = _geocode_address(address)
+    except Exception as e:
+        print(f"[watcher] geocode failed: {e!r}", flush=True)
+    if not geo or geo.get("lat") is None:
+        return jsonify({"ok": False,
+                        "error": "Could not find that address. Without coordinates no warning "
+                                 "can ever match it, so it would be a silent dud."}), 400
+
+    lat, lng = float(geo["lat"]), float(geo["lng"])
+    try:
+        tz = _tz_for_point(lat, lng)
+    except Exception:
+        tz = "America/Indiana/Indianapolis"
+
+    now_ms = int(time.time() * 1000)
+    token = new_secure_token()[:24]
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO sentry_subscribers
+                (email, phone, name, address, label, lat, lng, tornado_call,
+                 pack_allseason, daily, send_hour, tz_name, manage_token,
+                 status, is_internal, created_at, updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,TRUE,TRUE,FALSE,7,%s,%s,'active',TRUE,%s,%s)
+                RETURNING id""",
+                ((user.get("email") or "watcher@weathervalet.ai"), phone,
+                 label, address, label, lat, lng, tz, token, now_ms, now_ms))
+            new_id = cur.fetchone()["id"]
+
+    print(f"[watcher] id={new_id} {address} -> {phone} by {user.get('email')}", flush=True)
+    return jsonify({"ok": True, "sentry_id": new_id, "address": address,
+                    "lat": lat, "lng": lng, "tz": tz,
+                    "note": "Active, All-Season on, flagged internal. It will receive real "
+                            "warnings and will not count as a customer."})
+
+
+@app.post("/api/v1/admin/stormline/edit-address")
+def admin_stormline_edit_address():
+    """Move an existing Stormline row to a different address.
+
+    Re-geocodes, and refuses rather than saving something that can never
+    match a warning. Changing an address by hand in the database is how you
+    end up with a subscriber whose coordinates point at the old house.
+    """
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "not-authorized"}), 403
+
+    data = request.get_json(silent=True) or {}
+    try:
+        sid = int(data.get("sentry_id"))
+    except Exception:
+        return jsonify({"ok": False, "error": "Which row?"}), 400
+    address = _compose_address(data.get("street"), data.get("city"), data.get("state"))
+    if not address:
+        return jsonify({"ok": False, "error": "Street, city and state are all needed."}), 400
+
+    geo = None
+    try:
+        geo = _geocode_address(address)
+    except Exception as e:
+        print(f"[edit-address] geocode failed: {e!r}", flush=True)
+    if not geo or geo.get("lat") is None:
+        return jsonify({"ok": False,
+                        "error": "Could not find that address, so nothing was changed. The "
+                                 "old address is still being watched."}), 400
+
+    lat, lng = float(geo["lat"]), float(geo["lng"])
+    try:
+        tz = _tz_for_point(lat, lng)
+    except Exception:
+        tz = None
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            if tz:
+                cur.execute("""UPDATE sentry_subscribers
+                                  SET address=%s, lat=%s, lng=%s, tz_name=%s, updated_at=%s
+                                WHERE id=%s RETURNING address""",
+                            (address, lat, lng, tz, int(time.time() * 1000), sid))
+            else:
+                cur.execute("""UPDATE sentry_subscribers
+                                  SET address=%s, lat=%s, lng=%s, updated_at=%s
+                                WHERE id=%s RETURNING address""",
+                            (address, lat, lng, int(time.time() * 1000), sid))
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "No such row."}), 404
+    print(f"[edit-address] id={sid} -> {address} by {user.get('email')}", flush=True)
+    return jsonify({"ok": True, "sentry_id": sid, "address": address, "lat": lat, "lng": lng})
+
+
 @app.post("/api/v1/admin/stormline/mark-internal")
 def admin_stormline_mark_internal():
     """Flag a Stormline row as one of ours, or clear the flag.
@@ -18021,6 +18136,17 @@ button.go:disabled{opacity:.55}
 .actmsg{display:none;margin-top:11px;border-radius:9px;padding:11px 13px;font-size:14px;line-height:1.55}
 .actmsg.good{background:#0F2A4A;border:1px solid var(--blue);color:#BBD8FF}
 .actmsg.bad{background:#3A1220;border:1px solid #7C2740;color:#FFC2CE}
+.panel{border:1.5px solid rgba(30,107,255,.45);border-radius:15px;padding:22px;
+  background:linear-gradient(168deg,#18213A 0%,#0E1526 100%)}
+.pnote{color:#B8C7DE;font-size:14.5px;line-height:1.65;margin:0 0 14px}
+.frow{display:flex;flex-wrap:wrap;gap:12px}
+.frow>div{flex:1;min-width:150px}
+.panel label{display:block;font-size:11.5px;font-weight:800;letter-spacing:.09em;
+  text-transform:uppercase;color:#9FB6D6;margin:12px 0 6px}
+.panel input{width:100%;box-sizing:border-box;padding:12px 13px;font-size:15.5px;
+  font-family:inherit;color:#EAF1FF;border-radius:9px;background:rgba(255,255,255,.05);
+  border:1px solid rgba(126,182,255,.26)}
+.panel input:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 3px rgba(30,107,255,.24)}
 .note{border:1px solid rgba(30,107,255,.35);background:rgba(30,107,255,.08);border-radius:13px;
   padding:18px 20px;margin-top:32px;color:#D5E2F5;font-size:15px;line-height:1.7}
 .note b{color:#fff}
@@ -18045,6 +18171,24 @@ __WV_HEADER__
   <div class=hint>Searches Stormline, Sidekick, Watch and accounts at once.</div>
 
   <div id=results></div>
+
+  <div class=head>Watcher addresses</div>
+  <div class=panel>
+    <p class=pnote>Put a real address in storm country with your own number on it, and wait
+    for the Weather Service to warn it. That is the only test that proves the whole chain,
+    because a rehearsal never asks the Weather Service for anything.</p>
+    <div class=frow>
+      <div style="flex:2"><label for=w-street>Street</label><input id=w-street placeholder="201 W Gray St"></div>
+      <div><label for=w-city>City</label><input id=w-city placeholder="Norman"></div>
+      <div style="max-width:110px"><label for=w-state>State</label><input id=w-state placeholder="OK" maxlength=2></div>
+    </div>
+    <div class=frow>
+      <div><label for=w-label>What to call it</label><input id=w-label placeholder="Norman watcher"></div>
+      <div><label for=w-phone>Send to</label><input id=w-phone placeholder="317-555-0123"></div>
+    </div>
+    <button class=act id=w-go style="margin-top:16px">Add this watcher</button>
+    <div class=actmsg id=w-msg></div>
+  </div>
 
   <div class=note><b>Everything else is still on the old Command Center</b> while we
   rebuild it here: payroll, commissions, coverage, accuracy grading, missions, audits,
@@ -18192,6 +18336,33 @@ _ADMIN_SCRIPT = """<script>
       .catch(function(){ btn.disabled=false; btn.textContent='Find';
         document.getElementById('results').innerHTML='<div class=empty>Network problem.</div>'; });
   }
+  var wgo=document.getElementById('w-go');
+  if(wgo) wgo.addEventListener('click',function(){
+    var m=document.getElementById('w-msg');
+    function say(k,t){ m.className='actmsg '+k; m.innerHTML=t; m.style.display='block'; }
+    var body={street:document.getElementById('w-street').value,
+              city:document.getElementById('w-city').value,
+              state:document.getElementById('w-state').value,
+              label:document.getElementById('w-label').value,
+              phone:document.getElementById('w-phone').value};
+    if(!body.street||!body.city||!body.state){ say('bad','Street, city and state are all needed.'); return; }
+    if(!body.phone){ say('bad','Which number should it text?'); return; }
+    wgo.disabled=true; wgo.textContent='Adding...';
+    fetch('/api/v1/admin/stormline/add-watcher',{method:'POST',credentials:'include',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+     .then(function(r){return r.json();}).then(function(j){
+        wgo.disabled=false; wgo.textContent='Add this watcher';
+        if(j&&j.ok){
+          say('good','<b>Added and watching.</b><br>'+esc(j.address)
+            +'<br>Texts go to '+esc(body.phone)+'. It is flagged internal, so it will not '
+            +'count as a customer. Search for it above to send it a rehearsal.');
+          ['w-street','w-city','w-state','w-label'].forEach(function(id){
+            document.getElementById(id).value=''; });
+        } else { say('bad',(j&&j.error)||'Could not add that.'); }
+     }).catch(function(){ wgo.disabled=false; wgo.textContent='Add this watcher';
+        say('bad','Network problem.'); });
+  });
+
   document.getElementById('go').addEventListener('click',search);
   document.getElementById('q').addEventListener('keydown',function(e){ if(e.key==='Enter') search(); });
 })();
