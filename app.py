@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-189"
+BACKEND_BUILD = "0702-190"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -17229,7 +17229,7 @@ PORTAL_TOOLS = {
     "crew": ("Valet Crew", "/portal/crew",
              "The map, the live feed, and your own reports.", False),
     "subscriber": ("My WeatherValet", "/portal/account",
-                   "Your addresses, your phone numbers and your settings.", False),
+                   "Everything you have bought: addresses, passes and bookings.", True),
 }
 
 # Consoles that already exist as their own pages rather than screens in the
@@ -17283,6 +17283,192 @@ __WV_HEADER__
   __BODY__
 </div>
 __WV_FOOTER__"""
+
+
+# ---------------------------------------------------------------------------
+# My WeatherValet (Aug 21, 2026)
+#
+# The old subscriber portal only knew about Pro: watch cards, business
+# context, brief preferences. Stormline, Sidekick and Watch buyers had no
+# portal at all; a Stormline subscriber's only way in was a token link
+# buried in a text message.
+#
+# This shows a person everything they have bought, matched on the email they
+# signed in with. Read-mostly on purpose: moving an address or changing a
+# phone number still goes through a human, which is honest about how it
+# actually works rather than pretending at self-service that does not exist.
+# ---------------------------------------------------------------------------
+
+def _account_rows(email: str) -> dict:
+    """Everything this email has bought. Each lookup is guarded separately so
+    one missing table can never blank the whole page."""
+    out = {"stormline": [], "sidekick": [], "watch": []}
+    if not email:
+        return out
+    e = email.lower()
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT address, label, status, daily, send_hour,
+                                      manage_token, pack_allseason, phone, phone2
+                                 FROM sentry_subscribers
+                                WHERE lower(email) = %s AND status <> 'pending'
+                             ORDER BY id""", (e,))
+                out["stormline"] = cur.fetchall() or []
+    except Exception as ex:
+        print(f"[account] stormline lookup failed: {ex!r}", flush=True)
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT p.pass_type, p.status, g.opponent,
+                                      to_char(g.game_date,'FMMon FMDD') AS d
+                                 FROM gameday_passes p
+                            LEFT JOIN gameday_games g ON g.id = p.game_id
+                                WHERE lower(p.email) = %s AND p.status = 'active'
+                             ORDER BY g.game_date""", (e,))
+                out["sidekick"] = cur.fetchall() or []
+    except Exception as ex:
+        print(f"[account] sidekick lookup failed: {ex!r}", flush=True)
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT place, event_date, start_hour, end_hour, status
+                                 FROM watch_orders
+                                WHERE lower(email) = %s AND status <> 'pending'
+                             ORDER BY event_date DESC LIMIT 10""", (e,))
+                out["watch"] = cur.fetchall() or []
+    except Exception as ex:
+        print(f"[account] watch lookup failed: {ex!r}", flush=True)
+
+    return out
+
+
+_ACCOUNT_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>My WeatherValet</title><meta name=robots content="noindex">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+.wrapx{max-width:820px;margin:0 auto;padding:50px 22px 80px}
+h1{font-size:clamp(27px,4.4vw,40px);font-weight:900;letter-spacing:-.03em;color:#fff;margin:0 0 6px}
+.sub{color:#B8C7DE;font-size:16px;line-height:1.6;margin:0 0 32px}
+.back{display:inline-block;color:var(--sky);font-size:14px;font-weight:700;margin-bottom:18px}
+.head{font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:#A9B4C6;
+  font-weight:800;margin:32px 0 12px}
+.card{border:1.5px solid rgba(30,107,255,.5);border-radius:15px;padding:20px 22px;margin-bottom:12px;
+  background:linear-gradient(168deg,#18213A 0%,#0E1526 100%);
+  box-shadow:0 12px 34px -18px rgba(0,0,0,.9)}
+.card b{display:block;font-size:17px;color:#fff;letter-spacing:-.01em}
+.card i{display:block;font-style:normal;font-size:14.5px;color:#B8C7DE;line-height:1.6;margin-top:5px}
+.card a{color:var(--sky);font-weight:700}
+.pill{display:inline-block;font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;
+  font-weight:800;padding:4px 10px;border-radius:999px;margin-top:11px;
+  background:rgba(30,107,255,.18);color:#7FB0FF;border:1px solid rgba(30,107,255,.45)}
+.pill.off{background:rgba(255,255,255,.06);color:#A9B4C6;border-color:rgba(255,255,255,.16)}
+.empty{border:1px dashed rgba(126,182,255,.3);border-radius:14px;padding:22px;color:#B8C7DE;
+  line-height:1.65;font-size:15px}
+.empty a{color:var(--sky);font-weight:700}
+.note{border:1px solid rgba(30,107,255,.35);background:rgba(30,107,255,.08);border-radius:13px;
+  padding:18px 20px;margin-top:30px;color:#D5E2F5;font-size:15px;line-height:1.65}
+.note b{color:#fff}
+.note a{color:var(--sky);font-weight:700}
+</style></head><body>
+__WV_HEADER__
+<div class=wrapx>
+  <a class=back href="/portal">&larr; Your portal</a>
+  <h1>__GREETING__</h1>
+  <p class=sub>Everything on your account, in one place.</p>
+  __BODY__
+  <div class=note><b>Need to change something?</b> To move an address, change a phone
+  number, or cancel, email <a href="mailto:hello@weathervalet.ai">hello@weathervalet.ai</a>
+  and a person handles it the same day. Reply STOP to any message to stop texts
+  immediately.</div>
+</div>
+__WV_FOOTER__"""
+
+
+@app.get("/portal/account")
+def portal_account():
+    user = _get_current_user()
+    if not user:
+        return redirect("/signin", code=302)
+    email = (user.get("email") or "").strip()
+    rows = _account_rows(email)
+    body = ""
+
+    if rows["stormline"]:
+        body += "<div class=head>Addresses being watched</div>"
+        for r in rows["stormline"]:
+            where = r.get("label") or (r.get("address") or "")
+            extras = []
+            if r.get("daily"):
+                h = r.get("send_hour")
+                h = 7 if h is None else int(h)
+                extras.append("Morning summary at %d:00 AM" % h)
+            if r.get("pack_allseason"):
+                extras.append("All-Season pack")
+            phones = [p for p in (r.get("phone"), r.get("phone2")) if p]
+            if phones:
+                extras.append("Texts to " + " and ".join(phones))
+            detail = _html_escape(r.get("address") or "")
+            if extras:
+                detail += "<br>" + _html_escape(" &middot; ".join(extras)).replace(
+                    "&amp;middot;", "&middot;")
+            manage = ""
+            if r.get("manage_token"):
+                manage = (' &middot; <a href="/stormline/manage/%s">Change your send time</a>'
+                          % _html_escape(r["manage_token"]))
+            live = (r.get("status") == "active")
+            body += ('<div class=card><b>%s</b><i>%s</i>'
+                     '<span class="pill%s">%s</span>%s</div>'
+                     % (_html_escape(where), detail,
+                        "" if live else " off",
+                        "Watching" if live else _html_escape((r.get("status") or "").title()),
+                        manage))
+
+    if rows["sidekick"]:
+        body += "<div class=head>Sidekick</div>"
+        if any((x.get("pass_type") or "") == "season" for x in rows["sidekick"]):
+            body += ('<div class=card><b>Series pass</b>'
+                     '<i>All 8 Indiana Football home game days in Bloomington. Your '
+                     'Meteorologist messages you the evening before each one.</i>'
+                     '<span class=pill>Covered</span></div>')
+        else:
+            days = ", ".join(
+                "%s on %s" % (_html_escape(x.get("opponent") or ""), _html_escape(x.get("d") or ""))
+                for x in rows["sidekick"] if x.get("opponent"))
+            n = len(rows["sidekick"])
+            body += ('<div class=card><b>%d game day%s</b><i>%s</i>'
+                     '<span class=pill>Covered</span></div>'
+                     % (n, "" if n == 1 else "s", days or "Your days are booked."))
+
+    if rows["watch"]:
+        body += "<div class=head>Watch</div>"
+        for r in rows["watch"]:
+            d = (r["event_date"].strftime("%b %d, %Y")
+                 if hasattr(r["event_date"], "strftime") else str(r["event_date"]))
+            window = "%s to %s" % (_watch_hour_label(r.get("start_hour")),
+                                   _watch_hour_label(r.get("end_hour")))
+            st = (r.get("status") or "")
+            body += ('<div class=card><b>%s</b><i>%s &middot; %s</i>'
+                     '<span class="pill%s">%s</span></div>'
+                     % (_html_escape(r.get("place") or ""), d, window,
+                        "" if st in ("paid", "claimed", "active") else " off",
+                        "Booked" if st == "paid" else _html_escape(st.title())))
+
+    if not body:
+        body = ('<div class=empty>Nothing on this account yet. If you bought something with a '
+                'different email, tell us at <a href="/contact">contact</a> and we will join '
+                'them up. Otherwise, <a href="/home">have a look at what we do</a>.</div>')
+
+    first = ((user.get("name") or "").strip().split(" ") or [""])[0]
+    greeting = ("Hello, %s." % _html_escape(first)) if first else "My WeatherValet."
+    return wv_shell(_ACCOUNT_PAGE
+                    .replace("__GREETING__", greeting)
+                    .replace("__BODY__", body))
 
 
 @app.get("/portal")
