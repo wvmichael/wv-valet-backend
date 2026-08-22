@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-200"
+BACKEND_BUILD = "0702-201"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -17798,24 +17798,56 @@ def admin_stormline_add_watcher():
 
     data = request.get_json(silent=True) or {}
     label = (data.get("label") or "").strip()[:80] or "Watcher"
-    address = _compose_address(data.get("street"), data.get("city"), data.get("state"))
-    if not address:
-        return jsonify({"ok": False, "error": "Street, city and state are all needed."}), 400
+    street = (data.get("street") or "").strip()
+    city = (data.get("city") or "").strip()
+    state = (data.get("state") or "").strip()
+    if not city or not state:
+        return jsonify({"ok": False, "error": "City and state are needed."}), 400
     phone = _normalize_phone((data.get("phone") or "").strip())
     if not phone:
         return jsonify({"ok": False, "error": "A phone number to send to."}), 400
 
-    geo = None
+    # Coordinates typed in directly always win. Street addresses only resolve
+    # through Nominatim, which rate-limits hard and will refuse a run of
+    # lookups; a town centre from Open-Meteo is just as good for a watcher,
+    # since warning polygons are miles across.
+    lat = lng = None
+    how = ""
     try:
-        geo = _geocode_address(address)
-    except Exception as e:
-        print(f"[watcher] geocode failed: {e!r}", flush=True)
-    if not geo or geo.get("lat") is None:
-        return jsonify({"ok": False,
-                        "error": "Could not find that address. Without coordinates no warning "
-                                 "can ever match it, so it would be a silent dud."}), 400
+        if data.get("lat") not in (None, "") and data.get("lng") not in (None, ""):
+            lat, lng = float(data["lat"]), float(data["lng"])
+            how = "coordinates you typed in"
+    except Exception:
+        return jsonify({"ok": False, "error": "Those coordinates did not look like numbers."}), 400
 
-    lat, lng = float(geo["lat"]), float(geo["lng"])
+    tried = []
+    if lat is None and street:
+        tried.append("the full street address")
+        try:
+            g = _geocode_address(_compose_address(street, city, state))
+            if g and g.get("lat") is not None:
+                lat, lng, how = float(g["lat"]), float(g["lng"]), "the street address"
+        except Exception as e:
+            print(f"[watcher] street geocode failed: {e!r}", flush=True)
+
+    if lat is None:
+        tried.append("just the town")
+        try:
+            g = _geocode_address(f"{city}, {state}")
+            if g and g.get("lat") is not None:
+                lat, lng, how = float(g["lat"]), float(g["lng"]), "the centre of %s, %s" % (city, state)
+        except Exception as e:
+            print(f"[watcher] town geocode failed: {e!r}", flush=True)
+
+    if lat is None:
+        return jsonify({"ok": False,
+                        "error": ("Could not place that. Tried %s. Street addresses go through "
+                                  "OpenStreetMap, which refuses a run of lookups, so wait a "
+                                  "minute and try again, or leave Street blank and use just the "
+                                  "town, or paste coordinates from Google Maps below."
+                                  % " and ".join(tried))}), 400
+
+    address = _compose_address(street, city, state) or ("%s, %s" % (city, state))
     try:
         tz = _tz_for_point(lat, lng)
     except Exception:
@@ -17837,7 +17869,7 @@ def admin_stormline_add_watcher():
 
     print(f"[watcher] id={new_id} {address} -> {phone} by {user.get('email')}", flush=True)
     return jsonify({"ok": True, "sentry_id": new_id, "address": address,
-                    "lat": lat, "lng": lng, "tz": tz,
+                    "lat": lat, "lng": lng, "tz": tz, "how": how,
                     "note": "Active, All-Season on, flagged internal. It will receive real "
                             "warnings and will not count as a customer."})
 
@@ -18178,10 +18210,17 @@ __WV_HEADER__
     for the Weather Service to warn it. That is the only test that proves the whole chain,
     because a rehearsal never asks the Weather Service for anything.</p>
     <div class=frow>
-      <div style="flex:2"><label for=w-street>Street</label><input id=w-street placeholder="201 W Gray St"></div>
+      <div style="flex:2"><label for=w-street>Street (optional)</label><input id=w-street placeholder="Leave blank to use the town"></div>
       <div><label for=w-city>City</label><input id=w-city placeholder="Norman"></div>
       <div style="max-width:110px"><label for=w-state>State</label><input id=w-state placeholder="OK" maxlength=2></div>
     </div>
+    <div class=frow>
+      <div><label for=w-lat>Latitude (optional)</label><input id=w-lat placeholder="35.2226"></div>
+      <div><label for=w-lng>Longitude (optional)</label><input id=w-lng placeholder="-97.4395"></div>
+    </div>
+    <div class=pnote style="margin:10px 0 0;font-size:13.5px">Town and state is enough. A warning
+    polygon is miles across, so the middle of town is as good a target as a driveway. If you want
+    an exact spot, right-click it in Google Maps and paste the two numbers it shows.</div>
     <div class=frow>
       <div><label for=w-label>What to call it</label><input id=w-label placeholder="Norman watcher"></div>
       <div><label for=w-phone>Send to</label><input id=w-phone placeholder="317-555-0123"></div>
@@ -18343,9 +18382,11 @@ _ADMIN_SCRIPT = """<script>
     var body={street:document.getElementById('w-street').value,
               city:document.getElementById('w-city').value,
               state:document.getElementById('w-state').value,
+              lat:document.getElementById('w-lat').value,
+              lng:document.getElementById('w-lng').value,
               label:document.getElementById('w-label').value,
               phone:document.getElementById('w-phone').value};
-    if(!body.street||!body.city||!body.state){ say('bad','Street, city and state are all needed.'); return; }
+    if(!body.city||!body.state){ say('bad','City and state are needed.'); return; }
     if(!body.phone){ say('bad','Which number should it text?'); return; }
     wgo.disabled=true; wgo.textContent='Adding...';
     fetch('/api/v1/admin/stormline/add-watcher',{method:'POST',credentials:'include',
@@ -18354,9 +18395,10 @@ _ADMIN_SCRIPT = """<script>
         wgo.disabled=false; wgo.textContent='Add this watcher';
         if(j&&j.ok){
           say('good','<b>Added and watching.</b><br>'+esc(j.address)
+            +'<br>Placed using '+esc(j.how||'the address')+'.'
             +'<br>Texts go to '+esc(body.phone)+'. It is flagged internal, so it will not '
             +'count as a customer. Search for it above to send it a rehearsal.');
-          ['w-street','w-city','w-state','w-label'].forEach(function(id){
+          ['w-street','w-city','w-state','w-label','w-lat','w-lng'].forEach(function(id){
             document.getElementById(id).value=''; });
         } else { say('bad',(j&&j.error)||'Could not add that.'); }
      }).catch(function(){ wgo.disabled=false; wgo.textContent='Add this watcher';
