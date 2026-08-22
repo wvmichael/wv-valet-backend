@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-195"
+BACKEND_BUILD = "0702-196"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -14166,14 +14166,37 @@ __WV_HEADER__
 SENTRY_NAME = "WeatherValet Stormline"
 
 _STORMLINE_HERO = """<div class=hero>
-  <div class=brand>&#9889; WeatherValet</div>
-  <div class=pname>Stormline</div>
-  <h1>Who are you going to <em>worry about</em> at 2 AM?</h1>
-  <p><b>Stormline watches your address, not your location.</b> You are at work and outside
-  the warning area, so your phone says nothing while your house is inside it. Put the address
-  in, put the right numbers on it, and you are the one who calls home. Two numbers per
-  address, included.</p>
-  <div class=price>$12 a year, one address</div>
+ <div class=herogrid>
+  <div>
+   <div class=brand>&#9889; WeatherValet</div>
+   <div class=pname>Stormline</div>
+   <h1>Who are you going to <em>worry about</em> at 2 AM?</h1>
+   <p><b>Stormline watches your address, not your location.</b> You are at work and outside
+   the warning area, so your phone says nothing while your house is inside it. Put the address
+   in, put the right numbers on it, and you are the one who calls home. Two numbers per
+   address, included.</p>
+   <div class=price>$12 a year, one address</div>
+  </div>
+  <!-- Above the fold, the product itself: a real thread, so somebody sees
+       what they are buying before they read a word about it. -->
+  <div class=heroph>
+   <div class=ph>
+    <div class=bar><span style="font-size:16px">&#9889;</span>
+      <div><div class=who>WeatherValet Stormline</div>
+      <div class=sm>Mom's house &middot; Ashland, KY</div></div></div>
+    <div class=ts>2:07 AM</div>
+    <div class=call><div class=ring>&#128222;</div>
+      <div><div style="font-weight:700;color:#fff;font-size:13.5px">WeatherValet calling</div>
+      <div style="font-size:12px;color:#8FA6C6">Tornado warning &middot; spoken twice</div></div></div>
+    <div class="bub warn"><span class=hd>Tornado Warning</span>
+      A Tornado Warning includes your address (Mom's house) until 2:45 AM. Take shelter now:
+      interior room, lowest floor, away from windows. We'll text the all clear.</div>
+    <div class=ts>2:51 AM</div>
+    <div class="bub ok"><span class=hd>All clear</span>
+      All clear. The Tornado Warning that included your address has expired.</div>
+   </div>
+  </div>
+ </div>
 </div>"""
 
 _STORMLINE_DAILY_HERO = """<div class=hero>
@@ -14238,6 +14261,12 @@ body{background:var(--ink);color:var(--cream)}
 .s-light p,.s-light li,.s-light .fine{color:#41536F}
 .s-deep{background:linear-gradient(180deg,#04070E 0%,#0A1533 60%,#04070E 100%)}
 .inner{max-width:660px;margin:0 auto}
+/* Hero: copy on the left, the actual product on the right. Stacks on a
+   phone with the thread underneath, so the pitch still leads. */
+.herogrid{display:grid;grid-template-columns:1fr;gap:32px;align-items:center;
+  max-width:1060px;margin:0 auto;text-align:left}
+@media(min-width:900px){.herogrid{grid-template-columns:1.05fr .95fr;gap:56px}}
+.heroph .ph{max-width:320px;margin:0 auto}
 /* Phone threads, drawn in code rather than pasted as screenshots. They stay
    correct when the message wording changes, stay sharp on any screen, and
    cost nothing to load. Showing what arrives beats describing it. */
@@ -14422,11 +14451,11 @@ __WV_HEADER__
       <div class=ph>
         <div class=bar><span style="font-size:16px">&#9889;</span>
           <div><div class=who>WeatherValet Stormline</div>
-          <div class=sm>1205 Chestnut Lane</div></div></div>
+          <div class=sm>418 Prairie Rose Dr &middot; Norman, OK</div></div></div>
         <div class=ts>Tuesday 6:42 PM</div>
         <div class="bub warn"><span class=hd>Severe Thunderstorm Warning</span>
-          A Severe Thunderstorm Warning includes your address (1205 Chestnut Lane,
-          Lebanon, IN) until 7:15 PM. Damaging wind and hail possible. Move indoors,
+          A Severe Thunderstorm Warning includes your address (418 Prairie Rose Dr,
+          Norman, OK) until 7:15 PM. Damaging wind and hail possible. Move indoors,
           away from windows. We'll text the all clear.</div>
         <div class=ts>Tuesday 7:19 PM</div>
         <div class="bub ok"><span class=hd>All clear</span>
@@ -14441,7 +14470,7 @@ __WV_HEADER__
       <div class=ph>
         <div class=bar><span style="font-size:16px">&#9889;</span>
           <div><div class=who>WeatherValet Stormline</div>
-          <div class=sm>Mom's house &middot; Frankfort, IN</div></div></div>
+          <div class=sm>Mom's house &middot; Ashland, KY</div></div></div>
         <div class=ts>Saturday 2:07 AM</div>
         <div class=call><div class=ring>&#128222;</div>
           <div><div style="font-weight:700;color:#fff;font-size:13.5px">WeatherValet calling</div>
@@ -14484,10 +14513,10 @@ __WV_HEADER__
     <label for=s-phone2>Second phone <span style="text-transform:none;letter-spacing:0;font-weight:500;color:#7A8494">(included, and this is the one people forget)</span></label>
     <input id=s-phone2 type=tel placeholder="Mom's number, if this is Mom's house">
     <label for=s-address>The address to watch</label>
-    <input id=s-address autocomplete=street-address placeholder="1205 Chestnut Lane">
+    <input id=s-address autocomplete=street-address placeholder="418 Prairie Rose Dr">
     <div style="display:flex;gap:10px">
       <div style="flex:2"><label for=s-city>City</label>
-        <input id=s-city autocomplete=address-level2 placeholder="Lebanon"></div>
+        <input id=s-city autocomplete=address-level2 placeholder="Norman"></div>
       <div style="flex:1"><label for=s-state>State</label>
         <select id=s-state style="width:100%;box-sizing:border-box;padding:12px;
           border:1px solid rgba(15,18,22,.18);border-radius:8px;font-size:16px;background:#fff"><option value="">State</option><option>AL</option><option>AK</option><option>AZ</option><option>AR</option><option>CA</option><option>CO</option><option>CT</option><option>DE</option><option>DC</option><option>FL</option><option>GA</option><option>HI</option><option>ID</option><option>IL</option><option>IN</option><option>IA</option><option>KS</option><option>KY</option><option>LA</option><option>ME</option><option>MD</option><option>MA</option><option>MI</option><option>MN</option><option>MS</option><option>MO</option><option>MT</option><option>NE</option><option>NV</option><option>NH</option><option>NJ</option><option>NM</option><option>NY</option><option>NC</option><option>ND</option><option>OH</option><option>OK</option><option>OR</option><option>PA</option><option>RI</option><option>SC</option><option>SD</option><option>TN</option><option>TX</option><option>UT</option><option>VT</option><option>VA</option><option>WA</option><option>WV</option><option>WI</option><option>WY</option></select></div>
@@ -14514,10 +14543,10 @@ __WV_HEADER__
 
     <div id=second-wrap style="display:none;margin:-2px 0 12px">
       <label for=s-address2>Second address</label>
-      <input id=s-address2 placeholder="456 Oak St">
+      <input id=s-address2 placeholder="77 Kestrel Way">
       <div style="display:flex;gap:10px">
         <div style="flex:2"><label for=s-city2>City</label>
-          <input id=s-city2 placeholder="Zionsville"></div>
+          <input id=s-city2 placeholder="Cheyenne"></div>
         <div style="flex:1"><label for=s-state2>State</label>
           <select id=s-state2 style="width:100%;box-sizing:border-box;padding:12px;
             border:1px solid rgba(15,18,22,.18);border-radius:8px;font-size:16px;background:#fff"><option value="">State</option><option>AL</option><option>AK</option><option>AZ</option><option>AR</option><option>CA</option><option>CO</option><option>CT</option><option>DE</option><option>DC</option><option>FL</option><option>GA</option><option>HI</option><option>ID</option><option>IL</option><option>IN</option><option>IA</option><option>KS</option><option>KY</option><option>LA</option><option>ME</option><option>MD</option><option>MA</option><option>MI</option><option>MN</option><option>MS</option><option>MO</option><option>MT</option><option>NE</option><option>NV</option><option>NH</option><option>NJ</option><option>NM</option><option>NY</option><option>NC</option><option>ND</option><option>OH</option><option>OK</option><option>OR</option><option>PA</option><option>RI</option><option>SC</option><option>SD</option><option>TN</option><option>TX</option><option>UT</option><option>VT</option><option>VA</option><option>WA</option><option>WV</option><option>WI</option><option>WY</option></select></div>
@@ -15681,6 +15710,8 @@ __WV_HEADER__
       <li><b>A written brief each morning</b> for every location you watch.</li>
       <li><b>Ask anything, any time.</b> Not a ticket queue. A person.</li>
       <li><b>Alerts on your own thresholds.</b> Wind over 25. Below freezing. Your numbers.</li>
+      <li><b>We tell you the weather. You make the call.</b> A Meteorologist will tell you
+      what is likely and how confident they are. They will not decide your day for you.</li>
     </ul>
    </div>
    <div class=ph>
@@ -15689,12 +15720,13 @@ __WV_HEADER__
      <div class=ts>Thursday 5:40 AM</div>
      <div class=bub><span class=hd>Daily brief &middot; Lebanon yard</span>
        Dry through the morning, high near 78. A line arrives late afternoon, best guess
-       after 4. If you are pouring, pour early.
+       after 4, and it could be earlier if it speeds up.
        <div class=sig>__AV_MET__ Nick Dolan, WeatherValet Meteorologist</div></div>
      <div class=ts>Thursday 9:12 AM</div>
      <div class="bub you">Can we get the roof open on the Zionsville job Friday?</div>
-     <div class=bub>I'd go Friday morning. The front slows west of you and holds off until
-       evening. I'll message you tonight if that changes.
+     <div class=bub>Friday morning looks dry. The front slows west of you and the rain
+       holds off until evening in most of the guidance, though the timing is not locked in.
+       I'll message you tonight if it shifts.
        <div class=sig>__AV_MET__ Nick Dolan, WeatherValet Meteorologist</div></div>
      <div class=ts>Friday 2:04 PM</div>
      <div class=bub><span class=hd>Your alert &middot; wind over 25</span>
@@ -17866,7 +17898,7 @@ __WV_HEADER__
   phone number, name, or address.</p>
 
   <div class=searchbar>
-    <input id=q placeholder="dana@example.com, 3175550111, Chestnut Lane" autocomplete=off>
+    <input id=q placeholder="name@example.com, 3175550111, Prairie Rose" autocomplete=off>
     <button class=go id=go>Find</button>
   </div>
   <div class=hint>Searches Stormline, Sidekick, Watch and accounts at once.</div>
@@ -18893,10 +18925,10 @@ __WV_HEADER__
    <div class=art>
     <div class=phone>
       <div class=bar><span style="font-size:17px">&#9889;</span>
-        <div><div class=who>WeatherValet Stormline</div><div class=sm>1205 Chestnut Lane</div></div></div>
+        <div><div class=who>WeatherValet Stormline</div><div class=sm>2140 Cypress Bend &middot; Tupelo, MS</div></div></div>
       <div class=tstamp>Tuesday 6:42 PM</div>
       <div class="bub warn"><span class=hd>Severe Thunderstorm Warning</span>
-        A Severe Thunderstorm Warning includes your address (1205 Chestnut Lane, Lebanon, IN)
+        A Severe Thunderstorm Warning includes your address (2140 Cypress Bend, Tupelo, MS)
         until 7:15 PM. Damaging wind and hail possible. Move indoors, away from windows.
         We'll text the all-clear.</div>
       <div class=tstamp>Tuesday 7:19 PM</div>
@@ -18915,7 +18947,7 @@ __WV_HEADER__
    <div class=art>
     <div class=phone>
       <div class=bar><span style="font-size:17px">&#9889;</span>
-        <div><div class=who>WeatherValet Stormline</div><div class=sm>Mom's house &middot; Frankfort, IN</div></div></div>
+        <div><div class=who>WeatherValet Stormline</div><div class=sm>Mom's house &middot; Ashland, KY</div></div></div>
       <div class=tstamp>Saturday 2:07 AM</div>
       <div class=call><div class=ring>&#128222;</div>
         <div><div style="font-weight:700;color:#fff;font-size:14px">WeatherValet calling</div>
@@ -19285,7 +19317,7 @@ def sentry_checkout():
         return jsonify({"ok": False, "error": "Enter the full street address to watch."}), 400
     if _address_needs_more(address):
         return jsonify({"ok": False,
-                        "error": "Add the city and state so we watch the right place, e.g. '1205 Chestnut Lane, Lebanon, IN'."}), 400
+                        "error": "Add the city and state so we watch the right place, e.g. '418 Prairie Rose Dr, Norman, OK'."}), 400
     if address2 and len(address2) < 8:
         return jsonify({"ok": False, "error": "The second address needs a full street address, or leave it blank."}), 400
     if address2 and _address_needs_more(address2):
