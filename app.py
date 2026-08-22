@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-194"
+BACKEND_BUILD = "0702-195"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -13312,8 +13312,8 @@ function setType(t){
     ? 'Series Pass' : (n > 1 ? (n + ' Single Games') : 'Single Game');
   document.getElementById('t-price').textContent = seasonOn ? '$16' : ('$' + (5 * shown));
   document.getElementById('t-sub').textContent = seasonOn
-    ? 'Bloomington \\u00b7 8 home games \\u00b7 one-time'
-    : ('Bloomington \\u00b7 ' + shown + (shown > 1 ? ' home games' : ' home game') + ' \\u00b7 one-time');
+    ? 'Bloomington · 8 home games · one-time'
+    : ('Bloomington · ' + shown + (shown > 1 ? ' home games' : ' home game') + ' · one-time');
   document.getElementById('g-go').textContent = seasonOn
     ? 'Claim my series pass'
     : (n > 1 ? ('Cover me for these ' + n + ' games') : 'Cover me for this game');
@@ -14238,6 +14238,35 @@ body{background:var(--ink);color:var(--cream)}
 .s-light p,.s-light li,.s-light .fine{color:#41536F}
 .s-deep{background:linear-gradient(180deg,#04070E 0%,#0A1533 60%,#04070E 100%)}
 .inner{max-width:660px;margin:0 auto}
+/* Phone threads, drawn in code rather than pasted as screenshots. They stay
+   correct when the message wording changes, stay sharp on any screen, and
+   cost nothing to load. Showing what arrives beats describing it. */
+.phones{display:grid;grid-template-columns:1fr;gap:26px;margin-top:8px}
+@media(min-width:820px){.phones{grid-template-columns:1fr 1fr;gap:30px}}
+.ph{background:#0B0F18;border:9px solid #1B2334;border-radius:34px;padding:13px 11px 18px;
+  box-shadow:0 36px 80px -34px rgba(0,0,0,.95);max-width:340px;margin:0 auto;width:100%}
+.ph .bar{display:flex;align-items:center;gap:9px;padding:3px 5px 11px;
+  border-bottom:1px solid rgba(255,255,255,.08);margin-bottom:11px}
+.ph .who{font-size:13px;font-weight:700;color:#fff}
+.ph .sm{font-size:11px;color:#8FA6C6}
+.ph .ts{text-align:center;font-size:10.5px;color:#5D6E8C;letter-spacing:.08em;
+  text-transform:uppercase;margin:12px 0 7px}
+.bub{background:#18213A;border-radius:16px 16px 16px 5px;padding:11px 13px;font-size:13.6px;
+  line-height:1.5;color:#DCE7FA;margin-bottom:7px}
+.bub .hd{display:block;font-weight:800;font-size:11.5px;letter-spacing:.09em;
+  text-transform:uppercase;margin-bottom:5px;color:#7EB6FF}
+.bub.warn{background:linear-gradient(160deg,#7A1626,#4A0E19);border:1px solid rgba(224,36,60,.55)}
+.bub.warn .hd{color:#FF8DA0}
+.bub.ok{background:linear-gradient(160deg,#12401F,#0B2714);border:1px solid rgba(52,199,89,.35)}
+.bub.ok .hd{color:#89E3A0}
+.ph .call{display:flex;align-items:center;gap:11px;background:#111A2C;
+  border:1px solid rgba(224,36,60,.45);border-radius:14px;padding:12px;margin-bottom:7px}
+.ph .ring{width:38px;height:38px;border-radius:50%;background:var(--red,#E0243C);display:flex;
+  align-items:center;justify-content:center;font-size:17px;animation:rng 1.4s ease-in-out infinite}
+@keyframes rng{0%,100%{transform:rotate(0)}25%{transform:rotate(-11deg)}75%{transform:rotate(11deg)}}
+.phcap{text-align:center;font-size:13.5px;color:#8FA6C6;margin-top:11px;line-height:1.55}
+.phcap b{color:#fff}
+
 /* This page was originally light themed, so its text colours were dark. On the
    dark rooms that reads as invisible, measured at 1.1 contrast. Dark rooms get
    light text; the light room keeps the dark. Checked with a real contrast
@@ -14387,6 +14416,48 @@ __WV_HEADER__
 <section class="sec s-light">
  <div class=wrap><div class=inner>
     <h2>What actually arrives</h2>
+
+  <div class=phones>
+    <div>
+      <div class=ph>
+        <div class=bar><span style="font-size:16px">&#9889;</span>
+          <div><div class=who>WeatherValet Stormline</div>
+          <div class=sm>1205 Chestnut Lane</div></div></div>
+        <div class=ts>Tuesday 6:42 PM</div>
+        <div class="bub warn"><span class=hd>Severe Thunderstorm Warning</span>
+          A Severe Thunderstorm Warning includes your address (1205 Chestnut Lane,
+          Lebanon, IN) until 7:15 PM. Damaging wind and hail possible. Move indoors,
+          away from windows. We'll text the all clear.</div>
+        <div class=ts>Tuesday 7:19 PM</div>
+        <div class="bub ok"><span class=hd>All clear</span>
+          All clear. The Severe Thunderstorm Warning that included your address has
+          expired.</div>
+      </div>
+      <div class=phcap><b>A warning, then the all clear.</b><br>Nothing in between, and
+      nothing when the storm misses you.</div>
+    </div>
+
+    <div>
+      <div class=ph>
+        <div class=bar><span style="font-size:16px">&#9889;</span>
+          <div><div class=who>WeatherValet Stormline</div>
+          <div class=sm>Mom's house &middot; Frankfort, IN</div></div></div>
+        <div class=ts>Saturday 2:07 AM</div>
+        <div class=call><div class=ring>&#128222;</div>
+          <div><div style="font-weight:700;color:#fff;font-size:13.5px">WeatherValet calling</div>
+          <div style="font-size:12px;color:#8FA6C6">Tornado warning &middot; spoken twice</div></div></div>
+        <div class="bub warn"><span class=hd>Tornado Warning</span>
+          A Tornado Warning includes your address (Mom's house) until 2:45 AM. Take shelter
+          now: interior room, lowest floor, away from windows. We'll text the all clear.</div>
+        <div class=ts>Saturday 2:51 AM</div>
+        <div class="bub ok"><span class=hd>All clear</span>
+          All clear. The Tornado Warning that included your address has expired.</div>
+      </div>
+      <div class=phcap><b>Tornado warnings ring the phone.</b><br>A text at 2 AM gets slept
+      through. A ringing phone does not.</div>
+    </div>
+  </div>
+
     <ul class=feat>
       <li><b>A text with the radar map</b> as soon as a Severe Thunderstorm, Tornado, or Flash
       Flood Warning includes that address. Official National Weather Service warnings, relayed
@@ -14867,11 +14938,11 @@ document.getElementById('w-go').addEventListener('click', function(){
     if (j && j.ok && j.url) { window.location = j.url; return; }
     err.textContent = (j && j.error) || 'Something went wrong. Try again.';
     err.style.display = 'block'; btn.disabled = false;
-    btn.textContent = 'Book this day \\u00b7 $49';
+    btn.textContent = 'Book this day · $49';
   }).catch(function(){
     err.textContent = 'Network problem. Try again.';
     err.style.display = 'block'; btn.disabled = false;
-    btn.textContent = 'Book this day \\u00b7 $49';
+    btn.textContent = 'Book this day · $49';
   });
 });
 </script>
@@ -15328,11 +15399,11 @@ document.getElementById('r-go').addEventListener('click', function(){
     if (url) { window.location = url; return; }
     err.textContent = (j && (j.error || j.message)) || 'Something went wrong. Try again.';
     err.style.display = 'block'; btn.disabled = false;
-    btn.textContent = 'Ask a Meteorologist \\\\u00b7 $19';
+    btn.textContent = 'Ask a Meteorologist \\· $19';
   }).catch(function(){
     err.textContent = 'Network problem. Try again.';
     err.style.display = 'block'; btn.disabled = false;
-    btn.textContent = 'Ask a Meteorologist \\\\u00b7 $19';
+    btn.textContent = 'Ask a Meteorologist \\· $19';
   });
 });
 </script>
@@ -15500,7 +15571,7 @@ __WV_TOKENS__
 .pname{font-size:clamp(38px,9vw,62px);font-weight:900;letter-spacing:-.03em;line-height:1;margin:0 0 14px;color:#fff}
 h1{font-size:clamp(23px,3.4vw,32px);line-height:1.18;margin:0 0 12px;font-weight:800;letter-spacing:-.02em;color:#fff}
 h1 em{color:var(--sky);font-style:normal}
-.lede{font-size:16.5px;line-height:1.6;color:#B9CAE4;max-width:560px;margin:0 0 22px}
+.lede{font-size:19px;line-height:1.6;color:#C6D4EA;max-width:600px;margin:0 0 26px}
 .price{display:inline-block;background:var(--accent);color:#fff;border-radius:999px;padding:9px 24px;font-weight:800;font-size:18px}
 .sec{padding:64px 0;border-top:1px solid rgba(255,255,255,.06)}
 .s-black{background:#04070E}
@@ -15509,31 +15580,57 @@ h1 em{color:var(--sky);font-style:normal}
 .s-light h2,.s-light h3,.s-light b,.s-light strong{color:#08101F}
 .s-light p,.s-light li,.s-light label{color:#41536F}
 .inner{max-width:660px;margin:0 auto}
+/* What Pro actually is, shown rather than described: a thread with a person
+   in it. The daily brief and a real question, answered. */
+.showcase{display:grid;grid-template-columns:1fr;gap:34px;align-items:center;margin-top:8px}
+@media(min-width:900px){.showcase{grid-template-columns:1fr .9fr;gap:54px}}
+.ph{background:#0B0F18;border:9px solid #1B2334;border-radius:36px;padding:14px 12px 20px;
+  box-shadow:0 40px 90px -34px rgba(0,0,0,.95);max-width:352px;margin:0 auto;width:100%}
+.ph .bar{display:flex;align-items:center;gap:10px;padding:4px 6px 12px;
+  border-bottom:1px solid rgba(255,255,255,.08);margin-bottom:12px}
+.ph .who{font-size:13.5px;font-weight:700;color:#fff}
+.ph .sm{font-size:11.5px;color:#8FA6C6}
+.ph .ts{text-align:center;font-size:10.5px;color:#5D6E8C;letter-spacing:.08em;
+  text-transform:uppercase;margin:13px 0 8px}
+.bub{background:#18213A;border-radius:16px 16px 16px 5px;padding:12px 14px;font-size:14px;
+  line-height:1.55;color:#DCE7FA;margin-bottom:8px}
+.bub.you{background:#1E3A6B;border-radius:16px 16px 5px 16px;margin-left:34px;color:#EAF1FF}
+.bub .hd{display:block;font-weight:800;font-size:11.5px;letter-spacing:.09em;
+  text-transform:uppercase;margin-bottom:5px;color:#7EB6FF}
+.sig{display:flex;align-items:center;gap:8px;margin-top:9px;font-size:12px;color:#8FA6C6}
+.av{border-radius:50%;object-fit:cover;display:block;flex:0 0 auto}
+
 h2{font-size:clamp(24px,4vw,36px);line-height:1.08;margin:0 0 14px;font-weight:900;letter-spacing:-.025em;color:#fff}
-.sub{font-size:16.5px;color:#B9CAE4;max-width:600px;margin:0 0 28px}
+.sub{font-size:18px;color:#C6D4EA;max-width:640px;margin:0 0 30px;line-height:1.65}
 ul.feat{list-style:none;padding:0;margin:0}
-ul.feat li{padding:10px 0 10px 28px;position:relative;font-size:15.5px;line-height:1.6;color:#C4D3EC}
+ul.feat li{padding:13px 0 13px 32px;position:relative;font-size:17px;line-height:1.65;color:#C6D4EA}
 ul.feat li:before{content:"✓";position:absolute;left:2px;color:var(--sky);font-weight:800}
 ul.feat li b{color:#fff}
 .s-light ul.feat li{color:#41536F}
 .s-light ul.feat li b{color:#08101F}
 .s-light ul.feat li:before{color:#1E4FBF}
-label{display:block;font-size:12.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
-  color:#93A6C2;margin:16px 0 6px}
+label{display:block;font-size:13px;font-weight:800;letter-spacing:.09em;text-transform:uppercase;
+  color:#9FB6D6;margin:24px 0 9px}
 input{width:100%;box-sizing:border-box;padding:12px;border-radius:8px;font-size:16px;font-family:inherit;
   border:1px solid rgba(126,182,255,.28);background:#0C1424;color:#EAF1FF}
 .pick{display:grid;grid-template-columns:repeat(6,1fr);gap:8px}
-.pick button{padding:14px 4px;border-radius:10px;border:1px solid rgba(126,182,255,.22);
-  background:rgba(255,255,255,.04);color:#EAF1FF;font-size:17px;font-weight:700;cursor:pointer;transition:.18s}
-.pick button:hover{border-color:rgba(224,36,60,.6);transform:translateY(-2px)}
-.pick button.on{background:var(--accent);border-color:var(--accent);color:#fff}
-.bill{margin-top:22px;border-top:1px solid rgba(126,182,255,.2);padding-top:16px}
+.pick{gap:10px}
+.pick button{padding:18px 4px;border-radius:13px;border:1.5px solid rgba(126,182,255,.28);
+  background:linear-gradient(168deg,rgba(255,255,255,.07),rgba(255,255,255,.02));
+  color:#EAF1FF;font-size:19px;font-weight:800;cursor:pointer;transition:.18s}
+.pick button:hover{border-color:rgba(126,182,255,.7);transform:translateY(-2px);
+  box-shadow:0 12px 26px -14px rgba(30,107,255,.8)}
+.pick button.on{background:linear-gradient(160deg,#3D8BFF,#1E5FE0);border-color:var(--accent);
+  color:#fff;box-shadow:0 14px 32px -14px rgba(30,107,255,.95)}
+.bill{margin-top:26px;border:1.5px solid rgba(30,107,255,.45);border-radius:16px;
+  padding:22px 24px;background:linear-gradient(168deg,#18213A 0%,#0E1526 100%);
+  box-shadow:0 18px 44px -20px rgba(0,0,0,.9)}
 .bill .row{display:flex;justify-content:space-between;gap:14px;padding:7px 0;font-size:14.5px;color:#B9CAE4}
 .bill .row b{color:#fff;font-weight:600}
 .bill .tot{display:flex;justify-content:space-between;align-items:baseline;margin-top:10px;
   padding-top:14px;border-top:1px solid rgba(126,182,255,.2)}
 .bill .tot span{font-size:14.5px;color:#B9CAE4}
-.bill .tot b{font-size:30px;color:#fff;font-weight:800}
+.bill .tot b{font-size:40px;color:#fff;font-weight:800;letter-spacing:-.02em}
 button.go{width:100%;margin-top:20px;background:var(--accent);color:#fff;border:none;border-radius:10px;
   padding:15px;font-size:17px;font-weight:800;cursor:pointer;transition:.18s}
 button.go:hover{filter:brightness(1.14);transform:translateY(-1px)}
@@ -15574,7 +15671,39 @@ __WV_HEADER__
 
 <section class="sec s-black">
  <div class=wrap><div class=inner>
-  <h2>What you actually get</h2>
+
+  <div class=showcase>
+   <div>
+    <h2>What arrives, every day</h2>
+    <p class=sub>A brief written for what you actually do, and a Meteorologist you can
+    ask a direct question and get a direct answer from.</p>
+    <ul class=feat>
+      <li><b>A written brief each morning</b> for every location you watch.</li>
+      <li><b>Ask anything, any time.</b> Not a ticket queue. A person.</li>
+      <li><b>Alerts on your own thresholds.</b> Wind over 25. Below freezing. Your numbers.</li>
+    </ul>
+   </div>
+   <div class=ph>
+     <div class=bar><span style="font-size:17px">&#9889;</span>
+       <div><div class=who>WeatherValet Pro</div><div class=sm>Reynolds Concrete &middot; 3 sites</div></div></div>
+     <div class=ts>Thursday 5:40 AM</div>
+     <div class=bub><span class=hd>Daily brief &middot; Lebanon yard</span>
+       Dry through the morning, high near 78. A line arrives late afternoon, best guess
+       after 4. If you are pouring, pour early.
+       <div class=sig>__AV_MET__ Nick Dolan, WeatherValet Meteorologist</div></div>
+     <div class=ts>Thursday 9:12 AM</div>
+     <div class="bub you">Can we get the roof open on the Zionsville job Friday?</div>
+     <div class=bub>I'd go Friday morning. The front slows west of you and holds off until
+       evening. I'll message you tonight if that changes.
+       <div class=sig>__AV_MET__ Nick Dolan, WeatherValet Meteorologist</div></div>
+     <div class=ts>Friday 2:04 PM</div>
+     <div class=bub><span class=hd>Your alert &middot; wind over 25</span>
+       Gusts hitting 28 at the Lebanon yard in the next hour. You asked to be told.
+       <div class=sig>__AV_MET__ Nick Dolan, WeatherValet Meteorologist</div></div>
+   </div>
+  </div>
+
+  <h2 style="margin-top:56px">What you actually get</h2>
   <ul class=feat>
     <li><b>A written brief every day</b> for each location you watch, by a Meteorologist who
     knows what you do with it.</li>
@@ -15691,7 +15820,7 @@ __WV_HEADER__
     var total=BASE+(u-1)*USER+(l-1)*LOC;
     rows+='<div class=tot><span>Your total</span><b>'+money(total)+'/mo</b></div>';
     bill.innerHTML=rows;
-    document.getElementById('p-go').textContent='Start Pro \\\\u00b7 '+money(total)+'/month';
+    document.getElementById('p-go').textContent='Start Pro \\· '+money(total)+'/month';
   }
   render();
   document.getElementById('p-go').addEventListener('click', function(){
@@ -18174,7 +18303,7 @@ def contact_page():
 
 @app.get("/pro")
 def pro_page():
-    return wv_shell(_PRO_PAGE)
+    return wv_shell(_PRO_PAGE.replace("__AV_MET__", _met_img("nick", 22)))
 
 
 @app.get("/met-review")
@@ -18552,9 +18681,10 @@ body.returning .wb{display:flex}
    headline so it reads as a brand rather than a label. */
 .mark{display:flex;align-items:center;justify-content:center;gap:14px;
   margin-bottom:30px;color:#fff}
-.mark .bolt{width:30px;height:40px;flex:0 0 auto}
-.mark span{font-size:clamp(27px,3.6vw,42px);font-weight:800;letter-spacing:-.03em;
+.mark .bolt{width:44px;height:58px;flex:0 0 auto}
+.mark span{font-size:clamp(38px,5.4vw,64px);font-weight:800;letter-spacing:-.03em;
   line-height:1;color:#fff;white-space:nowrap}
+@media(max-width:600px){.mark .bolt{width:32px;height:42px}}
 @media(max-width:600px){.mark .bolt{width:30px;height:40px}.mark{gap:10px;margin-bottom:22px}}
 /* Two treatments in one headline gives it rhythm. One weight all the way
    through reads flat. */
@@ -18568,8 +18698,8 @@ h1 .way .swash{position:absolute;left:-1%;bottom:-.20em;width:91%;height:auto;
   text-shadow:0 2px 14px rgba(0,0,0,.75)}
 
 /* ---------------------------------------------------------------- chooser */
-.grid{display:grid;grid-template-columns:1fr;gap:20px}
-@media(min-width:760px){.grid{grid-template-columns:1fr 1fr;gap:24px}}
+.grid{display:grid;grid-template-columns:1fr;gap:24px;max-width:1000px;margin:0 auto}
+@media(min-width:760px){.grid{grid-template-columns:1fr 1fr;gap:34px 40px}}
 /* These are the only thing on the first screen you are meant to press, so
    they need to look pressable: real separation between them, a defined
    edge, a resting shadow, and an arrow that says "this goes somewhere". */
