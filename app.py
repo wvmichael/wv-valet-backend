@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-198"
+BACKEND_BUILD = "0702-199"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -18012,6 +18012,15 @@ button.go:disabled{opacity:.55}
   background:rgba(30,107,255,.18);color:#7FB0FF;border:1px solid rgba(30,107,255,.45)}
 .pill.off{background:rgba(255,255,255,.06);color:#A9B4C6;border-color:rgba(255,255,255,.16)}
 .empty{border:1px dashed rgba(126,182,255,.3);border-radius:13px;padding:22px;color:#B8C7DE;font-size:15px;line-height:1.65}
+.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
+.act{background:var(--accent);color:#fff;border:none;border-radius:9px;padding:11px 15px;
+  font-size:13.5px;font-weight:700;cursor:pointer;transition:.16s}
+.act:hover{filter:brightness(1.12);transform:translateY(-1px)}
+.act:disabled{opacity:.55;transform:none}
+.act.ghost{background:rgba(255,255,255,.06);border:1px solid rgba(126,182,255,.3);color:#C3D2E6}
+.actmsg{display:none;margin-top:11px;border-radius:9px;padding:11px 13px;font-size:14px;line-height:1.55}
+.actmsg.good{background:#0F2A4A;border:1px solid var(--blue);color:#BBD8FF}
+.actmsg.bad{background:#3A1220;border:1px solid #7C2740;color:#FFC2CE}
 .note{border:1px solid rgba(30,107,255,.35);background:rgba(30,107,255,.08);border-radius:13px;
   padding:18px 20px;margin-top:32px;color:#D5E2F5;font-size:15px;line-height:1.7}
 .note b{color:#fff}
@@ -18080,7 +18089,15 @@ _ADMIN_SCRIPT = """<script>
           +(extras.length?'<div class=row>'+extras.join(' &middot; ')+'</div>':'')
           +'<div class=row><span>Since</span> '+when(r.created_at)
           +(r.manage_token?' &middot; <a href="/stormline/manage/'+esc(r.manage_token)+'">their settings link</a>':'')
-          +'</div></div>';
+          +'</div>'
+          +'<div class=actions>'
+          +'<button class=act data-act="storm" data-id="'+r.id+'">Send a test thunderstorm warning</button>'
+          +'<button class=act data-act="tornado" data-id="'+r.id+'">Send a test tornado warning &amp; call</button>'
+          +'<button class="act ghost" data-act="internal" data-id="'+r.id+'" data-on="'+(r.is_internal?'1':'0')+'">'
+          +(r.is_internal?'Make this a real customer again':'Mark as internal test row')+'</button>'
+          +'</div>'
+          +'<div class=actmsg id="am'+r.id+'"></div>'
+          +'</div>';
       });
     }
     if(j.sidekick.length){
@@ -18112,6 +18129,55 @@ _ADMIN_SCRIPT = """<script>
       });
     }
     el.innerHTML=h;
+    wireActions();
+  }
+
+  function wireActions(){
+    Array.prototype.forEach.call(document.querySelectorAll('.act'), function(btn){
+      btn.addEventListener('click', function(){
+        var id=btn.getAttribute('data-id'), act=btn.getAttribute('data-act');
+        var msg=document.getElementById('am'+id);
+        var label=btn.textContent;
+        function say(kind,text){ msg.className='actmsg '+kind; msg.innerHTML=text; msg.style.display='block'; }
+        if(act==='internal'){
+          var turningOn = btn.getAttribute('data-on')!=='1';
+          btn.disabled=true; btn.textContent='Saving...';
+          fetch('/api/v1/admin/stormline/mark-internal',{method:'POST',credentials:'include',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({sentry_id:Number(id), internal:turningOn})})
+           .then(function(r){return r.json();}).then(function(j){
+              btn.disabled=false;
+              if(j&&j.ok){
+                btn.setAttribute('data-on', j.internal?'1':'0');
+                btn.textContent = j.internal ? 'Make this a real customer again' : 'Mark as internal test row';
+                say('good', j.internal
+                  ? '<b>Flagged as an internal test row.</b> It still gets every warning, it just stops counting as a customer.'
+                  : '<b>Counted as a customer again.</b>');
+              } else { btn.textContent=label; say('bad', (j&&j.error)||'Could not save that.'); }
+           }).catch(function(){ btn.disabled=false; btn.textContent=label; say('bad','Network problem.'); });
+          return;
+        }
+        var event = act==='tornado' ? 'Tornado Warning' : 'Severe Thunderstorm Warning';
+        // No newline escapes in this string: they survive Python's string
+        // parsing as real line breaks, which JavaScript will not allow
+        // inside quotes, and the whole script fails to parse.
+        if(!confirm('Send a REHEARSAL '+event+' to this address now? '
+          +'Every message says REHEARSAL first, so nobody takes shelter for it.')) return;
+        btn.disabled=true; btn.textContent='Sending...';
+        fetch('/api/v1/admin/stormline/test-alert',{method:'POST',credentials:'include',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({sentry_id:Number(id), event:event})})
+         .then(function(r){return r.json();}).then(function(j){
+            btn.disabled=false; btn.textContent=label;
+            if(j&&j.ok){
+              say('good','<b>Sent to '+(j.to||[]).join(' and ')+'.</b><br>'
+                +(act==='tornado'?'Both a text and a phone call. ':'')
+                +'Every message says REHEARSAL first. If nothing arrives in a minute, '
+                +'that is a real delivery problem worth chasing.');
+            } else { say('bad', (j&&j.error)||'That did not work.'); }
+         }).catch(function(){ btn.disabled=false; btn.textContent=label; say('bad','Network problem.'); });
+      });
+    });
   }
 
   function search(){
