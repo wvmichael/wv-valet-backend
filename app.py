@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-215"
+BACKEND_BUILD = "0702-216"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -20065,14 +20065,15 @@ __MET_NAV__
   <h1>Pro briefs</h1>
   <p class=sub>Pick one subscriber, several, or all of them. This is the same draft and the
   same send as the old composer, so a brief written here is identical to one written there.</p>
-  <div style="border:1.5px solid rgba(255,190,60,.5);background:rgba(255,190,60,.1);
-    border-radius:12px;padding:16px 18px;margin-bottom:22px;color:#FFDFA0;font-size:14.5px;
+  <div style="border:1.5px solid rgba(126,182,255,.4);background:rgba(30,107,255,.08);
+    border-radius:12px;padding:15px 18px;margin-bottom:22px;color:#C6D6EE;font-size:14px;
     line-height:1.65">
-    <b style="color:#fff">Still being checked. Use the old composer for real briefs.</b><br>
-    Sending works and a real message leaves. What is not yet proven is how this page reports
-    a <em>failed</em> send, and the list does not always refresh after sending. Until both are
-    fixed, write real briefs in the
-    <a href="__SPA__/" style="color:#FFD37E;font-weight:700">old composer</a>.
+    <b style="color:#fff">New page, and worth a second pair of eyes.</b> Sending is tested end
+    to end, including what happens when delivery fails. One known quirk: after you send, the
+    brief sometimes drops out of the list instead of showing as Sent. It did go; check
+    Recently sent or the old composer to confirm. If anything else looks wrong, the
+    <a href="__SPA__/" style="color:#7EB6FF;font-weight:700">old composer</a> is untouched and
+    works exactly as it did.
   </div>
   <div class=split>
     <div class=panel>
@@ -20122,7 +20123,12 @@ _MET_BRIEFS_SCRIPT = """<script>
   function load(){
     fetch('/api/v1/met/pro-briefs',{credentials:'include'})
      .then(function(r){return r.json();}).then(function(j){
-        drafts=(j&&j.drafts)||[];
+        var fresh=(j&&j.drafts)||[];
+        // Keep anything we know we just sent, even if the server has
+        // dropped it from the list, so the Met can see what went out.
+        var freshIds={}; fresh.forEach(function(d){ freshIds[d.id]=1; });
+        var keptSent=drafts.filter(function(d){ return d.status==='sent' && !freshIds[d.id]; });
+        drafts=fresh.concat(keptSent);
         var pending=drafts.filter(function(d){return d.status!=='sent';});
         document.getElementById('lh').textContent =
           pending.length ? pending.length+(pending.length===1?' brief to write':' briefs to write')
@@ -20232,12 +20238,14 @@ _MET_BRIEFS_SCRIPT = """<script>
     if(ids.length>1 && !confirm('Send this same brief to '+ids.length+' subscribers?')) return;
     var btn=this, label=btn.textContent;
     btn.disabled=true; btn.textContent='Sending...'; hide();
-    var done=0, failed=0;
+    var done=0, failed=0, lastError='';
     function next(i){
       if(i>=ids.length){
         btn.disabled=false; btn.textContent=label;
         selected={};
-        if(failed) say('bad','Sent '+done+', failed '+failed+'. Check the ones still marked waiting.');
+        if(failed) say('bad','<b>Sent '+done+', failed '+failed+'.</b>'
+          + (lastError ? '<br>'+esc(lastError) : '')
+          + '<br>The ones that failed are still marked waiting.');
         else say('good','Sent to '+done+(done===1?' subscriber.':' subscribers.'));
         load();
         return;
@@ -20247,7 +20255,16 @@ _MET_BRIEFS_SCRIPT = """<script>
         return fetch('/api/v1/met/pro-briefs/'+id+'/send',{method:'POST',credentials:'include',
           headers:{'Content-Type':'application/json'},body:'{}'});
       }).then(function(r){return r.json();}).then(function(j){
-        if(j&&j.ok) done++; else failed++;
+        if(j&&j.ok){
+          done++;
+          // Mark it here rather than waiting for the list to agree. A Met
+          // needs to see immediately which ones went.
+          drafts.forEach(function(d){ if(d.id===id){ d.status='sent';
+            d.sent_at = d.sent_at || Date.now(); } });
+        } else {
+          failed++;
+          lastError = (j && (j.message || j.error)) || '';
+        }
         next(i+1);
       }).catch(function(){ failed++; next(i+1); });
     }
