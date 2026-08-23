@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-219"
+BACKEND_BUILD = "0702-220"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -6395,7 +6395,7 @@ def _roles_to_workspaces(roles: list, email: str = "") -> list:
             print(f"[workspaces] sales rep lookup failed: {e!r}", flush=True)
     if ("admin" in roles or is_rep) and not any(w["role"] == "sales" for w in workspaces):
         workspaces.append({"role": "sales", "label": "Sales",
-                           "url": f"{_spa}/"})
+                           "url": "/portal/sales"})
     # Met View for admins (July 18, 2026): opens the Met portal, where the
     # Today board's admin branch shows EVERY subscriber's watch cards
     # company-wide, and the composer sends as the admin. Deliberately not
@@ -17435,7 +17435,7 @@ PORTAL_TOOLS = {
     "met": ("Met Portal", "/portal/met",
             "My Day: everything waiting on you, across every product.", True),
     "sales": ("Sales Portal", "/portal/sales",
-              "Your prospects, your pipeline and the letters going out.", False),
+              "Your prospects, and everyone else's.", True),
     "admin": ("Command Center", "/portal/admin",
               "Find any customer and see everything they bought.", True),
     "crew": ("Valet Crew", "/portal/crew",
@@ -21109,6 +21109,275 @@ def portal_met_replies():
                     .replace("__SHELTER__", _met_shelter_bar(user, spa))
                     .replace("__MET_NAV__", _met_nav("day", spa))
                     .replace("__WV_FOOTER__", _MET_REPLIES_SCRIPT + "\n__WV_FOOTER__"))
+
+
+# ---------------------------------------------------------------------------
+# Sales portal (Aug 23, 2026)
+#
+# Evan, Jackie and Laura. Built on the endpoints the old portal already uses,
+# so a prospect claimed or updated here is the same row.
+#
+# Reps are not a role: they are a row in sales_reps matched by email. That
+# is why the Employees tab ticks Sales rather than granting a role, and why
+# this page checks the roster rather than the role list.
+# ---------------------------------------------------------------------------
+
+_SALES_STATUS_LABEL = {
+    "letter_sent": "Letter sent",
+    "followed_up": "Followed up",
+    "interested": "Interested",
+    "trial": "On trial",
+    "converted": "Signed up",
+    "not_interested": "Not interested",
+}
+
+
+def _is_sales_rep(user: dict) -> bool:
+    """A rep is a row in sales_reps, matched by email. Admins count too."""
+    if not user:
+        return False
+    if "admin" in (user.get("roles") or []):
+        return True
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT 1 FROM sales_reps
+                                WHERE LOWER(email) = LOWER(%s) AND is_active = TRUE""",
+                            (user.get("email") or "",))
+                return cur.fetchone() is not None
+    except Exception as e:
+        print(f"[sales] rep check failed: {e!r}", flush=True)
+        return False
+
+
+_SALES_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Sales - WeatherValet</title><meta name=robots content="noindex">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+__MET_CHROME__
+.wrapx{max-width:1180px;margin:0 auto;padding:30px 22px 70px}
+h1{font-size:clamp(24px,3.6vw,32px);font-weight:900;letter-spacing:-.03em;color:#fff;margin:0 0 4px}
+.sub{color:#B8C7DE;font-size:15.5px;margin:0 0 20px;line-height:1.6}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:24px}
+.s{border:1.5px solid rgba(30,107,255,.4);border-radius:14px;padding:17px;
+  background:linear-gradient(168deg,#18213A 0%,#0E1526 100%)}
+.s b{display:block;font-size:30px;color:#fff;font-weight:800;line-height:1;letter-spacing:-.02em}
+.s i{display:block;font-style:normal;font-size:12.5px;color:#B8C7DE;margin-top:7px;line-height:1.4}
+.s.big b{color:#7FB0FF;font-size:38px}
+.bar2{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+.bar2 input,.bar2 select{padding:11px 13px;font-size:14.5px;font-family:inherit;color:#EAF1FF;
+  border-radius:9px;background:rgba(255,255,255,.05);border:1px solid rgba(126,182,255,.26)}
+.bar2 input{flex:1;min-width:200px}
+.bar2 input:focus,.bar2 select:focus{outline:none;border-color:var(--blue);
+  box-shadow:0 0 0 3px rgba(30,107,255,.22)}
+.bar2 select option{background:#0B1424}
+.count{font-size:13.5px;color:#8FA6C6}
+.p{border:1px solid rgba(126,182,255,.22);border-radius:13px;padding:16px 18px;margin-bottom:10px;
+  background:rgba(255,255,255,.035);transition:.15s}
+.p:hover{border-color:rgba(126,182,255,.5)}
+.p.mine{border-left:4px solid var(--blue)}
+.p .top{display:flex;justify-content:space-between;gap:12px;align-items:baseline;flex-wrap:wrap}
+.p b{font-size:16.5px;color:#fff}
+.p .who{font-size:12.5px;color:#8FA6C6;white-space:nowrap}
+.p .det{font-size:14px;color:#B8C7DE;margin-top:6px;line-height:1.6}
+.p .det a{color:#7EB6FF}
+.st{font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;font-weight:800;
+  padding:4px 9px;border-radius:999px;white-space:nowrap;
+  background:rgba(30,107,255,.18);color:#7FB0FF;border:1px solid rgba(30,107,255,.4)}
+.st.won{background:rgba(52,199,89,.16);color:#8CE3A4;border-color:rgba(52,199,89,.4)}
+.st.no{background:rgba(255,255,255,.06);color:#A9B4C6;border-color:rgba(255,255,255,.16)}
+.acts{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;align-items:center}
+.acts select,.acts input{padding:9px 11px;font-size:13.5px;font-family:inherit;color:#EAF1FF;
+  border-radius:8px;background:rgba(255,255,255,.06);border:1px solid rgba(126,182,255,.24)}
+.acts input{flex:1;min-width:170px}
+.b{border:none;border-radius:8px;padding:9px 14px;font-size:13.5px;font-weight:700;cursor:pointer}
+.b.go{background:var(--accent);color:#fff}
+.b.ghost{background:rgba(255,255,255,.06);border:1px solid rgba(126,182,255,.3);color:#C3D2E6}
+.b:disabled{opacity:.5}
+.rmsg{display:none;border-radius:8px;padding:9px 12px;margin-top:9px;font-size:13.5px}
+.rmsg.good{background:#0F2A4A;border:1px solid var(--blue);color:#BBD8FF}
+.rmsg.bad{background:#3A1220;border:1px solid #7C2740;color:#FFC2CE}
+.head{font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:#A9B4C6;
+  font-weight:800;margin:28px 0 12px}
+.empty{border:1px dashed rgba(126,182,255,.3);border-radius:13px;padding:24px;color:#B8C7DE;
+  font-size:15px;text-align:center;line-height:1.6}
+.note{border:1px solid rgba(126,182,255,.25);border-radius:12px;padding:15px 18px;margin-top:22px;
+  color:#B8C7DE;font-size:14px;line-height:1.7;background:rgba(255,255,255,.03)}
+.note b{color:#fff}
+.note a{color:#4D8FFF;font-weight:700}
+</style></head><body>
+__WV_HEADER__
+<div class=metbar><div class=in>
+  <nav class=metnav><a class=on href="/portal/sales">Prospects</a></nav>
+  <div class=spacer></div>
+  <a class=oldlink href="__SPA__/">Old sales portal</a>
+</div></div>
+<div class=wrapx>
+  <h1>__GREETING__</h1>
+  <p class=sub>Your prospects and everyone else's. Claim one and it is yours to work.</p>
+  <div class=stats id=stats></div>
+  <div class=bar2>
+    <input id=q placeholder="Search business, owner, address or phone">
+    <select id=f-status><option value="">Any status</option></select>
+    <select id=f-who><option value="">Everyone</option><option value="mine">Mine</option>
+      <option value="open">Unclaimed</option></select>
+    <span class=count id=count></span>
+  </div>
+  <div id=list><div class=empty>Loading...</div></div>
+  <div class=note><b>Commissions, letters and the trial intake form</b> are still on the
+  <a href="__SPA__/">old sales portal</a>.</div>
+</div>
+__WV_FOOTER__"""
+
+_SALES_SCRIPT = """<script>
+(function(){
+  var rows=[], me=null, statuses=[], admin=false;
+  var LABEL={letter_sent:'Letter sent',followed_up:'Followed up',interested:'Interested',
+             trial:'On trial',converted:'Signed up',not_interested:'Not interested'};
+  function esc(t){var d=document.createElement('div');d.textContent=(t===null||t===undefined)?'':t;return d.innerHTML;}
+  function say(id,k,t){var m=document.getElementById(id);
+    if(m){m.className='rmsg '+k;m.innerHTML=t;m.style.display='block';}}
+
+  function load(){
+    fetch('/api/v1/sales/prospects',{credentials:'include'})
+     .then(function(r){return r.json();}).then(function(j){
+        if(!j||!j.ok){ document.getElementById('list').innerHTML=
+          '<div class=empty>'+esc((j&&j.error)||'Could not load prospects.')+'</div>'; return; }
+        rows=j.prospects||[]; me=j.me||null; admin=!!j.admin;
+        statuses=j.statuses||Object.keys(LABEL);
+        var sel=document.getElementById('f-status');
+        if(sel.options.length<2){
+          statuses.forEach(function(s){
+            var o=document.createElement('option'); o.value=s; o.textContent=LABEL[s]||s;
+            sel.appendChild(o); });
+        }
+        renderStats(); render();
+     }).catch(function(){ document.getElementById('list').innerHTML=
+        '<div class=empty>Network problem.</div>'; });
+  }
+
+  function renderStats(){
+    var mine=rows.filter(function(p){return me&&p.claimed_by===me;});
+    function n(st){ return mine.filter(function(p){return p.status===st;}).length; }
+    document.getElementById('stats').innerHTML=
+       '<div class="s big"><b>'+mine.length+'</b><i>prospects you are working</i></div>'
+      +'<div class=s><b>'+n('interested')+'</b><i>interested</i></div>'
+      +'<div class=s><b>'+n('trial')+'</b><i>on trial</i></div>'
+      +'<div class=s><b>'+n('converted')+'</b><i>signed up</i></div>'
+      +'<div class=s><b>'+rows.filter(function(p){return !p.claimed_by;}).length
+        +'</b><i>unclaimed, anyone can take</i></div>';
+  }
+
+  function render(){
+    var q=(document.getElementById('q').value||'').toLowerCase().trim();
+    var fs=document.getElementById('f-status').value;
+    var fw=document.getElementById('f-who').value;
+    var list=rows.filter(function(p){
+      if(fs && p.status!==fs) return false;
+      if(fw==='mine' && !(me&&p.claimed_by===me)) return false;
+      if(fw==='open' && p.claimed_by) return false;
+      if(q && JSON.stringify(p).toLowerCase().indexOf(q)<0) return false;
+      return true;
+    });
+    document.getElementById('count').textContent=list.length+(list.length===1?' prospect':' prospects');
+    if(!list.length){ document.getElementById('list').innerHTML=
+      '<div class=empty>Nothing matches those filters.</div>'; return; }
+    document.getElementById('list').innerHTML=list.map(function(p){
+      var isMine = me && p.claimed_by===me;
+      var stClass = p.status==='converted' ? ' won' : (p.status==='not_interested' ? ' no' : '');
+      return '<div class="p'+(isMine?' mine':'')+'" data-id="'+p.id+'">'
+        +'<div class=top><b>'+esc(p.business_name||'(no name)')+'</b>'
+          +'<span class="st'+stClass+'">'+esc(LABEL[p.status]||p.status||'New')+'</span></div>'
+        +'<div class=det>'
+          +(p.owner_name?esc(p.owner_name)+'<br>':'')
+          +(p.address?esc(p.address)+'<br>':'')
+          +(p.phone?'<a href="tel:'+esc(p.phone)+'">'+esc(p.phone)+'</a>  ':'')
+          +(p.email?'<a href="mailto:'+esc(p.email)+'">'+esc(p.email)+'</a>':'')
+          +(p.notes?'<br><span style="color:#9FB3CE">'+esc(p.notes)+'</span>':'')
+        +'</div>'
+        +'<div class=acts>'
+          +(p.claimed_by
+             ? (isMine
+                 ? '<select class=st-sel>'+ (statuses.map(function(s){
+                     return '<option value="'+s+'"'+(p.status===s?' selected':'')+'>'
+                       +(LABEL[s]||s)+'</option>';}).join(''))+'</select>'
+                   +'<input class=note-in placeholder="Add a note">'
+                   +'<button class="b go">Save</button>'
+                   +'<button class="b ghost" data-release>Give it back</button>'
+                 : '<span class=who>Worked by '+esc((p.claimed_by||'another rep').replace(/-/g,' '))+'</span>')
+             : '<button class="b go" data-claim>Claim this one</button>')
+        +'</div><div class=rmsg id="pm'+p.id+'"></div></div>';
+    }).join('');
+    wire();
+  }
+
+  function post(url, body){
+    return fetch(url,{method:'POST',credentials:'include',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})})
+      .then(function(r){return r.json();});
+  }
+
+  function wire(){
+    Array.prototype.forEach.call(document.querySelectorAll('.p[data-id]'),function(el){
+      var id=Number(el.getAttribute('data-id'));
+      var claim=el.querySelector('[data-claim]');
+      if(claim) claim.addEventListener('click',function(){
+        claim.disabled=true; claim.textContent='Claiming...';
+        post('/api/v1/sales/prospects/'+id+'/claim').then(function(j){
+          if(j&&j.ok){ load(); } else { claim.disabled=false; claim.textContent='Claim this one';
+            say('pm'+id,'bad',(j&&j.error)||'Could not claim that.'); }
+        }).catch(function(){ claim.disabled=false; claim.textContent='Claim this one';
+          say('pm'+id,'bad','Network problem.'); });
+      });
+      var rel=el.querySelector('[data-release]');
+      if(rel) rel.addEventListener('click',function(){
+        if(!confirm('Put this back in the pool for anyone to claim?')) return;
+        rel.disabled=true;
+        post('/api/v1/sales/prospects/'+id+'/claim',{release:true}).then(function(j){
+          if(j&&j.ok) load(); else { rel.disabled=false;
+            say('pm'+id,'bad',(j&&j.error)||'Could not do that.'); }
+        }).catch(function(){ rel.disabled=false; say('pm'+id,'bad','Network problem.'); });
+      });
+      var save=el.querySelector('.b.go:not([data-claim])');
+      if(save && el.querySelector('.st-sel')) save.addEventListener('click',function(){
+        var body={status:el.querySelector('.st-sel').value,
+                  note:el.querySelector('.note-in').value};
+        save.disabled=true; save.textContent='...';
+        post('/api/v1/sales/prospects/'+id+'/update',body).then(function(j){
+          save.disabled=false; save.textContent='Save';
+          if(j&&j.ok){ say('pm'+id,'good','Saved.'); load(); }
+          else say('pm'+id,'bad',(j&&j.error)||'Could not save that.');
+        }).catch(function(){ save.disabled=false; save.textContent='Save';
+          say('pm'+id,'bad','Network problem.'); });
+      });
+    });
+  }
+
+  document.getElementById('q').addEventListener('input',render);
+  document.getElementById('f-status').addEventListener('change',render);
+  document.getElementById('f-who').addEventListener('change',render);
+  load();
+})();
+</script>"""
+
+
+@app.get("/portal/sales")
+def portal_sales():
+    user = _get_current_user()
+    if not user:
+        return redirect("/signin", code=302)
+    if not _is_sales_rep(user):
+        return redirect("/portal", code=302)
+    spa = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+    first = ((user.get("name") or "").strip().split(" ") or [""])[0]
+    greeting = ("%s's prospects." % _html_escape(first)) if first else "Sales."
+    return wv_shell(_SALES_PAGE
+                    .replace("__MET_CHROME__", _MET_CHROME_CSS)
+                    .replace("__SPA__", spa)
+                    .replace("__GREETING__", greeting)
+                    .replace("__WV_FOOTER__", _SALES_SCRIPT + "\n__WV_FOOTER__"))
 
 
 @app.get("/portal/met/messages")
