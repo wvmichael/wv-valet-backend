@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-212"
+BACKEND_BUILD = "0702-213"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -18445,6 +18445,7 @@ _ADMIN_SCRIPT = """<script>
 # ---------------------------------------------------------------------------
 
 _ADMIN_TABS = [("support", "Support", "/portal/admin"),
+               ("subscribers", "Subscribers", "/portal/admin/subscribers"),
                ("totals", "Totals", "/portal/admin/totals")]
 
 
@@ -18619,6 +18620,394 @@ __ADMIN_NAV__
   __INTERNAL__ Financial numbers are not here yet; they get their own tab.</div>
 </div>
 __WV_FOOTER__"""
+
+
+@app.get("/api/v1/admin/subscribers")
+def admin_subscribers_list():
+    """Every row in one tier, for the Command Center list."""
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "not-authorized"}), 403
+    tier = (request.args.get("tier") or "stormline").strip().lower()
+    rows = []
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                if tier == "stormline":
+                    cur.execute("""SELECT id, name, email, phone, phone2, address, label,
+                                          status, daily, send_hour, pack_allseason, tornado_call,
+                                          gift_from, is_internal, manage_token,
+                                          stripe_customer_id, created_at
+                                     FROM sentry_subscribers ORDER BY id DESC LIMIT 400""")
+                elif tier == "sidekick":
+                    cur.execute("""SELECT p.id, p.name, p.email, p.phone, p.pass_type, p.status,
+                                          p.created_at, g.opponent,
+                                          to_char(g.game_date,'FMMon FMDD') AS d
+                                     FROM gameday_passes p
+                                LEFT JOIN gameday_games g ON g.id = p.game_id
+                                 ORDER BY p.id DESC LIMIT 400""")
+                elif tier == "watch":
+                    cur.execute("""SELECT id, name, email, phone, place, event_date,
+                                          start_hour, end_hour, status, created_at
+                                     FROM watch_orders ORDER BY id DESC LIMIT 400""")
+                elif tier == "pro":
+                    cur.execute("""SELECT id, name, email, phone, subscription_tier AS status,
+                                          is_active, created_at
+                                     FROM users
+                                    WHERE subscription_tier IN
+                                          ('pro_single','pro_multi','pro_enterprise')
+                                 ORDER BY id DESC LIMIT 400""")
+                elif tier == "crew":
+                    cur.execute("""SELECT u.id, u.name, u.email, u.phone, r.granted_at AS created_at
+                                     FROM users u
+                                     JOIN user_roles r ON r.user_id = u.id AND r.role = 'crew'
+                                 ORDER BY r.granted_at DESC LIMIT 400""")
+                else:
+                    return jsonify({"ok": False, "error": "Unknown tier."}), 400
+                rows = [dict(r) for r in (cur.fetchall() or [])]
+    except Exception as e:
+        print(f"[subscribers] {tier} list failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "Could not load that list."}), 500
+    return jsonify({"ok": True, "tier": tier, "count": len(rows), "rows": rows})
+
+
+@app.post("/api/v1/admin/stormline/update")
+def admin_stormline_update():
+    """Edit a Stormline row in place: phones, label, daily, packs, status."""
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "not-authorized"}), 403
+    data = request.get_json(silent=True) or {}
+    try:
+        sid = int(data.get("sentry_id"))
+    except Exception:
+        return jsonify({"ok": False, "error": "Which row?"}), 400
+
+    sets, vals = [], []
+    if "phone" in data:
+        p = _normalize_phone((data.get("phone") or "").strip())
+        if not p:
+            return jsonify({"ok": False, "error": "That phone number did not look right."}), 400
+        sets.append("phone = %s"); vals.append(p)
+    if "phone2" in data:
+        raw = (data.get("phone2") or "").strip()
+        p2 = _normalize_phone(raw) if raw else None
+        if raw and not p2:
+            return jsonify({"ok": False, "error": "That second number did not look right."}), 400
+        sets.append("phone2 = %s"); vals.append(p2)
+    for field, col in (("label", "label"), ("name", "name"), ("email", "email")):
+        if field in data:
+            sets.append("%s = %%s" % col); vals.append((data.get(field) or "").strip() or None)
+    for flag in ("daily", "pack_allseason", "tornado_call"):
+        if flag in data:
+            sets.append("%s = %%s" % flag); vals.append(bool(data.get(flag)))
+    if "send_hour" in data:
+        try:
+            h = int(data.get("send_hour"))
+            if not 0 <= h <= 23:
+                raise ValueError
+        except Exception:
+            return jsonify({"ok": False, "error": "Send hour must be 0 to 23."}), 400
+        sets.append("send_hour = %s"); vals.append(h)
+    if "status" in data:
+        st = (data.get("status") or "").strip().lower()
+        if st not in ("active", "paused", "canceled"):
+            return jsonify({"ok": False, "error": "Status must be active, paused or canceled."}), 400
+        sets.append("status = %s"); vals.append(st)
+    if not sets:
+        return jsonify({"ok": False, "error": "Nothing to change."}), 400
+
+    sets.append("updated_at = %s"); vals.append(int(time.time() * 1000))
+    vals.append(sid)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE sentry_subscribers SET %s WHERE id = %%s RETURNING id"
+                            % ", ".join(sets), tuple(vals))
+                if not cur.fetchone():
+                    return jsonify({"ok": False, "error": "No such row."}), 404
+    except Exception as e:
+        print(f"[stormline-update] {sid} failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "Could not save that."}), 500
+    print(f"[stormline-update] {sid} by {user.get('email')}: {list(data.keys())}", flush=True)
+    return jsonify({"ok": True, "sentry_id": sid})
+
+
+@app.post("/api/v1/admin/stormline/delete")
+def admin_stormline_delete():
+    """Permanently remove a Stormline row.
+
+    Guarded on purpose: a row that has ever been attached to a Stripe
+    customer is somebody's paid subscription, and deleting it destroys the
+    record of what they bought. Those can be cancelled, not erased.
+
+    Test addresses we created ourselves have no Stripe link, so they can go.
+    """
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "not-authorized"}), 403
+    data = request.get_json(silent=True) or {}
+    try:
+        sid = int(data.get("sentry_id"))
+    except Exception:
+        return jsonify({"ok": False, "error": "Which row?"}), 400
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id, address, label, is_internal, stripe_customer_id
+                             FROM sentry_subscribers WHERE id = %s""", (sid,))
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "No such row."}), 404
+    if row.get("stripe_customer_id"):
+        return jsonify({"ok": False, "error": (
+            "That address is attached to a paying customer, so it cannot be erased. "
+            "Set it to canceled instead; the record of what they bought stays intact.")}), 400
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM sentry_relay_log WHERE sentry_id = %s", (sid,))
+                cur.execute("DELETE FROM sentry_subscribers WHERE id = %s", (sid,))
+    except Exception as e:
+        print(f"[stormline-delete] {sid} failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "Could not remove that."}), 500
+    print(f"[stormline-delete] removed {sid} ({row.get('address')}) by {user.get('email')}",
+          flush=True)
+    return jsonify({"ok": True, "sentry_id": sid,
+                    "address": row.get("label") or row.get("address")})
+
+
+_ADMIN_SUBS_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Subscribers - Command Center</title><meta name=robots content="noindex">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+__MET_CHROME__
+.wrapx{max-width:1240px;margin:0 auto;padding:30px 22px 80px}
+h1{font-size:clamp(24px,3.6vw,32px);font-weight:900;letter-spacing:-.03em;color:#fff;margin:0 0 4px}
+.sub{color:#B8C7DE;font-size:15.5px;margin:0 0 18px;line-height:1.6}
+.tiers{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+.tiers button{border:1px solid rgba(126,182,255,.3);background:rgba(255,255,255,.04);
+  color:#C3D2E6;border-radius:999px;padding:9px 17px;font-size:14.5px;cursor:pointer}
+.tiers button:hover{border-color:var(--blue)}
+.tiers button.on{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700}
+.bar2{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+.bar2 input{flex:1;min-width:200px;padding:11px 13px;font-size:14.5px;font-family:inherit;
+  color:#EAF1FF;border-radius:9px;background:rgba(255,255,255,.05);
+  border:1px solid rgba(126,182,255,.26)}
+.bar2 input:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 3px rgba(30,107,255,.22)}
+.count{font-size:13.5px;color:#8FA6C6}
+.tw{overflow-x:auto;border:1px solid rgba(126,182,255,.2);border-radius:13px}
+table{width:100%;border-collapse:collapse;font-size:14px;min-width:900px}
+th{text-align:left;padding:11px 12px;color:#8FA6C6;font-size:11px;letter-spacing:.1em;
+  text-transform:uppercase;font-weight:800;background:rgba(255,255,255,.03);
+  border-bottom:1px solid rgba(126,182,255,.22);white-space:nowrap}
+td{padding:11px 12px;border-bottom:1px solid rgba(126,182,255,.1);color:#D6E1F0;vertical-align:top}
+tr:hover td{background:rgba(255,255,255,.03)}
+td.name{color:#fff;font-weight:700;white-space:nowrap}
+td input,td select{width:100%;box-sizing:border-box;padding:7px 9px;font-size:13.5px;
+  font-family:inherit;color:#EAF1FF;border-radius:7px;background:rgba(255,255,255,.06);
+  border:1px solid rgba(126,182,255,.22)}
+td input:focus,td select:focus{outline:none;border-color:var(--blue)}
+td select option{background:#0B1424}
+.chk{display:flex;gap:9px;flex-wrap:wrap}
+.chk label{display:flex;align-items:center;gap:5px;font-size:12.5px;color:#B8C7DE;
+  white-space:nowrap;cursor:pointer}
+.chk input{width:auto;accent-color:var(--blue)}
+.rowacts{display:flex;gap:7px;flex-wrap:wrap}
+.b{border:none;border-radius:7px;padding:8px 12px;font-size:12.5px;font-weight:700;cursor:pointer}
+.b.save{background:var(--accent);color:#fff}
+.b.del{background:rgba(224,36,60,.16);color:#FF9AA8;border:1px solid rgba(224,36,60,.45)}
+.b:disabled{opacity:.5}
+.tag{font-size:10px;letter-spacing:.1em;text-transform:uppercase;font-weight:800;
+  padding:3px 7px;border-radius:999px;white-space:nowrap}
+.tag.int{background:rgba(255,190,60,.15);color:#FFD79A;border:1px solid rgba(255,190,60,.4)}
+.tag.paid{background:rgba(52,199,89,.14);color:#8CE3A4;border:1px solid rgba(52,199,89,.35)}
+.msg{display:none;border-radius:10px;padding:12px 14px;margin:14px 0;font-size:14.5px;line-height:1.55}
+.msg.good{background:#0F2A4A;border:1px solid var(--blue);color:#BBD8FF}
+.msg.bad{background:#3A1220;border:1px solid #7C2740;color:#FFC2CE}
+.empty{border:1px dashed rgba(126,182,255,.3);border-radius:13px;padding:24px;color:#B8C7DE;
+  text-align:center;font-size:15px}
+</style></head><body>
+__WV_HEADER__
+__ADMIN_NAV__
+<div class=wrapx>
+  <h1>Subscribers</h1>
+  <p class=sub>Everyone on each tier. Stormline rows can be edited here; the rest are a
+  read-only list for now.</p>
+  <div class=tiers id=tiers>
+    <button class=on data-t=stormline>Stormline</button>
+    <button data-t=sidekick>Sidekick</button>
+    <button data-t=watch>Watch</button>
+    <button data-t=pro>Pro</button>
+    <button data-t=crew>Valet Crew</button>
+  </div>
+  <div class=bar2>
+    <input id=q placeholder="Filter by name, email, phone or address">
+    <span class=count id=count></span>
+  </div>
+  <div id=msg class=msg></div>
+  <div id=out></div>
+</div>
+__WV_FOOTER__"""
+
+_ADMIN_SUBS_SCRIPT = """<script>
+(function(){
+  var tier='stormline', rows=[];
+  function esc(t){var d=document.createElement('div');d.textContent=(t===null||t===undefined)?'':t;return d.innerHTML;}
+  function say(k,t){var m=document.getElementById('msg');m.className='msg '+k;m.innerHTML=t;m.style.display='block';}
+  function hide(){document.getElementById('msg').style.display='none';}
+  function when(ms){ if(!ms) return ''; return new Date(Number(ms)).toLocaleDateString(undefined,
+    {month:'short',day:'numeric',year:'numeric'}); }
+  function hour(h){ if(h===null||h===undefined) return '';
+    h=Number(h); if(h===0) return '12 AM'; if(h===12) return '12 PM';
+    return (h<12? h+' AM' : (h-12)+' PM'); }
+
+  function load(){
+    hide();
+    document.getElementById('out').innerHTML='<div class=empty>Loading...</div>';
+    fetch('/api/v1/admin/subscribers?tier='+tier,{credentials:'include'})
+     .then(function(r){return r.json();}).then(function(j){
+        if(!j||!j.ok){ document.getElementById('out').innerHTML=
+          '<div class=empty>'+esc((j&&j.error)||'Could not load that list.')+'</div>'; return; }
+        rows=j.rows||[]; render();
+     }).catch(function(){ document.getElementById('out').innerHTML=
+        '<div class=empty>Network problem.</div>'; });
+  }
+
+  function matches(r,q){
+    if(!q) return true;
+    return JSON.stringify(r).toLowerCase().indexOf(q)>=0;
+  }
+
+  function render(){
+    var q=(document.getElementById('q').value||'').toLowerCase().trim();
+    var list=rows.filter(function(r){return matches(r,q);});
+    document.getElementById('count').textContent =
+      list.length + (list.length===1?' row':' rows') + (q?' matching':'');
+    if(!list.length){ document.getElementById('out').innerHTML=
+      '<div class=empty>Nothing here.</div>'; return; }
+    document.getElementById('out').innerHTML='<div class=tw><table>'
+      + (tier==='stormline' ? stormHead() : plainHead())
+      + '<tbody>' + list.map(tier==='stormline'?stormRow:plainRow).join('') + '</tbody></table></div>';
+    if(tier==='stormline') wire();
+  }
+
+  function stormHead(){
+    return '<thead><tr><th>Who</th><th>Address</th><th>Phones</th><th>Options</th>'
+      +'<th>Status</th><th>Since</th><th></th></tr></thead>';
+  }
+  function stormRow(r){
+    return '<tr data-id="'+r.id+'">'
+      +'<td class=name>'+esc(r.name||'(no name)')
+        +(r.is_internal?' <span class="tag int">Test</span>':'')
+        +(r.stripe_customer_id?' <span class="tag paid">Paid</span>':'')
+        +'<br><input class=f data-k=email value="'+esc(r.email||'')+'" style="margin-top:6px"></td>'
+      +'<td style="min-width:210px">'+esc(r.address||'')
+        +'<input class=f data-k=label placeholder="Label" value="'+esc(r.label||'')+'" style="margin-top:6px"></td>'
+      +'<td style="min-width:170px"><input class=f data-k=phone value="'+esc(r.phone||'')+'">'
+        +'<input class=f data-k=phone2 placeholder="Second number" value="'+esc(r.phone2||'')+'" style="margin-top:6px"></td>'
+      +'<td><div class=chk>'
+        +'<label><input type=checkbox class=f data-k=daily '+(r.daily?'checked':'')+'>Daily</label>'
+        +'<label><input type=checkbox class=f data-k=pack_allseason '+(r.pack_allseason?'checked':'')+'>All-Season</label>'
+        +'<label><input type=checkbox class=f data-k=tornado_call '+(r.tornado_call?'checked':'')+'>Call</label>'
+        +'</div><input class=f data-k=send_hour type=number min=0 max=23 value="'+(r.send_hour===null||r.send_hour===undefined?7:r.send_hour)+'" style="margin-top:6px;max-width:90px" title="Morning summary hour"></td>'
+      +'<td><select class=f data-k=status>'
+        +['active','paused','canceled'].map(function(s){
+            return '<option '+(r.status===s?'selected':'')+'>'+s+'</option>';}).join('')
+        +'</select></td>'
+      +'<td style="white-space:nowrap">'+esc(when(r.created_at))+'</td>'
+      +'<td><div class=rowacts><button class="b save">Save</button>'
+        +(r.stripe_customer_id?'':'<button class="b del">Remove</button>')
+        +'</div></td></tr>';
+  }
+
+  function plainHead(){
+    if(tier==='sidekick') return '<thead><tr><th>Who</th><th>Email</th><th>Phone</th>'
+      +'<th>Pass</th><th>Status</th><th>Bought</th></tr></thead>';
+    if(tier==='watch') return '<thead><tr><th>Who</th><th>Email</th><th>Place</th>'
+      +'<th>Date</th><th>Window</th><th>Status</th></tr></thead>';
+    if(tier==='pro') return '<thead><tr><th>Who</th><th>Email</th><th>Phone</th>'
+      +'<th>Tier</th><th>Active</th><th>Since</th></tr></thead>';
+    return '<thead><tr><th>Who</th><th>Email</th><th>Phone</th><th>Joined</th></tr></thead>';
+  }
+  function plainRow(r){
+    if(tier==='sidekick') return '<tr><td class=name>'+esc(r.name||'')+'</td><td>'+esc(r.email||'')
+      +'</td><td>'+esc(r.phone||'')+'</td><td>'
+      +esc(r.pass_type==='season'?'Series':(r.opponent?(r.opponent+' '+(r.d||'')):'Single'))
+      +'</td><td>'+esc(r.status||'')+'</td><td>'+esc(when(r.created_at))+'</td></tr>';
+    if(tier==='watch') return '<tr><td class=name>'+esc(r.name||'')+'</td><td>'+esc(r.email||'')
+      +'</td><td>'+esc(r.place||'')+'</td><td>'+esc(r.event_date||'')+'</td><td>'
+      +esc(hour(r.start_hour)+' to '+hour(r.end_hour))+'</td><td>'+esc(r.status||'')+'</td></tr>';
+    if(tier==='pro') return '<tr><td class=name>'+esc(r.name||'')+'</td><td>'+esc(r.email||'')
+      +'</td><td>'+esc(r.phone||'')+'</td><td>'+esc(r.status||'')+'</td><td>'
+      +(r.is_active?'Yes':'No')+'</td><td>'+esc(when(r.created_at))+'</td></tr>';
+    return '<tr><td class=name>'+esc(r.name||'')+'</td><td>'+esc(r.email||'')+'</td><td>'
+      +esc(r.phone||'')+'</td><td>'+esc(when(r.created_at))+'</td></tr>';
+  }
+
+  function wire(){
+    Array.prototype.forEach.call(document.querySelectorAll('tr[data-id]'),function(tr){
+      var id=Number(tr.getAttribute('data-id'));
+      var save=tr.querySelector('.b.save'), del=tr.querySelector('.b.del');
+      save.addEventListener('click',function(){
+        var body={sentry_id:id};
+        Array.prototype.forEach.call(tr.querySelectorAll('.f'),function(el){
+          var k=el.getAttribute('data-k');
+          body[k] = (el.type==='checkbox') ? el.checked
+                  : (el.type==='number' ? Number(el.value) : el.value);
+        });
+        save.disabled=true; save.textContent='...';
+        fetch('/api/v1/admin/stormline/update',{method:'POST',credentials:'include',
+          headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+         .then(function(r){return r.json();}).then(function(j){
+            save.disabled=false; save.textContent='Save';
+            if(j&&j.ok) say('good','Saved.');
+            else say('bad',(j&&j.error)||'Could not save that.');
+         }).catch(function(){ save.disabled=false; save.textContent='Save';
+            say('bad','Network problem.'); });
+      });
+      if(del) del.addEventListener('click',function(){
+        if(!confirm('Remove this address permanently? This cannot be undone. '
+          +'It only works for rows that never had a payment attached.')) return;
+        del.disabled=true; del.textContent='...';
+        fetch('/api/v1/admin/stormline/delete',{method:'POST',credentials:'include',
+          headers:{'Content-Type':'application/json'},body:JSON.stringify({sentry_id:id})})
+         .then(function(r){return r.json();}).then(function(j){
+            if(j&&j.ok){ say('good','Removed '+esc(j.address||'that address')+'.');
+              rows=rows.filter(function(x){return x.id!==id;}); render(); }
+            else { del.disabled=false; del.textContent='Remove';
+              say('bad',(j&&j.error)||'Could not remove that.'); }
+         }).catch(function(){ del.disabled=false; del.textContent='Remove';
+            say('bad','Network problem.'); });
+      });
+    });
+  }
+
+  Array.prototype.forEach.call(document.querySelectorAll('#tiers button'),function(b){
+    b.addEventListener('click',function(){
+      Array.prototype.forEach.call(document.querySelectorAll('#tiers button'),
+        function(x){x.className='';});
+      b.className='on'; tier=b.getAttribute('data-t'); load();
+    });
+  });
+  document.getElementById('q').addEventListener('input',render);
+  load();
+})();
+</script>"""
+
+
+@app.get("/portal/admin/subscribers")
+def portal_admin_subscribers():
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return redirect("/signin", code=302)
+    return wv_shell(_ADMIN_SUBS_PAGE
+                    .replace("__MET_CHROME__", _MET_CHROME_CSS)
+                    .replace("__ADMIN_NAV__", _admin_nav("subscribers"))
+                    .replace("__WV_FOOTER__", _ADMIN_SUBS_SCRIPT + "\n__WV_FOOTER__"))
 
 
 @app.get("/portal/admin/totals")
