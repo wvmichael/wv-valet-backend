@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-206"
+BACKEND_BUILD = "0702-207"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -18949,6 +18949,316 @@ _MET_ALL_SCRIPT = """<script>
   apply();
 })();
 </script>"""
+
+
+# ---------------------------------------------------------------------------
+# Met portal: Pro brief composer (Aug 22, 2026)
+#
+# Rebuilt to mimic what Mets already use, on exactly the endpoints the old
+# one uses: GET the drafts, PATCH to save, POST claim, POST send. No new
+# server behaviour at all, so a brief written here is byte-identical to one
+# written in the old composer.
+#
+# The core loop only: see today's briefs, pick one or several or all, edit
+# the four structured fields, send, and see what went out. AI refresh, bulk
+# scheduling and images stay on the old portal and are linked, because
+# half-rebuilding the tool they use every morning is worse than not
+# rebuilding it.
+# ---------------------------------------------------------------------------
+
+_MET_BRIEFS_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Pro briefs - WeatherValet</title><meta name=robots content="noindex">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+__MET_CHROME__
+.wrapx{max-width:1120px;margin:0 auto;padding:30px 22px 80px}
+h1{font-size:clamp(24px,3.8vw,34px);font-weight:900;letter-spacing:-.03em;color:#fff;margin:0 0 4px}
+.sub{color:#B8C7DE;font-size:15.5px;margin:0 0 20px;line-height:1.6}
+.split{display:grid;grid-template-columns:1fr;gap:20px}
+@media(min-width:920px){.split{grid-template-columns:330px 1fr;gap:26px;align-items:start}}
+.panel{border:1.5px solid rgba(30,107,255,.4);border-radius:15px;
+  background:linear-gradient(168deg,#18213A 0%,#0E1526 100%);padding:18px}
+.listhead{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px}
+.listhead b{font-size:14px;color:#fff}
+.mini{background:none;border:1px solid rgba(126,182,255,.3);color:#C3D2E6;border-radius:7px;
+  padding:6px 10px;font-size:12.5px;cursor:pointer}
+.mini:hover{border-color:var(--blue);color:#fff}
+.d{display:flex;gap:11px;align-items:flex-start;padding:12px;border-radius:11px;cursor:pointer;
+  border:1px solid transparent;transition:.14s;margin-bottom:7px}
+.d:hover{background:rgba(255,255,255,.04)}
+.d.on{background:rgba(30,107,255,.16);border-color:rgba(30,107,255,.55)}
+.d input{margin:3px 0 0;transform:scale(1.2);accent-color:var(--blue);flex:0 0 auto}
+.d b{display:block;font-size:14.5px;color:#fff}
+.d i{display:block;font-style:normal;font-size:12.5px;color:#8FA6C6;margin-top:3px;line-height:1.45}
+.d .st{font-size:10px;letter-spacing:.1em;text-transform:uppercase;font-weight:800;
+  padding:3px 7px;border-radius:999px;margin-top:5px;display:inline-block}
+.st.sent{background:rgba(52,199,89,.16);color:#8CE3A4;border:1px solid rgba(52,199,89,.4)}
+.st.wait{background:rgba(255,190,60,.14);color:#FFD79A;border:1px solid rgba(255,190,60,.35)}
+label{display:block;font-size:11.5px;font-weight:800;letter-spacing:.09em;text-transform:uppercase;
+  color:#9FB6D6;margin:16px 0 7px}
+textarea,input.t{width:100%;box-sizing:border-box;padding:12px 13px;font-size:15px;font-family:inherit;
+  color:#EAF1FF;border-radius:9px;background:rgba(255,255,255,.05);
+  border:1px solid rgba(126,182,255,.26);line-height:1.55}
+textarea{min-height:76px;resize:vertical}
+textarea:focus,input.t:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 3px rgba(30,107,255,.22)}
+.verd{display:flex;gap:8px;flex-wrap:wrap}
+.verd button{flex:1;min-width:96px;padding:12px 6px;border-radius:10px;font-size:15px;font-weight:800;
+  cursor:pointer;border:1.5px solid rgba(126,182,255,.28);background:rgba(255,255,255,.04);color:#EAF1FF}
+.verd button.on[data-v=clear]{background:#12401F;border-color:#34C759;color:#B7F0C4}
+.verd button.on[data-v=caution]{background:#43330E;border-color:#FFBE3C;color:#FFDFA0}
+.verd button.on[data-v=risk]{background:#4A0E19;border-color:#E0243C;color:#FFC9D0}
+.ctx{border:1px solid rgba(126,182,255,.2);border-radius:11px;padding:13px 15px;margin-bottom:16px;
+  background:rgba(255,255,255,.035);font-size:13.5px;color:#B8C7DE;line-height:1.6}
+.ctx b{color:#fff;display:block;margin-bottom:5px;font-size:14px}
+.acts{display:flex;gap:10px;flex-wrap:wrap;margin-top:20px;align-items:center}
+.go{background:var(--accent);color:#fff;border:none;border-radius:10px;padding:14px 22px;
+  font-size:15.5px;font-weight:800;cursor:pointer;box-shadow:0 12px 28px -12px rgba(30,107,255,.8)}
+.go:hover{filter:brightness(1.1)}
+.go:disabled{opacity:.5;box-shadow:none}
+.ghost{background:rgba(255,255,255,.06);border:1px solid rgba(126,182,255,.3);color:#C3D2E6;
+  border-radius:10px;padding:14px 18px;font-size:14.5px;cursor:pointer}
+.msg{display:none;border-radius:10px;padding:12px 14px;margin-top:14px;font-size:14.5px;line-height:1.55}
+.msg.good{background:#0F2A4A;border:1px solid var(--blue);color:#BBD8FF}
+.msg.bad{background:#3A1220;border:1px solid #7C2740;color:#FFC2CE}
+.recent{margin-top:26px}
+.recent .r{border-bottom:1px solid rgba(126,182,255,.14);padding:11px 0;font-size:13.5px;color:#B8C7DE}
+.recent .r b{color:#fff}
+.recent .r span{color:#8FA6C6;font-size:12.5px}
+.empty{border:1px dashed rgba(126,182,255,.3);border-radius:13px;padding:22px;color:#B8C7DE;
+  font-size:15px;line-height:1.6;text-align:center}
+.oldnote{margin-top:22px;font-size:13.5px;color:#8FA6C6;line-height:1.65}
+.oldnote a{color:#4D8FFF;font-weight:700}
+</style></head><body>
+__WV_HEADER__
+__SHELTER__
+__MET_NAV__
+<div class=wrapx>
+  <h1>Pro briefs</h1>
+  <p class=sub>Pick one subscriber, several, or all of them.</p>
+  <div style="border:1.5px solid rgba(255,190,60,.5);background:rgba(255,190,60,.1);
+    border-radius:12px;padding:16px 18px;margin-bottom:22px;color:#FFDFA0;font-size:14.5px;
+    line-height:1.65">
+    <b style="color:#fff">Not ready yet. Use the old composer for real briefs.</b><br>
+    This page lists, opens and saves correctly, but sending has not been proven end to end
+    in testing: it reported success without a message leaving. Until that is fixed and
+    verified, write real briefs in the
+    <a href="__SPA__/" style="color:#FFD37E;font-weight:700">old composer</a>.
+  </div>
+  <div class=split>
+    <div class=panel>
+      <div class=listhead><b id=lh>Loading...</b>
+        <button class=mini id=sel-all>Select all</button></div>
+      <div id=list></div>
+    </div>
+    <div class=panel id=editor>
+      <div class=empty id=nosel>Pick a subscriber on the left to write their brief.</div>
+      <div id=form style="display:none">
+        <div class=ctx id=ctx></div>
+        <label>Verdict</label>
+        <div class=verd id=verd>
+          <button type=button data-v=clear>Clear</button>
+          <button type=button data-v=caution>Caution</button>
+          <button type=button data-v=risk>Risk</button>
+        </div>
+        <label for=f-bottom>Bottom line for the customer</label>
+        <textarea id=f-bottom placeholder="The one sentence they will actually act on."></textarea>
+        <label for=f-weather>Weather details</label>
+        <textarea id=f-weather placeholder="Numbers, timing, what the models are doing."></textarea>
+        <label for=f-ahead>What to watch</label>
+        <textarea id=f-ahead placeholder="What could change, and when you will know."></textarea>
+        <div class=acts>
+          <button class=go id=send>Send</button>
+          <button class=ghost id=save>Save without sending</button>
+        </div>
+        <div id=msg class=msg></div>
+      </div>
+      <div class=recent id=recent></div>
+      <div class=oldnote>Refreshing the AI draft, scheduling ahead, and adding an image are
+      still on the <a href="__SPA__/">old composer</a>. Everything you write there shows up
+      here, and the other way round.</div>
+    </div>
+  </div>
+</div>
+__WV_FOOTER__"""
+
+_MET_BRIEFS_SCRIPT = """<script>
+(function(){
+  var drafts=[], current=null, selected={};
+  function esc(t){var d=document.createElement('div');d.textContent=(t===null||t===undefined)?'':t;return d.innerHTML;}
+  function say(kind,text){ var m=document.getElementById('msg');
+    m.className='msg '+kind; m.innerHTML=text; m.style.display='block'; }
+  function hide(){ var m=document.getElementById('msg'); m.style.display='none'; }
+
+  function load(){
+    fetch('/api/v1/met/pro-briefs',{credentials:'include'})
+     .then(function(r){return r.json();}).then(function(j){
+        drafts=(j&&j.drafts)||[];
+        var pending=drafts.filter(function(d){return d.status!=='sent';});
+        document.getElementById('lh').textContent =
+          pending.length ? pending.length+(pending.length===1?' brief to write':' briefs to write')
+                         : 'Nothing waiting';
+        var html=drafts.map(function(d){
+          var sent = d.status==='sent';
+          return '<div class="d'+(selected[d.id]?' on':'')+'" data-id="'+d.id+'">'
+            +'<input type=checkbox '+(selected[d.id]?'checked':'')+(sent?' disabled':'')+'>'
+            +'<span><b>'+esc(d.subscriber_name||'A subscriber')+'</b>'
+            +'<i>'+esc(d.location_label||'')+'</i>'
+            +'<span class="st '+(sent?'sent':'wait')+'">'+(sent?'Sent':'Waiting')+'</span>'
+            +'</span></div>';
+        }).join('');
+        document.getElementById('list').innerHTML = html ||
+          '<div class=empty>No Pro briefs right now.</div>';
+        wire();
+        renderRecent();
+     }).catch(function(){
+        document.getElementById('list').innerHTML='<div class=empty>Could not load briefs.</div>';
+     });
+  }
+
+  function wire(){
+    Array.prototype.forEach.call(document.querySelectorAll('.d'),function(el){
+      var id=Number(el.getAttribute('data-id'));
+      el.addEventListener('click',function(e){
+        var d=drafts.filter(function(x){return x.id===id;})[0];
+        if(!d) return;
+        if(e.target.tagName==='INPUT'){
+          if(e.target.checked){ selected[id]=true; el.className='d on'; }
+          else { delete selected[id]; el.className='d'; }
+          return;
+        }
+        open(d);
+      });
+    });
+  }
+
+  function open(d){
+    current=d;
+    hide();
+    document.getElementById('nosel').style.display='none';
+    document.getElementById('form').style.display='block';
+    var ctx='<b>'+esc(d.subscriber_name||'Subscriber')+'</b>';
+    if(d.subscriber_business_role) ctx+=esc(d.subscriber_business_role)+'<br>';
+    if(d.subscriber_weather_decisions) ctx+='Decides: '+esc(d.subscriber_weather_decisions)+'<br>';
+    if(d.subscriber_peak_need_times) ctx+='Needs it by: '+esc(d.subscriber_peak_need_times)+'<br>';
+    if(d.location_label) ctx+='Location: '+esc(d.location_label);
+    document.getElementById('ctx').innerHTML=ctx;
+    document.getElementById('f-bottom').value = d.bottom_line || d.met_snippet || d.ai_snippet || '';
+    document.getElementById('f-weather').value = d.weather_details || d.met_body || d.ai_body || '';
+    document.getElementById('f-ahead').value = d.whats_ahead || '';
+    var v=(d.met_verdict||d.ai_verdict||'caution').toLowerCase();
+    Array.prototype.forEach.call(document.querySelectorAll('#verd button'),function(b){
+      b.className = (b.getAttribute('data-v')===v) ? 'on' : ''; });
+    document.getElementById('send').textContent =
+      (Object.keys(selected).length>1) ? 'Send to '+Object.keys(selected).length+' subscribers' : 'Send';
+  }
+
+  Array.prototype.forEach.call(document.querySelectorAll('#verd button'),function(b){
+    b.addEventListener('click',function(){
+      Array.prototype.forEach.call(document.querySelectorAll('#verd button'),
+        function(x){ x.className=''; });
+      b.className='on';
+    });
+  });
+
+  document.getElementById('sel-all').addEventListener('click',function(){
+    var pending=drafts.filter(function(d){return d.status!=='sent';});
+    var all = pending.every(function(d){ return selected[d.id]; });
+    selected={};
+    if(!all) pending.forEach(function(d){ selected[d.id]=true; });
+    load();
+    this.textContent = all ? 'Select all' : 'Clear selection';
+  });
+
+  function payload(){
+    var v=document.querySelector('#verd button.on');
+    return {verdict: v?v.getAttribute('data-v'):'caution',
+            bottom_line: document.getElementById('f-bottom').value.trim(),
+            weather_details: document.getElementById('f-weather').value.trim(),
+            whats_ahead: document.getElementById('f-ahead').value.trim()};
+  }
+
+  function saveOne(id){
+    return fetch('/api/v1/met/pro-briefs/'+id,{method:'PATCH',credentials:'include',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(payload())})
+      .then(function(r){return r.json();});
+  }
+
+  document.getElementById('save').addEventListener('click',function(){
+    if(!current) return;
+    var btn=this; btn.disabled=true; hide();
+    saveOne(current.id).then(function(j){
+      btn.disabled=false;
+      if(j&&j.ok){ say('good','Saved. Nothing has gone out yet.'); load(); }
+      else say('bad',(j&&j.error)||'Could not save that.');
+    }).catch(function(){ btn.disabled=false; say('bad','Network problem.'); });
+  });
+
+  document.getElementById('send').addEventListener('click',function(){
+    if(!current) return;
+    var ids=Object.keys(selected).map(Number);
+    if(ids.length<1) ids=[current.id];
+    var p=payload();
+    if(!p.bottom_line){ say('bad','Write the bottom line first. That is the part they read.'); return; }
+    if(ids.length>1 && !confirm('Send this same brief to '+ids.length+' subscribers?')) return;
+    var btn=this, label=btn.textContent;
+    btn.disabled=true; btn.textContent='Sending...'; hide();
+    var done=0, failed=0;
+    function next(i){
+      if(i>=ids.length){
+        btn.disabled=false; btn.textContent=label;
+        selected={};
+        if(failed) say('bad','Sent '+done+', failed '+failed+'. Check the ones still marked waiting.');
+        else say('good','Sent to '+done+(done===1?' subscriber.':' subscribers.'));
+        load();
+        return;
+      }
+      var id=ids[i];
+      saveOne(id).then(function(){
+        return fetch('/api/v1/met/pro-briefs/'+id+'/send',{method:'POST',credentials:'include',
+          headers:{'Content-Type':'application/json'},body:'{}'});
+      }).then(function(r){return r.json();}).then(function(j){
+        if(j&&j.ok) done++; else failed++;
+        next(i+1);
+      }).catch(function(){ failed++; next(i+1); });
+    }
+    next(0);
+  });
+
+  function renderRecent(){
+    var sent=drafts.filter(function(d){return d.status==='sent';})
+                   .sort(function(a,b){return (b.sent_at||0)-(a.sent_at||0);}).slice(0,8);
+    if(!sent.length){ document.getElementById('recent').innerHTML=''; return; }
+    document.getElementById('recent').innerHTML =
+      '<label style="margin-top:0">Recently sent</label>' + sent.map(function(d){
+        var when = d.sent_at ? new Date(Number(d.sent_at)).toLocaleString(undefined,
+          {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : '';
+        return '<div class=r><b>'+esc(d.subscriber_name||'')+'</b> '
+          +'<span>'+esc(when)+(d.sent_by_name?' by '+esc(d.sent_by_name):'')+'</span></div>';
+      }).join('');
+  }
+
+  load();
+})();
+</script>"""
+
+
+@app.get("/portal/met/briefs")
+def portal_met_briefs():
+    user = _get_current_user()
+    if not user:
+        return redirect("/signin", code=302)
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return redirect("/portal", code=302)
+    spa = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+    return wv_shell(_MET_BRIEFS_PAGE
+                    .replace("__MET_CHROME__", _MET_CHROME_CSS)
+                    .replace("__SHELTER__", _met_shelter_bar(user, spa))
+                    .replace("__MET_NAV__", _met_nav("day", spa))
+                    .replace("__SPA__", spa)
+                    .replace("__WV_FOOTER__", _MET_BRIEFS_SCRIPT + "\n__WV_FOOTER__"))
 
 
 @app.get("/portal/met/all")
