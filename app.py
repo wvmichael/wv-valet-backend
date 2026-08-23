@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-217"
+BACKEND_BUILD = "0702-218"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -886,6 +886,30 @@ ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS manage_token TEXT;
 -- welcome text has to say who it came from, or the first message she gets
 -- is a stranger telling her about her own house.
 ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS gift_from TEXT;
+
+-- Pro watch card events (Aug 23, 2026). Dated things a subscriber has told
+-- us about: a home football game Friday, a concert Saturday at 7. The
+-- Sunday-evening text asks them about the week and their reply lands in
+-- brief_replies, but nothing ever turned those answers into anything a Met
+-- would see on the day. This is that store.
+--
+-- A dated entry here surfaces on My Day the day before and the day of, so
+-- nobody has to remember to open a watch card.
+CREATE TABLE IF NOT EXISTS pro_watch_events (
+    id              SERIAL PRIMARY KEY,
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    event_date      DATE NOT NULL,
+    start_hour      INTEGER,
+    what            TEXT NOT NULL,
+    place           TEXT,
+    notes           TEXT,
+    created_by      INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    from_reply_id   INTEGER,
+    created_at      BIGINT NOT NULL,
+    updated_at      BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pwe_date ON pro_watch_events(event_date);
+CREATE INDEX IF NOT EXISTS idx_pwe_user ON pro_watch_events(user_id, event_date);
 
 -- Internal test rows (Aug 21, 2026). Addresses we put in ourselves, in
 -- severe-weather corridors, to prove the Weather Service fetch is working.
@@ -19591,6 +19615,40 @@ def _met_day_cards(user: dict) -> list:
     except Exception as e:
         print(f"[my-day] watch lookup failed: {e!r}", flush=True)
 
+    # ── Dated entries from Pro watch cards ─────────────────────────────
+    # The day before and the day of, so a Met never has to remember to open
+    # somebody's card. This is the whole reason the card exists.
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT e.id, e.what, e.event_date, e.start_hour, e.place,
+                                      u.name AS subscriber_name
+                                 FROM pro_watch_events e
+                                 JOIN users u ON u.id = e.user_id
+                            LEFT JOIN subscriber_coverage sc ON sc.user_id = e.user_id
+                                WHERE e.event_date BETWEEN %s AND %s
+                                  AND (sc.primary_met_id = %s OR sc.primary_met_id IS NULL)
+                             ORDER BY e.event_date, e.start_hour NULLS LAST""",
+                            (today, tomorrow, uid))
+                for r in cur.fetchall() or []:
+                    same_day = (r["event_date"] == today)
+                    at = ""
+                    if r.get("start_hour") is not None:
+                        at = " at %s" % _watch_hour_label(r["start_hour"])
+                    cards.append({
+                        "kind": "event",
+                        "when": "today" if same_day else "tomorrow",
+                        "sort": 2 if same_day else 5,
+                        "title": "%s: %s" % (r.get("subscriber_name") or "A subscriber",
+                                             r.get("what") or "something on"),
+                        "sub": ("They told us about this%s. It is on their watch card."
+                                % at) + (" " + r["place"] if r.get("place") else ""),
+                        "meta": r["event_date"].strftime("%a %b %-d"),
+                        "href": "/portal/met/replies", "urgent": same_day,
+                    })
+    except Exception as e:
+        print(f"[my-day] watch events lookup failed: {e!r}", flush=True)
+
     # ── Week-ahead replies waiting to become watch card entries ────────
     # The customer has already done their part; this is the nudge so their
     # answer does not sit unread in a message list.
@@ -19609,7 +19667,7 @@ def _met_day_cards(user: dict) -> list:
                 "kind": "replies", "when": "waiting", "sort": 4,
                 "title": "%d repl%s about the week ahead" % (n, "y" if n == 1 else "ies"),
                 "sub": "Turn their answers into dated entries on their watch card.",
-                "meta": "Pro", "href": SPA_ROOT, "urgent": True,
+                "meta": "Pro", "href": "/portal/met/replies", "urgent": True,
             })
     except Exception as e:
         print(f"[my-day] replies lookup failed: {e!r}", flush=True)
@@ -20698,6 +20756,359 @@ _MET_MSG_SCRIPT = """<script>
   loadThreads();
 })();
 </script>"""
+
+
+@app.get("/api/v1/met/card-events")
+def met_card_events_list():
+    """Dated entries on a subscriber's watch card, or everyone's."""
+    user = _get_current_user()
+    if not user or not ({"met", "admin"} & set(user.get("roles") or [])):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    uid = request.args.get("user_id")
+    rows = []
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                if uid:
+                    cur.execute("""SELECT e.*, u.name AS subscriber_name
+                                     FROM pro_watch_events e
+                                     JOIN users u ON u.id = e.user_id
+                                    WHERE e.user_id = %s AND e.event_date >= CURRENT_DATE - 1
+                                 ORDER BY e.event_date, e.start_hour NULLS LAST""", (int(uid),))
+                else:
+                    cur.execute("""SELECT e.*, u.name AS subscriber_name
+                                     FROM pro_watch_events e
+                                     JOIN users u ON u.id = e.user_id
+                                    WHERE e.event_date >= CURRENT_DATE - 1
+                                 ORDER BY e.event_date, e.start_hour NULLS LAST LIMIT 200""")
+                rows = [dict(r) for r in (cur.fetchall() or [])]
+    except Exception as e:
+        print(f"[watch-events] list failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "Could not load those."}), 500
+    for r in rows:
+        if r.get("event_date"):
+            r["event_date"] = r["event_date"].isoformat()
+    return jsonify({"ok": True, "events": rows})
+
+
+@app.post("/api/v1/met/card-events")
+def met_card_event_add():
+    """Add a dated entry to a subscriber's watch card."""
+    user = _get_current_user()
+    if not user or not ({"met", "admin"} & set(user.get("roles") or [])):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    try:
+        sub_id = int(data.get("user_id"))
+    except Exception:
+        return jsonify({"ok": False, "error": "Which subscriber?"}), 400
+    what = (data.get("what") or "").strip()[:200]
+    if len(what) < 3:
+        return jsonify({"ok": False, "error": "What is happening?"}), 400
+    raw_date = (data.get("event_date") or "").strip()
+    try:
+        ev = datetime.strptime(raw_date, "%Y-%m-%d").date()
+    except Exception:
+        return jsonify({"ok": False, "error": "A date, as YYYY-MM-DD."}), 400
+    hour = data.get("start_hour")
+    if hour in ("", None):
+        hour = None
+    else:
+        try:
+            hour = int(hour)
+            if not 0 <= hour <= 23:
+                raise ValueError
+        except Exception:
+            return jsonify({"ok": False, "error": "Hour must be 0 to 23."}), 400
+
+    now_ms = int(time.time() * 1000)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""INSERT INTO pro_watch_events
+                                 (user_id, event_date, start_hour, what, place, notes,
+                                  created_by, from_reply_id, created_at, updated_at)
+                               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                            (sub_id, ev, hour, what,
+                             (data.get("place") or "").strip()[:200] or None,
+                             (data.get("notes") or "").strip()[:500] or None,
+                             user["id"], data.get("reply_id"), now_ms, now_ms))
+                new_id = cur.fetchone()["id"]
+                # mark the reply handled so it stops nagging on My Day
+                if data.get("reply_id"):
+                    cur.execute("""UPDATE brief_replies SET routed_status = 'handled',
+                                          routed_at_ms = %s WHERE id = %s""",
+                                (now_ms, int(data["reply_id"])))
+    except Exception as e:
+        print(f"[watch-events] add failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "Could not save that."}), 500
+    print(f"[watch-events] {new_id} for user {sub_id} on {ev} by {user.get('email')}", flush=True)
+    return jsonify({"ok": True, "id": new_id})
+
+
+@app.post("/api/v1/met/card-events/<int:event_id>/delete")
+def met_card_event_delete(event_id):
+    user = _get_current_user()
+    if not user or not ({"met", "admin"} & set(user.get("roles") or [])):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM pro_watch_events WHERE id = %s RETURNING what",
+                            (event_id,))
+                row = cur.fetchone()
+    except Exception as e:
+        print(f"[watch-events] delete failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "Could not remove that."}), 500
+    if not row:
+        return jsonify({"ok": False, "error": "No such entry."}), 404
+    return jsonify({"ok": True, "what": row["what"]})
+
+
+@app.post("/api/v1/met/replies/<int:reply_id>/dismiss")
+def met_reply_dismiss(reply_id):
+    """Mark a week-ahead reply handled without adding an event.
+
+    Plenty of replies are 'nothing this week', and those still need to stop
+    appearing or the nudge becomes noise nobody reads.
+    """
+    user = _get_current_user()
+    if not user or not ({"met", "admin"} & set(user.get("roles") or [])):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""UPDATE brief_replies SET routed_status = 'handled',
+                                      routed_at_ms = %s WHERE id = %s RETURNING id""",
+                            (int(time.time() * 1000), reply_id))
+                if not cur.fetchone():
+                    return jsonify({"ok": False, "error": "No such reply."}), 404
+    except Exception as e:
+        print(f"[replies] dismiss failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "Could not do that."}), 500
+    return jsonify({"ok": True})
+
+
+@app.get("/api/v1/met/replies")
+def met_replies_list():
+    """Week-ahead replies still waiting to become watch card entries."""
+    user = _get_current_user()
+    if not user or not ({"met", "admin"} & set(user.get("roles") or [])):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    rows = []
+    try:
+        cutoff = int(time.time() * 1000) - 14 * 86400 * 1000
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT r.id, r.received_at_ms, r.body, r.channel,
+                                      r.from_address, r.matched_user_id,
+                                      u.name AS subscriber_name, u.email AS subscriber_email
+                                 FROM brief_replies r
+                            LEFT JOIN users u ON u.id = r.matched_user_id
+                                WHERE r.received_at_ms > %s
+                                  AND COALESCE(r.routed_status,'') <> 'handled'
+                             ORDER BY r.received_at_ms DESC LIMIT 60""", (cutoff,))
+                rows = [dict(r) for r in (cur.fetchall() or [])]
+    except Exception as e:
+        print(f"[replies] list failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "Could not load replies."}), 500
+    return jsonify({"ok": True, "replies": rows})
+
+
+_MET_REPLIES_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Week ahead - WeatherValet</title><meta name=robots content="noindex">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+__MET_CHROME__
+.wrapx{max-width:1000px;margin:0 auto;padding:30px 22px 70px}
+h1{font-size:clamp(24px,3.6vw,32px);font-weight:900;letter-spacing:-.03em;color:#fff;margin:0 0 4px}
+.sub{color:#B8C7DE;font-size:15.5px;margin:0 0 22px;line-height:1.6}
+.head{font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:#A9B4C6;
+  font-weight:800;margin:30px 0 12px}
+.card{border:1.5px solid rgba(30,107,255,.42);border-radius:15px;padding:19px 21px;margin-bottom:13px;
+  background:linear-gradient(168deg,#18213A 0%,#0E1526 100%)}
+.card .who{font-size:16.5px;color:#fff;font-weight:700}
+.card .when{font-size:12.5px;color:#8FA6C6;float:right}
+.said{background:rgba(255,255,255,.05);border-left:3px solid var(--blue);border-radius:0 9px 9px 0;
+  padding:12px 14px;margin:11px 0 14px;color:#DCE7FA;font-size:14.5px;line-height:1.6}
+.frow{display:flex;gap:9px;flex-wrap:wrap;align-items:flex-end}
+.frow>div{flex:1;min-width:120px}
+label{display:block;font-size:11px;font-weight:800;letter-spacing:.09em;text-transform:uppercase;
+  color:#9FB6D6;margin:0 0 5px}
+input{width:100%;box-sizing:border-box;padding:10px 12px;font-size:14.5px;font-family:inherit;
+  color:#EAF1FF;border-radius:9px;background:rgba(255,255,255,.06);
+  border:1px solid rgba(126,182,255,.26)}
+input:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 3px rgba(30,107,255,.22)}
+.b{border:none;border-radius:9px;padding:11px 16px;font-size:14px;font-weight:700;cursor:pointer}
+.b.add{background:var(--accent);color:#fff}
+.b.skip{background:rgba(255,255,255,.06);border:1px solid rgba(126,182,255,.3);color:#C3D2E6}
+.b:disabled{opacity:.5}
+.ev{display:flex;justify-content:space-between;gap:12px;align-items:center;
+  border:1px solid rgba(126,182,255,.2);border-radius:11px;padding:12px 14px;margin-bottom:8px;
+  background:rgba(255,255,255,.035)}
+.ev b{color:#fff;font-size:14.5px}
+.ev i{font-style:normal;font-size:13px;color:#9FB3CE;display:block;margin-top:3px}
+.ev button{background:rgba(224,36,60,.16);color:#FF9AA8;border:1px solid rgba(224,36,60,.4);
+  border-radius:8px;padding:7px 11px;font-size:12.5px;cursor:pointer}
+.msg{display:none;border-radius:10px;padding:11px 13px;margin-top:11px;font-size:14px;line-height:1.5}
+.msg.good{background:#0F2A4A;border:1px solid var(--blue);color:#BBD8FF}
+.msg.bad{background:#3A1220;border:1px solid #7C2740;color:#FFC2CE}
+.empty{border:1px dashed rgba(126,182,255,.3);border-radius:13px;padding:24px;color:#B8C7DE;
+  font-size:15px;line-height:1.6;text-align:center}
+.note{border:1px solid rgba(126,182,255,.25);border-radius:12px;padding:15px 18px;margin-top:22px;
+  color:#B8C7DE;font-size:14px;line-height:1.7;background:rgba(255,255,255,.03)}
+.note b{color:#fff}
+</style></head><body>
+__WV_HEADER__
+__SHELTER__
+__MET_NAV__
+<div class=wrapx>
+  <h1>The week ahead</h1>
+  <p class=sub>What subscribers told us when we asked about their week. Turn each answer into
+  a dated entry and it shows up on My Day the day before and the day of, so nobody has to
+  remember to check.</p>
+
+  <div class=head>Replies waiting</div>
+  <div id=replies><div class=empty>Loading...</div></div>
+
+  <div class=head>Everything on the calendar</div>
+  <div id=events><div class=empty>Loading...</div></div>
+
+  <div class=note><b>Nothing is added automatically.</b> A model reading "concert Saturday
+  night at 7" could put the wrong date on a $99 customer's card and nobody would notice until
+  Saturday. A person reads the reply and adds the entry.</div>
+</div>
+__WV_FOOTER__"""
+
+_MET_REPLIES_SCRIPT = """<script>
+(function(){
+  function esc(t){var d=document.createElement('div');d.textContent=(t===null||t===undefined)?'':t;return d.innerHTML;}
+  function say(id,k,t){var m=document.getElementById(id);
+    if(!m) return; m.className='msg '+k; m.innerHTML=t; m.style.display='block';}
+  function when(ms){ if(!ms) return '';
+    return new Date(Number(ms)).toLocaleDateString(undefined,{month:'short',day:'numeric'}); }
+  function hour(h){ if(h===null||h===undefined||h==='') return '';
+    h=Number(h); if(h===0) return 'midnight'; if(h===12) return 'noon';
+    return (h<12? h+' AM' : (h-12)+' PM'); }
+  function nextDates(){
+    var out=[]; var d=new Date();
+    for(var i=0;i<10;i++){ var x=new Date(d.getTime()+i*86400000);
+      out.push(x.toISOString().slice(0,10)); }
+    return out;
+  }
+
+  function loadReplies(){
+    fetch('/api/v1/met/replies',{credentials:'include'})
+     .then(function(r){return r.json();}).then(function(j){
+        var list=(j&&j.replies)||[];
+        if(!list.length){ document.getElementById('replies').innerHTML=
+          '<div class=empty>No replies waiting. Everyone who wrote back has been dealt with.</div>';
+          return; }
+        document.getElementById('replies').innerHTML=list.map(function(r){
+          var who=r.subscriber_name||r.subscriber_email||r.from_address||'Someone';
+          return '<div class=card data-reply="'+r.id+'" data-user="'+(r.matched_user_id||'')+'">'
+            +'<span class=when>'+esc(when(r.received_at_ms))+'</span>'
+            +'<div class=who>'+esc(who)+'</div>'
+            +'<div class=said>'+esc(r.body||'')+'</div>'
+            +(r.matched_user_id ?
+              ('<div class=frow>'
+                +'<div style="flex:2"><label>What is happening</label>'
+                  +'<input class=f data-k=what placeholder="Home football game"></div>'
+                +'<div><label>Date</label><input class=f data-k=event_date type=date></div>'
+                +'<div style="max-width:110px"><label>Hour</label>'
+                  +'<input class=f data-k=start_hour type=number min=0 max=23 placeholder="19"></div>'
+                +'<div style="max-width:150px;flex:0 0 auto">'
+                  +'<button class="b add">Add to their card</button></div>'
+                +'</div>')
+              : '<div class=empty style="padding:14px">This reply is not matched to a '
+                +'subscriber account, so it cannot be added to a card. '+esc(r.from_address||'')+'</div>')
+            +'<div style="margin-top:10px"><button class="b skip">Nothing this week</button></div>'
+            +'<div class=msg id="rm'+r.id+'"></div>'
+            +'</div>';
+        }).join('');
+        wireReplies();
+     }).catch(function(){ document.getElementById('replies').innerHTML=
+        '<div class=empty>Could not load replies.</div>'; });
+  }
+
+  function wireReplies(){
+    Array.prototype.forEach.call(document.querySelectorAll('.card[data-reply]'),function(card){
+      var rid=Number(card.getAttribute('data-reply'));
+      var uid=card.getAttribute('data-user');
+      var add=card.querySelector('.b.add'), skip=card.querySelector('.b.skip');
+      if(add) add.addEventListener('click',function(){
+        var body={user_id:Number(uid), reply_id:rid};
+        Array.prototype.forEach.call(card.querySelectorAll('.f'),function(el){
+          body[el.getAttribute('data-k')]=el.value; });
+        if(!body.what){ say('rm'+rid,'bad','What is happening?'); return; }
+        if(!body.event_date){ say('rm'+rid,'bad','Pick the date.'); return; }
+        add.disabled=true; add.textContent='Adding...';
+        fetch('/api/v1/met/card-events',{method:'POST',credentials:'include',
+          headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+         .then(function(r){return r.json();}).then(function(j){
+            add.disabled=false; add.textContent='Add to their card';
+            if(j&&j.ok){ say('rm'+rid,'good','Added. It will appear on My Day the day before.');
+              loadReplies(); loadEvents(); }
+            else say('rm'+rid,'bad',(j&&j.error)||'Could not save that.');
+         }).catch(function(){ add.disabled=false; add.textContent='Add to their card';
+            say('rm'+rid,'bad','Network problem.'); });
+      });
+      skip.addEventListener('click',function(){
+        skip.disabled=true;
+        fetch('/api/v1/met/replies/'+rid+'/dismiss',{method:'POST',credentials:'include',
+          headers:{'Content-Type':'application/json'},body:'{}'})
+         .then(function(r){return r.json();}).then(function(){ loadReplies(); })
+         .catch(function(){ skip.disabled=false; });
+      });
+    });
+  }
+
+  function loadEvents(){
+    fetch('/api/v1/met/card-events',{credentials:'include'})
+     .then(function(r){return r.json();}).then(function(j){
+        var list=(j&&j.events)||[];
+        if(!list.length){ document.getElementById('events').innerHTML=
+          '<div class=empty>No dated entries yet.</div>'; return; }
+        document.getElementById('events').innerHTML=list.map(function(e){
+          return '<div class=ev><div><b>'+esc(e.what)+'</b>'
+            +'<i>'+esc(e.subscriber_name||'')+'  ·  '+esc(e.event_date)
+            +(e.start_hour!==null&&e.start_hour!==undefined?'  ·  '+esc(hour(e.start_hour)):'')
+            +'</i></div><button data-ev="'+e.id+'">Remove</button></div>';
+        }).join('');
+        Array.prototype.forEach.call(document.querySelectorAll('[data-ev]'),function(b){
+          b.addEventListener('click',function(){
+            b.disabled=true;
+            fetch('/api/v1/met/card-events/'+b.getAttribute('data-ev')+'/delete',
+              {method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:'{}'})
+             .then(function(r){return r.json();}).then(function(){ loadEvents(); })
+             .catch(function(){ b.disabled=false; });
+          });
+        });
+     }).catch(function(){ document.getElementById('events').innerHTML=
+        '<div class=empty>Could not load the calendar.</div>'; });
+  }
+
+  loadReplies(); loadEvents();
+})();
+</script>"""
+
+
+@app.get("/portal/met/replies")
+def portal_met_replies():
+    user = _get_current_user()
+    if not user:
+        return redirect("/signin", code=302)
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return redirect("/portal", code=302)
+    spa = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+    return wv_shell(_MET_REPLIES_PAGE
+                    .replace("__MET_CHROME__", _MET_CHROME_CSS)
+                    .replace("__SHELTER__", _met_shelter_bar(user, spa))
+                    .replace("__MET_NAV__", _met_nav("day", spa))
+                    .replace("__WV_FOOTER__", _MET_REPLIES_SCRIPT + "\n__WV_FOOTER__"))
 
 
 @app.get("/portal/met/messages")
