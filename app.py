@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-218"
+BACKEND_BUILD = "0702-219"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -19016,8 +19016,8 @@ def portal_admin_employees():
                     .replace("__WV_FOOTER__", _ADMIN_EMP_SCRIPT + "\n__WV_FOOTER__"))
 
 
-@app.get("/api/v1/admin/subscribers")
-def admin_subscribers_list():
+@app.get("/api/v1/admin/tier-list")
+def admin_tier_list():
     """Every row in one tier, for the Command Center list."""
     user = _get_current_user()
     if not user or "admin" not in (user.get("roles") or []):
@@ -19262,7 +19262,7 @@ _ADMIN_SUBS_SCRIPT = """<script>
   function load(){
     hide();
     document.getElementById('out').innerHTML='<div class=empty>Loading...</div>';
-    fetch('/api/v1/admin/subscribers?tier='+tier,{credentials:'include'})
+    fetch('/api/v1/admin/tier-list?tier='+tier,{credentials:'include'})
      .then(function(r){return r.json();}).then(function(j){
         if(!j||!j.ok){ document.getElementById('out').innerHTML=
           '<div class=empty>'+esc((j&&j.error)||'Could not load that list.')+'</div>'; return; }
