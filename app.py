@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-209"
+BACKEND_BUILD = "0702-210"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -12793,7 +12793,7 @@ WV_HEADER = """<header>
       <h6>Meteorologists watch your plans</h6>
       <a href="/gameday/iu"><b>Sidekick</b><i>$16/series</i></a>
       <a href="/met-review"><b>Met Review</b><i>$19</i></a>
-      <a href="/watch"><b>Watch</b><i>$49/day</i></a>
+      <a href="/watch"><b>Watch</b><i>$49/day &middot; one Met, one event</i></a>
       <a href="/pro"><b>Pro</b><i>from $99/mo</i></a>
     </div></div>
   <div class=nl>Who it's for &#9662;
@@ -14807,6 +14807,10 @@ footer a{color:#A9A08C}
 .s-paper h2,.s-paper h3,.s-paper b,.s-paper strong{color:#14110B}
 .s-paper p,.s-paper li,.s-paper label{color:#4E463A}
 .inner{max-width:660px;margin:0 auto}
+/* Watch on its own does not tell a first-time visitor what they are
+   buying. The sentence goes wherever the name goes. */
+.oneliner{font-size:clamp(15px,2vw,18px);color:#E4D6BC;font-weight:600;margin:6px 0 14px;
+  line-height:1.5}
 /* Dark rooms need light text; this page was drawn light. */
 .sec h2,.sec h3{color:#fff}
 .sec p,.sec li{color:#D6CFC0}
@@ -14874,6 +14878,7 @@ __WV_HEADER__
 <div class=hero>
   <div class=brand>&#9889; WeatherValet</div>
   <div class=pname>Watch</div>
+  <div class=oneliner>One Meteorologist. One event. Nobody else on the thread.</div>
   <h1>One day. One Meteorologist. <em>Yours.</em></h1>
   <p>Book a Meteorologist to stand guard over your event window, start to finish.
   They send the outlook the evening before, then stay with your day and message
@@ -19617,11 +19622,26 @@ __WV_HEADER__
 __WV_FOOTER__"""
 
 
+# Titles for the people wall. Everyone was labelled "Meteorologist"
+# unconditionally, directly under a promise that these are the people who
+# write your weather. Anyone on the team who is not a Meteorologist has to
+# be labelled correctly or that promise is false.
+#
+# Set a slug here to override. Anything not listed stays "Meteorologist".
+MET_TITLES = {
+    # "josh": "Tech Director",
+}
+
+
+def _met_title(slug: str) -> str:
+    return MET_TITLES.get(slug, "Meteorologist")
+
+
 @app.get("/about")
 def about_page():
     wall = "".join(
-        '<div class=met>%s<b>%s</b><i>Meteorologist</i></div>'
-        % (_met_img(slug, 96), _html_escape(name))
+        '<div class=met>%s<b>%s</b><i>%s</i></div>'
+        % (_met_img(slug, 96), _html_escape(name), _html_escape(_met_title(slug)))
         for slug, (name, _b64) in MET_AVATARS.items())
     return wv_shell(_ABOUT_PAGE.replace("__MET_WALL__", wall))
 
@@ -20078,6 +20098,8 @@ h1 .way .swash{position:absolute;left:-1%;bottom:-.20em;width:91%;height:auto;
   text-shadow:0 2px 14px rgba(0,0,0,.75)}
 
 /* ---------------------------------------------------------------- chooser */
+.prompt{font-size:clamp(15px,2vw,18.5px);font-weight:700;color:#fff;letter-spacing:.01em;
+  margin:0 auto 18px;max-width:1000px;text-align:center;opacity:.94}
 .grid{display:grid;grid-template-columns:1fr;gap:24px;max-width:1000px;margin:0 auto}
 @media(min-width:760px){.grid{grid-template-columns:1fr 1fr;gap:34px 40px}}
 /* These are the only thing on the first screen you are meant to press, so
@@ -20457,7 +20479,11 @@ __WV_HEADER__
   }
   function opts(node){
     stage.className='stage';
-    stage.innerHTML=crumb()+'<div class=grid id=g>'+T[node].map(function(o){
+    // A question above the boxes. Four panels with nothing above them
+    // read as information; with the question they read as a choice.
+    stage.innerHTML=crumb()
+      +(node==='start'?'<div class=prompt>What do you need weather for?</div>':'')
+      +'<div class=grid id=g>'+T[node].map(function(o){
       return '<button class=box data-go="'+o.go+'" data-l="'+esc(o.t)+'">'
         +'<span class=aura></span><span class=ico>'+o.i+'</span>'
         +'<b>'+esc(o.t)+'</b><i>'+esc(o.s)+'</i></button>';}).join('')+'</div>'
