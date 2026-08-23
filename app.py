@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-210"
+BACKEND_BUILD = "0702-211"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -18751,8 +18751,10 @@ def _met_shelter_bar(user: dict, spa: str) -> str:
 
 
 def _met_nav(active: str, spa: str) -> str:
+    # Messages is not rebuilt yet, so it opens the old portal rather than a
+    # dead link. A nav item that 404s is worse than one that is honest.
     items = [("day", "My Day", "/portal/met"), ("all", "All Work", "/portal/met/all"),
-             ("messages", "Messages", "/portal/met/messages"),
+             ("messages", "Messages", spa + "/"),
              ("numbers", "My Numbers", "/portal/met/numbers")]
     links = "".join('<a class="%s" href="%s">%s</a>'
                     % ("on" if k == active else "", href, label)
@@ -19265,6 +19267,227 @@ def portal_met_briefs():
                     .replace("__MET_NAV__", _met_nav("day", spa))
                     .replace("__SPA__", spa)
                     .replace("__WV_FOOTER__", _MET_BRIEFS_SCRIPT + "\n__WV_FOOTER__"))
+
+
+# ---------------------------------------------------------------------------
+# Met portal: My Numbers (Aug 23, 2026)
+#
+# What they did, and what WeatherValet did. No money on this page yet, and
+# deliberately nothing that ranks one Meteorologist against another: Chris
+# covers Kansas and Timmy covers Indiana, so comparing their brief counts
+# measures territory rather than effort.
+#
+# Internal test rows are excluded everywhere. We added that flag so watcher
+# addresses in storm country would stop inflating the customer count, and
+# this is exactly the page where that would have shown.
+# ---------------------------------------------------------------------------
+
+def _met_numbers(uid: int, days: int = 30) -> dict:
+    """Their work and the company's, over a window. Every lookup guarded on
+    its own so one missing table cannot blank the page."""
+    since = int(time.time() * 1000) - days * 86400 * 1000
+    since_date = (datetime.now(timezone.utc) - timedelta(days=days)).date()
+    mine, all_wv, people = {}, {}, set()
+
+    def q(label, sql, params, into, key, first=True):
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, params)
+                    row = cur.fetchone()
+                    into[key] = (row or {}).get("n", 0) or 0 if first else (cur.fetchall() or [])
+        except Exception as e:
+            print(f"[numbers] {label} failed: {e!r}", flush=True)
+            into.setdefault(key, 0 if first else [])
+
+    # ── their work ─────────────────────────────────────────────────────
+    q("briefs", """SELECT COUNT(*) AS n FROM brief_history
+                    WHERE is_met_touched = TRUE AND delivered_at > %s
+                      AND met_name = (SELECT name FROM users WHERE id = %s)""",
+      (since, uid), mine, "briefs")
+
+    q("reviews", """SELECT COUNT(*) AS n FROM verification_requests
+                     WHERE claimed_by_user_id = %s AND status IN ('completed','sent')
+                       AND updated_at > %s""", (uid, since), mine, "reviews")
+
+    q("gamedays", """SELECT COUNT(DISTINCT game_id) AS n FROM gameday_broadcasts
+                      WHERE met_user_id = %s AND created_at > %s""",
+      (uid, since), mine, "gamedays")
+
+    q("broadcasts", """SELECT COUNT(*) AS n, COALESCE(SUM(sent_count),0) AS reached
+                         FROM gameday_broadcasts
+                        WHERE met_user_id = %s AND created_at > %s""",
+      (uid, since), mine, "broadcasts")
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT COALESCE(SUM(sent_count),0) AS n FROM gameday_broadcasts
+                                WHERE met_user_id = %s AND created_at > %s""", (uid, since))
+                mine["gameday_reached"] = (cur.fetchone() or {}).get("n", 0) or 0
+    except Exception:
+        mine["gameday_reached"] = 0
+
+    q("watch", """SELECT COUNT(*) AS n FROM watch_orders
+                   WHERE met_user_id = %s AND event_date >= %s""",
+      (uid, since_date), mine, "watch")
+
+    q("shelters", """SELECT COUNT(*) AS n FROM storm_shelter_activations
+                      WHERE met_user_id = %s AND opened_at_ms > %s""",
+      (uid, since), mine, "shelters")
+
+    q("watchmsgs", """SELECT COUNT(*) AS n FROM watch_messages
+                       WHERE met_user_id = %s AND created_at > %s AND sent_ok = TRUE""",
+      (uid, since), mine, "watch_messages")
+
+    # people written to: distinct humans, not distinct messages
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT DISTINCT user_id FROM brief_history
+                                WHERE is_met_touched = TRUE AND delivered_at > %s
+                                  AND met_name = (SELECT name FROM users WHERE id = %s)""",
+                            (since, uid))
+                people.update(r["user_id"] for r in (cur.fetchall() or []) if r["user_id"])
+                cur.execute("""SELECT DISTINCT email FROM watch_orders
+                                WHERE met_user_id = %s AND event_date >= %s""",
+                            (uid, since_date))
+                people.update(r["email"] for r in (cur.fetchall() or []) if r["email"])
+    except Exception as e:
+        print(f"[numbers] people failed: {e!r}", flush=True)
+    mine["people"] = len(people) + (mine.get("gameday_reached") or 0)
+
+    # ── crew reports this Met cited ────────────────────────────────────
+    q("cited", """SELECT COUNT(*) AS n FROM crew_reports
+                   WHERE created_at > %s AND is_hidden = FALSE""",
+      (since,), mine, "crew_seen")
+
+    # ── the company ────────────────────────────────────────────────────
+    q("stormline", """SELECT COUNT(*) AS n FROM sentry_subscribers
+                       WHERE status = 'active' AND is_internal = FALSE""",
+      (), all_wv, "stormline")
+
+    q("daily", """SELECT COUNT(*) AS n FROM sentry_subscribers
+                   WHERE status = 'active' AND is_internal = FALSE AND daily = TRUE""",
+      (), all_wv, "daily")
+
+    q("warnings", """SELECT COUNT(*) AS n FROM sentry_relay_log WHERE warned_at > %s""",
+      (since,), all_wv, "warnings")
+
+    q("sidekick", """SELECT COUNT(*) AS n FROM gameday_passes WHERE status = 'active'""",
+      (), all_wv, "sidekick")
+
+    q("pro", """SELECT COUNT(*) AS n FROM users
+                 WHERE subscription_tier IN ('pro_single','pro_multi','pro_enterprise')
+                   AND is_active = TRUE""", (), all_wv, "pro")
+
+    q("allbriefs", """SELECT COUNT(*) AS n FROM brief_history WHERE delivered_at > %s""",
+      (since,), all_wv, "briefs")
+
+    q("allreviews", """SELECT COUNT(*) AS n FROM verification_requests
+                        WHERE status IN ('completed','sent') AND updated_at > %s""",
+      (since,), all_wv, "reviews")
+
+    q("crew", """SELECT COUNT(*) AS n FROM crew_reports
+                  WHERE created_at > %s AND is_hidden = FALSE""", (since,), all_wv, "crew")
+
+    q("crewpeople", """SELECT COUNT(*) AS n FROM user_roles WHERE role = 'crew'""",
+      (), all_wv, "crew_members")
+
+    return {"mine": mine, "wv": all_wv, "days": days}
+
+
+_MET_NUMBERS_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>My Numbers - WeatherValet</title><meta name=robots content="noindex">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+__MET_CHROME__
+.wrapx{max-width:1000px;margin:0 auto;padding:34px 22px 80px}
+h1{font-size:clamp(26px,4.2vw,38px);font-weight:900;letter-spacing:-.03em;color:#fff;margin:0 0 4px}
+.sub{color:#B8C7DE;font-size:16px;margin:0 0 24px;line-height:1.6}
+.head{font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:#A9B4C6;
+  font-weight:800;margin:32px 0 14px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px}
+.s{border:1.5px solid rgba(30,107,255,.4);border-radius:14px;padding:20px;
+  background:linear-gradient(168deg,#18213A 0%,#0E1526 100%)}
+.s b{display:block;font-size:34px;color:#fff;font-weight:800;letter-spacing:-.02em;line-height:1}
+.s i{display:block;font-style:normal;font-size:13.5px;color:#B8C7DE;margin-top:8px;line-height:1.45}
+.s.big b{font-size:44px;color:#7FB0FF}
+.note{border:1px solid rgba(126,182,255,.25);border-radius:13px;padding:17px 19px;margin-top:26px;
+  color:#B8C7DE;font-size:14.5px;line-height:1.7;background:rgba(255,255,255,.03)}
+.note b{color:#fff}
+</style></head><body>
+__WV_HEADER__
+__SHELTER__
+__MET_NAV__
+<div class=wrapx>
+  <h1>__GREETING__</h1>
+  <p class=sub>The last 30 days. Your work first, then all of WeatherValet.</p>
+
+  <div class=head>What you did</div>
+  <div class=stats>__MINE__</div>
+
+  <div class=head>All of WeatherValet</div>
+  <div class=stats>__WV__</div>
+
+  <div class=note><b>No money on this page yet</b>, and nothing here ranks Meteorologists
+  against each other. Chris covers Kansas and Timmy covers Indiana, so comparing counts
+  would measure territory rather than effort. Internal test addresses are excluded from
+  every number.</div>
+</div>
+__WV_FOOTER__"""
+
+
+@app.get("/portal/met/numbers")
+def portal_met_numbers():
+    user = _get_current_user()
+    if not user:
+        return redirect("/signin", code=302)
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return redirect("/portal", code=302)
+
+    spa = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+    n = _met_numbers(user["id"])
+    m, w = n["mine"], n["wv"]
+
+    def card(value, label, big=False):
+        return ('<div class="s%s"><b>%s</b><i>%s</i></div>'
+                % (" big" if big else "", value, _html_escape(label)))
+
+    mine_html = (
+        card(m.get("people", 0), "people you wrote to", big=True)
+        + card(m.get("briefs", 0), "Pro briefs you wrote")
+        + card(m.get("reviews", 0), "Met Reviews you answered")
+        + card(m.get("gamedays", 0), "game days you covered")
+        + card(m.get("gameday_reached", 0), "people reached on game days")
+        + card(m.get("watch", 0), "Watch events you took")
+        + card(m.get("watch_messages", 0), "messages sent during Watch windows")
+        + card(m.get("shelters", 0), "Storm Shelters you opened")
+    )
+
+    wv_html = (
+        card(w.get("stormline", 0), "addresses watched by Stormline", big=True)
+        + card(w.get("daily", 0), "of those getting a morning summary")
+        + card(w.get("warnings", 0), "warnings relayed in 30 days")
+        + card(w.get("sidekick", 0), "Sidekick passes active")
+        + card(w.get("pro", 0), "Pro subscribers")
+        + card(w.get("briefs", 0), "briefs sent by everyone")
+        + card(w.get("reviews", 0), "Met Reviews answered by everyone")
+        + card(w.get("crew", 0), "Crew reports filed in 30 days")
+        + card(w.get("crew_members", 0), "people on the Valet Crew")
+    )
+
+    first = ((user.get("name") or "").strip().split(" ") or [""])[0]
+    greeting = ("%s's numbers." % _html_escape(first)) if first else "My Numbers."
+    return wv_shell(_MET_NUMBERS_PAGE
+                    .replace("__MET_CHROME__", _MET_CHROME_CSS)
+                    .replace("__SHELTER__", _met_shelter_bar(user, spa))
+                    .replace("__MET_NAV__", _met_nav("numbers", spa))
+                    .replace("__GREETING__", greeting)
+                    .replace("__MINE__", mine_html)
+                    .replace("__WV__", wv_html))
 
 
 @app.get("/portal/met/all")
