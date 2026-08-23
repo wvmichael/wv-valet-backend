@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-211"
+BACKEND_BUILD = "0702-212"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -18150,7 +18150,8 @@ _ADMIN_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <style>
 __WV_TOKENS__
 :root{--accent:#1E6BFF}
-.wrapx{max-width:900px;margin:0 auto;padding:48px 22px 80px}
+__MET_CHROME__
+.wrapx{max-width:900px;margin:0 auto;padding:34px 22px 80px}
 h1{font-size:clamp(27px,4.4vw,40px);font-weight:900;letter-spacing:-.03em;color:#fff;margin:0 0 6px}
 .sub{color:#B8C7DE;font-size:16px;line-height:1.6;margin:0 0 26px}
 .back{display:inline-block;color:var(--sky);font-size:14px;font-weight:700;margin-bottom:18px}
@@ -18209,6 +18210,7 @@ button.go:disabled{opacity:.55}
 .tools a:hover{border-color:var(--blue)}
 </style></head><body>
 __WV_HEADER__
+__ADMIN_NAV__
 <div class=wrapx>
   <a class=back href="/portal">&larr; Your portal</a>
   <h1>Command Center</h1>
@@ -18430,6 +18432,260 @@ _ADMIN_SCRIPT = """<script>
 </script>"""
 
 
+# ---------------------------------------------------------------------------
+# Command Center: Totals (Aug 23, 2026)
+#
+# The company's numbers, broken down by Meteorologist, plus whether it is
+# growing. Same exclusion rule as everywhere else: internal watcher rows are
+# not customers and never appear in a count.
+#
+# Growth is shown as new signups per week for eight weeks. At current volume
+# most weeks will be small numbers, which is the honest picture rather than a
+# smoothed line that implies more than is there.
+# ---------------------------------------------------------------------------
+
+_ADMIN_TABS = [("support", "Support", "/portal/admin"),
+               ("totals", "Totals", "/portal/admin/totals")]
+
+
+def _admin_nav(active: str) -> str:
+    links = "".join('<a class="%s" href="%s">%s</a>'
+                    % ("on" if k == active else "", href, label)
+                    for k, label, href in _ADMIN_TABS)
+    return ('<div class=metbar><div class=in><nav class=metnav>%s</nav></div></div>' % links)
+
+
+def _wv_totals(days: int = 30) -> dict:
+    """Company counts, per-Met work, and eight weeks of signups."""
+    since = int(time.time() * 1000) - days * 86400 * 1000
+    out = {"counts": {}, "mets": [], "growth": []}
+
+    def one(key, sql, params=()):
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, params)
+                    out["counts"][key] = (cur.fetchone() or {}).get("n", 0) or 0
+        except Exception as e:
+            print(f"[totals] {key} failed: {e!r}", flush=True)
+            out["counts"].setdefault(key, 0)
+
+    one("stormline", """SELECT COUNT(*) AS n FROM sentry_subscribers
+                         WHERE status='active' AND is_internal = FALSE""")
+    one("daily", """SELECT COUNT(*) AS n FROM sentry_subscribers
+                     WHERE status='active' AND is_internal = FALSE AND daily = TRUE""")
+    one("internal", """SELECT COUNT(*) AS n FROM sentry_subscribers
+                        WHERE status='active' AND is_internal = TRUE""")
+    one("sidekick", "SELECT COUNT(*) AS n FROM gameday_passes WHERE status='active'")
+    one("sidekick_season", """SELECT COUNT(*) AS n FROM gameday_passes
+                               WHERE status='active' AND pass_type='season'""")
+    one("pro", """SELECT COUNT(*) AS n FROM users
+                   WHERE subscription_tier IN ('pro_single','pro_multi','pro_enterprise')
+                     AND is_active = TRUE""")
+    one("watch_booked", """SELECT COUNT(*) AS n FROM watch_orders
+                            WHERE status IN ('paid','claimed') AND event_date >= CURRENT_DATE""")
+    one("crew", "SELECT COUNT(*) AS n FROM user_roles WHERE role='crew'")
+    one("warnings", "SELECT COUNT(*) AS n FROM sentry_relay_log WHERE warned_at > %s", (since,))
+    one("briefs", "SELECT COUNT(*) AS n FROM brief_history WHERE delivered_at > %s", (since,))
+    one("reviews", """SELECT COUNT(*) AS n FROM verification_requests
+                       WHERE status IN ('completed','sent') AND updated_at > %s""", (since,))
+    one("crew_reports", """SELECT COUNT(*) AS n FROM crew_reports
+                            WHERE created_at > %s AND is_hidden = FALSE""", (since,))
+
+    # ── per Meteorologist ──────────────────────────────────────────────
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT u.id, u.name FROM users u
+                                 JOIN user_roles r ON r.user_id = u.id AND r.role='met'
+                             ORDER BY u.name""")
+                mets = cur.fetchall() or []
+        for m in mets:
+            row = {"name": m["name"] or "(no name)", "id": m["id"]}
+            def cnt(sql, params):
+                try:
+                    with db() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(sql, params)
+                            return (cur.fetchone() or {}).get("n", 0) or 0
+                except Exception:
+                    return 0
+            row["briefs"] = cnt("""SELECT COUNT(*) AS n FROM brief_history
+                                    WHERE is_met_touched = TRUE AND delivered_at > %s
+                                      AND met_name = %s""", (since, m["name"]))
+            row["reviews"] = cnt("""SELECT COUNT(*) AS n FROM verification_requests
+                                     WHERE claimed_by_user_id = %s
+                                       AND status IN ('completed','sent') AND updated_at > %s""",
+                                 (m["id"], since))
+            row["gamedays"] = cnt("""SELECT COUNT(DISTINCT game_id) AS n FROM gameday_broadcasts
+                                      WHERE met_user_id = %s AND created_at > %s""",
+                                  (m["id"], since))
+            row["reached"] = cnt("""SELECT COALESCE(SUM(sent_count),0) AS n FROM gameday_broadcasts
+                                     WHERE met_user_id = %s AND created_at > %s""",
+                                 (m["id"], since))
+            row["shelters"] = cnt("""SELECT COUNT(*) AS n FROM storm_shelter_activations
+                                      WHERE met_user_id = %s AND opened_at_ms > %s""",
+                                  (m["id"], since))
+            out["mets"].append(row)
+    except Exception as e:
+        print(f"[totals] met breakdown failed: {e!r}", flush=True)
+
+    # ── eight weeks of signups, per product ────────────────────────────
+    try:
+        for w in range(7, -1, -1):
+            start = int(time.time() * 1000) - (w + 1) * 7 * 86400 * 1000
+            end = int(time.time() * 1000) - w * 7 * 86400 * 1000
+            def between(sql):
+                try:
+                    with db() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(sql, (start, end))
+                            return (cur.fetchone() or {}).get("n", 0) or 0
+                except Exception:
+                    return 0
+            out["growth"].append({
+                "week": w,
+                "stormline": between("""SELECT COUNT(*) AS n FROM sentry_subscribers
+                                         WHERE is_internal = FALSE
+                                           AND created_at >= %s AND created_at < %s"""),
+                "sidekick": between("""SELECT COUNT(*) AS n FROM gameday_passes
+                                        WHERE created_at >= %s AND created_at < %s"""),
+                "crew": between("""SELECT COUNT(*) AS n FROM user_roles
+                                    WHERE role='crew' AND granted_at >= %s AND granted_at < %s"""),
+            })
+    except Exception as e:
+        print(f"[totals] growth failed: {e!r}", flush=True)
+
+    return out
+
+
+_ADMIN_TOTALS_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Totals - Command Center</title><meta name=robots content="noindex">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+__MET_CHROME__
+.wrapx{max-width:1040px;margin:0 auto;padding:34px 22px 80px}
+h1{font-size:clamp(26px,4.2vw,36px);font-weight:900;letter-spacing:-.03em;color:#fff;margin:0 0 4px}
+.sub{color:#B8C7DE;font-size:16px;margin:0 0 24px;line-height:1.6}
+.head{font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:#A9B4C6;
+  font-weight:800;margin:32px 0 14px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:13px}
+.s{border:1.5px solid rgba(30,107,255,.4);border-radius:14px;padding:19px;
+  background:linear-gradient(168deg,#18213A 0%,#0E1526 100%)}
+.s b{display:block;font-size:32px;color:#fff;font-weight:800;letter-spacing:-.02em;line-height:1}
+.s i{display:block;font-style:normal;font-size:13px;color:#B8C7DE;margin-top:7px;line-height:1.45}
+.s.big b{font-size:42px;color:#7FB0FF}
+table{width:100%;border-collapse:collapse;font-size:14.5px}
+th{text-align:left;padding:10px 12px;color:#8FA6C6;font-size:11.5px;letter-spacing:.1em;
+  text-transform:uppercase;font-weight:800;border-bottom:1px solid rgba(126,182,255,.22)}
+td{padding:13px 12px;border-bottom:1px solid rgba(126,182,255,.12);color:#D6E1F0}
+td.name{color:#fff;font-weight:700}
+tr:hover td{background:rgba(255,255,255,.03)}
+.bars{display:flex;gap:8px;align-items:flex-end;height:110px;margin-top:8px}
+.bar{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:6px}
+.bar .fill{width:100%;background:linear-gradient(180deg,#3D8BFF,#1E5FE0);border-radius:5px 5px 0 0;
+  min-height:3px}
+.bar .n{font-size:12px;color:#B8C7DE}
+.bar .wk{font-size:10.5px;color:#8FA6C6}
+.legend{font-size:13px;color:#8FA6C6;margin-top:12px;line-height:1.6}
+.note{border:1px solid rgba(126,182,255,.25);border-radius:13px;padding:17px 19px;margin-top:26px;
+  color:#B8C7DE;font-size:14.5px;line-height:1.7;background:rgba(255,255,255,.03)}
+.note b{color:#fff}
+</style></head><body>
+__WV_HEADER__
+__ADMIN_NAV__
+<div class=wrapx>
+  <h1>Totals</h1>
+  <p class=sub>Where WeatherValet stands, and what each Meteorologist has done. Last 30 days
+  for activity; subscriber counts are current.</p>
+
+  <div class=head>Customers right now</div>
+  <div class=stats>__COUNTS__</div>
+
+  <div class=head>Work in the last 30 days</div>
+  <div class=stats>__WORK__</div>
+
+  <div class=head>By Meteorologist, last 30 days</div>
+  <table><thead><tr><th>Meteorologist</th><th>Briefs</th><th>Reviews</th>
+    <th>Game days</th><th>Reached</th><th>Shelters</th></tr></thead>
+    <tbody>__METS__</tbody></table>
+
+  <div class=head>New signups, eight weeks</div>
+  __GROWTH__
+
+  <div class=note><b>Internal watcher addresses are excluded</b> from every customer count.
+  __INTERNAL__ Financial numbers are not here yet; they get their own tab.</div>
+</div>
+__WV_FOOTER__"""
+
+
+@app.get("/portal/admin/totals")
+def portal_admin_totals():
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return redirect("/signin", code=302)
+    t = _wv_totals()
+    c = t["counts"]
+
+    def card(v, label, big=False):
+        return ('<div class="s%s"><b>%s</b><i>%s</i></div>'
+                % (" big" if big else "", v, _html_escape(label)))
+
+    counts = (card(c.get("stormline", 0), "Stormline addresses", big=True)
+              + card(c.get("daily", 0), "of those on Stormline Daily")
+              + card(c.get("sidekick", 0), "Sidekick passes")
+              + card(c.get("sidekick_season", 0), "of those season passes")
+              + card(c.get("pro", 0), "Pro subscribers")
+              + card(c.get("watch_booked", 0), "Watch days booked ahead")
+              + card(c.get("crew", 0), "Valet Crew members"))
+
+    work = (card(c.get("warnings", 0), "warnings relayed", big=True)
+            + card(c.get("briefs", 0), "briefs sent")
+            + card(c.get("reviews", 0), "Met Reviews answered")
+            + card(c.get("crew_reports", 0), "Crew reports filed"))
+
+    rows = ""
+    for m in t["mets"]:
+        rows += ('<tr><td class=name>%s</td><td>%d</td><td>%d</td><td>%d</td>'
+                 '<td>%d</td><td>%d</td></tr>'
+                 % (_html_escape(m["name"]), m["briefs"], m["reviews"],
+                    m["gamedays"], m["reached"], m["shelters"]))
+    if not rows:
+        rows = '<tr><td colspan=6 style="color:#8FA6C6">No Meteorologists on the roster yet.</td></tr>'
+
+    g = t["growth"]
+    peak = max([max(w["stormline"], w["sidekick"], w["crew"]) for w in g] or [0]) or 1
+    bars = ""
+    for w in g:
+        total = w["stormline"] + w["sidekick"] + w["crew"]
+        h = int(90 * total / max(peak * 2, 1)) if total else 0
+        label = "now" if w["week"] == 0 else "-%dw" % w["week"]
+        bars += ('<div class=bar><span class=n>%d</span>'
+                 '<div class=fill style="height:%dpx"></div>'
+                 '<span class=wk>%s</span></div>' % (total, max(h, 3), label))
+    growth = ('<div class=bars>%s</div>'
+              '<div class=legend>New Stormline addresses, Sidekick passes and Crew members '
+              'each week. At this volume a single signup moves the chart, so read it as a '
+              'count rather than a trend.</div>' % bars)
+
+    internal = ""
+    if c.get("internal"):
+        internal = ("There %s currently %d test address%s in place." %
+                    ("is" if c["internal"] == 1 else "are", c["internal"],
+                     "" if c["internal"] == 1 else "es"))
+
+    return wv_shell(_ADMIN_TOTALS_PAGE
+                    .replace("__MET_CHROME__", _MET_CHROME_CSS)
+                    .replace("__ADMIN_NAV__", _admin_nav("totals"))
+                    .replace("__COUNTS__", counts)
+                    .replace("__WORK__", work)
+                    .replace("__METS__", rows)
+                    .replace("__GROWTH__", growth)
+                    .replace("__INTERNAL__", internal))
+
+
 @app.get("/portal/admin")
 def portal_admin():
     user = _get_current_user()
@@ -18437,6 +18693,8 @@ def portal_admin():
         return redirect("/signin", code=302)
     spa = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
     return wv_shell(_ADMIN_PAGE
+                    .replace("__MET_CHROME__", _MET_CHROME_CSS)
+                    .replace("__ADMIN_NAV__", _admin_nav("support"))
                     .replace("__SPA__", spa)
                     .replace("__WV_FOOTER__", _ADMIN_SCRIPT + "\n__WV_FOOTER__"))
 
