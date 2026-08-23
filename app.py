@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-214"
+BACKEND_BUILD = "0702-215"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -19490,6 +19490,9 @@ def portal_crew():
 # ---------------------------------------------------------------------------
 
 def _met_day_cards(user: dict) -> list:
+    # Cards for work whose own page is not rebuilt yet point at the old
+    # portal rather than a 404. Each moves to its own page as it is built.
+    SPA_ROOT = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/") + "/"
     """Everything this Meteorologist owes, newest need first.
 
     Every lookup is guarded on its own: one missing table must never blank
@@ -19535,7 +19538,7 @@ def _met_day_cards(user: dict) -> list:
                         "kind": "review", "when": "waiting", "sort": 1,
                         "title": "Met Review: %s" % (r.get("plan_location") or "a customer"),
                         "sub": (r.get("plan_window") or "They are waiting on your answer."),
-                        "meta": "$19", "href": "/portal/met/reviews", "urgent": True,
+                        "meta": "$19", "href": SPA_ROOT, "urgent": True,
                     })
     except Exception as e:
         print(f"[my-day] reviews lookup failed: {e!r}", flush=True)
@@ -19606,7 +19609,7 @@ def _met_day_cards(user: dict) -> list:
                 "kind": "replies", "when": "waiting", "sort": 4,
                 "title": "%d repl%s about the week ahead" % (n, "y" if n == 1 else "ies"),
                 "sub": "Turn their answers into dated entries on their watch card.",
-                "meta": "Pro", "href": "/portal/met/replies", "urgent": True,
+                "meta": "Pro", "href": SPA_ROOT, "urgent": True,
             })
     except Exception as e:
         print(f"[my-day] replies lookup failed: {e!r}", flush=True)
