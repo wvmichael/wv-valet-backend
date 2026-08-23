@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-207"
+BACKEND_BUILD = "0702-208"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -19036,14 +19036,15 @@ __SHELTER__
 __MET_NAV__
 <div class=wrapx>
   <h1>Pro briefs</h1>
-  <p class=sub>Pick one subscriber, several, or all of them.</p>
+  <p class=sub>Pick one subscriber, several, or all of them. This is the same draft and the
+  same send as the old composer, so a brief written here is identical to one written there.</p>
   <div style="border:1.5px solid rgba(255,190,60,.5);background:rgba(255,190,60,.1);
     border-radius:12px;padding:16px 18px;margin-bottom:22px;color:#FFDFA0;font-size:14.5px;
     line-height:1.65">
-    <b style="color:#fff">Not ready yet. Use the old composer for real briefs.</b><br>
-    This page lists, opens and saves correctly, but sending has not been proven end to end
-    in testing: it reported success without a message leaving. Until that is fixed and
-    verified, write real briefs in the
+    <b style="color:#fff">Still being checked. Use the old composer for real briefs.</b><br>
+    Sending works and a real message leaves. What is not yet proven is how this page reports
+    a <em>failed</em> send, and the list does not always refresh after sending. Until both are
+    fixed, write real briefs in the
     <a href="__SPA__/" style="color:#FFD37E;font-weight:700">old composer</a>.
   </div>
   <div class=split>
@@ -45265,7 +45266,7 @@ def _autosend_pro_brief_draft(draft_id: int) -> tuple[bool, str]:
     web_url = f"{frontend_base}/brief/{access_token}"
 
     # ── Dispatch through configured channels ──
-    channels = [ch for ch in (row.get("channels") or "").split(",") if ch]
+    channels = [ch for ch in (row.get("channels") or "sms,email").split(",") if ch]
     if not channels:
         try:
             with db() as conn:
@@ -46423,7 +46424,7 @@ def met_retry_suppressed_brief(history_id):
         }), 409
 
     # Good brief — send via subscriber's preferred channels
-    channels = [ch for ch in (row.get("channels") or "").split(",") if ch]
+    channels = [ch for ch in (row.get("channels") or "sms,email").split(",") if ch]
     channels_used = []
     any_success = False
     smart_subject = f"Your WeatherValet brief, {location_label}"
@@ -46540,7 +46541,7 @@ def met_manual_send_suppressed_brief(history_id):
         row.get("loc_address") or "")
 
     # Send via channels
-    channels = [ch for ch in (row.get("channels") or "").split(",") if ch]
+    channels = [ch for ch in (row.get("channels") or "sms,email").split(",") if ch]
     channels_used = []
     any_success = False
     met_name = user.get("name") or user.get("email") or "Met"
@@ -46825,7 +46826,9 @@ def met_pro_brief_send(draft_id):
     web_url = f"{frontend_base}/brief/{access_token}"
 
     # Dispatch through the channels the subscriber configured (snapshot)
-    channels = [ch for ch in (row["channels"] or "").split(",") if ch]
+    # The subscriber this brief was written for must not default to no
+    # channels while copied-in extras default to sms and email.
+    channels = [ch for ch in (row["channels"] or "sms,email").split(",") if ch]
     channels_used = []
     any_success = False
 
@@ -47300,6 +47303,26 @@ def met_pro_brief_send(draft_id):
                             (morning_preview, draft_id))
     except Exception as _mp:
         print(f"[morning-preview] failed draft={draft_id}: {_mp!r}", flush=True)
+    # Nothing reached the subscriber this brief was written for. Extras may
+    # have received it, and that is recorded below, but the person paying
+    # did not, so this is a failure and has to say so. Reporting success
+    # here is how a brief goes undelivered with nobody ever finding out.
+    if not channels_used:
+        print(f"[pro-brief-send] draft={draft_id} NOTHING DELIVERED to the subscriber; "
+              f"reporting failure", flush=True)
+        return jsonify({
+            "ok": False,
+            "error": "no-channels-succeeded",
+            "message": ("Nothing reached the subscriber. Check their phone number, email "
+                        "and delivery preferences before trying again."),
+            "channels_used": [],
+            "delivery_status": delivery_status,
+            "history_id": history_id,
+            "multi_results": multi_results,
+            "multi_count": len([r for r in multi_results if r.get("ok")]),
+            "draft_id": draft_id,
+        }), 502
+
     return jsonify({
         "ok": True,
         "channels_used": channels_used,
