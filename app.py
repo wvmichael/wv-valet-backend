@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-208"
+BACKEND_BUILD = "0702-209"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -6329,7 +6329,7 @@ def _roles_to_workspaces(roles: list, email: str = "") -> list:
         },
         "met": {
             "label": "Meteorologist",
-            "url": f"{_spa}/",          # not rebuilt yet
+            "url": "/portal/met",
         },
         "admin": {
             "label": "Command Center",
@@ -6379,7 +6379,7 @@ def _roles_to_workspaces(roles: list, email: str = "") -> list:
     # admin's own empty coverage instead).
     if "admin" in roles and not any(w["role"] == "met" for w in workspaces):
         workspaces.append({"role": "met", "label": "Met View",
-                           "url": f"{_spa}/"})          # not rebuilt yet
+                           "url": "/portal/met"})
     return workspaces
 
 
