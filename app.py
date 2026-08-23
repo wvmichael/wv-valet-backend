@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-204"
+BACKEND_BUILD = "0702-205"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -17404,7 +17404,7 @@ _SIGNIN_SCRIPT = """<script>
 PORTAL_TOOLS = {
     # role: (label, path, blurb, built_yet)
     "met": ("Met Portal", "/portal/met",
-            "Your post queue, Pro briefs, the suppressed list and subscriber threads.", False),
+            "My Day: everything waiting on you, across every product.", True),
     "sales": ("Sales Portal", "/portal/sales",
               "Your prospects, your pipeline and the letters going out.", False),
     "admin": ("Command Center", "/portal/admin",
@@ -18448,6 +18448,341 @@ def portal_crew():
     return wv_shell(_CREW_WS_PAGE
                     .replace("__SPA__", spa)
                     .replace("__WV_FOOTER__", _CREW_WS_SCRIPT + "\n__WV_FOOTER__"))
+
+
+# ---------------------------------------------------------------------------
+# Met portal: My Day (Aug 22, 2026)
+#
+# The page a Meteorologist lands on. One question answered: what do I owe,
+# and when. Work from every product in one list, because nobody thinks in
+# products at 5 AM.
+#
+# Two rules the shape follows:
+#   - Scheduled work groups. Pro briefs are one card, not thirty.
+#   - Reactive work never groups. A fired threshold or a waiting reply gets
+#     its own card, because urgent work nested inside a scheduled card is
+#     how it goes unseen for four hours.
+#
+# The old Met portal is untouched and linked at the top of every page. Until
+# a Met says this one is better, that one is the real one.
+# ---------------------------------------------------------------------------
+
+def _met_day_cards(user: dict) -> list:
+    """Everything this Meteorologist owes, newest need first.
+
+    Every lookup is guarded on its own: one missing table must never blank
+    the page a Met opens at 5 AM.
+    """
+    uid = user.get("id")
+    cards = []
+    today = datetime.now(timezone.utc).date()
+    tomorrow = today + timedelta(days=1)
+
+    # ── Pro briefs: one card per day, today and tomorrow only ──────────
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT status, COUNT(*) AS n
+                                 FROM pro_brief_drafts
+                                WHERE status IN ('pending','claimed')
+                                  AND (claimed_by_user_id IS NULL OR claimed_by_user_id = %s)
+                             GROUP BY status""", (uid,))
+                rows = cur.fetchall() or []
+        pending = sum(r["n"] for r in rows)
+        if pending:
+            cards.append({
+                "kind": "briefs", "when": "today", "sort": 0,
+                "title": "%d brief%s to write" % (pending, "" if pending == 1 else "s"),
+                "sub": "Pick one subscriber, several, or all of them.",
+                "meta": "Pro", "href": "/portal/met/briefs", "urgent": pending > 0,
+            })
+    except Exception as e:
+        print(f"[my-day] briefs lookup failed: {e!r}", flush=True)
+
+    # ── Met Reviews they have claimed ──────────────────────────────────
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT id, plan_location, plan_window, created_at
+                                 FROM verification_requests
+                                WHERE status IN ('claimed','in_progress')
+                                  AND claimed_by_user_id = %s
+                             ORDER BY created_at LIMIT 10""", (uid,))
+                for r in cur.fetchall() or []:
+                    cards.append({
+                        "kind": "review", "when": "waiting", "sort": 1,
+                        "title": "Met Review: %s" % (r.get("plan_location") or "a customer"),
+                        "sub": (r.get("plan_window") or "They are waiting on your answer."),
+                        "meta": "$19", "href": "/portal/met/reviews", "urgent": True,
+                    })
+    except Exception as e:
+        print(f"[my-day] reviews lookup failed: {e!r}", flush=True)
+
+    # ── Sidekick days they claimed, today and tomorrow ─────────────────
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT id, opponent, game_date, kickoff
+                                 FROM gameday_games
+                                WHERE claimed_by = %s AND game_date BETWEEN %s AND %s
+                             ORDER BY game_date""", (uid, today, tomorrow))
+                for r in cur.fetchall() or []:
+                    same_day = (r["game_date"] == today)
+                    cards.append({
+                        "kind": "sidekick",
+                        "when": "today" if same_day else "tomorrow",
+                        "sort": 2 if same_day else 6,
+                        "title": "Sidekick: %s" % (r.get("opponent") or "game day"),
+                        "sub": ("Kickoff %s. Outlook the evening before, brief that morning, "
+                                "updates through the day." % (r.get("kickoff") or "TBD")),
+                        "meta": r["game_date"].strftime("%a %b %-d"),
+                        "href": "/portal/sidekick", "urgent": same_day,
+                    })
+    except Exception as e:
+        print(f"[my-day] sidekick lookup failed: {e!r}", flush=True)
+
+    # ── Watch bookings they claimed, today and tomorrow ────────────────
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT id, place, event_date, start_hour, end_hour, what
+                                 FROM watch_orders
+                                WHERE met_user_id = %s
+                                  AND event_date BETWEEN %s AND %s
+                             ORDER BY event_date, start_hour""", (uid, today, tomorrow))
+                for r in cur.fetchall() or []:
+                    same_day = (r["event_date"] == today)
+                    cards.append({
+                        "kind": "watch",
+                        "when": "today" if same_day else "tomorrow",
+                        "sort": 3 if same_day else 7,
+                        "title": "Watch: %s" % (r.get("place") or "an event"),
+                        "sub": ((r.get("what") or "Their day, start to finish.") + " Window %s to %s."
+                                % (_watch_hour_label(r.get("start_hour")),
+                                   _watch_hour_label(r.get("end_hour")))),
+                        "meta": r["event_date"].strftime("%a %b %-d"),
+                        "href": "/portal/watch", "urgent": same_day,
+                    })
+    except Exception as e:
+        print(f"[my-day] watch lookup failed: {e!r}", flush=True)
+
+    # ── Week-ahead replies waiting to become watch card entries ────────
+    # The customer has already done their part; this is the nudge so their
+    # answer does not sit unread in a message list.
+    try:
+        cutoff = int(time.time() * 1000) - 7 * 86400 * 1000
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT COUNT(*) AS n FROM brief_replies
+                                WHERE primary_met_id = %s
+                                  AND received_at_ms > %s
+                                  AND coalesce(routed_status,'') <> 'handled'""",
+                            (uid, cutoff))
+                n = (cur.fetchone() or {}).get("n") or 0
+        if n:
+            cards.append({
+                "kind": "replies", "when": "waiting", "sort": 4,
+                "title": "%d repl%s about the week ahead" % (n, "y" if n == 1 else "ies"),
+                "sub": "Turn their answers into dated entries on their watch card.",
+                "meta": "Pro", "href": "/portal/met/replies", "urgent": True,
+            })
+    except Exception as e:
+        print(f"[my-day] replies lookup failed: {e!r}", flush=True)
+
+    return cards
+
+
+def _met_shelter_state(uid) -> dict:
+    """Is a Storm Shelter open right now? This rides in the header on every
+    Met page, because it is the only genuinely time-critical thing here."""
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT id, region_label, nws_event, met_user_id
+                                 FROM storm_shelter_activations
+                                WHERE closed_at_ms IS NULL
+                             ORDER BY opened_at_ms DESC LIMIT 1""")
+                row = cur.fetchone()
+        if row:
+            return {"open": True, "region": row.get("region_label") or "",
+                    "event": row.get("nws_event") or "",
+                    "mine": row.get("met_user_id") == uid}
+    except Exception as e:
+        print(f"[my-day] shelter lookup failed: {e!r}", flush=True)
+    return {"open": False}
+
+
+_MET_DAY_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>My Day - WeatherValet</title><meta name=robots content="noindex">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+.metbar{border-bottom:1px solid var(--line);background:rgba(0,0,0,.6)}
+.metbar .in{max-width:1000px;margin:0 auto;padding:12px 22px;display:flex;align-items:center;
+  gap:16px;flex-wrap:wrap}
+.metnav{display:flex;gap:6px;flex-wrap:wrap}
+.metnav a{padding:8px 13px;border-radius:8px;font-size:14px;color:#C3D2E6;font-weight:600}
+.metnav a:hover{background:rgba(126,182,255,.1);color:#fff}
+.metnav a.on{background:var(--accent);color:#fff}
+.spacer{flex:1}
+.oldlink{font-size:13px;color:#8FA6C6}
+.oldlink:hover{color:var(--sky)}
+.shelter{display:block;padding:14px 22px;font-weight:700;font-size:15px;text-align:center}
+.shelter.quiet{background:rgba(255,255,255,.04);color:#8FA6C6;font-weight:600;font-size:13.5px}
+.shelter.loud{background:linear-gradient(90deg,#7A1626,#B3172B);color:#fff;
+  animation:pulsebar 2.6s ease-in-out infinite}
+@keyframes pulsebar{0%,100%{filter:brightness(1)}50%{filter:brightness(1.25)}}
+.wrapx{max-width:1000px;margin:0 auto;padding:34px 22px 80px}
+h1{font-size:clamp(26px,4.2vw,38px);font-weight:900;letter-spacing:-.03em;color:#fff;margin:0 0 4px}
+.sub{color:#B8C7DE;font-size:16px;margin:0 0 24px}
+.sorter{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px;align-items:center}
+.sorter span{font-size:12.5px;letter-spacing:.1em;text-transform:uppercase;color:#8FA6C6;font-weight:800}
+.sorter button{border:1px solid rgba(126,182,255,.28);background:rgba(255,255,255,.04);
+  color:#C3D2E6;border-radius:999px;padding:8px 15px;font-size:14px;cursor:pointer;transition:.16s}
+.sorter button:hover{border-color:var(--blue)}
+.sorter button.on{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700}
+.card{display:block;border:1.5px solid rgba(30,107,255,.45);border-radius:15px;padding:20px 22px;
+  margin-bottom:12px;background:linear-gradient(168deg,#18213A 0%,#0E1526 100%);
+  box-shadow:0 14px 36px -20px rgba(0,0,0,.9);transition:.2s;position:relative}
+.card:hover{transform:translateY(-3px);border-color:rgba(126,182,255,.85)}
+.card.urgent{border-color:rgba(224,36,60,.6)}
+.card .top{display:flex;justify-content:space-between;gap:14px;align-items:baseline}
+.card b{font-size:18px;color:#fff;letter-spacing:-.015em}
+.card .meta{font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:#7FB0FF;
+  font-weight:800;white-space:nowrap}
+.card i{display:block;font-style:normal;font-size:14.5px;color:#B8C7DE;line-height:1.6;margin-top:7px}
+.card.ahead{opacity:.72;border-color:rgba(126,182,255,.24)}
+.card.ahead .meta{color:#8FA6C6}
+.head{font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:#A9B4C6;
+  font-weight:800;margin:26px 0 12px}
+.clear{border:1px dashed rgba(126,182,255,.3);border-radius:14px;padding:26px;color:#B8C7DE;
+  font-size:16px;line-height:1.65;text-align:center}
+</style></head><body>
+__WV_HEADER__
+__SHELTER__
+<div class=metbar><div class=in>
+  <nav class=metnav>
+    <a class=on href="/portal/met">My Day</a>
+    <a href="/portal/met/all">All Work</a>
+    <a href="/portal/met/messages">Messages</a>
+    <a href="/portal/met/numbers">My Numbers</a>
+  </nav>
+  <div class=spacer></div>
+  <a class=oldlink href="__SPA__/">Old Met portal</a>
+</div></div>
+<div class=wrapx>
+  <h1>__GREETING__</h1>
+  <p class=sub>__SUBLINE__</p>
+  <div class=sorter>
+    <span>Sort</span>
+    <button class=on data-sort=need>What needs me first</button>
+    <button data-sort=product>By product</button>
+    <button data-sort=when>By when</button>
+  </div>
+  <div id=cards>__CARDS__</div>
+</div>
+__WV_FOOTER__"""
+
+_MET_DAY_SCRIPT = """<script>
+(function(){
+  var wrap=document.getElementById('cards');
+  if(!wrap) return;
+  var all=Array.prototype.slice.call(wrap.querySelectorAll('.card'));
+  function apply(mode){
+    var sorted=all.slice();
+    if(mode==='product'){
+      sorted.sort(function(a,b){
+        var ka=a.getAttribute('data-kind'), kb=b.getAttribute('data-kind');
+        return ka<kb?-1:ka>kb?1:0;
+      });
+    } else if(mode==='when'){
+      sorted.sort(function(a,b){
+        return Number(a.getAttribute('data-when-rank'))-Number(b.getAttribute('data-when-rank'));
+      });
+    } else {
+      sorted.sort(function(a,b){
+        return Number(a.getAttribute('data-sort'))-Number(b.getAttribute('data-sort'));
+      });
+    }
+    // headings only make sense in the default order; drop them otherwise
+    Array.prototype.forEach.call(wrap.querySelectorAll('.head'),function(h){
+      h.style.display = (mode==='need') ? '' : 'none'; });
+    sorted.forEach(function(c){ wrap.appendChild(c); });
+  }
+  Array.prototype.forEach.call(document.querySelectorAll('.sorter button'),function(b){
+    b.addEventListener('click',function(){
+      Array.prototype.forEach.call(document.querySelectorAll('.sorter button'),
+        function(x){ x.className=''; });
+      b.className='on';
+      apply(b.getAttribute('data-sort'));
+    });
+  });
+})();
+</script>"""
+
+
+@app.get("/portal/met")
+def portal_met_day():
+    user = _get_current_user()
+    if not user:
+        return redirect("/signin", code=302)
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return redirect("/portal", code=302)
+
+    spa = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+    cards = _met_day_cards(user)
+    shelter = _met_shelter_state(user.get("id"))
+
+    if shelter.get("open"):
+        who = "You have" if shelter.get("mine") else "A Meteorologist has"
+        bar = ('<a class="shelter loud" href="%s/">&#9888; Storm Shelter is OPEN. %s one running '
+               'for %s%s. Open the old portal to post updates.</a>'
+               % (spa, who, _html_escape(shelter.get("region") or "a region"),
+                  (" (" + _html_escape(shelter["event"]) + ")") if shelter.get("event") else ""))
+    else:
+        bar = ('<a class="shelter quiet" href="%s/">No Storm Shelter open. '
+               'Open one from the old portal when severe weather hits.</a>' % spa)
+
+    when_rank = {"today": 0, "waiting": 1, "tomorrow": 2}
+    html = ""
+    if cards:
+        urgent = [c for c in cards if c["when"] != "tomorrow"]
+        ahead = [c for c in cards if c["when"] == "tomorrow"]
+
+        def render(c):
+            return ('<a class="card%s%s" href="%s" data-kind="%s" data-sort="%d" data-when-rank="%d">'
+                    '<div class=top><b>%s</b><span class=meta>%s</span></div><i>%s</i></a>'
+                    % (" urgent" if c.get("urgent") else "",
+                       " ahead" if c["when"] == "tomorrow" else "",
+                       c["href"], c["kind"], c["sort"], when_rank.get(c["when"], 9),
+                       _html_escape(c["title"]), _html_escape(c["meta"]),
+                       _html_escape(c["sub"])))
+
+        if urgent:
+            html += '<div class=head>Now</div>' + "".join(render(c) for c in
+                                                          sorted(urgent, key=lambda x: x["sort"]))
+        if ahead:
+            html += '<div class=head>Tomorrow</div>' + "".join(render(c) for c in
+                                                               sorted(ahead, key=lambda x: x["sort"]))
+    else:
+        html = ('<div class=clear>Nothing waiting on you right now.<br>'
+                'Check <a href="/portal/met/all" style="color:#7EB6FF;font-weight:700">All Work</a> '
+                'for anything unclaimed across WeatherValet.</div>')
+
+    first = ((user.get("name") or "").strip().split(" ") or [""])[0]
+    greeting = ("Morning, %s." % _html_escape(first)) if first else "My Day."
+    n = len(cards)
+    subline = ("%d thing%s waiting on you." % (n, "" if n == 1 else "s")) if n else "You are clear."
+
+    return wv_shell(_MET_DAY_PAGE
+                    .replace("__SPA__", spa)
+                    .replace("__SHELTER__", bar)
+                    .replace("__GREETING__", greeting)
+                    .replace("__SUBLINE__", subline)
+                    .replace("__CARDS__", html)
+                    .replace("__WV_FOOTER__", _MET_DAY_SCRIPT + "\n__WV_FOOTER__"))
 
 
 @app.get("/portal/account")
