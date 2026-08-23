@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-213"
+BACKEND_BUILD = "0702-214"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -18446,6 +18446,7 @@ _ADMIN_SCRIPT = """<script>
 
 _ADMIN_TABS = [("support", "Support", "/portal/admin"),
                ("subscribers", "Subscribers", "/portal/admin/subscribers"),
+               ("employees", "Employees", "/portal/admin/employees"),
                ("totals", "Totals", "/portal/admin/totals")]
 
 
@@ -18620,6 +18621,375 @@ __ADMIN_NAV__
   __INTERNAL__ Financial numbers are not here yet; they get their own tab.</div>
 </div>
 __WV_FOOTER__"""
+
+
+_STAFF_ROLES = ("met", "admin", "sales", "crew")
+
+
+@app.get("/api/v1/admin/employees")
+def admin_employees_list():
+    """Everyone with a staff role, plus what they have done.
+
+    Work counts are here on purpose: before you revoke somebody's access it
+    is worth seeing that they wrote 40 briefs, because their name is on
+    those and the record has to survive them leaving.
+    """
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "not-authorized"}), 403
+    out = []
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT u.id, u.name, u.email, u.phone, u.is_active, u.created_at,
+                                      COALESCE(string_agg(r.role, ',' ORDER BY r.role), '') AS roles
+                                 FROM users u
+                                 JOIN user_roles r ON r.user_id = u.id
+                                WHERE r.role IN ('met','admin','crew')
+                             GROUP BY u.id ORDER BY u.name""")
+                rows = {r["id"]: dict(r) for r in (cur.fetchall() or [])}
+
+                # sales reps live in their own table, matched by email
+                cur.execute("""SELECT u.id, u.name, u.email, u.phone, u.is_active, u.created_at
+                                 FROM sales_reps s
+                                 JOIN users u ON LOWER(u.email) = LOWER(s.email)
+                                WHERE s.is_active = TRUE""")
+                for r in (cur.fetchall() or []):
+                    row = rows.setdefault(r["id"], dict(r, roles=""))
+                    row["roles"] = ",".join(sorted(set(
+                        [x for x in (row.get("roles") or "").split(",") if x] + ["sales"])))
+
+                for uid, row in rows.items():
+                    cur.execute("""SELECT COUNT(*) AS n FROM brief_history
+                                    WHERE is_met_touched = TRUE AND met_name = %s""",
+                                (row.get("name") or "",))
+                    row["briefs"] = (cur.fetchone() or {}).get("n", 0) or 0
+                    cur.execute("""SELECT COUNT(*) AS n FROM gameday_broadcasts
+                                    WHERE met_user_id = %s""", (uid,))
+                    row["broadcasts"] = (cur.fetchone() or {}).get("n", 0) or 0
+                out = sorted(rows.values(), key=lambda r: (r.get("name") or "").lower())
+    except Exception as e:
+        print(f"[employees] list failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "Could not load the roster."}), 500
+    return jsonify({"ok": True, "rows": out})
+
+
+@app.post("/api/v1/admin/employees/save")
+def admin_employees_save():
+    """Create or update a staff account and set exactly which roles they hold."""
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "not-authorized"}), 403
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()[:120]
+    email = (data.get("email") or "").strip().lower()[:200]
+    phone_raw = (data.get("phone") or "").strip()
+    roles = [r for r in (data.get("roles") or []) if r in _STAFF_ROLES]
+
+    if len(name) < 2:
+        return jsonify({"ok": False, "error": "Their name."}), 400
+    if not email or not is_valid_email(email):
+        return jsonify({"ok": False, "error": "A working email address."}), 400
+    phone = normalize_phone(phone_raw) if phone_raw else None
+    if phone_raw and not phone:
+        return jsonify({"ok": False, "error": "That phone number did not look right."}), 400
+
+    now_ms = int(time.time() * 1000)
+    created = False
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM users WHERE LOWER(email) = %s", (email,))
+                row = cur.fetchone()
+            if row:
+                uid = row["id"]
+            else:
+                uid = _get_or_create_user(email, conn)
+                created = True
+            with conn.cursor() as cur:
+                cur.execute("UPDATE users SET name = %s WHERE id = %s", (name, uid))
+                if phone:
+                    cur.execute("UPDATE users SET phone = %s WHERE id = %s", (phone, uid))
+
+                # roles are set to exactly what was ticked, no more
+                cur.execute("""DELETE FROM user_roles WHERE user_id = %s
+                                 AND role IN ('met','admin','crew')""", (uid,))
+                for r in roles:
+                    if r == "sales":
+                        continue
+                    cur.execute("""INSERT INTO user_roles (user_id, role, granted_at)
+                                   VALUES (%s,%s,%s) ON CONFLICT DO NOTHING""", (uid, r, now_ms))
+
+                if "sales" in roles:
+                    cur.execute("""SELECT id FROM sales_reps WHERE LOWER(email) = %s""", (email,))
+                    if cur.fetchone():
+                        cur.execute("""UPDATE sales_reps SET is_active = TRUE, name = %s,
+                                              updated_at = %s WHERE LOWER(email) = %s""",
+                                    (name, now_ms, email))
+                    else:
+                        slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40] or ("rep%d" % uid)
+                        cur.execute("""INSERT INTO sales_reps
+                                         (slug, name, email, phone, is_active, created_at, updated_at)
+                                       VALUES (%s,%s,%s,%s,TRUE,%s,%s)""",
+                                    (slug, name, email, phone, now_ms, now_ms))
+                else:
+                    cur.execute("""UPDATE sales_reps SET is_active = FALSE, updated_at = %s
+                                    WHERE LOWER(email) = %s""", (now_ms, email))
+    except Exception as e:
+        print(f"[employees] save failed for {email}: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "Could not save that."}), 500
+
+    # a new hire needs a way in
+    sent = False
+    if created and data.get("send_invite", True):
+        try:
+            base = os.environ.get("PUBLIC_BASE_URL", "https://weathervalet.ai").rstrip("/")
+            raw = new_secure_token()
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""INSERT INTO magic_link_tokens
+                                     (token_hash, user_id, created_at, expires_at, ip_requested)
+                                   VALUES (%s,%s,%s,%s,'employee-invite')""",
+                                (hash_token(raw), uid, now_ts(),
+                                 now_ts() + MAGIC_LINK_TTL_SECONDS))
+            _send_magic_link_email(email,
+                                   f"{base}/?auth=verify&token={raw}&intent=new-account",
+                                   intent="new-account")
+            sent = True
+        except Exception as e:
+            print(f"[employees] invite failed for {email}: {e!r}", flush=True)
+
+    print(f"[employees] {'created' if created else 'updated'} {email} roles={roles} "
+          f"by {user.get('email')}", flush=True)
+    return jsonify({"ok": True, "user_id": uid, "created": created, "invited": sent,
+                    "roles": roles})
+
+
+@app.post("/api/v1/admin/employees/revoke")
+def admin_employees_revoke():
+    """Take away every staff role. The person and their work stay.
+
+    Deleting the user would orphan every brief they wrote, and their name is
+    on those. Somebody leaving is not a reason to rewrite what happened.
+    """
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "not-authorized"}), 403
+    data = request.get_json(silent=True) or {}
+    try:
+        uid = int(data.get("user_id"))
+    except Exception:
+        return jsonify({"ok": False, "error": "Which person?"}), 400
+    if uid == user.get("id"):
+        return jsonify({"ok": False, "error":
+                        "That is you. Removing your own access would lock you out."}), 400
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT email, name FROM users WHERE id = %s", (uid,))
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"ok": False, "error": "No such person."}), 404
+                cur.execute("""DELETE FROM user_roles WHERE user_id = %s
+                                 AND role IN ('met','admin','crew')""", (uid,))
+                cur.execute("""UPDATE sales_reps SET is_active = FALSE, updated_at = %s
+                                WHERE LOWER(email) = LOWER(%s)""",
+                            (int(time.time() * 1000), row["email"]))
+    except Exception as e:
+        print(f"[employees] revoke failed for {uid}: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "Could not do that."}), 500
+    print(f"[employees] revoked all access for {row['email']} by {user.get('email')}", flush=True)
+    return jsonify({"ok": True, "user_id": uid, "name": row.get("name")})
+
+
+_ADMIN_EMP_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Employees - Command Center</title><meta name=robots content="noindex">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+__MET_CHROME__
+.wrapx{max-width:1120px;margin:0 auto;padding:30px 22px 80px}
+h1{font-size:clamp(24px,3.6vw,32px);font-weight:900;letter-spacing:-.03em;color:#fff;margin:0 0 4px}
+.sub{color:#B8C7DE;font-size:15.5px;margin:0 0 20px;line-height:1.6}
+.panel{border:1.5px solid rgba(30,107,255,.4);border-radius:15px;padding:20px;margin-bottom:22px;
+  background:linear-gradient(168deg,#18213A 0%,#0E1526 100%)}
+.panel h2{font-size:17px;color:#fff;margin:0 0 14px;font-weight:800}
+.frow{display:flex;gap:12px;flex-wrap:wrap}
+.frow>div{flex:1;min-width:170px}
+label{display:block;font-size:11.5px;font-weight:800;letter-spacing:.09em;text-transform:uppercase;
+  color:#9FB6D6;margin:10px 0 6px}
+input[type=text],input[type=email],input[type=tel]{width:100%;box-sizing:border-box;padding:12px 13px;
+  font-size:15px;font-family:inherit;color:#EAF1FF;border-radius:9px;
+  background:rgba(255,255,255,.05);border:1px solid rgba(126,182,255,.26)}
+input:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 3px rgba(30,107,255,.22)}
+.roles{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px}
+.roles label{display:flex;align-items:center;gap:6px;font-size:14px;color:#D6E1F0;
+  text-transform:none;letter-spacing:0;margin:0;cursor:pointer;
+  border:1px solid rgba(126,182,255,.26);border-radius:999px;padding:9px 15px}
+.roles label:hover{border-color:var(--blue)}
+.roles input{accent-color:var(--blue)}
+.b{border:none;border-radius:9px;padding:12px 18px;font-size:14.5px;font-weight:700;cursor:pointer}
+.b.go{background:var(--accent);color:#fff;margin-top:16px}
+.b.small{padding:8px 12px;font-size:12.5px}
+.b.rev{background:rgba(224,36,60,.16);color:#FF9AA8;border:1px solid rgba(224,36,60,.45)}
+.b:disabled{opacity:.5}
+.tw{overflow-x:auto;border:1px solid rgba(126,182,255,.2);border-radius:13px}
+table{width:100%;border-collapse:collapse;font-size:14px;min-width:820px}
+th{text-align:left;padding:11px 12px;color:#8FA6C6;font-size:11px;letter-spacing:.1em;
+  text-transform:uppercase;font-weight:800;background:rgba(255,255,255,.03);
+  border-bottom:1px solid rgba(126,182,255,.22)}
+td{padding:12px;border-bottom:1px solid rgba(126,182,255,.1);color:#D6E1F0;vertical-align:top}
+tr:hover td{background:rgba(255,255,255,.03)}
+td.name{color:#fff;font-weight:700;white-space:nowrap}
+.pill{font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;font-weight:800;
+  padding:3px 8px;border-radius:999px;margin-right:5px;white-space:nowrap;
+  background:rgba(30,107,255,.18);color:#7FB0FF;border:1px solid rgba(30,107,255,.4)}
+.msg{display:none;border-radius:10px;padding:12px 14px;margin:14px 0;font-size:14.5px;line-height:1.55}
+.msg.good{background:#0F2A4A;border:1px solid var(--blue);color:#BBD8FF}
+.msg.bad{background:#3A1220;border:1px solid #7C2740;color:#FFC2CE}
+.note{border:1px solid rgba(126,182,255,.25);border-radius:12px;padding:15px 18px;margin-top:20px;
+  color:#B8C7DE;font-size:14px;line-height:1.7;background:rgba(255,255,255,.03)}
+.note b{color:#fff}
+</style></head><body>
+__WV_HEADER__
+__ADMIN_NAV__
+<div class=wrapx>
+  <h1>Employees</h1>
+  <p class=sub>Who works here and what they can reach. Adding somebody emails them a link to
+  set a password.</p>
+
+  <div class=panel>
+    <h2>Add or update someone</h2>
+    <div class=frow>
+      <div><label for=e-name>Name</label><input type=text id=e-name placeholder="Timmy Albertson"></div>
+      <div><label for=e-email>Email</label><input type=email id=e-email placeholder="timmy@weathervalet.com"></div>
+      <div><label for=e-phone>Phone (optional)</label><input type=tel id=e-phone placeholder="317-555-0123"></div>
+    </div>
+    <label>What can they reach?</label>
+    <div class=roles>
+      <label><input type=checkbox value=met> Meteorologist</label>
+      <label><input type=checkbox value=sales> Sales</label>
+      <label><input type=checkbox value=crew> Valet Crew</label>
+      <label><input type=checkbox value=admin> Command Center</label>
+    </div>
+    <button class="b go" id=e-save>Save this person</button>
+    <div id=msg class=msg></div>
+  </div>
+
+  <div class=tw><table><thead><tr><th>Name</th><th>Email</th><th>Phone</th>
+    <th>Can reach</th><th>Work</th><th></th></tr></thead>
+    <tbody id=rows><tr><td colspan=6>Loading...</td></tr></tbody></table></div>
+
+  <div class=note><b>Removing access does not delete the person.</b> Their roles come off and
+  they can no longer sign in to anything, but the briefs they wrote keep their name on them.
+  A record of what happened should survive somebody leaving.</div>
+</div>
+__WV_FOOTER__"""
+
+_ADMIN_EMP_SCRIPT = """<script>
+(function(){
+  var rows=[];
+  function esc(t){var d=document.createElement('div');d.textContent=(t===null||t===undefined)?'':t;return d.innerHTML;}
+  function say(k,t){var m=document.getElementById('msg');m.className='msg '+k;m.innerHTML=t;m.style.display='block';}
+  function hide(){document.getElementById('msg').style.display='none';}
+
+  function load(){
+    fetch('/api/v1/admin/employees',{credentials:'include'})
+     .then(function(r){return r.json();}).then(function(j){
+        rows=(j&&j.rows)||[];
+        if(!rows.length){ document.getElementById('rows').innerHTML=
+          '<tr><td colspan=6>Nobody on the roster yet.</td></tr>'; return; }
+        document.getElementById('rows').innerHTML=rows.map(function(r){
+          var roles=(r.roles||'').split(',').filter(Boolean);
+          var label={met:'Meteorologist',sales:'Sales',crew:'Crew',admin:'Command Center'};
+          return '<tr data-id="'+r.id+'">'
+            +'<td class=name>'+esc(r.name||'(no name)')+'</td>'
+            +'<td>'+esc(r.email||'')+'</td>'
+            +'<td>'+esc(r.phone||'')+'</td>'
+            +'<td>'+roles.map(function(x){return '<span class=pill>'+esc(label[x]||x)+'</span>';}).join('')+'</td>'
+            +'<td>'+(r.briefs||0)+' briefs<br>'+(r.broadcasts||0)+' broadcasts</td>'
+            +'<td><button class="b small" data-edit>Edit</button> '
+              +'<button class="b small rev" data-rev>Remove access</button></td></tr>';
+        }).join('');
+        wire();
+     }).catch(function(){ document.getElementById('rows').innerHTML=
+        '<tr><td colspan=6>Could not load the roster.</td></tr>'; });
+  }
+
+  function wire(){
+    Array.prototype.forEach.call(document.querySelectorAll('tr[data-id]'),function(tr){
+      var id=Number(tr.getAttribute('data-id'));
+      var r=rows.filter(function(x){return x.id===id;})[0];
+      tr.querySelector('[data-edit]').addEventListener('click',function(){
+        document.getElementById('e-name').value=r.name||'';
+        document.getElementById('e-email').value=r.email||'';
+        document.getElementById('e-phone').value=r.phone||'';
+        var have=(r.roles||'').split(',');
+        Array.prototype.forEach.call(document.querySelectorAll('.roles input'),function(c){
+          c.checked = have.indexOf(c.value)>=0; });
+        window.scrollTo({top:0,behavior:'smooth'});
+        say('good','Editing '+esc(r.name||r.email)+'. Change what you need and save.');
+      });
+      tr.querySelector('[data-rev]').addEventListener('click',function(){
+        if(!confirm('Remove all access for '+(r.name||r.email)+'? They keep their account and '
+          +'their work stays on record, but they will not be able to sign in to anything.')) return;
+        var btn=this; btn.disabled=true; btn.textContent='...';
+        fetch('/api/v1/admin/employees/revoke',{method:'POST',credentials:'include',
+          headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:id})})
+         .then(function(r2){return r2.json();}).then(function(j){
+            btn.disabled=false; btn.textContent='Remove access';
+            if(j&&j.ok){ say('good','Access removed for '+esc(j.name||'them')+'.'); load(); }
+            else say('bad',(j&&j.error)||'Could not do that.');
+         }).catch(function(){ btn.disabled=false; btn.textContent='Remove access';
+            say('bad','Network problem.'); });
+      });
+    });
+  }
+
+  document.getElementById('e-save').addEventListener('click',function(){
+    hide();
+    var roles=[];
+    Array.prototype.forEach.call(document.querySelectorAll('.roles input'),function(c){
+      if(c.checked) roles.push(c.value); });
+    var body={name:document.getElementById('e-name').value,
+              email:document.getElementById('e-email').value,
+              phone:document.getElementById('e-phone').value,
+              roles:roles};
+    if(!body.name||!body.email){ say('bad','Name and email are both needed.'); return; }
+    if(!roles.length && !confirm('No roles ticked. Saving will remove all their access. Continue?')) return;
+    var btn=this; btn.disabled=true; btn.textContent='Saving...';
+    fetch('/api/v1/admin/employees/save',{method:'POST',credentials:'include',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+     .then(function(r){return r.json();}).then(function(j){
+        btn.disabled=false; btn.textContent='Save this person';
+        if(j&&j.ok){
+          say('good', j.created
+            ? '<b>Added.</b>'+(j.invited?' They have been emailed a link to set a password.':'')
+            : '<b>Updated.</b>');
+          ['e-name','e-email','e-phone'].forEach(function(i){document.getElementById(i).value='';});
+          Array.prototype.forEach.call(document.querySelectorAll('.roles input'),
+            function(c){c.checked=false;});
+          load();
+        } else say('bad',(j&&j.error)||'Could not save that.');
+     }).catch(function(){ btn.disabled=false; btn.textContent='Save this person';
+        say('bad','Network problem.'); });
+  });
+
+  load();
+})();
+</script>"""
+
+
+@app.get("/portal/admin/employees")
+def portal_admin_employees():
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return redirect("/signin", code=302)
+    return wv_shell(_ADMIN_EMP_PAGE
+                    .replace("__MET_CHROME__", _MET_CHROME_CSS)
+                    .replace("__ADMIN_NAV__", _admin_nav("employees"))
+                    .replace("__WV_FOOTER__", _ADMIN_EMP_SCRIPT + "\n__WV_FOOTER__"))
 
 
 @app.get("/api/v1/admin/subscribers")
