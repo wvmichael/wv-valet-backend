@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-216"
+BACKEND_BUILD = "0702-217"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -19774,7 +19774,7 @@ def _met_nav(active: str, spa: str) -> str:
     # Messages is not rebuilt yet, so it opens the old portal rather than a
     # dead link. A nav item that 404s is worse than one that is honest.
     items = [("day", "My Day", "/portal/met"), ("all", "All Work", "/portal/met/all"),
-             ("messages", "Messages", spa + "/"),
+             ("messages", "Messages", "/portal/met/messages"),
              ("numbers", "My Numbers", "/portal/met/numbers")]
     links = "".join('<a class="%s" href="%s">%s</a>'
                     % ("on" if k == active else "", href, label)
@@ -20474,6 +20474,247 @@ __MET_NAV__
   every number.</div>
 </div>
 __WV_FOOTER__"""
+
+
+# ---------------------------------------------------------------------------
+# Met portal: Messages (Aug 23, 2026)
+#
+# One-to-one conversations with subscribers. Threads on the left, the open
+# conversation on the right, composer at the bottom. Built on the same
+# thread endpoints the old portal uses, so a reply sent here is the same row
+# and the same delivery.
+#
+# The old portal split this across three tabs: messages, history and the
+# subscriber directory. All three answer "what did we say to this person",
+# so they are one screen here.
+# ---------------------------------------------------------------------------
+
+_MET_MSG_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Messages - WeatherValet</title><meta name=robots content="noindex">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+__MET_CHROME__
+.wrapx{max-width:1180px;margin:0 auto;padding:26px 22px 60px}
+h1{font-size:clamp(23px,3.4vw,30px);font-weight:900;letter-spacing:-.03em;color:#fff;margin:0 0 4px}
+.sub{color:#B8C7DE;font-size:15px;margin:0 0 18px;line-height:1.6}
+.split{display:grid;grid-template-columns:1fr;gap:18px}
+@media(min-width:900px){.split{grid-template-columns:320px 1fr;gap:22px;align-items:start}}
+.panel{border:1.5px solid rgba(30,107,255,.4);border-radius:15px;
+  background:linear-gradient(168deg,#18213A 0%,#0E1526 100%);padding:16px}
+.search{width:100%;box-sizing:border-box;padding:11px 13px;font-size:14.5px;font-family:inherit;
+  color:#EAF1FF;border-radius:9px;background:rgba(255,255,255,.05);
+  border:1px solid rgba(126,182,255,.26);margin-bottom:12px}
+.search:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 3px rgba(30,107,255,.22)}
+.t{display:block;padding:12px;border-radius:11px;cursor:pointer;border:1px solid transparent;
+  transition:.14s;margin-bottom:6px}
+.t:hover{background:rgba(255,255,255,.04)}
+.t.on{background:rgba(30,107,255,.16);border-color:rgba(30,107,255,.55)}
+.t .top{display:flex;justify-content:space-between;gap:10px;align-items:baseline}
+.t b{font-size:14.5px;color:#fff}
+.t .when{font-size:11.5px;color:#8FA6C6;white-space:nowrap}
+.t i{display:block;font-style:normal;font-size:12.5px;color:#9FB3CE;margin-top:4px;
+  line-height:1.45;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.t .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--red);
+  margin-left:6px;vertical-align:middle}
+.t .tier{font-size:10px;letter-spacing:.1em;text-transform:uppercase;font-weight:800;
+  color:#7FB0FF;margin-top:5px;display:inline-block}
+.conv{min-height:420px;display:flex;flex-direction:column}
+.chead{border-bottom:1px solid rgba(126,182,255,.2);padding-bottom:12px;margin-bottom:14px}
+.chead b{font-size:17px;color:#fff;display:block}
+.chead i{font-style:normal;font-size:13px;color:#8FA6C6;display:block;margin-top:3px}
+.msgs{flex:1;overflow-y:auto;max-height:440px;padding-right:4px}
+.m{max-width:78%;padding:11px 14px;border-radius:15px;font-size:14.5px;line-height:1.55;
+  margin-bottom:9px;color:#DCE7FA}
+.m.them{background:#18213A;border-radius:15px 15px 15px 4px}
+.m.us{background:#1E3A6B;margin-left:auto;border-radius:15px 15px 4px 15px}
+.m .who{display:block;font-size:11px;letter-spacing:.07em;text-transform:uppercase;
+  font-weight:800;color:#7FB0FF;margin-bottom:4px}
+.m.us .who{color:#BBD8FF}
+.m .at{display:block;font-size:11px;color:#8FA6C6;margin-top:5px}
+.composer{border-top:1px solid rgba(126,182,255,.2);padding-top:14px;margin-top:14px}
+textarea{width:100%;box-sizing:border-box;padding:12px 13px;font-size:15px;font-family:inherit;
+  color:#EAF1FF;border-radius:10px;background:rgba(255,255,255,.05);
+  border:1px solid rgba(126,182,255,.26);min-height:76px;resize:vertical}
+textarea:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 3px rgba(30,107,255,.22)}
+.go{background:var(--accent);color:#fff;border:none;border-radius:10px;padding:13px 22px;
+  font-size:15px;font-weight:800;cursor:pointer;margin-top:12px;
+  box-shadow:0 12px 28px -12px rgba(30,107,255,.8)}
+.go:hover{filter:brightness(1.1)}
+.go:disabled{opacity:.5;box-shadow:none}
+.msg{display:none;border-radius:10px;padding:11px 13px;margin-top:12px;font-size:14px;line-height:1.5}
+.msg.good{background:#0F2A4A;border:1px solid var(--blue);color:#BBD8FF}
+.msg.bad{background:#3A1220;border:1px solid #7C2740;color:#FFC2CE}
+.empty{border:1px dashed rgba(126,182,255,.3);border-radius:13px;padding:26px;color:#B8C7DE;
+  font-size:15px;line-height:1.6;text-align:center}
+.oldnote{font-size:13px;color:#8FA6C6;margin-top:16px;line-height:1.6}
+.oldnote a{color:#4D8FFF;font-weight:700}
+</style></head><body>
+__WV_HEADER__
+__SHELTER__
+__MET_NAV__
+<div class=wrapx>
+  <h1>Messages</h1>
+  <p class=sub>Every conversation with a subscriber, and what has been said. A reply here goes
+  out the same way it does from the old portal.</p>
+  <div class=split>
+    <div class=panel>
+      <input class=search id=q placeholder="Search name or email">
+      <div id=threads><div class=empty>Loading...</div></div>
+    </div>
+    <div class="panel conv">
+      <div id=none class=empty>Pick a conversation on the left.</div>
+      <div id=conv style="display:none">
+        <div class=chead><b id=c-name></b><i id=c-meta></i></div>
+        <div class=msgs id=msgs></div>
+        <div class=composer>
+          <textarea id=reply placeholder="Write your reply. It goes to them as a message, signed with your name."></textarea>
+          <button class=go id=send>Send reply</button>
+          <div id=msg class=msg></div>
+        </div>
+      </div>
+      <div class=oldnote>Starting a brand new thread with somebody who has never written in is
+      still on the <a href="__SPA__/">old portal</a>.</div>
+    </div>
+  </div>
+</div>
+__WV_FOOTER__"""
+
+_MET_MSG_SCRIPT = """<script>
+(function(){
+  var threads=[], current=null;
+  function esc(t){var d=document.createElement('div');d.textContent=(t===null||t===undefined)?'':t;return d.innerHTML;}
+  function say(k,t){var m=document.getElementById('msg');m.className='msg '+k;m.innerHTML=t;m.style.display='block';}
+  function hide(){document.getElementById('msg').style.display='none';}
+  function ago(ms){
+    if(!ms) return '';
+    var s=Math.round((Date.now()-Number(ms))/1000);
+    if(s<90) return 'just now';
+    if(s<3600) return Math.round(s/60)+'m';
+    if(s<86400) return Math.round(s/3600)+'h';
+    return Math.round(s/86400)+'d';
+  }
+  function stamp(ms){
+    if(!ms) return '';
+    return new Date(Number(ms)).toLocaleString(undefined,
+      {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
+  }
+
+  function loadThreads(){
+    fetch('/api/v1/met/threads',{credentials:'include'})
+     .then(function(r){return r.json();}).then(function(j){
+        threads=(j&&j.threads)||[];
+        renderThreads();
+     }).catch(function(){ document.getElementById('threads').innerHTML=
+        '<div class=empty>Could not load conversations.</div>'; });
+  }
+
+  function renderThreads(){
+    var q=(document.getElementById('q').value||'').toLowerCase().trim();
+    var list=threads.filter(function(t){
+      if(!q) return true;
+      return ((t.subscriber_name||'')+' '+(t.subscriber_email||'')).toLowerCase().indexOf(q)>=0;
+    });
+    if(!list.length){ document.getElementById('threads').innerHTML=
+      '<div class=empty>'+(q?'Nobody matches that.':'No conversations yet.')+'</div>'; return; }
+    document.getElementById('threads').innerHTML=list.map(function(t){
+      return '<div class="t'+(current&&current.id===t.id?' on':'')+'" data-id="'+t.id+'">'
+        +'<div class=top><b>'+esc(t.subscriber_name||t.subscriber_email||'Someone')
+        +(t.unread_for_met?'<span class=dot></span>':'')+'</b>'
+        +'<span class=when>'+esc(ago(t.last_message_at))+'</span></div>'
+        +'<i>'+esc(t.last_message_preview||'')+'</i>'
+        +(t.subscriber_tier?'<span class=tier>'+esc(t.subscriber_tier)+'</span>':'')
+        +'</div>';
+    }).join('');
+    Array.prototype.forEach.call(document.querySelectorAll('.t'),function(el){
+      el.addEventListener('click',function(){
+        var id=Number(el.getAttribute('data-id'));
+        open(threads.filter(function(x){return x.id===id;})[0]);
+      });
+    });
+  }
+
+  function open(t){
+    if(!t) return;
+    current=t; hide();
+    document.getElementById('none').style.display='none';
+    document.getElementById('conv').style.display='block';
+    document.getElementById('c-name').textContent = t.subscriber_name || t.subscriber_email || 'Someone';
+    var bits=[];
+    if(t.subscriber_email) bits.push(t.subscriber_email);
+    if(t.subscriber_tier) bits.push(t.subscriber_tier);
+    if(t.team_primary_name) bits.push('Primary: '+t.team_primary_name);
+    document.getElementById('c-meta').textContent = bits.join('  ·  ');
+    document.getElementById('msgs').innerHTML='<div class=empty>Loading...</div>';
+    renderThreads();
+    fetch('/api/v1/met/threads/'+t.id,{credentials:'include'})
+     .then(function(r){return r.json();}).then(function(j){
+        var ms=(j&&j.messages)||[];
+        if(!ms.length){ document.getElementById('msgs').innerHTML=
+          '<div class=empty>Nothing said yet.</div>'; return; }
+        document.getElementById('msgs').innerHTML=ms.map(function(m){
+          var us=(m.sender_role||'')!=='subscriber';
+          return '<div class="m '+(us?'us':'them')+'">'
+            +'<span class=who>'+esc(m.sender_name||(us?'WeatherValet':'Them'))+'</span>'
+            +esc(m.body||'')
+            +'<span class=at>'+esc(stamp(m.created_at))+'</span></div>';
+        }).join('');
+        var box=document.getElementById('msgs'); box.scrollTop=box.scrollHeight;
+        // opening a thread is reading it
+        fetch('/api/v1/met/threads/'+t.id+'/mark-read',{method:'POST',credentials:'include',
+          headers:{'Content-Type':'application/json'},body:'{}'})
+         .then(function(){ t.unread_for_met=0; renderThreads(); }).catch(function(){});
+     }).catch(function(){ document.getElementById('msgs').innerHTML=
+        '<div class=empty>Could not load that conversation.</div>'; });
+  }
+
+  document.getElementById('send').addEventListener('click',function(){
+    if(!current) return;
+    var body=document.getElementById('reply').value.trim();
+    if(body.length<2){ say('bad','Write something first.'); return; }
+    var btn=this; btn.disabled=true; btn.textContent='Sending...'; hide();
+    fetch('/api/v1/met/threads/'+current.id+'/messages',{method:'POST',credentials:'include',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({body:body})})
+     .then(function(r){return r.json().then(function(j){return {s:r.status,j:j};});})
+     .then(function(res){
+        btn.disabled=false; btn.textContent='Send reply';
+        if(res.j&&res.j.ok){
+          document.getElementById('reply').value='';
+          say('good','Sent.');
+          open(current);
+          loadThreads();
+        } else {
+          var e=(res.j&&(res.j.message||res.j.error))||'';
+          say('bad', e==='empty-message' ? 'Write something first.'
+             : e==='message-too-long' ? 'That is too long for one message.'
+             : ('Could not send that.'+(e?' ('+esc(e)+')':'')));
+        }
+     }).catch(function(){ btn.disabled=false; btn.textContent='Send reply';
+        say('bad','Network problem.'); });
+  });
+
+  document.getElementById('q').addEventListener('input',renderThreads);
+  loadThreads();
+})();
+</script>"""
+
+
+@app.get("/portal/met/messages")
+def portal_met_messages():
+    user = _get_current_user()
+    if not user:
+        return redirect("/signin", code=302)
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return redirect("/portal", code=302)
+    spa = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+    return wv_shell(_MET_MSG_PAGE
+                    .replace("__MET_CHROME__", _MET_CHROME_CSS)
+                    .replace("__SHELTER__", _met_shelter_bar(user, spa))
+                    .replace("__MET_NAV__", _met_nav("messages", spa))
+                    .replace("__SPA__", spa)
+                    .replace("__WV_FOOTER__", _MET_MSG_SCRIPT + "\n__WV_FOOTER__"))
 
 
 @app.get("/portal/met/numbers")
