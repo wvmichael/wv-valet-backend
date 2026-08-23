@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-205"
+BACKEND_BUILD = "0702-206"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -18618,21 +18618,7 @@ _MET_DAY_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <style>
 __WV_TOKENS__
 :root{--accent:#1E6BFF}
-.metbar{border-bottom:1px solid var(--line);background:rgba(0,0,0,.6)}
-.metbar .in{max-width:1000px;margin:0 auto;padding:12px 22px;display:flex;align-items:center;
-  gap:16px;flex-wrap:wrap}
-.metnav{display:flex;gap:6px;flex-wrap:wrap}
-.metnav a{padding:8px 13px;border-radius:8px;font-size:14px;color:#C3D2E6;font-weight:600}
-.metnav a:hover{background:rgba(126,182,255,.1);color:#fff}
-.metnav a.on{background:var(--accent);color:#fff}
-.spacer{flex:1}
-.oldlink{font-size:13px;color:#8FA6C6}
-.oldlink:hover{color:var(--sky)}
-.shelter{display:block;padding:14px 22px;font-weight:700;font-size:15px;text-align:center}
-.shelter.quiet{background:rgba(255,255,255,.04);color:#8FA6C6;font-weight:600;font-size:13.5px}
-.shelter.loud{background:linear-gradient(90deg,#7A1626,#B3172B);color:#fff;
-  animation:pulsebar 2.6s ease-in-out infinite}
-@keyframes pulsebar{0%,100%{filter:brightness(1)}50%{filter:brightness(1.25)}}
+__MET_CHROME__
 .wrapx{max-width:1000px;margin:0 auto;padding:34px 22px 80px}
 h1{font-size:clamp(26px,4.2vw,38px);font-weight:900;letter-spacing:-.03em;color:#fff;margin:0 0 4px}
 .sub{color:#B8C7DE;font-size:16px;margin:0 0 24px}
@@ -18661,16 +18647,7 @@ h1{font-size:clamp(26px,4.2vw,38px);font-weight:900;letter-spacing:-.03em;color:
 </style></head><body>
 __WV_HEADER__
 __SHELTER__
-<div class=metbar><div class=in>
-  <nav class=metnav>
-    <a class=on href="/portal/met">My Day</a>
-    <a href="/portal/met/all">All Work</a>
-    <a href="/portal/met/messages">Messages</a>
-    <a href="/portal/met/numbers">My Numbers</a>
-  </nav>
-  <div class=spacer></div>
-  <a class=oldlink href="__SPA__/">Old Met portal</a>
-</div></div>
+__MET_NAV__
 <div class=wrapx>
   <h1>__GREETING__</h1>
   <p class=sub>__SUBLINE__</p>
@@ -18722,6 +18699,315 @@ _MET_DAY_SCRIPT = """<script>
 </script>"""
 
 
+# ---------------------------------------------------------------------------
+# Met portal: All Work (Aug 22, 2026)
+#
+# Everything across WeatherValet, not just yours. This is the covering page:
+# Timmy is stuck in traffic and somebody needs to find his 6 PM Sidekick
+# outlook in seconds.
+#
+# Claiming is a signal, not a lock. Nothing in the send paths checks who
+# claimed a job, so anyone can pick up anything. This page just makes that
+# findable, which is the part that was missing.
+# ---------------------------------------------------------------------------
+
+# Shared Met chrome: the same header bar, shelter strip and nav on every
+# Met page, defined once so they cannot drift apart.
+_MET_CHROME_CSS = """
+.metbar{border-bottom:1px solid var(--line);background:rgba(0,0,0,.6)}
+.metbar .in{max-width:1060px;margin:0 auto;padding:12px 22px;display:flex;align-items:center;
+  gap:16px;flex-wrap:wrap}
+.metnav{display:flex;gap:6px;flex-wrap:wrap}
+.metnav a{padding:8px 13px;border-radius:8px;font-size:14px;color:#C3D2E6;font-weight:600}
+.metnav a:hover{background:rgba(126,182,255,.1);color:#fff}
+.metnav a.on{background:var(--accent);color:#fff}
+.spacer{flex:1}
+.oldlink{font-size:13px;color:#8FA6C6}
+.oldlink:hover{color:#4D8FFF}
+.shelter{display:block;padding:14px 22px;font-weight:700;font-size:15px;text-align:center}
+.shelter.quiet{background:rgba(255,255,255,.04);color:#8FA6C6;font-weight:600;font-size:13.5px}
+.shelter.loud{background:linear-gradient(90deg,#7A1626,#B3172B);color:#fff;
+  animation:pulsebar 2.6s ease-in-out infinite}
+@keyframes pulsebar{0%,100%{filter:brightness(1)}50%{filter:brightness(1.25)}}
+"""
+
+
+def _met_shelter_bar(user: dict, spa: str) -> str:
+    """The Storm Shelter strip. Quiet when nothing is open, loud when one is."""
+    sh = _met_shelter_state(user.get("id"))
+    if sh.get("open"):
+        who = "You have" if sh.get("mine") else "A Meteorologist has"
+        return ('<a class="shelter loud" href="%s/">&#9888; Storm Shelter is OPEN. %s one running '
+                'for %s%s. Open the old portal to post updates.</a>'
+                % (spa, who, _html_escape(sh.get("region") or "a region"),
+                   (" (" + _html_escape(sh["event"]) + ")") if sh.get("event") else ""))
+    return ('<a class="shelter quiet" href="%s/">No Storm Shelter open. '
+            'Open one from the old portal when severe weather hits.</a>' % spa)
+
+
+def _met_nav(active: str, spa: str) -> str:
+    items = [("day", "My Day", "/portal/met"), ("all", "All Work", "/portal/met/all"),
+             ("messages", "Messages", "/portal/met/messages"),
+             ("numbers", "My Numbers", "/portal/met/numbers")]
+    links = "".join('<a class="%s" href="%s">%s</a>'
+                    % ("on" if k == active else "", href, label)
+                    for k, label, href in items)
+    return ('<div class=metbar><div class=in><nav class=metnav>%s</nav>'
+            '<div class=spacer></div>'
+            '<a class=oldlink href="%s/">Old Met portal</a></div></div>' % (links, spa))
+
+
+def _all_work_rows(days_ahead: int = 14) -> list:
+    """Every job in a bounded window, claimed or not, across every product."""
+    rows = []
+    today = datetime.now(timezone.utc).date()
+    until = today + timedelta(days=days_ahead)
+
+    def grab(fn, label):
+        try:
+            fn()
+        except Exception as e:
+            print(f"[all-work] {label} lookup failed: {e!r}", flush=True)
+
+    def sidekick():
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT g.id, g.opponent, g.venue, g.game_date, g.kickoff,
+                                      g.claimed_by, u.name AS met_name
+                                 FROM gameday_games g
+                            LEFT JOIN users u ON u.id = g.claimed_by
+                                WHERE g.game_date BETWEEN %s AND %s
+                             ORDER BY g.game_date""", (today, until))
+                for r in cur.fetchall() or []:
+                    rows.append({
+                        "product": "Sidekick",
+                        "title": r.get("opponent") or "Game day",
+                        "where": r.get("venue") or "Bloomington, IN",
+                        "date": r["game_date"],
+                        "time": r.get("kickoff") or "",
+                        "met": r.get("met_name") or "",
+                        "open": not r.get("claimed_by"),
+                        "href": "/portal/sidekick",
+                    })
+
+    def watch():
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT w.id, w.place, w.what, w.event_date, w.start_hour,
+                                      w.end_hour, w.met_user_id, w.status, u.name AS met_name
+                                 FROM watch_orders w
+                            LEFT JOIN users u ON u.id = w.met_user_id
+                                WHERE w.event_date BETWEEN %s AND %s
+                                  AND w.status NOT IN ('pending','refunded','canceled')
+                             ORDER BY w.event_date, w.start_hour""", (today, until))
+                for r in cur.fetchall() or []:
+                    rows.append({
+                        "product": "Watch",
+                        "title": r.get("what") or "An event",
+                        "where": r.get("place") or "",
+                        "date": r["event_date"],
+                        "time": "%s to %s" % (_watch_hour_label(r.get("start_hour")),
+                                              _watch_hour_label(r.get("end_hour"))),
+                        "met": r.get("met_name") or "",
+                        "open": not r.get("met_user_id"),
+                        "href": "/portal/watch",
+                    })
+
+    def reviews():
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT v.id, v.plan_location, v.plan_window, v.plan_text,
+                                      v.status, v.claimed_by_user_id, u.name AS met_name
+                                 FROM verification_requests v
+                            LEFT JOIN users u ON u.id = v.claimed_by_user_id
+                                WHERE v.status IN ('paid','pending','claimed','in_progress')
+                             ORDER BY v.created_at LIMIT 60""")
+                for r in cur.fetchall() or []:
+                    rows.append({
+                        "product": "Met Review",
+                        "title": (r.get("plan_text") or "A review")[:70],
+                        "where": r.get("plan_location") or "",
+                        "date": None,
+                        "time": r.get("plan_window") or "",
+                        "met": r.get("met_name") or "",
+                        "open": not r.get("claimed_by_user_id"),
+                        "href": "/portal/met",
+                    })
+
+    def briefs():
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT b.id, b.location_label, b.status,
+                                      b.claimed_by_user_id, u.name AS met_name
+                                 FROM pro_brief_drafts b
+                            LEFT JOIN users u ON u.id = b.claimed_by_user_id
+                                WHERE b.status IN ('pending','claimed')
+                             ORDER BY b.created_at LIMIT 60""")
+                for r in cur.fetchall() or []:
+                    rows.append({
+                        "product": "Pro",
+                        "title": "Daily brief",
+                        "where": r.get("location_label") or "",
+                        "date": today,
+                        "time": "",
+                        "met": r.get("met_name") or "",
+                        "open": not r.get("claimed_by_user_id"),
+                        "href": "/portal/met",
+                    })
+
+    grab(sidekick, "sidekick"); grab(watch, "watch")
+    grab(reviews, "reviews"); grab(briefs, "briefs")
+    rows.sort(key=lambda r: (r["date"] or today, r["product"]))
+    return rows
+
+
+_MET_ALL_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>All Work - WeatherValet</title><meta name=robots content="noindex">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+__MET_CHROME__
+.wrapx{max-width:1060px;margin:0 auto;padding:34px 22px 80px}
+h1{font-size:clamp(26px,4.2vw,38px);font-weight:900;letter-spacing:-.03em;color:#fff;margin:0 0 4px}
+.sub{color:#B8C7DE;font-size:16px;margin:0 0 22px;line-height:1.6}
+.filters{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
+.filters select,.filters input{padding:11px 13px;font-size:14.5px;font-family:inherit;color:#EAF1FF;
+  border-radius:9px;background:rgba(255,255,255,.05);border:1px solid rgba(126,182,255,.26)}
+.filters input{min-width:210px}
+.filters select:focus,.filters input:focus{outline:none;border-color:var(--blue);
+  box-shadow:0 0 0 3px rgba(30,107,255,.22)}
+.filters select option{background:#0B1424;color:#EAF1FF}
+.count{font-size:13.5px;color:#8FA6C6;margin:12px 0 18px}
+.row{display:block;border:1px solid rgba(126,182,255,.22);border-radius:13px;padding:15px 18px;
+  margin-bottom:9px;background:rgba(255,255,255,.035);transition:.16s}
+.row:hover{border-color:var(--blue);transform:translateY(-2px)}
+.row.open{border-left:4px solid var(--red)}
+.row .l1{display:flex;justify-content:space-between;gap:14px;align-items:baseline;flex-wrap:wrap}
+.row b{font-size:16.5px;color:#fff}
+.row .tag{font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;font-weight:800;
+  padding:4px 9px;border-radius:999px;background:rgba(30,107,255,.18);color:#7FB0FF;
+  border:1px solid rgba(30,107,255,.4);white-space:nowrap}
+.row .l2{font-size:14px;color:#B8C7DE;margin-top:6px;line-height:1.55}
+.row .who{color:#8FA6C6}
+.row .unc{color:#FF9AA8;font-weight:700}
+.empty{border:1px dashed rgba(126,182,255,.3);border-radius:14px;padding:26px;color:#B8C7DE;
+  font-size:15.5px;line-height:1.65;text-align:center}
+</style></head><body>
+__WV_HEADER__
+__SHELTER__
+__MET_NAV__
+<div class=wrapx>
+  <h1>All Work</h1>
+  <p class=sub>Everything across WeatherValet, whoever it belongs to. Claiming is a signal,
+  not a lock, so anything here can be picked up by anyone.</p>
+  <div class=filters>
+    <select id=f-product><option value="">Every product</option>__PRODUCTS__</select>
+    <select id=f-met><option value="">Anyone</option>__METS__<option value="__open">Unclaimed only</option></select>
+    <select id=f-when><option value="">Any date</option>
+      <option value="today">Today</option><option value="3">Next 3 days</option>
+      <option value="7">Next week</option></select>
+    <input id=f-text placeholder="Search place, customer, opponent">
+  </div>
+  <div class=count id=count></div>
+  <div id=rows>__ROWS__</div>
+  <div class=empty id=none style="display:none">Nothing matches those filters.</div>
+</div>
+__WV_FOOTER__"""
+
+_MET_ALL_SCRIPT = """<script>
+(function(){
+  var rows=Array.prototype.slice.call(document.querySelectorAll('#rows .row'));
+  var fp=document.getElementById('f-product'), fm=document.getElementById('f-met'),
+      fw=document.getElementById('f-when'), ft=document.getElementById('f-text'),
+      count=document.getElementById('count'), none=document.getElementById('none');
+  function apply(){
+    var p=fp.value, m=fm.value, w=fw.value, t=(ft.value||'').toLowerCase().trim();
+    var shown=0;
+    rows.forEach(function(r){
+      var ok=true;
+      if(p && r.getAttribute('data-product')!==p) ok=false;
+      if(ok && m==='__open' && r.getAttribute('data-open')!=='1') ok=false;
+      if(ok && m && m!=='__open' && r.getAttribute('data-met')!==m) ok=false;
+      if(ok && w){
+        var d=Number(r.getAttribute('data-days'));
+        if(w==='today' && d!==0) ok=false;
+        else if(w!=='today' && (isNaN(d) || d>Number(w))) ok=false;
+      }
+      if(ok && t && r.getAttribute('data-search').indexOf(t)<0) ok=false;
+      r.style.display = ok ? '' : 'none';
+      if(ok) shown++;
+    });
+    var openN=rows.filter(function(r){
+      return r.style.display!=='none' && r.getAttribute('data-open')==='1'; }).length;
+    count.textContent = shown + (shown===1?' job':' jobs')
+      + (openN ? '  ·  ' + openN + ' unclaimed' : '  ·  all claimed');
+    none.style.display = shown ? 'none' : 'block';
+  }
+  [fp,fm,fw].forEach(function(el){ el.addEventListener('change',apply); });
+  ft.addEventListener('input',apply);
+  apply();
+})();
+</script>"""
+
+
+@app.get("/portal/met/all")
+def portal_met_all():
+    user = _get_current_user()
+    if not user:
+        return redirect("/signin", code=302)
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return redirect("/portal", code=302)
+
+    spa = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+    rows = _all_work_rows()
+    today = datetime.now(timezone.utc).date()
+
+    products = sorted({r["product"] for r in rows})
+    mets = sorted({r["met"] for r in rows if r["met"]})
+
+    html = ""
+    for r in rows:
+        days = (r["date"] - today).days if r["date"] else ""
+        when = ""
+        if r["date"]:
+            when = r["date"].strftime("%a %b %-d")
+            if r["date"] == today:
+                when = "Today"
+        who = ('<span class=unc>Unclaimed</span>' if r["open"]
+               else '<span class=who>%s</span>' % _html_escape(r["met"]))
+        bits = [x for x in (when, r["time"], r["where"]) if x]
+        search = " ".join([r["title"], r["where"], r["met"], r["product"]]).lower()
+        html += ('<a class="row%s" href="%s" data-product="%s" data-met="%s" data-open="%s" '
+                 'data-days="%s" data-search="%s">'
+                 '<div class=l1><b>%s</b><span class=tag>%s</span></div>'
+                 '<div class=l2>%s &middot; %s</div></a>'
+                 % (" open" if r["open"] else "", r["href"],
+                    _html_escape(r["product"]), _html_escape(r["met"]),
+                    "1" if r["open"] else "0", days, _html_escape(search),
+                    _html_escape(r["title"]), _html_escape(r["product"]),
+                    _html_escape(" &middot; ".join(bits)).replace("&amp;middot;", "&middot;"),
+                    who))
+
+    if not rows:
+        html = ('<div class=empty>Nothing booked in the next two weeks. '
+                'That is either very quiet or worth checking.</div>')
+
+    return wv_shell(_MET_ALL_PAGE
+                    .replace("__MET_CHROME__", _MET_CHROME_CSS)
+                    .replace("__SHELTER__", _met_shelter_bar(user, spa))
+                    .replace("__MET_NAV__", _met_nav("all", spa))
+                    .replace("__PRODUCTS__", "".join(
+                        '<option value="%s">%s</option>' % (_html_escape(p), _html_escape(p))
+                        for p in products))
+                    .replace("__METS__", "".join(
+                        '<option value="%s">%s</option>' % (_html_escape(m), _html_escape(m))
+                        for m in mets))
+                    .replace("__ROWS__", html)
+                    .replace("__WV_FOOTER__", _MET_ALL_SCRIPT + "\n__WV_FOOTER__"))
+
+
 @app.get("/portal/met")
 def portal_met_day():
     user = _get_current_user()
@@ -18733,17 +19019,6 @@ def portal_met_day():
 
     spa = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
     cards = _met_day_cards(user)
-    shelter = _met_shelter_state(user.get("id"))
-
-    if shelter.get("open"):
-        who = "You have" if shelter.get("mine") else "A Meteorologist has"
-        bar = ('<a class="shelter loud" href="%s/">&#9888; Storm Shelter is OPEN. %s one running '
-               'for %s%s. Open the old portal to post updates.</a>'
-               % (spa, who, _html_escape(shelter.get("region") or "a region"),
-                  (" (" + _html_escape(shelter["event"]) + ")") if shelter.get("event") else ""))
-    else:
-        bar = ('<a class="shelter quiet" href="%s/">No Storm Shelter open. '
-               'Open one from the old portal when severe weather hits.</a>' % spa)
 
     when_rank = {"today": 0, "waiting": 1, "tomorrow": 2}
     html = ""
@@ -18777,8 +19052,9 @@ def portal_met_day():
     subline = ("%d thing%s waiting on you." % (n, "" if n == 1 else "s")) if n else "You are clear."
 
     return wv_shell(_MET_DAY_PAGE
-                    .replace("__SPA__", spa)
-                    .replace("__SHELTER__", bar)
+                    .replace("__MET_CHROME__", _MET_CHROME_CSS)
+                    .replace("__MET_NAV__", _met_nav("day", spa))
+                    .replace("__SHELTER__", _met_shelter_bar(user, spa))
                     .replace("__GREETING__", greeting)
                     .replace("__SUBLINE__", subline)
                     .replace("__CARDS__", html)
