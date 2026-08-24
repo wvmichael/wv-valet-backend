@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-227"
+BACKEND_BUILD = "0702-229"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -12946,12 +12946,47 @@ WV_FOOTER = """<footer>
 </body></html>"""
 
 
+# Meta Pixel (Aug 24, 2026). Injected into every page rendered through
+# wv_shell, which is every public page and every portal page.
+#
+# Note on the snippet: the version pasted from Ads Manager was missing the
+# [0] after getElementsByTagName(e), which makes s an HTMLCollection rather
+# than an element. s.parentNode is then undefined and the pixel never
+# loads. This is Meta's own published snippet, with the [0] present.
+META_PIXEL_ID = "945737508575398"
+
+META_PIXEL = """<!-- Meta Pixel Code -->
+<script>
+!function(f,b,e,v,n,t,s)
+{if(f.fbq)return;n=f.fbq=function(){n.callMethod?
+n.callMethod.apply(n,arguments):n.queue.push(arguments)};
+if(!f._fbq)f._fbq=n;n.push=n;n.loaded=!0;n.version='2.0';
+n.queue=[];t=b.createElement(e);t.async=!0;
+t.src=v;s=b.getElementsByTagName(e)[0];
+s.parentNode.insertBefore(t,s)}(window, document,'script',
+'https://connect.facebook.net/en_US/fbevents.js');
+fbq('init', '__PIXEL_ID__');
+fbq('track', 'PageView');
+</script>
+<noscript><img height="1" width="1" style="display:none"
+src="https://www.facebook.com/tr?id=__PIXEL_ID__&ev=PageView&noscript=1" /></noscript>
+<!-- End Meta Pixel Code -->""".replace("__PIXEL_ID__", META_PIXEL_ID)
+
+
 def wv_shell(page: str) -> str:
-    """Drop the shared tokens, header and footer into a page constant."""
-    return (page
-            .replace("__WV_TOKENS__", WV_TOKENS)
-            .replace("__WV_HEADER__", WV_HEADER)
-            .replace("__WV_FOOTER__", WV_FOOTER))
+    """Drop the shared tokens, header and footer into a page constant.
+
+    Also injects the Meta Pixel immediately before </head> so it loads on
+    every page. Pages are plain strings rather than templates, so the
+    insertion is done here rather than in a layout file.
+    """
+    out = (page
+           .replace("__WV_TOKENS__", WV_TOKENS)
+           .replace("__WV_HEADER__", WV_HEADER)
+           .replace("__WV_FOOTER__", WV_FOOTER))
+    if META_PIXEL_ID and "</head>" in out and "fbevents.js" not in out:
+        out = out.replace("</head>", META_PIXEL + "\n</head>", 1)
+    return out
 
 
 _GAMEDAY_TERMS_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
@@ -61497,7 +61532,27 @@ _SEED_AUG17_PROSPECTS = [
         "email": "",
         "wave": "Week of Aug 17",
         "note": ""
-    }
+    },
+    {
+        "business": "Lakeside Golf & Games",
+        "owner": "",
+        "address": "645 Fieldhouse Wy, Lebanon, IN 46052",
+        "phone": "(574) 253-1454",
+        "website": "",
+        "email": "",
+        "wave": "Week of Aug 17",
+        "note": ""
+    },
+    {
+        "business": "Parky's Smokehouse",
+        "owner": "",
+        "address": "2479 N Lebanon St., Lebanon, IN 46052",
+        "phone": "(812) 391-2318",
+        "website": "",
+        "email": "",
+        "wave": "Week of Aug 17",
+        "note": ""
+    },
 ]
 
 
