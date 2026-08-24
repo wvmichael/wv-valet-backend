@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-226"
+BACKEND_BUILD = "0702-227"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -14417,10 +14417,11 @@ button:active{transform:translateY(0)}
 button:disabled{opacity:.55;transform:none;box-shadow:none}
 .fine{font-size:12.5px;color:#7F94B4;margin-top:14px;line-height:1.55;text-align:center}
 .err{display:none;background:#FDECEC;border:1px solid #F3B4B4;color:#8A1F1F;border-radius:8px;padding:10px 12px;margin-top:14px;font-size:14px}
-.addon{position:relative;display:flex;gap:13px;align-items:flex-start;margin:0 0 11px;
-  padding:16px 17px;border-radius:13px;cursor:pointer;overflow:hidden;
-  background:linear-gradient(165deg,rgba(255,255,255,.055),rgba(255,255,255,.015));
-  border:1px solid rgba(126,182,255,.2);
+.addon{text-transform:none;letter-spacing:0;font-weight:400;
+  position:relative;display:flex;gap:13px;align-items:flex-start;margin:0 0 11px;
+  padding:15px 16px;border-radius:12px;cursor:pointer;overflow:hidden;
+  background:rgba(255,255,255,.035);
+  border:1px solid rgba(126,182,255,.16);
   transition:transform .2s cubic-bezier(.2,.7,.3,1),border-color .2s,box-shadow .2s,background .2s}
 /* A quiet blue wash that only wakes up when the row is chosen. */
 .addon:before{content:"";position:absolute;inset:0;opacity:0;transition:opacity .25s;
@@ -14431,8 +14432,10 @@ button:disabled{opacity:.55;transform:none;box-shadow:none}
 .addon.on:before{opacity:1}
 .addon>*{position:relative}
 .addon input{width:auto;margin:3px 0 0;flex:0 0 auto;transform:scale(1.35);accent-color:var(--blue)}
-.addon b{display:block;font-size:15.5px;color:#fff;letter-spacing:-.01em}
-.addon i{display:block;font-style:normal;font-size:13.5px;color:#A9BDD8;line-height:1.55;margin-top:3px}
+.addon b{display:block;font-size:15.5px;color:#fff;letter-spacing:-.01em;
+  text-transform:none;font-weight:700}
+.addon i{display:block;font-style:normal;font-size:13.5px;color:#9FB3CE;line-height:1.6;
+  margin-top:4px;text-transform:none;letter-spacing:0;font-weight:400}
 .addon .amt{font-weight:800;font-size:15.5px;color:#7EB6FF;white-space:nowrap}
 .addon.on .amt{color:#fff}
 .addon-h{font-size:11.5px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;
@@ -14586,8 +14589,7 @@ __WV_HEADER__
 
     <label class=addon id=ad-gift for=s-gift><input type=checkbox id=s-gift>
       <span style="flex:1"><b>This is a gift</b>
-      <i>Buying it for someone else? Put their address and their phone above, and
-      we will tell them who it is from so the first message is not a mystery.</i></span>
+      <i>We tell them who it is from, so the first text is not a mystery.</i></span>
       <span class=amt>Free</span></label>
 
     <div id=gift-wrap style="display:none;margin:-2px 0 12px">
@@ -14599,8 +14601,7 @@ __WV_HEADER__
 
     <label class=addon id=ad-second for=s-second><input type=checkbox id=s-second>
       <span style="flex:1"><b>Watch a second address</b>
-      <i>Mom's house, the lake place, the shop, a rental. Same warnings, same
-      tornado call, on the same bill. Most services charge full price again.</i></span>
+      <i>Mom's house, the lake place, the shop. Same warnings, same bill.</i></span>
       <span class=amt>+$8/yr</span></label>
 
     <div id=second-wrap style="display:none;margin:-2px 0 12px">
@@ -14619,15 +14620,12 @@ __WV_HEADER__
 
     <label class=addon id=ad-pack for=s-pack><input type=checkbox id=s-pack>
       <span style="flex:1"><b>All-Season pack</b>
-      <i>Winter storm, ice, and blizzard warnings. Frost and freeze warnings for
-      the garden. Extreme heat and high wind. Same address, same phone, all year.</i></span>
+      <i>Winter storms, ice, frost and freeze, extreme heat and high wind.</i></span>
       <span class=amt>+$9/yr</span></label>
 
     <label class=addon id=ad-daily for=s-daily><input type=checkbox id=s-daily>
       <span style="flex:1"><b>Add the morning summary</b>
-      <i>Every morning, an automated summary of the National Weather Service
-      forecast for your address, at the hour you pick. Not written by a
-      Meteorologist, and it says so.</i></span>
+      <i>One text at the hour you pick. Automated, and it says so.</i></span>
       <span class=amt>+$12/yr</span></label>
 
     <div id=daily-wrap style="display:none;margin:-2px 0 12px">
