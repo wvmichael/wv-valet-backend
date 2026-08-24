@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-223"
+BACKEND_BUILD = "0702-224"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -19056,6 +19056,14 @@ def admin_tier_list():
                                     WHERE u.subscription_tier IN
                                           ('pro_single','pro_multi','pro_enterprise')
                                  ORDER BY u.id DESC LIMIT 400""")
+                elif tier == "review":
+                    cur.execute("""SELECT v.id, v.customer_email, v.customer_phone,
+                                          v.plan_text, v.plan_location, v.plan_window,
+                                          v.status, v.tier, v.price_cents, v.created_at,
+                                          v.stripe_payment_id, v.stripe_session_id,
+                                          v.completed_by_name
+                                     FROM verification_requests v
+                                 ORDER BY v.id DESC LIMIT 400""")
                 elif tier == "crew":
                     cur.execute("""SELECT u.id, u.name, u.email, u.phone,
                                           r.granted_at AS created_at,
@@ -19132,6 +19140,52 @@ def admin_stormline_update():
         return jsonify({"ok": False, "error": "Could not save that."}), 500
     print(f"[stormline-update] {sid} by {user.get('email')}: {list(data.keys())}", flush=True)
     return jsonify({"ok": True, "sentry_id": sid})
+
+
+@app.post("/api/v1/admin/review/delete")
+def admin_review_delete():
+    """Permanently remove a Met Review.
+
+    Guarded like the Stormline delete: anything with a Stripe payment
+    against it is a real customer's order, and erasing it destroys the
+    record of what they bought and what a Meteorologist told them. Those
+    can be cancelled, not deleted.
+
+    Tests we created ourselves never took a payment, so they can go.
+    """
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "not-authorized"}), 403
+    data = request.get_json(silent=True) or {}
+    try:
+        rid = int(data.get("review_id"))
+    except Exception:
+        return jsonify({"ok": False, "error": "Which review?"}), 400
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id, customer_email, plan_location, status,
+                                  stripe_payment_id, stripe_session_id
+                             FROM verification_requests WHERE id = %s""", (rid,))
+            row = cur.fetchone()
+    if not row:
+        return jsonify({"ok": False, "error": "No such review."}), 404
+    if row.get("stripe_payment_id"):
+        return jsonify({"ok": False, "error": (
+            "Somebody paid for that one, so it cannot be erased. Set it to canceled "
+            "instead; the record of what they bought and what we told them stays.")}), 400
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM verification_requests WHERE id = %s", (rid,))
+    except Exception as e:
+        print(f"[review-delete] {rid} failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "Could not remove that."}), 500
+    print(f"[review-delete] removed {rid} ({row.get('customer_email')}) "
+          f"by {user.get('email')}", flush=True)
+    return jsonify({"ok": True, "review_id": rid,
+                    "who": row.get("customer_email") or row.get("plan_location") or "that one"})
 
 
 @app.post("/api/v1/admin/stormline/delete")
@@ -19242,6 +19296,7 @@ __ADMIN_NAV__
     <button class=on data-t=stormline>Stormline</button>
     <button data-t=sidekick>Sidekick</button>
     <button data-t=watch>Watch</button>
+    <button data-t=review>Met Reviews</button>
     <button data-t=pro>Pro</button>
     <button data-t=crew>Valet Crew</button>
   </div>
@@ -19295,9 +19350,11 @@ _ADMIN_SUBS_SCRIPT = """<script>
       + '<tbody>' + list.map(
           tier==='stormline' ? stormRow
           : (tier==='pro'||tier==='crew') ? personRow
+          : tier==='review' ? reviewRow
           : plainRow).join('') + '</tbody></table></div>';
     if(tier==='stormline') wire();
     if(tier==='pro'||tier==='crew') wirePeople();
+    if(tier==='review') wireReviews();
   }
 
   function stormHead(){
@@ -19405,7 +19462,45 @@ _ADMIN_SUBS_SCRIPT = """<script>
     });
   }
 
+  function reviewRow(r){
+    var paid = !!r.stripe_payment_id;
+    return '<tr data-rid="'+r.id+'">'
+      +'<td class=name>'+esc(r.customer_email||'(no email)')
+        +(paid?' <span class="tag paid">Paid</span>':' <span class="tag int">No payment</span>')
+        +'</td>'
+      +'<td style="min-width:200px">'+esc(r.plan_text||'')
+        +(r.plan_location?'<br><span style="color:#8FA6C6;font-size:12.5px">'
+          +esc(r.plan_location)+(r.plan_window?'  ·  '+esc(r.plan_window):'')+'</span>':'')+'</td>'
+      +'<td>'+esc(r.status||'')+(r.completed_by_name?'<br><span style="color:#8FA6C6;'
+        +'font-size:12.5px">by '+esc(r.completed_by_name)+'</span>':'')+'</td>'
+      +'<td>'+esc(when(r.created_at))+'</td>'
+      +'<td>'+(paid?'':'<button class="b del" data-rid="'+r.id+'">Remove</button>')
+        +'<div class=actmsg id="rv'+r.id+'"></div></td></tr>';
+  }
+
+  function wireReviews(){
+    Array.prototype.forEach.call(document.querySelectorAll('.b.del[data-rid]'),function(btn){
+      var rid=Number(btn.getAttribute('data-rid'));
+      btn.addEventListener('click',function(){
+        if(!confirm('Remove this Met Review permanently? This only works for ones that '
+          +'never took a payment.')) return;
+        btn.disabled=true; btn.textContent='...';
+        fetch('/api/v1/admin/review/delete',{method:'POST',credentials:'include',
+          headers:{'Content-Type':'application/json'},body:JSON.stringify({review_id:rid})})
+         .then(function(r){return r.json();}).then(function(j){
+            if(j&&j.ok){ say('good','Removed '+esc(j.who||'that one')+'.');
+              rows=rows.filter(function(x){return x.id!==rid;}); render(); }
+            else { btn.disabled=false; btn.textContent='Remove';
+              say('bad',(j&&j.error)||'Could not remove that.'); }
+         }).catch(function(){ btn.disabled=false; btn.textContent='Remove';
+            say('bad','Network problem.'); });
+      });
+    });
+  }
+
   function plainHead(){
+    if(tier==='review') return '<thead><tr><th>Customer</th><th>What they asked</th>'
+      +'<th>Status</th><th>Asked</th><th></th></tr></thead>';
     if(tier==='sidekick') return '<thead><tr><th>Who</th><th>Email</th><th>Phone</th>'
       +'<th>Pass</th><th>Status</th><th>Bought</th></tr></thead>';
     if(tier==='watch') return '<thead><tr><th>Who</th><th>Email</th><th>Place</th>'
