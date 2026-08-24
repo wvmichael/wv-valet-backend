@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-225"
+BACKEND_BUILD = "0702-226"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -14218,6 +14218,7 @@ _STORMLINE_HERO = """<div class=hero>
    in, put the right numbers on it, and you are the one who calls home. Two numbers per
    address, included.</p>
    <div class=price>$12 a year, one address</div>
+   <a class=herobuy href="#buy">Put a Stormline on it &rarr;</a>
   </div>
   <!-- Above the fold, the product itself: a real thread, so somebody sees
        what they are buying before they read a word about it. -->
@@ -14232,10 +14233,11 @@ _STORMLINE_HERO = """<div class=hero>
       <div style="font-size:12px;color:#8FA6C6">Tornado warning &middot; spoken twice</div></div></div>
     <div class="bub warn"><span class=hd>Tornado Warning</span>
       A Tornado Warning includes your address (Mom's house) until 2:45 AM. Take shelter now:
-      interior room, lowest floor, away from windows. We'll text the all clear.</div>
+      interior room, lowest floor, away from windows. We'll text you when it expires.</div>
     <div class=ts>2:51 AM</div>
-    <div class="bub ok"><span class=hd>All clear</span>
-      All clear. The Tornado Warning that included your address has expired.</div>
+    <div class="bub ok"><span class=hd>Warning expired</span>
+      The Tornado Warning for your address has expired. That means the warning ended,
+      not that the weather is done. We are still watching.</div>
    </div>
   </div>
  </div>
@@ -14247,7 +14249,7 @@ _STORMLINE_DAILY_HERO = """<div class=hero>
   <h1>The forecast, <em>before you go looking for it.</em></h1>
   <p>Every morning at the hour you pick, a plain summary of the National Weather Service
   forecast for your address. Plus everything Stormline does the rest of the year: warning
-  texts with radar, a phone call for tornadoes, and the all clear. One message a day,
+  texts with radar, a phone call for tornadoes, and word when the warning expires. One message a day,
   and a phone call on the day it matters.</p>
   <div class=price>$24 a year, all in</div>
 </div>
@@ -14264,7 +14266,7 @@ _STORMLINE_DAILY_HERO = """<div class=hero>
       flash flood warning covers that exact address. Not your county. Your address.</li>
       <li><b>A phone call for tornado warnings</b> that says the warning twice, because a
       text at 2 AM gets slept through.</li>
-      <li><b>The all clear</b> when the warning expires.</li>
+      <li><b>Word when the warning expires</b>, so nobody sits in the basement wondering.</li>
       <li><b>No app, no login, nothing to check.</b> Works on any phone that gets texts.</li>
     </ul>
     <div class=dollar><b>Why a daily message and not another app?</b> Because you already
@@ -14279,7 +14281,7 @@ _STORMLINE_DAILY_HERO = """<div class=hero>
 _SENTRY_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>WeatherValet Stormline - watch the address you cannot stand next to - $12/year</title>
-<meta name=description content="Official National Weather Service warnings for one exact address. Texts with radar, a phone call for tornadoes, and the all clear. $12 a year.">
+<meta name=description content="Official National Weather Service warnings for one exact address. Texts with radar, a phone call for tornadoes, and word when it expires. $12 a year.">
 <style>
 __WV_TOKENS__
 /* Stormline runs on the shared shell. Only the accent and the page-specific
@@ -14309,6 +14311,23 @@ body{background:var(--ink);color:var(--cream)}
   max-width:1060px;margin:0 auto;text-align:left}
 @media(min-width:900px){.herogrid{grid-template-columns:1.05fr .95fr;gap:56px}}
 .heroph .ph{max-width:320px;margin:0 auto}
+.herobuy{display:inline-block;margin-top:18px;background:var(--blue);color:#fff;font-weight:800;
+  font-size:17px;padding:15px 28px;border-radius:11px;
+  box-shadow:0 14px 34px -14px rgba(30,107,255,.9);transition:.18s}
+.herobuy:hover{filter:brightness(1.1);transform:translateY(-1px)}
+/* On a phone the form is nearly six screens down, so the price and the
+   button follow you instead. Always one tap away. */
+.stickybuy{display:none}
+@media(max-width:820px){
+  .stickybuy{display:flex;position:fixed;left:0;right:0;bottom:0;z-index:70;
+    align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;
+    background:rgba(4,7,14,.96);border-top:1px solid rgba(30,107,255,.5)}
+  .stickybuy b{color:#fff;font-size:15px}
+  .stickybuy i{display:block;font-style:normal;font-size:12px;color:#8FA6C6}
+  .stickybuy a{background:var(--blue);color:#fff;font-weight:800;font-size:15px;
+    padding:12px 20px;border-radius:10px;white-space:nowrap}
+  body{padding-bottom:74px}
+}
 /* Phone threads, drawn in code rather than pasted as screenshots. They stay
    correct when the message wording changes, stay sharp on any screen, and
    cost nothing to load. Showing what arrives beats describing it. */
@@ -14477,7 +14496,7 @@ __WV_HEADER__
           <td class=y>Yes. Texts reach any phone that gets texts, and the tornado call
           reaches a landline too</td></tr>
       <tr><td class=y>Tells you it is over</td><td class=n>Rarely</td>
-          <td class=y>An all-clear text when the warning expires</td></tr>
+          <td class=y>A text when the warning expires</td></tr>
     </table>
     <p class=a style="margin-top:12px">Keep your free alerts. They are good. Stormline is for
     the address you cannot stand next to.</p>
@@ -14498,13 +14517,13 @@ __WV_HEADER__
         <div class="bub warn"><span class=hd>Severe Thunderstorm Warning</span>
           A Severe Thunderstorm Warning includes your address (418 Prairie Rose Dr,
           Norman, OK) until 7:15 PM. The Weather Service lists wind to 60 mph and hail
-          up to 1 inch. Move indoors, away from windows. We'll text the all clear.</div>
+          up to 1 inch. Move indoors, away from windows. We'll text you when it expires.</div>
         <div class=ts>Tuesday 7:19 PM</div>
-        <div class="bub ok"><span class=hd>All clear</span>
-          All clear. The Severe Thunderstorm Warning that included your address has
-          expired.</div>
+        <div class="bub ok"><span class=hd>Warning expired</span>
+          The Severe Thunderstorm Warning for your address has expired. The warning
+          ended, not the weather. We are still watching.</div>
       </div>
-      <div class=phcap><b>A warning, then the all clear.</b><br>Nothing in between, and
+      <div class=phcap><b>A warning, then word when it expires.</b><br>Nothing in between, and
       nothing when the storm misses you.</div>
     </div>
 
@@ -14519,10 +14538,11 @@ __WV_HEADER__
           <div style="font-size:12px;color:#8FA6C6">Tornado warning &middot; spoken twice</div></div></div>
         <div class="bub warn"><span class=hd>Tornado Warning</span>
           A Tornado Warning includes your address (Mom's house) until 2:45 AM. Take shelter
-          now: interior room, lowest floor, away from windows. We'll text the all clear.</div>
+          now: interior room, lowest floor, away from windows. We'll text you when it expires.</div>
         <div class=ts>Saturday 2:51 AM</div>
-        <div class="bub ok"><span class=hd>All clear</span>
-          All clear. The Tornado Warning that included your address has expired.</div>
+        <div class="bub ok"><span class=hd>Warning expired</span>
+          The Tornado Warning for your address has expired. The warning ended, not the
+      weather. We are still watching.</div>
       </div>
       <div class=phcap><b>Tornado warnings ring the phone.</b><br>A text at 2 AM gets slept
       through. A ringing phone does not.</div>
@@ -14547,7 +14567,7 @@ __WV_HEADER__
 
 <section class="sec s-deep">
  <div class=wrap><div class=inner>
-    <h2>Put a Stormline on it</h2>
+    <h2 id=buy>Put a Stormline on it</h2>
     <div id=err class=err></div>
     <label for=s-name>Your name</label><input id=s-name autocomplete=name>
     <label for=s-email>Email</label><input id=s-email type=email autocomplete=email>
@@ -14650,6 +14670,10 @@ __WV_HEADER__
   </div></div>
 </section>
 
+<div class=stickybuy>
+  <div><b>$12 a year</b><i>One address, watched all year</i></div>
+  <a href="#buy">Put one on it</a>
+</div>
 __WV_FOOTER__
 <script>
 document.getElementById('s-go').addEventListener('click', function(){
@@ -16203,7 +16227,7 @@ __WV_HEADER__
     <div class=tier><div class=t>Stormline</div><div class=p>$12/year</div>
       <p>You don't watch the weather. Stormline watches your address.</p>
       <ul><li>Warning texts with a radar map</li><li>A phone call for tornado warnings</li>
-      <li>All clear when it expires</li><li>Two phone numbers per address</li>
+      <li>A text when the warning expires</li><li>Two phone numbers per address</li>
       <li>+$8/yr another address &middot; +$9/yr All-Season pack</li></ul>
       <a class=go href="/stormline">Put a Stormline on it &rarr;</a></div>
     <div class=tier><div class=t>Stormline Daily</div><div class=p>$24/year</div>
@@ -22692,7 +22716,8 @@ __WV_HEADER__
         interior room, lowest floor, away from windows. We'll text the all-clear.</div>
       <div class=tstamp>Saturday 2:51 AM</div>
       <div class="bub ok"><span class=hd>All clear</span>
-        All clear. The Tornado Warning that included your address has expired.</div>
+        The Tornado Warning for your address has expired. The warning ended, not the
+      weather. We are still watching.</div>
     </div>
    </div>
    <div>
@@ -40069,7 +40094,7 @@ def _sentry_relay_warning(alert: dict) -> int:
             # All-clear only follows the storm warnings. Nobody needs a 3 AM
             # text saying the freeze warning ended.
             if not pack_only:
-                body += " We'll text the all-clear."
+                body += " We'll text you when the warning expires."
             targets = [sub["phone"]] + ([sub["phone2"]] if sub.get("phone2") else [])
             delivered = False
             for tphone in targets:
@@ -40118,8 +40143,9 @@ def _sentry_allclear_pass() -> int:
                 ok = False
                 for tphone in [r["phone"]] + ([r["phone2"]] if r.get("phone2") else []):
                     if send_sms(tphone,
-                                f"WeatherValet Stormline: all clear. The {r['event']} that "
-                                f"included your address ({r['address']}) has expired."):
+                                f"WeatherValet Stormline: the {r['event']} for your address "
+                                f"({r['address']}) has expired. That means the warning ended, "
+                                f"not that the weather is done. We are still watching."):
                         ok = True
                 with db() as conn:
                     with conn.cursor() as cur:
