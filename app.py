@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-222"
+BACKEND_BUILD = "0702-223"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -19045,14 +19045,21 @@ def admin_tier_list():
                                           start_hour, end_hour, status, created_at
                                      FROM watch_orders ORDER BY id DESC LIMIT 400""")
                 elif tier == "pro":
-                    cur.execute("""SELECT id, name, email, phone, subscription_tier AS status,
-                                          is_active, created_at
-                                     FROM users
-                                    WHERE subscription_tier IN
+                    cur.execute("""SELECT u.id, u.name, u.email, u.phone,
+                                          u.subscription_tier AS status, u.is_active,
+                                          u.created_at, u.trial_ends_at, u.is_discounted,
+                                          sr.name AS rep_name,
+                                          (u.password_hash IS NOT NULL) AS has_password
+                                     FROM users u
+                                LEFT JOIN sales_attributions sa ON sa.user_id = u.id
+                                LEFT JOIN sales_reps sr ON sr.slug = sa.rep_slug
+                                    WHERE u.subscription_tier IN
                                           ('pro_single','pro_multi','pro_enterprise')
-                                 ORDER BY id DESC LIMIT 400""")
+                                 ORDER BY u.id DESC LIMIT 400""")
                 elif tier == "crew":
-                    cur.execute("""SELECT u.id, u.name, u.email, u.phone, r.granted_at AS created_at
+                    cur.execute("""SELECT u.id, u.name, u.email, u.phone,
+                                          r.granted_at AS created_at,
+                                          (u.password_hash IS NOT NULL) AS has_password
                                      FROM users u
                                      JOIN user_roles r ON r.user_id = u.id AND r.role = 'crew'
                                  ORDER BY r.granted_at DESC LIMIT 400""")
@@ -19229,8 +19236,8 @@ __WV_HEADER__
 __ADMIN_NAV__
 <div class=wrapx>
   <h1>Subscribers</h1>
-  <p class=sub>Everyone on each tier. Stormline rows can be edited here; the rest are a
-  read-only list for now.</p>
+  <p class=sub>Everyone on each tier. Stormline, Pro and Valet Crew can be edited here.
+  Sidekick and Watch are read-only: the old Command Center had no actions for them either.</p>
   <div class=tiers id=tiers>
     <button class=on data-t=stormline>Stormline</button>
     <button data-t=sidekick>Sidekick</button>
@@ -19285,8 +19292,12 @@ _ADMIN_SUBS_SCRIPT = """<script>
       '<div class=empty>Nothing here.</div>'; return; }
     document.getElementById('out').innerHTML='<div class=tw><table>'
       + (tier==='stormline' ? stormHead() : plainHead())
-      + '<tbody>' + list.map(tier==='stormline'?stormRow:plainRow).join('') + '</tbody></table></div>';
+      + '<tbody>' + list.map(
+          tier==='stormline' ? stormRow
+          : (tier==='pro'||tier==='crew') ? personRow
+          : plainRow).join('') + '</tbody></table></div>';
     if(tier==='stormline') wire();
+    if(tier==='pro'||tier==='crew') wirePeople();
   }
 
   function stormHead(){
@@ -19318,14 +19329,91 @@ _ADMIN_SUBS_SCRIPT = """<script>
         +'</div></td></tr>';
   }
 
+  // Pro and Crew rows get the support actions the old Command Center had:
+  // change a phone number, set a password when somebody cannot get in,
+  // extend a trial, mark them discounted, assign a rep, or nudge them.
+  function personRow(r){
+    var pro = tier==='pro';
+    return '<tr data-uid="'+r.id+'">'
+      +'<td class=name>'+esc(r.name||'(no name)')
+        +(r.is_discounted?' <span class="tag int">Discounted</span>':'')
+        +(r.has_password?'':' <span class="tag int">No password</span>')
+        +'</td>'
+      +'<td>'+esc(r.email||'')+'</td>'
+      +'<td style="min-width:160px"><input class=pf data-k=phone value="'+esc(r.phone||'')+'"></td>'
+      +(pro?'<td>'+esc(r.status||'')+(r.rep_name?'<br><span style="color:#8FA6C6;font-size:12.5px">Rep: '
+          +esc(r.rep_name)+'</span>':'')+'</td>':'')
+      +'<td>'+esc(when(r.created_at))+'</td>'
+      +'<td style="min-width:300px"><div class=rowacts>'
+        +'<button class="b save" data-act=phone>Save phone</button>'
+        +'<button class="b" data-act=password style="background:rgba(255,255,255,.08);'
+          +'border:1px solid rgba(126,182,255,.3);color:#C3D2E6">Set password</button>'
+        +(pro?'<button class="b" data-act=trial style="background:rgba(255,255,255,.08);'
+          +'border:1px solid rgba(126,182,255,.3);color:#C3D2E6">Extend trial</button>'
+          +'<button class="b" data-act=discount style="background:rgba(255,255,255,.08);'
+          +'border:1px solid rgba(126,182,255,.3);color:#C3D2E6">'
+          +(r.is_discounted?'Full price':'Discounted')+'</button>'
+          +'<button class="b" data-act=nudge style="background:rgba(255,255,255,.08);'
+          +'border:1px solid rgba(126,182,255,.3);color:#C3D2E6">Nudge</button>':'')
+        +'</div><div class=actmsg id="um'+r.id+'"></div></td></tr>';
+  }
+
+  function wirePeople(){
+    Array.prototype.forEach.call(document.querySelectorAll('tr[data-uid]'),function(tr){
+      var uid=Number(tr.getAttribute('data-uid'));
+      function tell(k,t){ var m=document.getElementById('um'+uid);
+        m.className='actmsg '+k; m.innerHTML=t; m.style.display='block'; }
+      Array.prototype.forEach.call(tr.querySelectorAll('[data-act]'),function(btn){
+        btn.addEventListener('click',function(){
+          var act=btn.getAttribute('data-act'), url=null, body={}, label=btn.textContent;
+          if(act==='phone'){
+            url='/api/v1/admin/users/'+uid+'/contact';
+            body={phone:tr.querySelector('[data-k=phone]').value};
+          } else if(act==='password'){
+            var pw=prompt('New password for this person. They can sign in with it straight away.');
+            if(!pw) return;
+            if(pw.length<8){ tell('bad','Use at least 8 characters.'); return; }
+            url='/api/v1/admin/users/'+uid+'/set-password'; body={password:pw};
+          } else if(act==='trial'){
+            var d=prompt('How many days to add to their trial?','14');
+            if(!d) return;
+            url='/api/v1/admin/users/'+uid+'/extend-trial'; body={days:Number(d)};
+          } else if(act==='discount'){
+            var turningOn = label.indexOf('Discounted')>=0;
+            url='/api/v1/admin/users/'+uid+'/discounted'; body={value:turningOn};
+          } else if(act==='nudge'){
+            if(!confirm('Send them a reminder text?')) return;
+            url='/api/v1/admin/users/'+uid+'/nudge-sms';
+          }
+          if(!url) return;
+          btn.disabled=true; btn.textContent='...';
+          fetch(url,{method:'POST',credentials:'include',
+            headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+           .then(function(r){return r.json();}).then(function(j){
+              btn.disabled=false; btn.textContent=label;
+              if(j&&j.ok){
+                tell('good', act==='password' ? 'Password set. Tell them what it is.'
+                   : act==='nudge' ? 'Reminder sent.'
+                   : act==='trial' ? 'Trial extended.'
+                   : act==='discount' ? 'Saved.' : 'Saved.');
+                if(act==='discount') load();
+              } else tell('bad',(j&&(j.message||j.error))||'That did not work.');
+           }).catch(function(){ btn.disabled=false; btn.textContent=label;
+              tell('bad','Network problem.'); });
+        });
+      });
+    });
+  }
+
   function plainHead(){
     if(tier==='sidekick') return '<thead><tr><th>Who</th><th>Email</th><th>Phone</th>'
       +'<th>Pass</th><th>Status</th><th>Bought</th></tr></thead>';
     if(tier==='watch') return '<thead><tr><th>Who</th><th>Email</th><th>Place</th>'
       +'<th>Date</th><th>Window</th><th>Status</th></tr></thead>';
     if(tier==='pro') return '<thead><tr><th>Who</th><th>Email</th><th>Phone</th>'
-      +'<th>Tier</th><th>Active</th><th>Since</th></tr></thead>';
-    return '<thead><tr><th>Who</th><th>Email</th><th>Phone</th><th>Joined</th></tr></thead>';
+      +'<th>Tier</th><th>Since</th><th>Help them</th></tr></thead>';
+    return '<thead><tr><th>Who</th><th>Email</th><th>Phone</th><th>Joined</th>'
+      +'<th>Help them</th></tr></thead>';
   }
   function plainRow(r){
     if(tier==='sidekick') return '<tr><td class=name>'+esc(r.name||'')+'</td><td>'+esc(r.email||'')
