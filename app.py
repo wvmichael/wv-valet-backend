@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-224"
+BACKEND_BUILD = "0702-225"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -15133,7 +15133,7 @@ def watch_console():
         return ("<h3 style='font-family:sans-serif;padding:30px;'>Meteorologists only. "
                 "<a href='/signin'>Sign in</a>, then come back.</h3>", 403)
     spa = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
-    return _WATCH_CONSOLE_PAGE.replace("__SPA__", spa)
+    return wv_shell(_WATCH_CONSOLE_PAGE.replace("__SPA__", spa))
 
 
 @app.get("/api/v1/watch/orders")
