@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-221"
+BACKEND_BUILD = "0702-222"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -21210,7 +21210,8 @@ h1{font-size:clamp(24px,3.6vw,32px);font-weight:900;letter-spacing:-.03em;color:
 </style></head><body>
 __WV_HEADER__
 <div class=metbar><div class=in>
-  <nav class=metnav><a class=on href="/portal/sales">Prospects</a></nav>
+  <nav class=metnav><a class=on href="/portal/sales">Prospects</a>
+    <a href="/portal">Your portal</a></nav>
   <div class=spacer></div>
   <a class=oldlink href="__SPA__/">Old sales portal</a>
 </div></div>
