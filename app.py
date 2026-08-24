@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-220"
+BACKEND_BUILD = "0702-221"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -49728,6 +49728,23 @@ def met_pro_brief_compose_update():
                      verdict, body_text),
                 )
                 draft_id = cur.fetchone()["id"]
+
+                # An ad-hoc weather update is a real message to a real
+                # subscriber, so it belongs in their history like any other.
+                # Without this row it appears nowhere on their record, does
+                # not count in a Met's numbers, and does not count in the
+                # company totals. Found after Chris sent one and nothing
+                # showed against the subscriber afterwards.
+                cur.execute(
+                    """INSERT INTO brief_history
+                         (user_id, brief_type, delivered_at, verdict, snippet,
+                          full_body, delivery_status, channels_used,
+                          is_met_touched, met_name)
+                       VALUES (%s, 'update', %s, %s, %s, %s, 'sent', %s, TRUE, %s)""",
+                    (target_user_id, now_ms, verdict, snippet, body_text,
+                     ",".join(channels_used),
+                     user.get("name") or user.get("email") or "Met"),
+                )
     except Exception as e:
         print(f"[compose-update] draft insert failed: {e}", flush=True)
         # Don't return error to user — the update was successfully sent.
