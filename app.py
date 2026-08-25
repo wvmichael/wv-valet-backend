@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-229"
+BACKEND_BUILD = "0702-230"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -12973,6 +12973,57 @@ src="https://www.facebook.com/tr?id=__PIXEL_ID__&ev=PageView&noscript=1" /></nos
 <!-- End Meta Pixel Code -->""".replace("__PIXEL_ID__", META_PIXEL_ID)
 
 
+def _inject_purchase(html: str, value_dollars: float, content_name: str = "") -> str:
+    """Put a Purchase event into a finished page, before </head>.
+
+    Adds the base pixel too, but only if the page does not already carry it:
+    pages rendered through wv_shell already have it, and firing two copies
+    double-counts every PageView.
+    """
+    if not META_PIXEL_ID or "</head>" not in html:
+        return html
+    try:
+        value = round(float(value_dollars), 2)
+    except Exception:
+        value = 0.0
+    base = "" if "fbevents.js" in html else META_PIXEL
+    block = base + ("""
+<script>
+  try {
+    fbq('track', 'Purchase', {value: __VALUE__, currency: 'USD',
+        content_name: '__NAME__'});
+  } catch (e) {}
+</script>""").replace("__VALUE__", "%.2f" % value).replace(
+        "__NAME__", _html_escape(content_name or ""))
+    return html.replace("</head>", block + "\n</head>", 1)
+
+
+def _sentry_purchase_value(sentry_id) -> float:
+    """What this Stormline order actually cost, from its own row."""
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT group_id, pack_allseason, daily
+                                 FROM sentry_subscribers WHERE id = %s""", (int(sentry_id),))
+                row = cur.fetchone()
+                if not row:
+                    return SENTRY_PRICE_CENTS / 100.0
+                cents = SENTRY_PRICE_CENTS
+                if row.get("pack_allseason"):
+                    cents += SENTRY_ALLSEASON_CENTS
+                if row.get("daily"):
+                    cents += SENTRY_DAILY_CENTS
+                if row.get("group_id"):
+                    cur.execute("""SELECT COUNT(*) AS n FROM sentry_subscribers
+                                    WHERE group_id = %s""", (row["group_id"],))
+                    extra = max(0, ((cur.fetchone() or {}).get("n") or 1) - 1)
+                    cents += extra * SENTRY_EXTRA_ADDRESS_CENTS
+                return cents / 100.0
+    except Exception as e:
+        print(f"[purchase-pixel] sentry value lookup failed: {e!r}", flush=True)
+        return SENTRY_PRICE_CENTS / 100.0
+
+
 def wv_shell(page: str) -> str:
     """Drop the shared tokens, header and footer into a page constant.
 
@@ -13592,6 +13643,11 @@ def gameday_welcome_page():
                                  ORDER BY g.game_date""", (sid,))
                     rows = cur.fetchall() or []
             if rows:
+                # A series pass is one charge; single games are per game.
+                if (rows[0].get("pass_type") or "season") == "season":
+                    purchase_value = GAMEDAY_SEASON_CENTS / 100.0
+                else:
+                    purchase_value = len(rows) * GAMEDAY_SINGLE_CENTS / 100.0
                 if (rows[0].get("pass_type") or "season") == "season":
                     headline = "You're covered for the whole series."
                     detail = ("Payment received. You'll get a welcome text shortly. Your "
@@ -13612,7 +13668,8 @@ def gameday_welcome_page():
                                   f"and each outlook lands the evening before.")
         except Exception as e:
             print(f"[onduty] welcome lookup failed: {e!r}", flush=True)
-    return ("""<!doctype html><html lang=en><head><meta charset=utf-8>
+    purchase_value = locals().get("purchase_value", GAMEDAY_SEASON_CENTS / 100.0)
+    html = ("""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>You're covered</title><style>
 body{font-family:Inter,Arial,sans-serif;background:#1A0505;color:#fff;display:flex;
@@ -13626,6 +13683,7 @@ align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:c
 &nbsp;&middot;&nbsp; <a href="/contact" style="color:#E8B4BC;font-weight:700">Need to change something?</a></p>
 <p class=f>WeatherValet is an independent weather service, not affiliated with or
 endorsed by Indiana University.</p></div></body></html>""")
+    return _inject_purchase(html, purchase_value, "Sidekick")
 
 
 @app.post("/api/v1/admin/gameday/partners")
@@ -15663,7 +15721,9 @@ def pro_checkout():
 
 @app.get("/pro/welcome")
 def pro_welcome_page():
-    return wv_shell(_PRO_WELCOME_PAGE)
+    # Pro is a monthly subscription; report the first month's base charge.
+    return _inject_purchase(wv_shell(_PRO_WELCOME_PAGE),
+                            PRO_BASE_CENTS / 100.0, "Pro")
 
 
 _PRO_WELCOME_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
@@ -22143,7 +22203,7 @@ def watch_page():
 
 @app.get("/watch/booked")
 def watch_booked_page():
-    return """<!doctype html><html lang=en><head><meta charset=utf-8>
+    html = ("""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>Your Watch is booked</title><style>
 body{font-family:Inter,Arial,sans-serif;background:#171C25;color:#fff;display:flex;
@@ -22155,7 +22215,8 @@ align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:c
 place. Your Meteorologist sends the outlook the evening before.</p>
 <p style="margin-top:26px"><a href="/home" style="color:#C8892A;font-weight:700">Back to WeatherValet</a>
 &nbsp;&middot;&nbsp; <a href="/contact" style="color:#C8892A;font-weight:700">Need to change something?</a></p>
-</div></body></html>"""
+</div></body></html>""")
+    return _inject_purchase(html, 49.00, "Watch")
 
 
 @app.post("/api/v1/watch/checkout")
@@ -23183,12 +23244,14 @@ def sentry_checkout():
 
 @app.get("/sentry/welcome")
 def sentry_welcome_page():
-    return """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+    value = _sentry_purchase_value(request.args.get("sid"))
+    html = ("""<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>Your Stormline is up</title><style>body{font-family:Inter,Arial,sans-serif;background:#0A1422;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:center;padding:20px}
 .b{max-width:440px}h1{font-size:26px}p{color:#B9C7DC;line-height:1.6}</style></head>
 <body><div class=b><div style="font-size:44px">&#9889;</div><h1>Your Stormline is up.</h1>
 <p>Payment received. You'll get a welcome text shortly confirming the address we're watching.
-From now on, if the National Weather Service puts your address inside a warning, you'll know.</p></div></body></html>"""
+From now on, if the National Weather Service puts your address inside a warning, you'll know.</p></div></body></html>""")
+    return _inject_purchase(html, value, "Stormline")
 
 
 def _activate_sentry(sentry_id: int, stripe_customer_id: str) -> None:
