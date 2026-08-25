@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-230"
+BACKEND_BUILD = "0702-232"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -13264,6 +13264,9 @@ h1 .pop{color:var(--bolt)}
 .gp:last-child{margin-bottom:0}
 .gp input{width:auto;margin:0;flex:0 0 auto;transform:scale(1.3);accent-color:#A6192E}
 .gp-h{font-size:12.5px;font-weight:800;letter-spacing:.07em;text-transform:uppercase;color:#6E5A5F;margin:0 0 8px}
+.nonaffil{font-size:12.5px;line-height:1.55;color:#6B5F62;margin:14px 0 4px;
+  padding:10px 12px;border:1px solid rgba(27,20,22,.18);border-radius:8px;
+  background:rgba(27,20,22,.03)}
 .consent{display:flex;gap:10px;align-items:flex-start;margin:16px 0 2px;font-size:12.8px;line-height:1.5;
   font-weight:500;letter-spacing:0;text-transform:none;color:#4A383C;cursor:pointer}
 .consent input{width:auto;margin:2px 0 0;flex:0 0 auto;transform:scale(1.25);accent-color:#A6192E}
@@ -13310,8 +13313,8 @@ __WV_HEADER__
   <div class=brand><span class=bolt>&#9889;</span> WeatherValet</div>
   <div class=pname>Sidekick</div>
   <h1>Rain or shine,<br>know before <span class=pop>kickoff.</span></h1>
-  <p class=sub>A certified Meteorologist on your side for <b>every Indiana University Football
-  home game</b>. Messaged to you live: tailgate outlook, storm alerts, radar updates, the all-clear.</p>
+  <p class=sub>A certified Meteorologist on your side for <b>every home football Saturday in
+  Bloomington</b>. Messaged to you live: tailgate outlook, storm alerts, radar updates, the all-clear.</p>
   <div class=kick>&#127944; Series pass: all 8 home games, $16 &middot; Single game, $5</div>
   <p class=how>How it works: <b>the Meteorologist's outlook the evening before</b>, a <b>morning brief</b>
   on game day, and <b>live updates as needed</b> through the day. Hopefully it stays ALL CLEAR, but if the
@@ -13326,9 +13329,9 @@ __WV_HEADER__
       </div>
       <div class=msgs>
         <div class=stamp>Friday 4:30 PM</div>
-        <div class=msg style="animation-delay:.1s">Tomorrow's outlook for Bloomington: <b>dry morning for the tailgate</b>, a line of storms possible mid-afternoon, clearing by evening. I'll be watching it all day for you. - Timmy, WeatherValet Meteorologist</div>
+        <div class=msg style="animation-delay:.1s">Tomorrow's outlook for Bloomington: <b>dry morning for the tailgate</b>, a line of storms possible mid-afternoon, clearing by evening. I'll be watching it all day for you. &mdash; your WeatherValet Meteorologist</div>
         <div class=stamp>Saturday 9:02 AM</div>
-        <div class=msg style="animation-delay:.4s">Morning, Bloomington. <b>Tailgate looks dry until about 2 PM.</b> That line of storms is west of Terre Haute, moving east. More from me as it develops. - Timmy</div>
+        <div class=msg style="animation-delay:.4s">Morning, Bloomington. <b>Tailgate looks dry until about 2 PM.</b> That line of storms is west of Terre Haute, moving east. More from me as it develops. &mdash; your WeatherValet Meteorologist</div>
         <div class=stamp>2:14 PM</div>
         <div class="msg alert" style="animation-delay:.7s"><b>Lightning within 8 miles of the stadium.</b> The rain is close behind it, moving in from the west. Looks like a solid soaking, not an all-afternoon washout.</div>
         <div class=stamp>2:52 PM</div>
@@ -13362,7 +13365,7 @@ __WV_HEADER__
 
 <section class="sec s-crim"><div class=wrap><div class=inner>
 <div class=ticketzone>
-  <p class=pricing-line><b>Series pass: all 8 Indiana University Football home games for $16 total.</b><br>
+  <p class=pricing-line><b>Series pass: all 8 Bloomington home football Saturdays for $16 total.</b><br>
   Or cover a single game for $5. That's it. No subscription, no app.</p>
   <div class=ticket>
     <div class=t-head><span class=tt id=t-title>Series Pass</span><span class=pr id=t-price>$16</span></div>
@@ -13388,6 +13391,8 @@ __WV_HEADER__
       delivery depends on your carrier and is not guaranteed. I agree to the
       <a href="/gameday/terms" target="_blank" rel=noopener>Sidekick Terms</a> and
       <a href="/privacy" target="_blank" rel=noopener>Privacy Policy</a>.</span></label>
+    <p class=nonaffil>WeatherValet is an independent weather service. We are not affiliated
+    with, sponsored by, or endorsed by Indiana University or any school.</p>
     <button id=g-go>Claim my series pass</button>
     <div class=fine>The series pass covers all 8 home games starting with the opener (including the Friday
     night game); single passes cover only the games you check above. One-time payment via Stripe.
@@ -13580,7 +13585,7 @@ def gameday_checkout():
                 pass_ids.append(cur.fetchone()["id"])
     pass_id = pass_ids[0]
     if pass_type == "single":
-        picks = ["%s vs %s" % (g.get("d") or "", g.get("opponent") or "") for g in game_rows]
+        picks = [(g.get("d") or "") for g in game_rows]
         line_name = ("WeatherValet Sidekick - single home game" if quantity == 1
                      else "WeatherValet Sidekick - %d single home games" % quantity)
         line_desc = ("; ".join(picks) if quantity <= 4 else "%d home games" % quantity)
@@ -13654,7 +13659,7 @@ def gameday_welcome_page():
                               "Meteorologist is on duty for all 8 home game days, starting "
                               "with the opener.")
                 else:
-                    picks = [f"{r['opponent']} on {r['d']}" for r in rows if r.get("opponent")]
+                    picks = [r["d"] for r in rows if r.get("d")]
                     if len(picks) == 1:
                         headline = "You're covered for that day."
                         detail = (f"Payment received. Your Meteorologist is on duty for "
@@ -13842,10 +13847,9 @@ def _gameday_picker_html() -> str:
     for i, g in enumerate(games):
         out.append(
             '<label class=gp><input type=checkbox class=gpick value="%d"%s>'
-            '<span>%s &middot; %s <span style="color:#7A6A6E">&middot; %s</span></span></label>'
+            '<span>%s <span style="color:#7A6A6E">&middot; kickoff %s</span></span></label>'
             % (int(g["id"]), (" checked" if i == 0 else ""),
                _html_escape(g.get("d") or ""),
-               _html_escape(g.get("opponent") or ""),
                _html_escape(g.get("kickoff") or "TBA")))
     return "".join(out)
 
