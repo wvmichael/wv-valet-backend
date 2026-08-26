@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-232"
+BACKEND_BUILD = "0702-233"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -21944,6 +21944,30 @@ def portal_account():
                     .replace("__SPA__", spa)
                     .replace("__GREETING__", greeting)
                     .replace("__BODY__", body))
+
+
+@app.errorhandler(404)
+def _redirect_case_mismatch(e):
+    """Send /Stormline to /stormline instead of a dead end.
+
+    Flask routes are case-sensitive, so a capital letter anywhere in the
+    path is a 404. People type URLs off posters, business cards and letters
+    and capitalise them naturally, and every one of those was a visitor we
+    had already paid for landing on nothing.
+
+    Only redirects when the lowercase version is a real GET route, so this
+    cannot mask a genuine 404 or create a loop.
+    """
+    path = (request.path or "")
+    lower = path.lower()
+    if request.method == "GET" and lower != path:
+        for rule in app.url_map.iter_rules():
+            if "GET" in (rule.methods or set()) and str(rule) == lower:
+                qs = ("?" + request.query_string.decode()) if request.query_string else ""
+                return redirect(lower + qs, code=301)
+    return ("<h1>Page not found</h1>"
+            "<p>That address does not exist. "
+            "<a href=\"/home\">Go to WeatherValet</a></p>"), 404
 
 
 @app.get("/portal")
