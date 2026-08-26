@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-235"
+BACKEND_BUILD = "0702-236"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -910,6 +910,20 @@ CREATE TABLE IF NOT EXISTS pro_watch_events (
 );
 CREATE INDEX IF NOT EXISTS idx_pwe_date ON pro_watch_events(event_date);
 CREATE INDEX IF NOT EXISTS idx_pwe_user ON pro_watch_events(user_id, event_date);
+
+-- Widget forecast fallback (Aug 26, 2026). The in-memory forecast cache is
+-- wiped by every deploy, so after a restart the first widget request goes
+-- straight to Open-Meteo. When Open-Meteo is rate-limiting us (HTTP 429)
+-- there is nothing to fall back on and partner sites show an error, which
+-- is exactly what NWKS Radio saw for weeks.
+--
+-- Last known good forecast per location, so a restart or a rate limit
+-- degrades to slightly old data instead of a blank widget.
+CREATE TABLE IF NOT EXISTS widget_forecast_cache (
+    cache_key   TEXT PRIMARY KEY,
+    payload     TEXT NOT NULL,
+    fetched_at  BIGINT NOT NULL
+);
 
 -- Internal test rows (Aug 21, 2026). Addresses we put in ourselves, in
 -- severe-weather corridors, to prove the Weather Service fetch is working.
@@ -34974,7 +34988,9 @@ def admin_nws_test_page():
 # own. That's fine — Open-Meteo handles modest traffic and the cache
 # only needs to prevent runaway request rates, not be globally unique.
 _WIDGET_FORECAST_CACHE: dict[tuple[float, float], tuple[int, dict]] = {}
-WIDGET_CACHE_TTL_SECONDS = 600  # 10 minutes
+WIDGET_CACHE_TTL_SECONDS = 1800  # 30 minutes. A 7-day forecast does not
+# change every 10 minutes, and fewer calls means fewer 429s from Open-Meteo.
+# Severe alerts use their own, much shorter cache.
 
 
 def _fetch_forecast_7day(lat: float, lng: float) -> Optional[dict]:
@@ -35008,6 +35024,19 @@ def _fetch_forecast_7day(lat: float, lng: float) -> Optional[dict]:
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         _WIDGET_FORECAST_CACHE[cache_key] = (now_ms, data)
+        # Keep a copy that survives a deploy.
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO widget_forecast_cache (cache_key, payload, fetched_at)
+                             VALUES (%s,%s,%s)
+                           ON CONFLICT (cache_key) DO UPDATE
+                             SET payload = EXCLUDED.payload,
+                                 fetched_at = EXCLUDED.fetched_at""",
+                        ("%s,%s" % cache_key, json.dumps(data), now_ms))
+        except Exception as _e:
+            print(f"[widget-forecast] could not persist cache: {_e!r}", flush=True)
         return data
     except Exception as e:
         print(f"[widget-forecast] fetch failed for ({lat},{lng}): {e}", flush=True)
@@ -35016,6 +35045,23 @@ def _fetch_forecast_7day(lat: float, lng: float) -> Optional[dict]:
         if cached:
             print(f"[widget-forecast] serving stale cache for ({lat},{lng})", flush=True)
             return cached[1]
+        # Nothing in memory, which is the normal state just after a deploy.
+        # Fall back to the last good forecast we stored.
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""SELECT payload, fetched_at FROM widget_forecast_cache
+                                    WHERE cache_key = %s""", ("%s,%s" % cache_key,))
+                    row = cur.fetchone()
+            if row:
+                age_min = int((now_ms - row["fetched_at"]) / 60000)
+                print(f"[widget-forecast] serving saved forecast for ({lat},{lng}), "
+                      f"{age_min} minutes old", flush=True)
+                data = json.loads(row["payload"])
+                _WIDGET_FORECAST_CACHE[cache_key] = (row["fetched_at"], data)
+                return data
+        except Exception as _e:
+            print(f"[widget-forecast] saved forecast unusable: {_e!r}", flush=True)
         return None
 
 
