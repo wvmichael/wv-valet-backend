@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-237"
+BACKEND_BUILD = "0702-238"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -34576,7 +34576,62 @@ def _field_rain_totals(lat: float, lng: float, plant_date: str) -> Optional[dict
     return out
 
 
+# ── Open-Meteo call budget (Aug 26, 2026) ──────────────────────────────
+# Three fetchers called Open-Meteo fresh on every invocation: the daily
+# brief forecast, the threshold checker and the rain nowcast. All three run
+# on schedulers, per subscriber, so the call volume scaled with customers
+# and scheduler frequency rather than with anything real. That exhausted
+# the quota, Open-Meteo started returning HTTP 429, and everything that
+# depends on a forecast broke at once, including a partner radio station's
+# widget that was down for weeks before anyone traced it.
+#
+# A forecast for the same coordinates does not change between two calls a
+# few minutes apart, so one short-lived cache in front of all three cuts
+# the volume dramatically without changing what anyone receives.
+_OPENMETEO_CACHE: dict = {}
+_OPENMETEO_TTL = {
+    "forecast": 900,    # 15 min. Daily briefs; a 7-day outlook is stable.
+    "threshold": 300,   # 5 min. Wind and temperature thresholds move faster.
+    "nowcast": 180,     # 3 min. Rain nowcast is the one that must stay fresh.
+}
+
+
+def _openmeteo_cached(kind: str, key: tuple, fetch):
+    """Call `fetch` at most once per TTL for the same key.
+
+    On failure, serves the last good value regardless of age. A slightly
+    old forecast is better than none, and it stops one rate-limited call
+    from taking out every brief in the queue.
+    """
+    ttl = _OPENMETEO_TTL.get(kind, 300)
+    cache_key = (kind,) + tuple(key)
+    now = time.time()
+    hit = _OPENMETEO_CACHE.get(cache_key)
+    if hit and (now - hit[0]) < ttl:
+        return hit[1]
+    try:
+        value = fetch()
+    except Exception as e:
+        print(f"[open-meteo] {kind} raised {e!r}", flush=True)
+        value = None
+    if value is not None:
+        _OPENMETEO_CACHE[cache_key] = (now, value)
+        return value
+    if hit:
+        age = int(now - hit[0])
+        print(f"[open-meteo] {kind} failed; serving {age}s-old value", flush=True)
+        return hit[1]
+    return None
+
+
 def _fetch_forecast(lat: float, lng: float, day_offset: int = 0) -> Optional[dict]:
+    """Cached wrapper. See _openmeteo_cached for why."""
+    return _openmeteo_cached(
+        "forecast", (round(lat, 3), round(lng, 3), day_offset),
+        lambda: _fetch_forecast_uncached(lat, lng, day_offset))
+
+
+def _fetch_forecast_uncached(lat: float, lng: float, day_offset: int = 0) -> Optional[dict]:
     """Fetch a forecast from Open-Meteo for the given lat/lng.
 
     Returns a dict with the day's high/low, hourly precipitation,
@@ -34626,6 +34681,13 @@ _LAST_RAIN_ALERT_RUN_MS = 0   # throttle so we only poll every few minutes
 
 
 def _fetch_rain_nowcast(lat: float, lng: float) -> Optional[dict]:
+    """Cached wrapper. See _openmeteo_cached for why."""
+    return _openmeteo_cached(
+        "nowcast", (round(lat, 3), round(lng, 3)),
+        lambda: _fetch_rain_nowcast_uncached(lat, lng))
+
+
+def _fetch_rain_nowcast_uncached(lat: float, lng: float) -> Optional[dict]:
     """Open-Meteo 15-minute precip nowcast + hourly probability, UTC unixtime."""
     try:
         url = (
@@ -39220,6 +39282,13 @@ def _threshold_cmp_label(comparator):
 
 
 def _fetch_threshold_forecast(lat, lng):
+    """Cached wrapper. See _openmeteo_cached for why."""
+    return _openmeteo_cached(
+        "threshold", (round(float(lat), 3), round(float(lng), 3)),
+        lambda: _fetch_threshold_forecast_uncached(lat, lng))
+
+
+def _fetch_threshold_forecast_uncached(lat, lng):
     """Open-Meteo current + next-12h hourly for the threshold metrics, in
     imperial units (mph, F, inch). UTC unixtime."""
     try:
