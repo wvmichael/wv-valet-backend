@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-239"
+BACKEND_BUILD = "0702-240"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -14635,6 +14635,43 @@ button:disabled{opacity:.55;transform:none;box-shadow:none}
 .total{display:flex;justify-content:space-between;align-items:baseline;margin:20px 0 0;padding-top:18px;
   border-top:1px solid rgba(126,182,255,.24);font-size:15px;color:#A9BDD8}
 .total b{font-size:30px;color:#fff;font-weight:800;letter-spacing:-.02em}
+/* The two-step signup card (Aug 27, 2026). The old form blended into the
+   dark page on purpose and read as decoration; buyers did not see a form.
+   This is the opposite: a light card that is unmistakably a thing you
+   fill in. Step 1 asks who and where. Step 2 shows the order and offers
+   the add-ons, after the buyer has already said yes. */
+.formcard{background:#F7FAFF;border:1px solid #C9DEFF;border-radius:18px;
+  padding:26px 22px 24px;box-shadow:0 30px 70px -30px rgba(0,0,0,.6);color:#0B1220}
+.steptag{display:inline-block;font-size:11px;font-weight:800;letter-spacing:.14em;
+  text-transform:uppercase;color:#1E5FE0;background:#E3EEFF;border:1px solid #C9DEFF;
+  border-radius:999px;padding:5px 11px;margin-bottom:10px}
+.formcard h2{color:#0B1220;margin-top:0}
+.formsub{font-size:14.5px;color:#4A5B74;margin:2px 0 4px;line-height:1.55}
+.lnote{text-transform:none;letter-spacing:0;font-weight:500;color:#7A8494}
+.formcard label{color:#33507A}
+.formcard input,.formcard select{background:#fff;border:1px solid #C7D6EE;color:#0B1220}
+.formcard input::placeholder{color:#93A5C0}
+.formcard input:hover,.formcard select:hover{border-color:#8FB4E8}
+.formcard input:focus,.formcard select:focus{background:#fff;border-color:var(--blue);
+  box-shadow:0 0 0 3px rgba(30,107,255,.18)}
+.formcard select option{background:#fff;color:#0B1220}
+.formcard .addon{background:#fff;border:1px solid #D5E1F3}
+.formcard .addon b{color:#0B1220}
+.formcard .addon i{color:#5B6B85}
+.formcard .addon .amt{color:#1E5FE0}
+.formcard .addon.on .amt{color:#0B1220}
+.formcard .addon-h{color:#33507A}
+.formcard .total{border-top-color:#C9DEFF;color:#4A5B74}
+.formcard .total b{color:#0B1220}
+.formcard .fine{color:#6B7C96}
+.ordersum{display:flex;justify-content:space-between;gap:12px;align-items:baseline;
+  background:#fff;border:1px solid #D5E1F3;border-radius:12px;padding:14px 16px;
+  font-size:14.5px;color:#33507A;line-height:1.5;margin-top:8px}
+.ordersum b{color:#0B1220}
+.osamt{font-weight:800;color:#0B1220;white-space:nowrap}
+.backlink{display:block;text-align:center;margin-top:14px;font-size:13.5px;
+  color:#1E5FE0;font-weight:700;cursor:pointer;text-decoration:none}
+.backlink:hover{text-decoration:underline}
 .ladder{text-align:center;font-size:13.5px;color:#5B6470;padding:0 18px 40px;max-width:640px;margin:0 auto}
 .ladder a{color:var(--blue);font-weight:700;text-decoration:none}
 .who{list-style:none;padding:0;margin:0}
@@ -14751,7 +14788,7 @@ __WV_HEADER__
       <li><b>The 2 AM tornado phone call.</b> A real call that says the warning twice. Texts get
       ignored at night; a ringing phone does not. Your welcome text walks you through adding
       us to your phone's Do Not Disturb exceptions, which is worth the thirty seconds.</li>
-      <li><b>The all-clear</b> when the warning expires, so nobody is sitting in the basement guessing.</li>
+      <li><b>A text when the warning expires</b>, so nobody is sitting in the basement guessing. The warning ended, not the weather.</li>
       <li><b>Two phone numbers per address.</b> Yours and your spouse's, or yours and Mom's.</li>
       <li><b>No app, no login, nothing to check.</b> It only speaks when it has something to say.</li>
     </ul>
@@ -14762,80 +14799,95 @@ __WV_HEADER__
 
 <section class="sec s-deep">
  <div class=wrap><div class=inner>
-    <h2 id=buy>Put a Stormline on it</h2>
-    <div id=err class=err></div>
-    <label for=s-name>Your name</label><input id=s-name autocomplete=name>
-    <label for=s-email>Email</label><input id=s-email type=email autocomplete=email>
-    <label for=s-phone>Mobile phone <span style="text-transform:none;letter-spacing:0;font-weight:500;color:#7A8494">(texts go here)</span></label><input id=s-phone type=tel autocomplete=tel placeholder="317-555-0123">
-    <label for=s-phone2>Second phone <span style="text-transform:none;letter-spacing:0;font-weight:500;color:#7A8494">(included, and this is the one people forget)</span></label>
-    <input id=s-phone2 type=tel placeholder="Mom's number, if this is Mom's house">
-    <label for=s-address>The address to watch</label>
-    <input id=s-address autocomplete=street-address placeholder="418 Prairie Rose Dr">
-    <div style="display:flex;gap:10px">
-      <div style="flex:2"><label for=s-city>City</label>
-        <input id=s-city autocomplete=address-level2 placeholder="Norman"></div>
-      <div style="flex:1"><label for=s-state>State</label>
-        <select id=s-state style="width:100%;box-sizing:border-box;padding:12px;
-          border:1px solid rgba(15,18,22,.18);border-radius:8px;font-size:16px;background:#fff"><option value="">State</option><option>AL</option><option>AK</option><option>AZ</option><option>AR</option><option>CA</option><option>CO</option><option>CT</option><option>DE</option><option>DC</option><option>FL</option><option>GA</option><option>HI</option><option>ID</option><option>IL</option><option>IN</option><option>IA</option><option>KS</option><option>KY</option><option>LA</option><option>ME</option><option>MD</option><option>MA</option><option>MI</option><option>MN</option><option>MS</option><option>MO</option><option>MT</option><option>NE</option><option>NV</option><option>NH</option><option>NJ</option><option>NM</option><option>NY</option><option>NC</option><option>ND</option><option>OH</option><option>OK</option><option>OR</option><option>PA</option><option>RI</option><option>SC</option><option>SD</option><option>TN</option><option>TX</option><option>UT</option><option>VT</option><option>VA</option><option>WA</option><option>WV</option><option>WI</option><option>WY</option></select></div>
-    </div>
+  <div class=formcard id=buy>
 
-    <label class=addon id=ad-gift for=s-gift><input type=checkbox id=s-gift>
-      <span style="flex:1"><b>This is a gift</b>
-      <i>We tell them who it is from, so the first text is not a mystery.</i></span>
-      <span class=amt>Free</span></label>
-
-    <div id=gift-wrap style="display:none;margin:-2px 0 12px">
-      <label for=s-giftfrom>Your name, as they know you</label>
-      <input id=s-giftfrom placeholder="Sarah, your daughter" maxlength=60>
-    </div>
-
-    <div class=addon-h>Add to this account</div>
-
-    <label class=addon id=ad-second for=s-second><input type=checkbox id=s-second>
-      <span style="flex:1"><b>Watch a second address</b>
-      <i>Mom's house, the lake place, the shop. Same warnings, same bill.</i></span>
-      <span class=amt>+$8/yr</span></label>
-
-    <div id=second-wrap style="display:none;margin:-2px 0 12px">
-      <label for=s-address2>Second address</label>
-      <input id=s-address2 placeholder="77 Kestrel Way">
+    <div id=step1>
+      <div class=steptag>Step 1 of 2</div>
+      <h2>Put a Stormline on it</h2>
+      <p class=formsub>The address to watch, and where to reach you. That is all this step asks.</p>
+      <div id=err class=err></div>
+      <label for=s-name>Your name</label><input id=s-name autocomplete=name>
+      <label for=s-email>Email</label><input id=s-email type=email autocomplete=email>
+      <label for=s-phone>Mobile phone <span class=lnote>(texts go here)</span></label><input id=s-phone type=tel autocomplete=tel placeholder="317-555-0123">
+      <label for=s-phone2>Second phone <span class=lnote>(included, and this is the one people forget)</span></label>
+      <input id=s-phone2 type=tel placeholder="Mom's number, if this is Mom's house">
+      <label for=s-address>The address to watch</label>
+      <input id=s-address autocomplete=street-address placeholder="418 Prairie Rose Dr">
       <div style="display:flex;gap:10px">
-        <div style="flex:2"><label for=s-city2>City</label>
-          <input id=s-city2 placeholder="Cheyenne"></div>
-        <div style="flex:1"><label for=s-state2>State</label>
-          <select id=s-state2 style="width:100%;box-sizing:border-box;padding:12px;
-            border:1px solid rgba(15,18,22,.18);border-radius:8px;font-size:16px;background:#fff"><option value="">State</option><option>AL</option><option>AK</option><option>AZ</option><option>AR</option><option>CA</option><option>CO</option><option>CT</option><option>DE</option><option>DC</option><option>FL</option><option>GA</option><option>HI</option><option>ID</option><option>IL</option><option>IN</option><option>IA</option><option>KS</option><option>KY</option><option>LA</option><option>ME</option><option>MD</option><option>MA</option><option>MI</option><option>MN</option><option>MS</option><option>MO</option><option>MT</option><option>NE</option><option>NV</option><option>NH</option><option>NJ</option><option>NM</option><option>NY</option><option>NC</option><option>ND</option><option>OH</option><option>OK</option><option>OR</option><option>PA</option><option>RI</option><option>SC</option><option>SD</option><option>TN</option><option>TX</option><option>UT</option><option>VT</option><option>VA</option><option>WA</option><option>WV</option><option>WI</option><option>WY</option></select></div>
+        <div style="flex:2"><label for=s-city>City</label>
+          <input id=s-city autocomplete=address-level2 placeholder="Norman"></div>
+        <div style="flex:1"><label for=s-state>State</label>
+          <select id=s-state><option value="">State</option><option>AL</option><option>AK</option><option>AZ</option><option>AR</option><option>CA</option><option>CO</option><option>CT</option><option>DE</option><option>DC</option><option>FL</option><option>GA</option><option>HI</option><option>ID</option><option>IL</option><option>IN</option><option>IA</option><option>KS</option><option>KY</option><option>LA</option><option>ME</option><option>MD</option><option>MA</option><option>MI</option><option>MN</option><option>MS</option><option>MO</option><option>MT</option><option>NE</option><option>NV</option><option>NH</option><option>NJ</option><option>NM</option><option>NY</option><option>NC</option><option>ND</option><option>OH</option><option>OK</option><option>OR</option><option>PA</option><option>RI</option><option>SC</option><option>SD</option><option>TN</option><option>TX</option><option>UT</option><option>VT</option><option>VA</option><option>WA</option><option>WV</option><option>WI</option><option>WY</option></select></div>
       </div>
-      <label for=s-label2>Call it what? (optional)</label>
-      <input id=s-label2 placeholder="Mom's house" maxlength=60>
+      <button id=s-next>Protect this address &middot; $12/year</button>
+      <div class=fine>Next: a quick look at your order, then Stripe checkout. Cancel anytime.</div>
     </div>
 
-    <label class=addon id=ad-pack for=s-pack><input type=checkbox id=s-pack>
-      <span style="flex:1"><b>All-Season pack</b>
-      <i>Winter storms, ice, frost and freeze, extreme heat and high wind.</i></span>
-      <span class=amt>+$9/yr</span></label>
+    <div id=step2 style="display:none">
+      <div class=steptag>Step 2 of 2</div>
+      <h2>Look it over, then checkout</h2>
+      <div class=ordersum><span>Stormline for <b id=s-addrline>your address</b></span><span class=osamt>$12/yr</span></div>
+      <div id=err2 class=err></div>
 
-    <label class=addon id=ad-daily for=s-daily><input type=checkbox id=s-daily>
-      <span style="flex:1"><b>Add the morning summary</b>
-      <i>One text at the hour you pick. Automated, and it says so.</i></span>
-      <span class=amt>+$12/yr</span></label>
+      <div class=addon-h>Add to this account</div>
 
-    <div id=daily-wrap style="display:none;margin:-2px 0 12px">
-      <label for=s-hour>Send it at</label>
-      <select id=s-hour style="width:100%;box-sizing:border-box;padding:12px;
-        border:1px solid rgba(15,18,22,.18);border-radius:8px;font-size:16px;background:#fff">
-        <option value=5>5:00 AM</option><option value=6>6:00 AM</option>
-        <option value=7 selected>7:00 AM</option><option value=8>8:00 AM</option>
-        <option value=9>9:00 AM</option><option value=10>10:00 AM</option>
-      </select>
-      <div class=fine style="text-align:left;margin-top:7px">Local time at the address
-      we watch. You can change it any time from the link in your messages.</div>
+      <label class=addon id=ad-second for=s-second><input type=checkbox id=s-second>
+        <span style="flex:1"><b>Watch a second address</b>
+        <i>Mom's house, the lake place, the shop. Same warnings, same bill.</i></span>
+        <span class=amt>+$8/yr</span></label>
+
+      <div id=second-wrap style="display:none;margin:-2px 0 12px">
+        <label for=s-address2>Second address</label>
+        <input id=s-address2 placeholder="77 Kestrel Way">
+        <div style="display:flex;gap:10px">
+          <div style="flex:2"><label for=s-city2>City</label>
+            <input id=s-city2 placeholder="Cheyenne"></div>
+          <div style="flex:1"><label for=s-state2>State</label>
+            <select id=s-state2><option value="">State</option><option>AL</option><option>AK</option><option>AZ</option><option>AR</option><option>CA</option><option>CO</option><option>CT</option><option>DE</option><option>DC</option><option>FL</option><option>GA</option><option>HI</option><option>ID</option><option>IL</option><option>IN</option><option>IA</option><option>KS</option><option>KY</option><option>LA</option><option>ME</option><option>MD</option><option>MA</option><option>MI</option><option>MN</option><option>MS</option><option>MO</option><option>MT</option><option>NE</option><option>NV</option><option>NH</option><option>NJ</option><option>NM</option><option>NY</option><option>NC</option><option>ND</option><option>OH</option><option>OK</option><option>OR</option><option>PA</option><option>RI</option><option>SC</option><option>SD</option><option>TN</option><option>TX</option><option>UT</option><option>VT</option><option>VA</option><option>WA</option><option>WV</option><option>WI</option><option>WY</option></select></div>
+        </div>
+        <label for=s-label2>Call it what? (optional)</label>
+        <input id=s-label2 placeholder="Mom's house" maxlength=60>
+      </div>
+
+      <label class=addon id=ad-pack for=s-pack><input type=checkbox id=s-pack>
+        <span style="flex:1"><b>All-Season pack</b>
+        <i>Winter storms, ice, frost and freeze, extreme heat and high wind.</i></span>
+        <span class=amt>+$9/yr</span></label>
+
+      <label class=addon id=ad-daily for=s-daily><input type=checkbox id=s-daily>
+        <span style="flex:1"><b>Add the morning summary</b>
+        <i>One text at the hour you pick. Automated, and it says so.</i></span>
+        <span class=amt>+$12/yr</span></label>
+
+      <div id=daily-wrap style="display:none;margin:-2px 0 12px">
+        <label for=s-hour>Send it at</label>
+        <select id=s-hour>
+          <option value=5>5:00 AM</option><option value=6>6:00 AM</option>
+          <option value=7 selected>7:00 AM</option><option value=8>8:00 AM</option>
+          <option value=9>9:00 AM</option><option value=10>10:00 AM</option>
+        </select>
+        <div class=fine style="text-align:left;margin-top:7px">Local time at the address
+        we watch. You can change it any time from the link in your messages.</div>
+      </div>
+
+      <label class=addon id=ad-gift for=s-gift><input type=checkbox id=s-gift>
+        <span style="flex:1"><b>This is a gift</b>
+        <i>We tell them who it is from, so the first text is not a mystery.</i></span>
+        <span class=amt>Free</span></label>
+
+      <div id=gift-wrap style="display:none;margin:-2px 0 12px">
+        <label for=s-giftfrom>Your name, as they know you</label>
+        <input id=s-giftfrom placeholder="Sarah, your daughter" maxlength=60>
+      </div>
+
+      <div class=total><span id=s-summary>Stormline, one address</span><b id=s-total>$12/yr</b></div>
+      <button id=s-go>Continue to checkout &middot; $12/year</button>
+      <a id=s-back class=backlink>&larr; Back to the address</a>
+      <div class=fine>Checkout is handled by Stripe. Cancel anytime. Alerts relay official National Weather Service warnings for the exact address you enter.</div>
     </div>
 
-    <div class=total><span id=s-summary>Stormline, one address</span><b id=s-total>$12/yr</b></div>
-    <button id=s-go>Protect this address &middot; $12/year</button>
-    <div class=fine>Checkout is handled by Stripe. Cancel anytime. Alerts relay official National Weather Service warnings for the exact address you enter.</div>
-  </div></div>
+  </div>
+ </div></div>
 </section>
 
 <section class="sec s-black">
@@ -14866,23 +14918,41 @@ __WV_HEADER__
 </div>
 __WV_FOOTER__
 <script>
-document.getElementById('s-go').addEventListener('click', function(){
-  var btn = this; btn.disabled = true; btn.textContent = 'One moment...';
+function wvShowStep(n){
+  document.getElementById('step1').style.display = (n === 1) ? 'block' : 'none';
+  document.getElementById('step2').style.display = (n === 2) ? 'block' : 'none';
+  var card = document.getElementById('buy');
+  if (card && card.scrollIntoView) { card.scrollIntoView({behavior:'smooth', block:'start'}); }
+}
+document.getElementById('s-next').addEventListener('click', function(){
   var err = document.getElementById('err'); err.style.display = 'none';
-  if (!document.getElementById('s-city').value.trim()
+  if (document.getElementById('s-address').value.trim().length < 5
+      || !document.getElementById('s-city').value.trim()
       || !document.getElementById('s-state').value) {
-    err.textContent = 'Add the city and state so we watch the right place.';
-    err.style.display = 'block'; btn.disabled = false; btn.textContent = wvBtnLabel();
+    err.textContent = 'Add the street address, city and state so we watch the right place.';
+    err.style.display = 'block';
     return;
   }
+  document.getElementById('s-addrline').textContent =
+    document.getElementById('s-address').value.trim() + ', '
+    + document.getElementById('s-city').value.trim() + ' '
+    + document.getElementById('s-state').value;
+  wvSync();
+  wvShowStep(2);
+});
+document.getElementById('s-back').addEventListener('click', function(){ wvShowStep(1); });
+document.getElementById('s-go').addEventListener('click', function(){
+  var btn = this;
+  var err = document.getElementById('err2'); err.style.display = 'none';
   if (document.getElementById('s-second').checked
       && (document.getElementById('s-address2').value.trim().length < 5
           || !document.getElementById('s-city2').value.trim()
           || !document.getElementById('s-state2').value)) {
     err.textContent = 'Fill in the second address, city and state, or uncheck it.';
-    err.style.display = 'block'; btn.disabled = false; btn.textContent = wvBtnLabel();
+    err.style.display = 'block';
     return;
   }
+  btn.disabled = true; btn.textContent = 'One moment...';
   fetch('/api/v1/sentry/checkout', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
@@ -14910,10 +14980,10 @@ document.getElementById('s-go').addEventListener('click', function(){
   }).then(function(r){ return r.json(); }).then(function(d){
     if (d.ok && d.url) { window.location.href = d.url; return; }
     err.textContent = d.error || 'Something went wrong. Check the fields and try again.';
-    err.style.display = 'block'; btn.disabled = false; btn.textContent = wvBtnLabel();
+    err.style.display = 'block'; btn.disabled = false; btn.textContent = wvGoLabel();
   }).catch(function(){
     err.textContent = 'Connection problem. Try again.';
-    err.style.display = 'block'; btn.disabled = false; btn.textContent = wvBtnLabel();
+    err.style.display = 'block'; btn.disabled = false; btn.textContent = wvGoLabel();
   });
 });
 
@@ -14925,11 +14995,7 @@ function wvTotal(){
     + (document.getElementById('s-daily').checked ? 1200 * n : 0);
   return (cents / 100).toFixed(0);
 }
-function wvBtnLabel(){
-  var n = wvAddrCount();
-  return (n > 1 ? 'Protect these addresses' : 'Protect this address')
-    + ' · $' + wvTotal() + '/year';
-}
+function wvGoLabel(){ return 'Continue to checkout \u00b7 $' + wvTotal() + '/year'; }
 function wvSync(){
   var second = document.getElementById('s-second').checked;
   var pack = document.getElementById('s-pack').checked;
@@ -14947,7 +15013,7 @@ function wvSync(){
   if (daily) { bits.push('morning summary'); }
   document.getElementById('s-summary').textContent = bits.join(' + ');
   document.getElementById('s-total').textContent = '$' + wvTotal() + '/yr';
-  document.getElementById('s-go').textContent = wvBtnLabel();
+  document.getElementById('s-go').textContent = wvGoLabel();
 }
 document.getElementById('s-second').addEventListener('change', wvSync);
 document.getElementById('s-pack').addEventListener('change', wvSync);
@@ -16789,7 +16855,7 @@ __WV_HEADER__
       <a href="/met-review">Get a review &rarr;</a></div>
     <div class=card><b>Stormline</b><div class=p>$12/year</div>
       <p>Official warnings for one exact address, all year. Texts with radar, a phone call for
-      tornadoes, and the all clear.</p>
+      tornadoes, and a text when the warning expires.</p>
       <a href="/stormline">Put a Stormline on it &rarr;</a></div>
   </div>
 </div></div></section>
@@ -17208,7 +17274,7 @@ WV_TIERS = {
     "forecast": ("AI Forecast", "Free", "/forecast",
                  "Ask once, get an answer in seconds. It's AI, and we'll never pretend otherwise."),
     "stormline": ("Stormline", "$12/year", "/stormline",
-                  "Official warnings for one exact address. Texts with radar, a phone call for tornadoes, the all clear."),
+                  "Official warnings for one exact address. Texts with radar, a phone call for tornadoes, a text when the warning expires."),
     "daily": ("Stormline Daily", "$24/year", "/stormlinedaily",
               "Everything Stormline does, plus a plain forecast every morning at the hour you pick."),
     "sidekick": ("Sidekick", "$16/series", "/gameday/iu",
@@ -22951,11 +23017,11 @@ __WV_HEADER__
       <div class="bub warn"><span class=hd>Severe Thunderstorm Warning</span>
         A Severe Thunderstorm Warning includes your address (2140 Cypress Bend, Tupelo, MS)
         until 7:15 PM. The Weather Service lists wind to 60 mph and hail up to 1 inch.
-        Move indoors, away from windows. We'll text the all-clear.</div>
+        Move indoors, away from windows.</div>
       <div class=tstamp>Tuesday 7:19 PM</div>
-      <div class="bub ok"><span class=hd>All clear</span>
-        WeatherValet Stormline: all clear. The Severe Thunderstorm Warning that included your
-        address has expired.</div>
+      <div class="bub ok"><span class=hd>Warning expired</span>
+        The Severe Thunderstorm Warning for your address has expired. The warning ended,
+        not the weather. We are still watching.</div>
     </div>
    </div>
   </div>
@@ -22975,9 +23041,9 @@ __WV_HEADER__
         <div style="font-size:12px;color:#8CA0C0">Tornado warning &middot; spoken twice</div></div></div>
       <div class="bub warn"><span class=hd>Tornado Warning</span>
         A Tornado Warning includes your address (Mom's house) until 2:45 AM. Take shelter now:
-        interior room, lowest floor, away from windows. We'll text the all-clear.</div>
+        interior room, lowest floor, away from windows.</div>
       <div class=tstamp>Saturday 2:51 AM</div>
-      <div class="bub ok"><span class=hd>All clear</span>
+      <div class="bub ok"><span class=hd>Warning expired</span>
         The Tornado Warning for your address has expired. The warning ended, not the
       weather. We are still watching.</div>
     </div>
@@ -23057,7 +23123,7 @@ __WV_HEADER__
       <a class=go href="/forecast">Ask it now &rarr;</a></div>
     <div class=tier><div class=t>Stormline</div><div class=p>$12/year</div>
       <p>You don't watch the weather. Stormline watches your address. Warning texts with radar,
-      a phone call for tornadoes, the all clear.</p>
+      a phone call for tornadoes, a text when the warning expires.</p>
       <a class=go href="/stormline">Put a Stormline on it &rarr;</a></div>
     <div class=tier><div class=t>Stormline Daily</div><div class=p>$24/year</div>
       <p>The forecast finds you every morning. And the warning finds you at 2 AM.</p>
@@ -23264,7 +23330,7 @@ def _sentry_line_items(address_count: int, pack_allseason: bool, daily: bool = F
             "recurring": {"interval": "year"},
             "product_data": {
                 "name": f"{SENTRY_NAME} - storm alerts for one address",
-                "description": "Warning texts with radar map, tornado voice call, all-clear. Official NWS warnings for your exact address."
+                "description": "Warning texts with radar map, tornado voice call, and a text when the warning expires. Official NWS warnings for your exact address."
             },
         },
     }]
