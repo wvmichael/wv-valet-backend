@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-240"
+BACKEND_BUILD = "0702-241"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -14635,40 +14635,69 @@ button:disabled{opacity:.55;transform:none;box-shadow:none}
 .total{display:flex;justify-content:space-between;align-items:baseline;margin:20px 0 0;padding-top:18px;
   border-top:1px solid rgba(126,182,255,.24);font-size:15px;color:#A9BDD8}
 .total b{font-size:30px;color:#fff;font-weight:800;letter-spacing:-.02em}
-/* The two-step signup card (Aug 27, 2026). The old form blended into the
-   dark page on purpose and read as decoration; buyers did not see a form.
-   This is the opposite: a light card that is unmistakably a thing you
-   fill in. Step 1 asks who and where. Step 2 shows the order and offers
-   the add-ons, after the buyer has already said yes. */
-.formcard{background:#F7FAFF;border:1px solid #C9DEFF;border-radius:18px;
-  padding:26px 22px 24px;box-shadow:0 30px 70px -30px rgba(0,0,0,.6);color:#0B1220}
-.steptag{display:inline-block;font-size:11px;font-weight:800;letter-spacing:.14em;
-  text-transform:uppercase;color:#1E5FE0;background:#E3EEFF;border:1px solid #C9DEFF;
-  border-radius:999px;padding:5px 11px;margin-bottom:10px}
-.formcard h2{color:#0B1220;margin-top:0}
-.formsub{font-size:14.5px;color:#4A5B74;margin:2px 0 4px;line-height:1.55}
+/* The two-step signup card (Aug 27, 2026, premium pass same day).
+   A gradient navy header band carries the step and the promise; the body
+   is sectioned so the eye gets one job at a time. Step 1 asks who and
+   where. Step 2 shows the order and offers the add-ons, after the buyer
+   has already said yes. */
+.formcard{border-radius:22px;padding:0;overflow:hidden;color:#0B1220;
+  background:linear-gradient(180deg,#FFFFFF,#F2F7FF 60%,#EAF2FF);
+  border:1px solid rgba(30,107,255,.3);
+  box-shadow:0 40px 90px -35px rgba(4,16,42,.8),0 2px 0 rgba(255,255,255,.4) inset}
+.fchead{position:relative;padding:24px 24px 20px;color:#fff;overflow:hidden;
+  background:linear-gradient(155deg,#0B2350,#123C8F 52%,#1E5FE0)}
+.fchead:before{content:"";position:absolute;inset:0;
+  background:radial-gradient(90% 150% at 100% 0%,rgba(126,182,255,.38),transparent 55%)}
+.fchead>*{position:relative}
+.steptag{display:inline-block;font-size:10.5px;font-weight:800;letter-spacing:.16em;
+  text-transform:uppercase;color:#DCEAFF;background:rgba(255,255,255,.14);
+  border:1px solid rgba(255,255,255,.3);border-radius:999px;padding:5px 12px;margin-bottom:12px}
+.fchead h2{margin:0;color:#fff;font-size:24px;letter-spacing:-.02em}
+.formsub{font-size:14px;color:#C9DBF7;margin:7px 0 0;line-height:1.55}
+.fprog{display:flex;gap:7px;margin-top:16px}
+.fpseg{height:4px;flex:1;border-radius:99px;background:rgba(255,255,255,.22)}
+.fpseg.on{background:linear-gradient(90deg,#7EB6FF,#FFFFFF)}
+.fbody{padding:18px 24px 26px}
+.fsec{margin-top:22px;padding-top:18px;border-top:1px solid rgba(30,107,255,.14)}
+.fsec.first{margin-top:6px;padding-top:0;border-top:none}
+.fsec-h{display:flex;align-items:center;gap:10px;font-size:11px;font-weight:800;
+  letter-spacing:.15em;text-transform:uppercase;color:#1E5FE0}
+.fsec-h:after{content:"";height:1px;flex:1;
+  background:linear-gradient(90deg,rgba(30,107,255,.35),transparent)}
 .lnote{text-transform:none;letter-spacing:0;font-weight:500;color:#7A8494}
 .formcard label{color:#33507A}
-.formcard input,.formcard select{background:#fff;border:1px solid #C7D6EE;color:#0B1220}
+.formcard input,.formcard select{background:#fff;border:1px solid #C7D6EE;color:#0B1220;
+  box-shadow:0 1px 2px rgba(11,29,64,.06)}
 .formcard input::placeholder{color:#93A5C0}
 .formcard input:hover,.formcard select:hover{border-color:#8FB4E8}
 .formcard input:focus,.formcard select:focus{background:#fff;border-color:var(--blue);
   box-shadow:0 0 0 3px rgba(30,107,255,.18)}
 .formcard select option{background:#fff;color:#0B1220}
-.formcard .addon{background:#fff;border:1px solid #D5E1F3}
+.formcard .addon{background:linear-gradient(180deg,#FFFFFF,#F8FBFF);border:1px solid #D5E1F3;
+  box-shadow:0 6px 18px -12px rgba(11,29,64,.35)}
+.formcard .addon.on{border-color:var(--blue);
+  background:linear-gradient(180deg,#FFFFFF,#EFF6FF);
+  box-shadow:0 14px 30px -14px rgba(30,107,255,.55),inset 0 0 0 1px rgba(30,107,255,.35)}
 .formcard .addon b{color:#0B1220}
 .formcard .addon i{color:#5B6B85}
-.formcard .addon .amt{color:#1E5FE0}
-.formcard .addon.on .amt{color:#0B1220}
-.formcard .addon-h{color:#33507A}
-.formcard .total{border-top-color:#C9DEFF;color:#4A5B74}
-.formcard .total b{color:#0B1220}
-.formcard .fine{color:#6B7C96}
+.formcard .addon .amt{color:#1E5FE0;background:#EAF2FF;border:1px solid #C9DEFF;
+  border-radius:999px;padding:4px 11px;font-size:13.5px}
+.formcard .addon.on .amt{color:#fff;border-color:transparent;
+  background:linear-gradient(160deg,#3D8BFF,#1E5FE0)}
 .ordersum{display:flex;justify-content:space-between;gap:12px;align-items:baseline;
-  background:#fff;border:1px solid #D5E1F3;border-radius:12px;padding:14px 16px;
-  font-size:14.5px;color:#33507A;line-height:1.5;margin-top:8px}
+  background:linear-gradient(120deg,#FFFFFF,#F0F6FF);border:1px solid #C9DEFF;
+  border-radius:13px;padding:15px 17px;font-size:14.5px;color:#33507A;line-height:1.5;
+  box-shadow:0 6px 18px -12px rgba(11,29,64,.3)}
 .ordersum b{color:#0B1220}
 .osamt{font-weight:800;color:#0B1220;white-space:nowrap}
+.formcard .total{margin:22px 0 0;padding:16px 18px;border-top:none;border-radius:14px;
+  color:#C9DBF7;background:linear-gradient(120deg,#0B2350,#123C8F);
+  box-shadow:0 14px 30px -16px rgba(4,16,42,.8)}
+.formcard .total b{color:#fff;font-size:30px}
+.formcard button{margin-top:16px;padding:18px;font-size:18px;border-radius:13px;
+  background:linear-gradient(160deg,#4C9AFF,#1E5FE0 55%,#123C8F);
+  box-shadow:0 16px 34px -12px rgba(30,107,255,.8),inset 0 1px 0 rgba(255,255,255,.35)}
+.formcard .fine{color:#6B7C96}
 .backlink{display:block;text-align:center;margin-top:14px;font-size:13.5px;
   color:#1E5FE0;font-weight:700;cursor:pointer;text-decoration:none}
 .backlink:hover{text-decoration:underline}
@@ -14802,88 +14831,110 @@ __WV_HEADER__
   <div class=formcard id=buy>
 
     <div id=step1>
-      <div class=steptag>Step 1 of 2</div>
-      <h2>Put a Stormline on it</h2>
-      <p class=formsub>The address to watch, and where to reach you. That is all this step asks.</p>
-      <div id=err class=err></div>
-      <label for=s-name>Your name</label><input id=s-name autocomplete=name>
-      <label for=s-email>Email</label><input id=s-email type=email autocomplete=email>
-      <label for=s-phone>Mobile phone <span class=lnote>(texts go here)</span></label><input id=s-phone type=tel autocomplete=tel placeholder="317-555-0123">
-      <label for=s-phone2>Second phone <span class=lnote>(included, and this is the one people forget)</span></label>
-      <input id=s-phone2 type=tel placeholder="Mom's number, if this is Mom's house">
-      <label for=s-address>The address to watch</label>
-      <input id=s-address autocomplete=street-address placeholder="418 Prairie Rose Dr">
-      <div style="display:flex;gap:10px">
-        <div style="flex:2"><label for=s-city>City</label>
-          <input id=s-city autocomplete=address-level2 placeholder="Norman"></div>
-        <div style="flex:1"><label for=s-state>State</label>
-          <select id=s-state><option value="">State</option><option>AL</option><option>AK</option><option>AZ</option><option>AR</option><option>CA</option><option>CO</option><option>CT</option><option>DE</option><option>DC</option><option>FL</option><option>GA</option><option>HI</option><option>ID</option><option>IL</option><option>IN</option><option>IA</option><option>KS</option><option>KY</option><option>LA</option><option>ME</option><option>MD</option><option>MA</option><option>MI</option><option>MN</option><option>MS</option><option>MO</option><option>MT</option><option>NE</option><option>NV</option><option>NH</option><option>NJ</option><option>NM</option><option>NY</option><option>NC</option><option>ND</option><option>OH</option><option>OK</option><option>OR</option><option>PA</option><option>RI</option><option>SC</option><option>SD</option><option>TN</option><option>TX</option><option>UT</option><option>VT</option><option>VA</option><option>WA</option><option>WV</option><option>WI</option><option>WY</option></select></div>
+      <div class=fchead>
+        <div class=steptag>Step 1 of 2</div>
+        <h2>Put a Stormline on it</h2>
+        <p class=formsub>The address to watch, and where to reach you.</p>
+        <div class=fprog><span class="fpseg on"></span><span class=fpseg></span></div>
       </div>
-      <button id=s-next>Protect this address &middot; $12/year</button>
-      <div class=fine>Next: a quick look at your order, then Stripe checkout. Cancel anytime.</div>
+      <div class=fbody>
+        <div id=err class=err></div>
+
+        <div class="fsec first">
+          <div class=fsec-h>Where to reach you</div>
+          <label for=s-name>Your name</label><input id=s-name autocomplete=name>
+          <label for=s-email>Email</label><input id=s-email type=email autocomplete=email>
+          <label for=s-phone>Mobile phone <span class=lnote>(texts go here)</span></label><input id=s-phone type=tel autocomplete=tel placeholder="317-555-0123">
+          <label for=s-phone2>Second phone <span class=lnote>(included, and this is the one people forget)</span></label>
+          <input id=s-phone2 type=tel placeholder="Mom's number, if this is Mom's house">
+        </div>
+
+        <div class=fsec>
+          <div class=fsec-h>The address to watch</div>
+          <label for=s-address>Street address</label>
+          <input id=s-address autocomplete=street-address placeholder="418 Prairie Rose Dr">
+          <div style="display:flex;gap:10px">
+            <div style="flex:2"><label for=s-city>City</label>
+              <input id=s-city autocomplete=address-level2 placeholder="Norman"></div>
+            <div style="flex:1"><label for=s-state>State</label>
+              <select id=s-state><option value="">State</option><option>AL</option><option>AK</option><option>AZ</option><option>AR</option><option>CA</option><option>CO</option><option>CT</option><option>DE</option><option>DC</option><option>FL</option><option>GA</option><option>HI</option><option>ID</option><option>IL</option><option>IN</option><option>IA</option><option>KS</option><option>KY</option><option>LA</option><option>ME</option><option>MD</option><option>MA</option><option>MI</option><option>MN</option><option>MS</option><option>MO</option><option>MT</option><option>NE</option><option>NV</option><option>NH</option><option>NJ</option><option>NM</option><option>NY</option><option>NC</option><option>ND</option><option>OH</option><option>OK</option><option>OR</option><option>PA</option><option>RI</option><option>SC</option><option>SD</option><option>TN</option><option>TX</option><option>UT</option><option>VT</option><option>VA</option><option>WA</option><option>WV</option><option>WI</option><option>WY</option></select></div>
+          </div>
+        </div>
+
+        <button id=s-next>Protect this address &middot; $12/year</button>
+        <div class=fine>Next: a quick look at your order, then Stripe checkout. Cancel anytime.</div>
+      </div>
     </div>
 
     <div id=step2 style="display:none">
-      <div class=steptag>Step 2 of 2</div>
-      <h2>Look it over, then checkout</h2>
-      <div class=ordersum><span>Stormline for <b id=s-addrline>your address</b></span><span class=osamt>$12/yr</span></div>
-      <div id=err2 class=err></div>
+      <div class=fchead>
+        <div class=steptag>Step 2 of 2</div>
+        <h2>Look it over, then checkout</h2>
+        <p class=formsub>Add anything useful, or go straight through.</p>
+        <div class=fprog><span class="fpseg on"></span><span class="fpseg on"></span></div>
+      </div>
+      <div class=fbody>
+        <div class=ordersum><span>Stormline for <b id=s-addrline>your address</b></span><span class=osamt>$12/yr</span></div>
+        <div id=err2 class=err></div>
 
-      <div class=addon-h>Add to this account</div>
+        <div class=fsec>
+          <div class=fsec-h>Add to this account</div>
 
-      <label class=addon id=ad-second for=s-second><input type=checkbox id=s-second>
-        <span style="flex:1"><b>Watch a second address</b>
-        <i>Mom's house, the lake place, the shop. Same warnings, same bill.</i></span>
-        <span class=amt>+$8/yr</span></label>
+          <label class=addon id=ad-second for=s-second><input type=checkbox id=s-second>
+            <span style="flex:1"><b>Watch a second address</b>
+            <i>Mom's house, the lake place, the shop. Same warnings, same bill.</i></span>
+            <span class=amt>+$8/yr</span></label>
 
-      <div id=second-wrap style="display:none;margin:-2px 0 12px">
-        <label for=s-address2>Second address</label>
-        <input id=s-address2 placeholder="77 Kestrel Way">
-        <div style="display:flex;gap:10px">
-          <div style="flex:2"><label for=s-city2>City</label>
-            <input id=s-city2 placeholder="Cheyenne"></div>
-          <div style="flex:1"><label for=s-state2>State</label>
-            <select id=s-state2><option value="">State</option><option>AL</option><option>AK</option><option>AZ</option><option>AR</option><option>CA</option><option>CO</option><option>CT</option><option>DE</option><option>DC</option><option>FL</option><option>GA</option><option>HI</option><option>ID</option><option>IL</option><option>IN</option><option>IA</option><option>KS</option><option>KY</option><option>LA</option><option>ME</option><option>MD</option><option>MA</option><option>MI</option><option>MN</option><option>MS</option><option>MO</option><option>MT</option><option>NE</option><option>NV</option><option>NH</option><option>NJ</option><option>NM</option><option>NY</option><option>NC</option><option>ND</option><option>OH</option><option>OK</option><option>OR</option><option>PA</option><option>RI</option><option>SC</option><option>SD</option><option>TN</option><option>TX</option><option>UT</option><option>VT</option><option>VA</option><option>WA</option><option>WV</option><option>WI</option><option>WY</option></select></div>
+          <div id=second-wrap style="display:none;margin:-2px 0 12px">
+            <label for=s-address2>Second address</label>
+            <input id=s-address2 placeholder="77 Kestrel Way">
+            <div style="display:flex;gap:10px">
+              <div style="flex:2"><label for=s-city2>City</label>
+                <input id=s-city2 placeholder="Cheyenne"></div>
+              <div style="flex:1"><label for=s-state2>State</label>
+                <select id=s-state2><option value="">State</option><option>AL</option><option>AK</option><option>AZ</option><option>AR</option><option>CA</option><option>CO</option><option>CT</option><option>DE</option><option>DC</option><option>FL</option><option>GA</option><option>HI</option><option>ID</option><option>IL</option><option>IN</option><option>IA</option><option>KS</option><option>KY</option><option>LA</option><option>ME</option><option>MD</option><option>MA</option><option>MI</option><option>MN</option><option>MS</option><option>MO</option><option>MT</option><option>NE</option><option>NV</option><option>NH</option><option>NJ</option><option>NM</option><option>NY</option><option>NC</option><option>ND</option><option>OH</option><option>OK</option><option>OR</option><option>PA</option><option>RI</option><option>SC</option><option>SD</option><option>TN</option><option>TX</option><option>UT</option><option>VT</option><option>VA</option><option>WA</option><option>WV</option><option>WI</option><option>WY</option></select></div>
+            </div>
+            <label for=s-label2>Call it what? (optional)</label>
+            <input id=s-label2 placeholder="Mom's house" maxlength=60>
+          </div>
+
+          <label class=addon id=ad-pack for=s-pack><input type=checkbox id=s-pack>
+            <span style="flex:1"><b>All-Season pack</b>
+            <i>Winter storms, ice, frost and freeze, extreme heat and high wind.</i></span>
+            <span class=amt>+$9/yr</span></label>
+
+          <label class=addon id=ad-daily for=s-daily><input type=checkbox id=s-daily>
+            <span style="flex:1"><b>Add the morning summary</b>
+            <i>One text at the hour you pick. Automated, and it says so.</i></span>
+            <span class=amt>+$12/yr</span></label>
+
+          <div id=daily-wrap style="display:none;margin:-2px 0 12px">
+            <label for=s-hour>Send it at</label>
+            <select id=s-hour>
+              <option value=5>5:00 AM</option><option value=6>6:00 AM</option>
+              <option value=7 selected>7:00 AM</option><option value=8>8:00 AM</option>
+              <option value=9>9:00 AM</option><option value=10>10:00 AM</option>
+            </select>
+            <div class=fine style="text-align:left;margin-top:7px">Local time at the address
+            we watch. You can change it any time from the link in your messages.</div>
+          </div>
+
+          <label class=addon id=ad-gift for=s-gift><input type=checkbox id=s-gift>
+            <span style="flex:1"><b>This is a gift</b>
+            <i>We tell them who it is from, so the first text is not a mystery.</i></span>
+            <span class=amt>Free</span></label>
+
+          <div id=gift-wrap style="display:none;margin:-2px 0 12px">
+            <label for=s-giftfrom>Your name, as they know you</label>
+            <input id=s-giftfrom placeholder="Sarah, your daughter" maxlength=60>
+          </div>
         </div>
-        <label for=s-label2>Call it what? (optional)</label>
-        <input id=s-label2 placeholder="Mom's house" maxlength=60>
+
+        <div class=total><span id=s-summary>Stormline, one address</span><b id=s-total>$12/yr</b></div>
+        <button id=s-go>Continue to checkout &middot; $12/year</button>
+        <a id=s-back class=backlink>&larr; Back to the address</a>
+        <div class=fine>Checkout is handled by Stripe. Cancel anytime. Alerts relay official National Weather Service warnings for the exact address you enter.</div>
       </div>
-
-      <label class=addon id=ad-pack for=s-pack><input type=checkbox id=s-pack>
-        <span style="flex:1"><b>All-Season pack</b>
-        <i>Winter storms, ice, frost and freeze, extreme heat and high wind.</i></span>
-        <span class=amt>+$9/yr</span></label>
-
-      <label class=addon id=ad-daily for=s-daily><input type=checkbox id=s-daily>
-        <span style="flex:1"><b>Add the morning summary</b>
-        <i>One text at the hour you pick. Automated, and it says so.</i></span>
-        <span class=amt>+$12/yr</span></label>
-
-      <div id=daily-wrap style="display:none;margin:-2px 0 12px">
-        <label for=s-hour>Send it at</label>
-        <select id=s-hour>
-          <option value=5>5:00 AM</option><option value=6>6:00 AM</option>
-          <option value=7 selected>7:00 AM</option><option value=8>8:00 AM</option>
-          <option value=9>9:00 AM</option><option value=10>10:00 AM</option>
-        </select>
-        <div class=fine style="text-align:left;margin-top:7px">Local time at the address
-        we watch. You can change it any time from the link in your messages.</div>
-      </div>
-
-      <label class=addon id=ad-gift for=s-gift><input type=checkbox id=s-gift>
-        <span style="flex:1"><b>This is a gift</b>
-        <i>We tell them who it is from, so the first text is not a mystery.</i></span>
-        <span class=amt>Free</span></label>
-
-      <div id=gift-wrap style="display:none;margin:-2px 0 12px">
-        <label for=s-giftfrom>Your name, as they know you</label>
-        <input id=s-giftfrom placeholder="Sarah, your daughter" maxlength=60>
-      </div>
-
-      <div class=total><span id=s-summary>Stormline, one address</span><b id=s-total>$12/yr</b></div>
-      <button id=s-go>Continue to checkout &middot; $12/year</button>
-      <a id=s-back class=backlink>&larr; Back to the address</a>
-      <div class=fine>Checkout is handled by Stripe. Cancel anytime. Alerts relay official National Weather Service warnings for the exact address you enter.</div>
     </div>
 
   </div>
