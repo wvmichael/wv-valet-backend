@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-238"
+BACKEND_BUILD = "0702-239"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -7020,11 +7020,19 @@ def widget_region_compat(region_slug, size):
 
 @app.get("/api/v1/widget/embed")
 def widget_embed_page():
-    """Framable copy of the widget page for partner-site iframes."""
-    resp = make_response(WIDGET_EMBED_HTML)
+    """Framable copy of the widget page for partner-site iframes.
+
+    This is the address partner sites actually use, so it must serve the
+    intact copy like every other widget route. It was still serving our
+    damaged in-file copy, which is why NWKS Radio's homepage widget stayed
+    broken after the page routes were fixed.
+    """
+    resp = make_response(_widget_html())
     resp.headers["Content-Type"] = "text/html; charset=utf-8"
-    # 5-minute browser cache; the forecast data itself is fetched live.
-    resp.headers["Cache-Control"] = "public, max-age=300"
+    # 60 seconds. Long enough to spare the server, short enough that a fix
+    # reaches a partner's page the same day rather than whenever their
+    # browser feels like it.
+    resp.headers["Cache-Control"] = "public, max-age=60"
     return resp
 
 
