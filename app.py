@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-241"
+BACKEND_BUILD = "0702-242"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -18803,6 +18803,7 @@ _ADMIN_SCRIPT = """<script>
 
 _ADMIN_TABS = [("support", "Support", "/portal/admin"),
                ("subscribers", "Subscribers", "/portal/admin/subscribers"),
+               ("find", "Find", "/portal/admin/find"),
                ("employees", "Employees", "/portal/admin/employees"),
                ("totals", "Totals", "/portal/admin/totals")]
 
@@ -31887,6 +31888,385 @@ def admin_brief_replies():
 # active subscribers with their coverage state, and the unassigned ones
 # that need attention. Used during pre-launch dogfooding and ongoing
 # admin operations.
+
+def _wv_digits(v) -> str:
+    """Phone comparison key: digits only, last 10 (drops country code)."""
+    d = "".join(ch for ch in str(v or "") if ch.isdigit())
+    return d[-10:] if len(d) >= 10 else d
+
+
+@app.route("/api/v1/admin/find", methods=["OPTIONS"])
+def _admin_find_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/find")
+def admin_find_person():
+    """Search one person across everything, read-only.
+
+    Matches q (case-insensitive substring for email/name, digit match for
+    phone) against: users (ANY role, active or not), sentry_subscribers
+    (email, name, phone, AND phone2), gameday_passes, watch_orders. For
+    each hit, pulls what the Subscribers list never shows: roles,
+    is_active, saved locations with lat/lng and county, and the recent
+    rows from every send ledger (severe_alert_relays, sentry_relay_log,
+    crew_severe_alert_notifications), so "why did this person get a text"
+    and "why is this person invisible" are answerable from one box.
+
+    Tables here are small (hundreds of rows at most), so matching happens
+    in Python after bounded selects; no clever SQL to get wrong.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    q = (request.args.get("q") or "").strip()
+    if len(q) < 3:
+        return jsonify({"ok": False, "error": "query-too-short"}), 400
+    ql = q.lower()
+    qd = _wv_digits(q)
+    phone_search = len(qd) >= 7
+
+    def txt_hit(*vals) -> bool:
+        return any(ql in str(v or "").lower() for v in vals)
+
+    def ph_hit(*vals) -> bool:
+        if not phone_search:
+            return False
+        return any(qd and qd == _wv_digits(v) for v in vals)
+
+    out = {"ok": True, "q": q, "users": [], "stormline": [],
+           "sidekick": [], "watch": []}
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            # ── users: no role filter, no is_active filter, on purpose ──
+            cur.execute(
+                """SELECT id, email, name, phone, subscription_tier,
+                          is_active, created_at
+                     FROM users ORDER BY id LIMIT 3000""")
+            all_users = cur.fetchall()
+            hits = [u for u in all_users
+                    if txt_hit(u.get("email"), u.get("name"))
+                    or ph_hit(u.get("phone"))][:20]
+
+            for u in hits:
+                uid = u["id"]
+                cur.execute(
+                    "SELECT role FROM user_roles WHERE user_id = %s", (uid,))
+                roles = sorted(r["role"] for r in cur.fetchall())
+
+                cur.execute(
+                    """SELECT label, address_text, county, lat, lng, is_primary
+                         FROM saved_locations WHERE user_id = %s
+                        ORDER BY is_primary DESC, id LIMIT 10""", (uid,))
+                locs = [{"label": l.get("label") or "",
+                         "address": l.get("address_text") or "",
+                         "county": l.get("county") or "",
+                         "lat": l.get("lat"), "lng": l.get("lng"),
+                         "is_primary": bool(l.get("is_primary"))}
+                        for l in cur.fetchall()]
+
+                cur.execute(
+                    """SELECT pm.name AS met_name
+                         FROM subscriber_coverage sc
+                         LEFT JOIN users pm ON pm.id = sc.primary_met_id
+                        WHERE sc.user_id = %s""", (uid,))
+                cov = cur.fetchone()
+
+                cur.execute(
+                    """SELECT event, area_label, sent_at, expiry_notice_sent_at
+                         FROM severe_alert_relays WHERE user_id = %s
+                        ORDER BY sent_at DESC LIMIT 10""", (uid,))
+                relays = [{"event": r["event"], "area": r["area_label"],
+                           "sent_at": r["sent_at"],
+                           "expired_notice": bool(r.get("expiry_notice_sent_at"))}
+                          for r in cur.fetchall()]
+
+                cur.execute(
+                    """SELECT event, notified_at
+                         FROM crew_severe_alert_notifications
+                        WHERE crew_user_id = %s
+                        ORDER BY notified_at DESC LIMIT 10""", (uid,))
+                crew_notes = [{"event": r.get("event") or "severe alert",
+                               "sent_at": r["notified_at"]}
+                              for r in cur.fetchall()]
+
+                # Say plainly why the Subscribers list would skip this row.
+                hidden = []
+                if "subscriber" not in roles:
+                    hidden.append("no subscriber role")
+                if not u.get("is_active"):
+                    hidden.append("marked inactive")
+
+                out["users"].append({
+                    "id": uid, "email": u["email"], "name": u.get("name") or "",
+                    "phone": u.get("phone") or "",
+                    "tier": u.get("subscription_tier") or "",
+                    "is_active": bool(u.get("is_active")),
+                    "roles": roles,
+                    "created_at": u.get("created_at"),
+                    "primary_met": (cov or {}).get("met_name") or "",
+                    "locations": locs,
+                    "warning_sends": relays,
+                    "crew_sends": crew_notes,
+                    "hidden_from_subscribers_because": hidden,
+                })
+
+            # ── Stormline, including phone2 ──
+            cur.execute(
+                """SELECT id, email, name, phone, phone2, address, label,
+                          lat, lng, status, is_internal, tornado_call,
+                          pack_allseason, created_at
+                     FROM sentry_subscribers ORDER BY id LIMIT 3000""")
+            for r in cur.fetchall():
+                via = []
+                if txt_hit(r.get("email"), r.get("name")):
+                    via.append("email/name")
+                if ph_hit(r.get("phone")):
+                    via.append("phone")
+                if ph_hit(r.get("phone2")):
+                    via.append("second phone")
+                if not via:
+                    continue
+                cur.execute(
+                    """SELECT event, area_desc, warned_at, allclear_at
+                         FROM sentry_relay_log WHERE sentry_id = %s
+                        ORDER BY warned_at DESC LIMIT 10""", (r["id"],))
+                logs = [{"event": x["event"], "area": x.get("area_desc") or "",
+                         "sent_at": x["warned_at"],
+                         "expired_notice": bool(x.get("allclear_at"))}
+                        for x in cur.fetchall()]
+                out["stormline"].append({
+                    "id": r["id"], "email": r["email"],
+                    "name": r.get("name") or "",
+                    "phone": r.get("phone") or "",
+                    "phone2": r.get("phone2") or "",
+                    "address": r.get("label") or r.get("address") or "",
+                    "full_address": r.get("address") or "",
+                    "lat": r.get("lat"), "lng": r.get("lng"),
+                    "status": r.get("status") or "",
+                    "is_internal": bool(r.get("is_internal")),
+                    "tornado_call": bool(r.get("tornado_call")),
+                    "matched_via": via,
+                    "warning_sends": logs,
+                })
+                if len(out["stormline"]) >= 20:
+                    break
+
+            # ── Sidekick passes ──
+            cur.execute(
+                """SELECT id, name, email, phone, pass_type, status, created_at
+                     FROM gameday_passes ORDER BY id LIMIT 3000""")
+            out["sidekick"] = [
+                {"id": r["id"], "name": r.get("name") or "",
+                 "email": r["email"], "phone": r.get("phone") or "",
+                 "pass_type": r.get("pass_type") or "",
+                 "status": r.get("status") or "",
+                 "created_at": r.get("created_at")}
+                for r in cur.fetchall()
+                if txt_hit(r.get("email"), r.get("name"))
+                or ph_hit(r.get("phone"))][:20]
+
+            # ── Watch bookings ──
+            cur.execute(
+                """SELECT id, name, email, phone, place, event_date, status
+                     FROM watch_orders ORDER BY id LIMIT 3000""")
+            out["watch"] = [
+                {"id": r["id"], "name": r.get("name") or "",
+                 "email": r["email"], "phone": r.get("phone") or "",
+                 "place": r.get("place") or "",
+                 "event_date": str(r.get("event_date") or ""),
+                 "status": r.get("status") or ""}
+                for r in cur.fetchall()
+                if txt_hit(r.get("email"), r.get("name"))
+                or ph_hit(r.get("phone"))][:20]
+
+    out["found_anything"] = bool(out["users"] or out["stormline"]
+                                 or out["sidekick"] or out["watch"])
+    return jsonify(out)
+
+
+_ADMIN_FIND_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Find anyone &middot; WeatherValet</title>
+__MET_CHROME__
+<style>
+.findbar{display:flex;gap:10px;margin:18px 0 8px}
+.findbar input{flex:1;box-sizing:border-box;padding:13px 15px;font-size:16px;
+  border-radius:10px;border:1px solid rgba(126,182,255,.3);color:#EAF1FF;
+  background:rgba(255,255,255,.05)}
+.findbar button{width:auto;margin:0;padding:13px 22px;font-size:15px;font-weight:800;
+  border:none;border-radius:10px;color:#fff;cursor:pointer;
+  background:linear-gradient(160deg,#3D8BFF,#1E5FE0)}
+.findnote{font-size:13px;color:#8FA6C6;margin-bottom:16px}
+.fh{font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;
+  color:#7EB6FF;margin:22px 0 8px}
+.fcard{background:rgba(255,255,255,.045);border:1px solid rgba(126,182,255,.18);
+  border-radius:12px;padding:14px 16px;margin-bottom:10px;font-size:14px;line-height:1.6}
+.fcard b{color:#fff}
+.fcard .dim{color:#8FA6C6}
+.fcard .warn{color:#FFC46B;font-weight:700}
+.fcard .okp{color:#7EE2A8;font-weight:700}
+.fcard ul{margin:6px 0 0;padding-left:18px}
+.fcard li{margin:2px 0}
+#find-empty{display:none;color:#8FA6C6;font-size:15px;margin-top:18px}
+#find-err{display:none;background:#FDECEC;border:1px solid #F3B4B4;color:#8A1F1F;
+  border-radius:8px;padding:10px 12px;margin-top:12px;font-size:14px}
+</style></head><body>
+__ADMIN_NAV__
+<div class=wrap style="max-width:860px;margin:0 auto;padding:0 18px 60px">
+  <h1 style="font-size:22px;margin:22px 0 4px">Find anyone</h1>
+  <div class=findnote>Email, phone number, or name. Searches every list at once:
+  accounts, Stormline addresses (including second phones), Sidekick, Watch. Shows
+  recent warning texts and why an account is missing from the Subscribers tab.</div>
+  <div class=findbar>
+    <input id=find-q placeholder="takesgrace@yahoo.com, 785-555-0142, or Paul" autocomplete=off>
+    <button id=find-go>Search</button>
+  </div>
+  <div id=find-err></div>
+  <div id=find-out></div>
+  <div id=find-empty>Nothing anywhere for that. Not in accounts, Stormline, Sidekick,
+  or Watch. If they paid in Stripe, the purchase never reached this system: check the
+  email on the Stripe customer against what was imported.</div>
+</div>
+__WV_FOOTER__"""
+
+
+_ADMIN_FIND_SCRIPT = """<script>
+function fdt(ms){
+  if (!ms) { return ''; }
+  try { return new Date(ms).toLocaleString([], {dateStyle:'medium', timeStyle:'short'}); }
+  catch (e) { return String(ms); }
+}
+function fesc(t){
+  var d = document.createElement('div'); d.textContent = t == null ? '' : String(t);
+  return d.innerHTML;
+}
+function fsends(list){
+  if (!list || !list.length) { return '<div class=dim>No warning sends on record.</div>'; }
+  var h = '<ul>';
+  list.forEach(function(r){
+    h += '<li>' + fesc(r.event) + ' &middot; ' + fesc(r.area || '') + ' &middot; '
+       + fesc(fdt(r.sent_at))
+       + (r.expired_notice ? ' <span class=dim>(expiry notice sent)</span>' : '')
+       + '</li>';
+  });
+  return h + '</ul>';
+}
+function renderFind(d){
+  var out = document.getElementById('find-out');
+  var html = '';
+  if (d.users.length) {
+    html += '<div class=fh>Accounts</div>';
+    d.users.forEach(function(u){
+      html += '<div class=fcard><b>' + fesc(u.name || u.email) + '</b>'
+        + ' <span class=dim>&middot; ' + fesc(u.email) + (u.phone ? ' &middot; ' + fesc(u.phone) : '') + '</span><br>'
+        + 'Roles: ' + (u.roles.length ? fesc(u.roles.join(', ')) : '<span class=dim>none</span>')
+        + ' &middot; Tier: ' + (u.tier ? fesc(u.tier) : '<span class=dim>none</span>')
+        + ' &middot; ' + (u.is_active ? '<span class=okp>active</span>' : '<span class=warn>inactive</span>');
+      if (u.primary_met) { html += ' &middot; Met: ' + fesc(u.primary_met); }
+      if (u.hidden_from_subscribers_because.length) {
+        html += '<br><span class=warn>Missing from the Subscribers tab: '
+          + fesc(u.hidden_from_subscribers_because.join(' and ')) + '.</span>';
+      }
+      if (u.locations.length) {
+        html += '<br><span class=dim>Saved locations:</span><ul>';
+        u.locations.forEach(function(l){
+          html += '<li>' + fesc(l.label || l.address || 'unnamed')
+            + (l.address && l.label !== l.address ? ' &middot; ' + fesc(l.address) : '')
+            + (l.county ? ' &middot; ' + fesc(l.county) : '')
+            + (l.lat != null ? ' &middot; ' + l.lat.toFixed(4) + ', ' + l.lng.toFixed(4) : ' &middot; <span class=warn>no coordinates</span>')
+            + (l.is_primary ? ' <span class=dim>(primary)</span>' : '') + '</li>';
+        });
+        html += '</ul>';
+      } else {
+        html += '<br><span class=warn>No saved locations, so severe weather matching cannot find this account.</span>';
+      }
+      html += '<span class=dim>Warning texts (subscriber relay):</span>' + fsends(u.warning_sends);
+      if (u.crew_sends.length) {
+        html += '<span class=dim>Crew notifications:</span>' + fsends(u.crew_sends);
+      }
+      html += '</div>';
+    });
+  }
+  if (d.stormline.length) {
+    html += '<div class=fh>Stormline addresses</div>';
+    d.stormline.forEach(function(r){
+      html += '<div class=fcard><b>' + fesc(r.address) + '</b>'
+        + (r.full_address && r.full_address !== r.address ? ' <span class=dim>&middot; ' + fesc(r.full_address) + '</span>' : '')
+        + '<br>' + fesc(r.name || r.email) + ' <span class=dim>&middot; ' + fesc(r.email) + '</span>'
+        + '<br>Status: ' + (r.status === 'active' ? '<span class=okp>active</span>' : '<span class=warn>' + fesc(r.status) + '</span>')
+        + (r.is_internal ? ' &middot; <span class=dim>internal test address</span>' : '')
+        + ' &middot; Matched via ' + fesc(r.matched_via.join(', '))
+        + '<br><span class=dim>Phones: ' + fesc(r.phone) + (r.phone2 ? ' and ' + fesc(r.phone2) : '') + '</span>'
+        + (r.lat != null ? '<br><span class=dim>Pin: ' + r.lat.toFixed(4) + ', ' + r.lng.toFixed(4) + '</span>' : '<br><span class=warn>No coordinates: relay cannot match this address.</span>')
+        + '<span class=dim>Warning texts:</span>' + fsends(r.warning_sends)
+        + '</div>';
+    });
+  }
+  if (d.sidekick.length) {
+    html += '<div class=fh>Sidekick passes</div>';
+    d.sidekick.forEach(function(r){
+      html += '<div class=fcard><b>' + fesc(r.name || r.email) + '</b> <span class=dim>&middot; '
+        + fesc(r.email) + '</span><br>' + fesc(r.pass_type) + ' pass &middot; ' + fesc(r.status)
+        + ' &middot; ' + fesc(fdt(r.created_at)) + '</div>';
+    });
+  }
+  if (d.watch.length) {
+    html += '<div class=fh>Watch bookings</div>';
+    d.watch.forEach(function(r){
+      html += '<div class=fcard><b>' + fesc(r.name || r.email) + '</b> <span class=dim>&middot; '
+        + fesc(r.email) + '</span><br>' + fesc(r.place) + ' &middot; ' + fesc(r.event_date)
+        + ' &middot; ' + fesc(r.status) + '</div>';
+    });
+  }
+  out.innerHTML = html;
+  document.getElementById('find-empty').style.display = d.found_anything ? 'none' : 'block';
+}
+function runFind(){
+  var q = document.getElementById('find-q').value.trim();
+  var err = document.getElementById('find-err'); err.style.display = 'none';
+  if (q.length < 3) {
+    err.textContent = 'Give me at least three characters.';
+    err.style.display = 'block'; return;
+  }
+  var btn = document.getElementById('find-go');
+  btn.disabled = true; btn.textContent = 'Searching...';
+  fetch('/api/v1/admin/find?q=' + encodeURIComponent(q), {credentials:'include'})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      btn.disabled = false; btn.textContent = 'Search';
+      if (!d.ok) {
+        err.textContent = d.error || 'Search failed.'; err.style.display = 'block';
+        return;
+      }
+      renderFind(d);
+    })
+    .catch(function(){
+      btn.disabled = false; btn.textContent = 'Search';
+      err.textContent = 'Connection problem. Try again.'; err.style.display = 'block';
+    });
+}
+document.getElementById('find-go').addEventListener('click', runFind);
+document.getElementById('find-q').addEventListener('keydown', function(e){
+  if (e.key === 'Enter') { runFind(); }
+});
+</script>"""
+
+
+@app.get("/portal/admin/find")
+def portal_admin_find():
+    user = _get_current_user()
+    if not user or "admin" not in (user.get("roles") or []):
+        return redirect("/signin", code=302)
+    return wv_shell(_ADMIN_FIND_PAGE
+                    .replace("__MET_CHROME__", _MET_CHROME_CSS)
+                    .replace("__ADMIN_NAV__", _admin_nav("find"))
+                    .replace("__WV_FOOTER__", _ADMIN_FIND_SCRIPT + "\n__WV_FOOTER__"))
+
 
 @app.route("/api/v1/admin/subscribers", methods=["OPTIONS"])
 def _admin_subscribers_preflight():
