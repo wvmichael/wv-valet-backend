@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-242"
+BACKEND_BUILD = "0702-243"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -32128,6 +32128,14 @@ __ADMIN_NAV__
   </div>
   <div id=find-err></div>
   <div id=find-out></div>
+  <div class=fh style="margin-top:30px">Tier audit</div>
+  <div class=findnote>Lists every account with the subscriber role whose tier the
+  system does not recognize. Those accounts get severe warnings but are invisible
+  to the Pro list, the brief composer, and the Totals counts.</div>
+  <div class=findbar style="margin-top:6px">
+    <button id=audit-go style="width:auto">Run tier audit</button>
+  </div>
+  <div id=audit-out></div>
   <div id=find-empty>Nothing anywhere for that. Not in accounts, Stormline, Sidekick,
   or Watch. If they paid in Stripe, the purchase never reached this system: check the
   email on the Stripe customer against what was imported.</div>
@@ -32251,10 +32259,103 @@ function runFind(){
     });
 }
 document.getElementById('find-go').addEventListener('click', runFind);
+document.getElementById('audit-go').addEventListener('click', function(){
+  var btn = this; btn.disabled = true; btn.textContent = 'Auditing...';
+  var out = document.getElementById('audit-out');
+  fetch('/api/v1/admin/tier-audit', {credentials:'include'})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      btn.disabled = false; btn.textContent = 'Run tier audit';
+      if (!d.ok) { out.innerHTML = '<div class=fcard>' + fesc(d.error || 'Audit failed.') + '</div>'; return; }
+      var h = '<div class=fcard><b>Tiers in use</b><ul>';
+      d.tier_counts.forEach(function(t){
+        var bad = d.recognized.indexOf(t.tier) === -1;
+        h += '<li>' + (bad ? '<span class=warn>' : '') + fesc(t.tier)
+           + (bad ? '</span>' : '') + ' &middot; ' + t.n + '</li>';
+      });
+      h += '</ul></div>';
+      if (!d.ghost_count) {
+        h += '<div class=fcard><span class=okp>Every subscriber carries a recognized tier.</span></div>';
+      } else {
+        h += '<div class=fcard><b><span class=warn>' + d.ghost_count
+           + ' account' + (d.ghost_count === 1 ? '' : 's') + ' with an unrecognized tier</span></b><ul>';
+        d.ghosts.forEach(function(g){
+          h += '<li>' + fesc(g.name || g.email) + ' <span class=dim>&middot; ' + fesc(g.email)
+             + '</span> &middot; tier ' + fesc(g.tier)
+             + (g.is_active ? '' : ' &middot; <span class=warn>inactive</span>') + '</li>';
+        });
+        h += '</ul></div>';
+      }
+      out.innerHTML = h;
+    })
+    .catch(function(){
+      btn.disabled = false; btn.textContent = 'Run tier audit';
+      out.innerHTML = '<div class=fcard>Connection problem. Try again.</div>';
+    });
+});
 document.getElementById('find-q').addEventListener('keydown', function(e){
   if (e.key === 'Enter') { runFind(); }
 });
 </script>"""
+
+
+@app.route("/api/v1/admin/tier-audit", methods=["OPTIONS"])
+def _admin_tier_audit_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/tier-audit")
+def admin_tier_audit():
+    """Every subscriber-role account whose subscription_tier the system
+    does not recognize, plus a count of every tier value in use.
+
+    The recognized set is exactly what the tier-gated queries check:
+    pro_single / pro_multi / pro_enterprise (the Pro list, the brief
+    composer, Totals) and hobbyist (the free tier). Anything else,
+    including NULL and empty, is a ghost: warned about severe weather,
+    invisible everywhere money is counted.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    known = ("pro_single", "pro_multi", "pro_enterprise", "hobbyist")
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT COALESCE(NULLIF(TRIM(u.subscription_tier), ''),
+                                   '(blank)') AS tier,
+                          COUNT(*) AS n
+                     FROM users u
+                     JOIN user_roles ur
+                       ON ur.user_id = u.id AND ur.role = 'subscriber'
+                    GROUP BY 1 ORDER BY n DESC""")
+            counts = [{"tier": r["tier"], "n": r["n"]} for r in cur.fetchall()]
+
+            cur.execute(
+                """SELECT u.id, u.email, u.name, u.phone,
+                          COALESCE(NULLIF(TRIM(u.subscription_tier), ''),
+                                   '(blank)') AS tier,
+                          u.is_active, u.created_at
+                     FROM users u
+                     JOIN user_roles ur
+                       ON ur.user_id = u.id AND ur.role = 'subscriber'
+                    WHERE u.subscription_tier IS NULL
+                       OR TRIM(u.subscription_tier) = ''
+                       OR u.subscription_tier NOT IN %s
+                    ORDER BY u.created_at DESC LIMIT 200""", (known,))
+            ghosts = [{"id": r["id"], "email": r["email"],
+                       "name": r.get("name") or "",
+                       "phone": r.get("phone") or "",
+                       "tier": r["tier"],
+                       "is_active": bool(r.get("is_active"))}
+                      for r in cur.fetchall()]
+
+    return jsonify({"ok": True, "recognized": list(known),
+                    "tier_counts": counts, "ghosts": ghosts,
+                    "ghost_count": len(ghosts)})
 
 
 @app.get("/portal/admin/find")
