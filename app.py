@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-262"
+BACKEND_BUILD = "0702-263"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -13186,7 +13186,7 @@ src="https://www.facebook.com/tr?id=__PIXEL_ID__&ev=PageView&noscript=1" /></nos
 <!-- End Meta Pixel Code -->""".replace("__PIXEL_ID__", META_PIXEL_ID)
 
 
-def _inject_purchase(html: str, value_dollars: float, content_name: str = "") -> str:
+def _inject_purchase(html: str, value_dollars: float, content_name: str = "", event_id=None) -> str:
     """Put a Purchase event into a finished page, before </head>.
 
     Adds the base pixel too, but only if the page does not already carry it:
@@ -13200,15 +13200,78 @@ def _inject_purchase(html: str, value_dollars: float, content_name: str = "") ->
     except Exception:
         value = 0.0
     base = "" if "fbevents.js" in html else META_PIXEL
+    eid_js = ", {eventID: '__EID__'}" if event_id else ""
     block = base + ("""
 <script>
   try {
     fbq('track', 'Purchase', {value: __VALUE__, currency: 'USD',
-        content_name: '__NAME__'});
+        content_name: '__NAME__'}__EIDARG__);
   } catch (e) {}
 </script>""").replace("__VALUE__", "%.2f" % value).replace(
-        "__NAME__", _html_escape(content_name or ""))
+        "__NAME__", _html_escape(content_name or "")).replace(
+        "__EIDARG__", eid_js).replace(
+        "__EID__", _html_escape(str(event_id or "")))
     return html.replace("</head>", block + "\n</head>", 1)
+
+
+def _meta_capi_purchase(email, phone, value_dollars, event_id,
+                        source_url="https://weathervalet.ai/stormline",
+                        content_name="Stormline"):
+    """Server-side Purchase to Meta's Conversions API (Aug 30, 2026).
+
+    The browser pixel already fires on the welcome page, but one ad
+    blocker eats the event and the ads learn nothing; the Aug 19 test
+    purchase vanished exactly this way. This fires from the Stripe
+    webhook, where no blocker exists. Same event_id as the browser event
+    so Meta deduplicates instead of double-counting. Needs
+    META_CAPI_TOKEN in env (Events Manager -> Settings -> Conversions
+    API -> Generate access token); silently does nothing without it.
+    Optional META_TEST_EVENT_CODE routes events to the Test Events tab.
+    """
+    token = os.environ.get("META_CAPI_TOKEN", "").strip()
+    if not token or not META_PIXEL_ID:
+        return
+    import hashlib
+
+    def _h(v):
+        v = (v or "").strip().lower()
+        return hashlib.sha256(v.encode("utf-8")).hexdigest() if v else None
+
+    user_data = {}
+    if email:
+        user_data["em"] = [_h(email)]
+    digits = "".join(c for c in str(phone or "") if c.isdigit())
+    if digits:
+        if len(digits) == 10:
+            digits = "1" + digits
+        user_data["ph"] = [_h(digits)]
+    payload = {"data": [{
+        "event_name": "Purchase",
+        "event_time": int(time.time()),
+        "event_id": event_id,
+        "action_source": "website",
+        "event_source_url": source_url,
+        "user_data": user_data,
+        "custom_data": {"value": round(float(value_dollars), 2),
+                        "currency": "USD",
+                        "content_name": content_name},
+    }]}
+    test_code = os.environ.get("META_TEST_EVENT_CODE", "").strip()
+    if test_code:
+        payload["test_event_code"] = test_code
+    try:
+        req = urllib.request.Request(
+            f"https://graph.facebook.com/v21.0/{META_PIXEL_ID}/events"
+            f"?access_token={token}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=8):
+            pass
+        print(f"[meta-capi] Purchase sent event_id={event_id} "
+              f"value={value_dollars}", flush=True)
+    except Exception as e:
+        print(f"[meta-capi] Purchase failed event_id={event_id}: {e!r}",
+              flush=True)
 
 
 def _sentry_purchase_value(sentry_id) -> float:
@@ -18740,7 +18803,7 @@ __WV_FOOTER__"""
 _ADMIN_SCRIPT = """<script>
 (function(){
   function esc(t){var d=document.createElement('div');d.textContent=(t===null||t===undefined)?'':t;return d.innerHTML;}
-  function when(ms){ if(!ms) return ''; var d=new Date(Number(ms));
+  function when(ms){ if(!ms) return ''; ms=Number(ms); if(ms<1e12) ms*=1000; var d=new Date(ms);
     return d.toLocaleDateString(undefined,{month:'short',day:'numeric',year:'numeric'}); }
   function hour(h){ if(h===null||h===undefined) return '';
     h=Number(h); if(h===0||h===24) return 'midnight'; if(h===12) return 'noon';
@@ -19832,7 +19895,7 @@ _ADMIN_SUBS_SCRIPT = """<script>
   function esc(t){var d=document.createElement('div');d.textContent=(t===null||t===undefined)?'':t;return d.innerHTML;}
   function say(k,t){var m=document.getElementById('msg');m.className='msg '+k;m.innerHTML=t;m.style.display='block';}
   function hide(){document.getElementById('msg').style.display='none';}
-  function when(ms){ if(!ms) return ''; return new Date(Number(ms)).toLocaleDateString(undefined,
+  function when(ms){ if(!ms) return ''; ms=Number(ms); if(ms<1e12) ms*=1000; return new Date(ms).toLocaleDateString(undefined,
     {month:'short',day:'numeric',year:'numeric'}); }
   function hour(h){ if(h===null||h===undefined) return '';
     h=Number(h); if(h===0) return '12 AM'; if(h===12) return '12 PM';
@@ -19908,7 +19971,8 @@ _ADMIN_SUBS_SCRIPT = """<script>
   // extend a trial, mark them discounted, assign a rep, or nudge them.
   function wvBadge(r){
     if(r.trial_ends_at){
-      var dl=Math.ceil((r.trial_ends_at-Date.now())/86400000);
+      var te=Number(r.trial_ends_at); if(te<1e12) te*=1000;
+      var dl=Math.ceil((te-Date.now())/86400000);
       if(dl>0) return ' <span class="tag" style="background:rgba(255,196,107,.14);'
         +'border:1px solid rgba(255,196,107,.5);color:#FFC46B">Free Trial &middot; '+dl+'d left</span>';
       return ' <span class="tag" style="background:rgba(224,36,60,.14);'
@@ -24385,7 +24449,9 @@ def sentry_welcome_page():
 <body><div class=b><div style="font-size:44px">&#9889;</div><h1>Your Stormline is up.</h1>
 <p>Payment received. You'll get a welcome text shortly confirming the address we're watching.
 From now on, if the National Weather Service puts your address inside a warning, you'll know.</p></div></body></html>""")
-    return _inject_purchase(html, value, "Stormline")
+    sid = (request.args.get("sid") or "").strip()
+    return _inject_purchase(html, value, "Stormline",
+                            event_id=(f"sentry-{sid}" if sid else None))
 
 
 def _activate_sentry(sentry_id: int, stripe_customer_id: str) -> None:
@@ -24424,6 +24490,20 @@ def _activate_sentry_group(sentry_ids, stripe_customer_id: str) -> None:
     if not rows:
         print(f"[sentry] activate: {ids} not found or already active", flush=True)
         return
+    # Server-side Purchase to Meta, deduped against the welcome page's
+    # browser event via the shared event_id (Aug 30, 2026).
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT email, phone FROM sentry_subscribers
+                        WHERE id = %s""", (ids[0],))
+                r0 = cur.fetchone() or {}
+        _meta_capi_purchase(r0.get("email"), r0.get("phone"),
+                            _sentry_purchase_value(ids[0]),
+                            event_id=f"sentry-{ids[0]}")
+    except Exception as e:
+        print(f"[meta-capi] hook failed: {e!r}", flush=True)
     row = rows[0]
     first = (row.get("name") or "").split(" ")[0]
     hello = f"Hi {first}, " if first else ""
@@ -42233,6 +42313,16 @@ def _build_warning_map(alert: dict):
                 radar_layer.alpha_composite(r, (ox, oy))
             lbl = _fetch_tile(label_tpl.format(z=z, x=wrap_tx, y=ty), deadline)
             if lbl:
+                # Phone-readability pass (Aug 30, 2026): brighten the label
+                # tile and composite it twice, doubling its opacity so city
+                # names and borders survive MMS compression on a small
+                # screen.
+                try:
+                    from PIL import ImageEnhance as _Enh
+                    lbl = _Enh.Brightness(lbl).enhance(1.4)
+                except Exception:
+                    pass
+                labels_layer.alpha_composite(lbl, (ox, oy))
                 labels_layer.alpha_composite(lbl, (ox, oy))
     base = _Img.alpha_composite(base, radar_layer)
     base = _Img.alpha_composite(base, labels_layer)
