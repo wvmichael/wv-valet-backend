@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-249"
+BACKEND_BUILD = "0702-250"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -32177,9 +32177,11 @@ def admin_find_person():
 
 _ADMIN_FIND_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>Find anyone &middot; WeatherValet</title>
-__MET_CHROME__
+<title>Find anyone &middot; WeatherValet</title><meta name=robots content="noindex">
 <style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+__MET_CHROME__
 .findbar{display:flex;gap:10px;margin:18px 0 8px}
 .findbar input{flex:1;box-sizing:border-box;padding:13px 15px;font-size:16px;
   border-radius:10px;border:1px solid #2E4A7E;color:#EAF1FF;
@@ -32885,6 +32887,7 @@ def portal_admin_find():
     if not user or "admin" not in (user.get("roles") or []):
         return redirect("/signin", code=302)
     return wv_shell(_ADMIN_FIND_PAGE
+                    .replace("__WV_TOKENS__", WV_TOKENS)
                     .replace("__MET_CHROME__", _MET_CHROME_CSS)
                     .replace("__ADMIN_NAV__", _admin_nav("find"))
                     .replace("__WV_FOOTER__", _ADMIN_FIND_SCRIPT + "\n__WV_FOOTER__"))
