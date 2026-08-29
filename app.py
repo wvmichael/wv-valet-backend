@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-255"
+BACKEND_BUILD = "0702-256"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -1530,6 +1530,17 @@ CREATE INDEX IF NOT EXISTS idx_bbd_subscriber_sent
 -- free-text label the Met enters (e.g. "Central Kansas" or "Boone
 -- County, IN") — we don't yet pin it to a strict geography. Tracking
 -- evolves with usage.
+CREATE TABLE IF NOT EXISTS severe_met_texts (
+    id             SERIAL PRIMARY KEY,
+    nws_alert_id   TEXT    NOT NULL,
+    met_user_id    INTEGER NOT NULL,
+    met_name       TEXT,
+    body           TEXT    NOT NULL,
+    sent_count     INTEGER NOT NULL DEFAULT 0,
+    failed_count   INTEGER NOT NULL DEFAULT 0,
+    created_at     BIGINT  NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS storm_shelter_activations (
     id                  SERIAL PRIMARY KEY,
     met_user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -20503,18 +20514,19 @@ def _met_shelter_bar(user: dict, spa: str) -> str:
     sh = _met_shelter_state(user.get("id"))
     if sh.get("open"):
         who = "You have" if sh.get("mine") else "A Meteorologist has"
-        return ('<a class="shelter loud" href="%s/">&#9888; Storm Shelter is OPEN. %s one running '
-                'for %s%s. Open the old portal to post updates.</a>'
-                % (spa, who, _html_escape(sh.get("region") or "a region"),
+        return ('<a class="shelter loud" href="/portal/met/severe">&#9888; Storm Shelter is OPEN. %s one running '
+                'for %s%s. Open Severe to act.</a>'
+                % (who, _html_escape(sh.get("region") or "a region"),
                    (" (" + _html_escape(sh["event"]) + ")") if sh.get("event") else ""))
-    return ('<a class="shelter quiet" href="%s/">No Storm Shelter open. '
-            'Open one from the old portal when severe weather hits.</a>' % spa)
+    return ('<a class="shelter quiet" href="/portal/met/severe">No Storm Shelter open. '
+            'Severe weather lives at Severe now, ready when it hits.</a>')
 
 
 def _met_nav(active: str, spa: str) -> str:
     # Messages is not rebuilt yet, so it opens the old portal rather than a
     # dead link. A nav item that 404s is worse than one that is honest.
     items = [("day", "My Day", "/portal/met"), ("all", "All Work", "/portal/met/all"),
+             ("severe", "Severe", "/portal/met/severe"),
              ("people", "My People", "/portal/met/people"),
              ("messages", "Messages", "/portal/met/messages"),
              ("numbers", "My Numbers", "/portal/met/numbers")]
@@ -22354,6 +22366,408 @@ def _met_people_card(r) -> str:
                 ' <span class=dim>(search their name there)</span>')
     bits.append("</div>")
     return "".join(bits)
+
+
+def _severe_board_sentry(alert):
+    """Active, non-internal Stormline addresses inside the alert polygon.
+    Stormline is polygon-only by design: county alerts return empty."""
+    geom = alert.get("geometry")
+    if not geom:
+        return []
+    geom_str = json.dumps(geom)
+    out = []
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, COALESCE(name,'') AS name, email, phone,
+                          COALESCE(phone2,'') AS phone2,
+                          address, COALESCE(label,'') AS label, lat, lng
+                     FROM sentry_subscribers
+                    WHERE status = 'active'
+                      AND COALESCE(is_internal, FALSE) = FALSE""")
+            for r in cur.fetchall():
+                if r["lat"] is None or r["lng"] is None:
+                    continue
+                if _point_in_polygon_geojson(float(r["lat"]), float(r["lng"]),
+                                             geom_str):
+                    out.append(r)
+    return out
+
+
+def _severe_affected(alert):
+    """Subscribers + Stormline rows affected by one alert, via the exact
+    matchers the relay itself uses."""
+    if alert.get("geometry"):
+        subs = _find_pro_subscribers_in_polygon(alert["geometry"])
+    else:
+        subs = _find_pro_subscribers_by_county(alert)
+    return subs, _severe_board_sentry(alert)
+
+
+@app.route("/api/v1/met/severe/board", methods=["OPTIONS"])
+def _met_severe_board_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/severe/board")
+def met_severe_board():
+    """Everything a Met needs during severe weather, one payload:
+    each active alert with who is affected and what the automated relay
+    already did. No location gating, ever: any signed-in Met can act on
+    any alert from anywhere (Aug 29, 2026, the point of the overhaul).
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    alerts = _fetch_active_nws_alerts()
+    now_ms = int(time.time() * 1000)
+    boards = []
+    with db() as conn:
+        with conn.cursor() as cur:
+            for a in alerts:
+                subs, sentry = _severe_affected(a)
+                cur.execute(
+                    """SELECT COUNT(*) AS n FROM severe_alert_relays
+                        WHERE nws_alert_id = %s""", (a["nws_id"],))
+                relay_subs = int((cur.fetchone() or {}).get("n") or 0)
+                cur.execute(
+                    """SELECT COUNT(*) AS n FROM sentry_relay_log
+                        WHERE nws_alert_id = %s""", (a["nws_id"],))
+                relay_sentry = int((cur.fetchone() or {}).get("n") or 0)
+                cur.execute(
+                    """SELECT met_name, body, sent_count, failed_count,
+                              created_at
+                         FROM severe_met_texts
+                        WHERE nws_alert_id = %s
+                        ORDER BY created_at DESC LIMIT 5""", (a["nws_id"],))
+                met_texts = [{"by": r.get("met_name") or "",
+                              "body": r["body"],
+                              "sent": r["sent_count"],
+                              "failed": r["failed_count"],
+                              "at": r["created_at"]} for r in cur.fetchall()]
+                boards.append({
+                    "nws_id": a["nws_id"],
+                    "event": a["event"],
+                    "severity": a["severity"],
+                    "headline": a["headline"],
+                    "area_desc": a["area_desc"],
+                    "instruction": (a.get("instruction") or "")[:280],
+                    "match_mode": a["match_mode"],
+                    "expires_at": a["expires_at"],
+                    "subscribers": [{
+                        "name": x["name"] or x["email"],
+                        "phone": x["phone"],
+                        "where": x.get("loc_label") or "",
+                        "county": x.get("loc_county") or "",
+                        "met": x.get("met_name") or ""} for x in subs],
+                    "stormline": [{
+                        "who": x["name"] or x["email"],
+                        "address": x.get("label") or x.get("address") or "",
+                        "phones": 1 + (1 if x.get("phone2") else 0)}
+                        for x in sentry],
+                    "relay": {"subscriber_texts": relay_subs,
+                              "stormline_texts": relay_sentry},
+                    "met_texts": met_texts,
+                })
+    return jsonify({"ok": True, "alerts": boards, "fetched_at": now_ms})
+
+
+@app.route("/api/v1/met/severe/text", methods=["OPTIONS"])
+def _met_severe_text_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/met/severe/text")
+def met_severe_text():
+    """Met texts everyone affected by one active alert, as themselves.
+
+    Body: { "nws_id": "...", "body": "<= 440 chars" }
+    The message is the Met's own words with their signature appended:
+    human judgment, human name, exactly what the brand promises. Sends
+    to affected subscriber phones plus Stormline phones and second
+    phones, deduplicated. Recorded in severe_met_texts.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    nws_id = (data.get("nws_id") or "").strip()
+    body = (data.get("body") or "").strip()
+    if not nws_id:
+        return jsonify({"ok": False, "error": "nws-id-required"}), 400
+    if not body:
+        return jsonify({"ok": False, "error": "empty-message"}), 400
+    if len(body) > 440:
+        return jsonify({"ok": False, "error": "message-too-long"}), 400
+
+    alert = None
+    for a in _fetch_active_nws_alerts():
+        if a["nws_id"] == nws_id:
+            alert = a
+            break
+    if alert is None:
+        return jsonify({"ok": False, "error": "alert-not-active"}), 404
+
+    subs, sentry = _severe_affected(alert)
+    met_name = (user.get("name") or "").strip() or "Your Meteorologist"
+    text = f"{body}\n- {met_name}, WeatherValet Meteorologist"
+
+    phones = []
+    seen = set()
+    def add(p):
+        d = "".join(ch for ch in str(p or "") if ch.isdigit())
+        d = d[-10:] if len(d) >= 10 else d
+        if d and len(d) >= 7 and d not in seen:
+            seen.add(d)
+            phones.append(p)
+    for x in subs:
+        add(x.get("phone"))
+    for x in sentry:
+        add(x.get("phone"))
+        add(x.get("phone2"))
+    if not phones:
+        return jsonify({"ok": False, "error": "nobody-affected"}), 400
+
+    sent = failed = 0
+    for p in phones:
+        try:
+            if send_sms(p, text):
+                sent += 1
+            else:
+                failed += 1
+        except Exception:
+            failed += 1
+        time.sleep(0.05)
+
+    now_ms = int(time.time() * 1000)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO severe_met_texts
+                         (nws_alert_id, met_user_id, met_name, body,
+                          sent_count, failed_count, created_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                    (nws_id, user["id"], met_name, body, sent, failed, now_ms))
+    except Exception as e:
+        print(f"[severe-met-text] record failed: {e!r}", flush=True)
+    print(f"[severe-met-text] met={met_name} alert={nws_id} "
+          f"sent={sent} failed={failed}", flush=True)
+    return jsonify({"ok": True, "sent": sent, "failed": failed})
+
+
+_MET_SEVERE_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Severe &middot; WeatherValet</title><meta name=robots content="noindex">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+__MET_CHROME__
+.wrapx{max-width:980px;margin:0 auto;padding:26px 22px 70px}
+h1{font-size:24px;font-weight:900;letter-spacing:-.02em;color:#fff;margin:0 0 4px}
+.psub{color:#B8C7DE;font-size:15px;margin:0 0 20px;line-height:1.6}
+.acard{background:#0E1D3C;border:1px solid #2E4A7E;border-radius:14px;color:#C9D8F0;
+  padding:17px 18px;margin-bottom:14px;font-size:14px;line-height:1.65}
+.acard.tor{border-color:#E0243C;box-shadow:0 0 0 1px rgba(224,36,60,.35)}
+.acard b{color:#fff}
+.acard .dim{color:#8FA6C6}
+.acard .warn{color:#FFC46B;font-weight:700}
+.acard .okp{color:#7EE2A8;font-weight:700}
+.acard .red{color:#FF8296;font-weight:800}
+.ahead{display:flex;justify-content:space-between;gap:12px;align-items:baseline;flex-wrap:wrap}
+.aev{font-size:17px;font-weight:900;color:#fff}
+.aev.tor{color:#FF8296}
+.acount{font-size:13px;color:#8FA6C6;white-space:nowrap}
+.apeople{margin:10px 0 0;padding:12px 14px;background:rgba(255,255,255,.04);
+  border:1px solid rgba(126,182,255,.14);border-radius:10px}
+.apeople ul{margin:6px 0 0;padding-left:18px}
+.apeople li{margin:2px 0}
+.atext{margin-top:12px}
+.atext textarea{width:100%;box-sizing:border-box;min-height:84px;padding:12px 14px;
+  font-size:15px;line-height:1.5;color:#EAF1FF;background:#0A1730;border:1px solid #2E4A7E;
+  border-radius:10px;font-family:inherit;resize:vertical}
+.atext textarea:focus{outline:none;border-color:var(--blue)}
+.abtns{display:flex;gap:10px;margin-top:10px;flex-wrap:wrap;align-items:center}
+.abtns button{border:none;border-radius:9px;color:#fff;cursor:pointer;font-weight:800;
+  font-size:13.5px;padding:11px 18px;background:linear-gradient(160deg,#3D8BFF,#1E5FE0)}
+.abtns button.shel{background:linear-gradient(160deg,#FF7A5C,#E0243C)}
+.abtns button:disabled{opacity:.55;cursor:default}
+.ares{font-size:13.5px}
+#sv-empty{display:none;color:#8FA6C6;font-size:15px;padding:24px 0}
+#sv-note{color:#5B7396;font-size:12.5px;margin-top:16px}
+</style></head><body>
+__MET_NAV__
+<div class=wrapx>
+  <h1>Severe</h1>
+  <div class=psub>Every active warning and watch we relay, who is in it, and what
+  already went out. Works for every Meteorologist from anywhere: there is no
+  location gate on this page.</div>
+  <div id=sv-list></div>
+  <div id=sv-empty>No active alerts in the WeatherValet event set right now.
+  When one fires, this page shows who is affected and lets you act.</div>
+  <div id=sv-note></div>
+</div>
+__WV_FOOTER__"""
+
+
+_MET_SEVERE_SCRIPT = """<script>
+function svEsc(t){
+  var d = document.createElement('div'); d.textContent = t == null ? '' : String(t);
+  return d.innerHTML;
+}
+function svMins(ms){
+  if (!ms) { return ''; }
+  var m = Math.round((ms - Date.now()) / 60000);
+  if (m <= 0) { return 'expiring now'; }
+  if (m < 90) { return 'expires in ' + m + ' min'; }
+  return 'expires in about ' + Math.round(m / 60) + ' h';
+}
+function svCard(a){
+  var tor = /tornado warning/i.test(a.event);
+  var h = '<div class="acard' + (tor ? ' tor' : '') + '" data-id="' + svEsc(a.nws_id) + '">';
+  h += '<div class=ahead><span class="aev' + (tor ? ' tor' : '') + '">' + svEsc(a.event) + '</span>'
+     + '<span class=acount>' + svEsc(svMins(a.expires_at)) + '</span></div>';
+  h += '<div class=dim>' + svEsc(a.area_desc) + '</div>';
+  if (a.match_mode === 'county') {
+    h += '<div class=dim>County-based alert (no polygon). Stormline does not relay these.</div>';
+  }
+  var n = a.subscribers.length, m = a.stormline.length;
+  h += '<div class=apeople><b>' + n + ' subscriber' + (n === 1 ? '' : 's') + ' &middot; '
+     + m + ' Stormline address' + (m === 1 ? '' : 'es') + ' in this alert.</b> ';
+  h += 'Auto-relay so far: ' + (a.relay.subscriber_texts + a.relay.stormline_texts > 0
+        ? '<span class=okp>' + a.relay.subscriber_texts + ' subscriber + '
+          + a.relay.stormline_texts + ' Stormline texts sent</span>'
+        : '<span class=warn>nothing sent yet</span>') + '.';
+  if (n) {
+    h += '<ul>';
+    a.subscribers.forEach(function(p){
+      h += '<li>' + svEsc(p.name) + (p.where ? ' <span class=dim>&middot; ' + svEsc(p.where) + '</span>' : '')
+         + (p.met ? ' <span class=dim>&middot; Met: ' + svEsc(p.met) + '</span>'
+                  : ' <span class=warn>&middot; no Met assigned</span>') + '</li>';
+    });
+    h += '</ul>';
+  }
+  if (m) {
+    h += '<ul>';
+    a.stormline.forEach(function(p){
+      h += '<li>' + svEsc(p.address) + ' <span class=dim>&middot; ' + svEsc(p.who)
+         + ' &middot; ' + p.phones + ' phone' + (p.phones === 1 ? '' : 's') + '</span></li>';
+    });
+    h += '</ul>';
+  }
+  h += '</div>';
+  if (a.met_texts.length) {
+    h += '<div class=apeople><b>Met texts on this alert</b><ul>';
+    a.met_texts.forEach(function(t){
+      h += '<li>' + svEsc(t.by) + ': "' + svEsc(t.body) + '" <span class=dim>&middot; '
+         + t.sent + ' sent' + (t.failed ? ', <span class=red>' + t.failed + ' failed</span>' : '') + '</span></li>';
+    });
+    h += '</ul></div>';
+  }
+  var total = n + m;
+  h += '<div class=atext><textarea maxlength=440 placeholder="Your words, sent as you. '
+     + 'Example: Chris here, watching this cell on radar. The rotation is passing '
+     + 'north of town. Stay put until the warning expires."></textarea>'
+     + '<div class=abtns>'
+     + '<button class=sv-send' + (total ? '' : ' disabled') + '>Text everyone in this alert ('
+     + total + ')</button>'
+     + '<button class="shel sv-shelter">Open Storm Shelter</button>'
+     + '<span class=ares></span></div></div>';
+  return h + '</div>';
+}
+function svWire(){
+  Array.prototype.forEach.call(document.querySelectorAll('.acard'), function(card){
+    var id = card.getAttribute('data-id');
+    var res = card.querySelector('.ares');
+    var sendBtn = card.querySelector('.sv-send');
+    if (sendBtn) {
+      sendBtn.addEventListener('click', function(){
+        var ta = card.querySelector('textarea');
+        var body = (ta.value || '').trim();
+        if (!body) { res.innerHTML = '<span class=warn>Write the message first.</span>'; return; }
+        if (!window.confirm('Send this text, signed with your name, to everyone in this alert?')) { return; }
+        sendBtn.disabled = true; sendBtn.textContent = 'Sending...';
+        fetch('/api/v1/met/severe/text', {method:'POST', credentials:'include',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({nws_id: id, body: body})})
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          sendBtn.disabled = false; sendBtn.textContent = 'Text everyone in this alert';
+          if (d.ok) {
+            res.innerHTML = '<span class=okp>' + d.sent + ' sent</span>'
+              + (d.failed ? ', <span class=red>' + d.failed + ' failed</span>' : '');
+            ta.value = '';
+          } else {
+            res.innerHTML = '<span class=warn>' + svEsc(d.error || 'failed') + '</span>';
+          }
+        })
+        .catch(function(){
+          sendBtn.disabled = false; sendBtn.textContent = 'Text everyone in this alert';
+          res.innerHTML = '<span class=warn>Connection problem.</span>';
+        });
+      });
+    }
+    var shBtn = card.querySelector('.sv-shelter');
+    if (shBtn) {
+      shBtn.addEventListener('click', function(){
+        shBtn.disabled = true; shBtn.textContent = 'Opening...';
+        var ev = card.querySelector('.aev').textContent;
+        var region = card.querySelector('.dim').textContent.slice(0, 190);
+        fetch('/api/v1/met/storm-shelter/open', {method:'POST', credentials:'include',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({region_label: region, nws_event: ev})})
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          shBtn.disabled = false;
+          shBtn.textContent = d.ok ? 'Shelter open' : (d.error === 'already-open' ? 'Already open' : 'Open Storm Shelter');
+          if (d.ok || d.error === 'already-open') { shBtn.classList.add('okp'); }
+        })
+        .catch(function(){ shBtn.disabled = false; shBtn.textContent = 'Open Storm Shelter'; });
+      });
+    }
+  });
+}
+function svLoad(){
+  fetch('/api/v1/met/severe/board', {credentials:'include'})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (!d.ok) { return; }
+      var list = document.getElementById('sv-list');
+      list.innerHTML = d.alerts.map(svCard).join('');
+      document.getElementById('sv-empty').style.display = d.alerts.length ? 'none' : 'block';
+      document.getElementById('sv-note').textContent =
+        'Checked ' + new Date(d.fetched_at).toLocaleTimeString() + '. Refreshes every 2 minutes.';
+      svWire();
+    })
+    .catch(function(){});
+}
+svLoad();
+setInterval(svLoad, 120000);
+</script>"""
+
+
+@app.get("/portal/met/severe")
+def portal_met_severe():
+    user = _get_current_user()
+    if not user:
+        return redirect("/signin", code=302)
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return redirect("/portal", code=302)
+    spa = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+    return wv_shell(_MET_SEVERE_PAGE
+                    .replace("__WV_TOKENS__", WV_TOKENS)
+                    .replace("__MET_CHROME__", _MET_CHROME_CSS)
+                    .replace("__MET_NAV__", _met_nav("severe", spa))
+                    .replace("__WV_FOOTER__", _MET_SEVERE_SCRIPT + "\n__WV_FOOTER__"))
 
 
 @app.get("/portal/met/people")
