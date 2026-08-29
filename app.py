@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-257"
+BACKEND_BUILD = "0702-258"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -42324,18 +42324,11 @@ def _sentry_relay_warning(alert: dict) -> int:
             subs = cur.fetchall()
     if not subs:
         return 0
-    # Map URL from the ledger the Pro relay already populated this tick.
-    map_url = ""
-    if event in _MAP_EVENTS:
-        try:
-            with db() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT map_url FROM warning_maps WHERE nws_alert_id = %s",
-                                (alert.get("nws_id"),))
-                    r = cur.fetchone()
-                    map_url = (r or {}).get("map_url") or ""
-        except Exception:
-            map_url = ""
+    # Build-or-fetch (Aug 29, 2026): Stormline used to only READ the map
+    # ledger; if its send fired before the subscriber relay built the map,
+    # Stormline texts went out imageless forever. Both paths now share the
+    # same build-or-fetch with retry.
+    map_url = _warning_map_url_for(alert)
     sent = 0
     for sub in subs:
         try:
@@ -42437,6 +42430,88 @@ def _sentry_allclear_pass() -> int:
     return sent
 
 
+def _warning_map_url_for(alert: dict) -> str:
+    """Fetch or build the warning radar map for one alert. Shared by the
+    subscriber relay AND the Stormline relay (Aug 29, 2026), so whichever
+    sends first builds it and both attach it.
+
+    Fixes the poison-forever bug: a failed build used to store '' and was
+    never retried, so one slow tile fetch meant every text for that
+    warning went out imageless. Now an empty row is retried on later
+    ticks for up to 15 minutes after first attempt, then given up on.
+    Exactly one team email per warning, on whichever attempt first
+    produces a URL."""
+    if (alert.get("event") or "") not in _MAP_EVENTS:
+        return ""
+    nws_id = alert.get("nws_id")
+    now_ms = int(time.time() * 1000)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT map_url, created_at, notified_at
+                         FROM warning_maps WHERE nws_alert_id = %s""",
+                    (nws_id,))
+                row = cur.fetchone()
+        if row is not None:
+            url = row.get("map_url") or ""
+            if url:
+                return url
+            if now_ms - int(row.get("created_at") or 0) > 15 * 60 * 1000:
+                return ""
+            built = _warning_map_for_alert(alert) or ""
+            if not built:
+                return ""
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """UPDATE warning_maps SET map_url = %s
+                            WHERE nws_alert_id = %s AND COALESCE(map_url,'') = ''""",
+                        (built, nws_id))
+                    won = cur.rowcount > 0
+            if won and not row.get("notified_at"):
+                try:
+                    _notify_team_warning_map(alert, built)
+                    with db() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE warning_maps SET notified_at = %s WHERE nws_alert_id = %s",
+                                (int(time.time() * 1000), nws_id))
+                except Exception as e:
+                    print(f"[warn-map] team notify failed: {e!r}", flush=True)
+            return built
+        built = _warning_map_for_alert(alert) or ""
+        claimed = False
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO warning_maps (nws_alert_id, map_url, created_at)
+                       VALUES (%s, %s, %s)
+                       ON CONFLICT (nws_alert_id) DO NOTHING
+                       RETURNING nws_alert_id""",
+                    (nws_id, built, now_ms))
+                claimed = cur.fetchone() is not None
+                if not claimed:
+                    cur.execute("SELECT map_url FROM warning_maps WHERE nws_alert_id = %s",
+                                (nws_id,))
+                    r2 = cur.fetchone()
+                    built = (r2 or {}).get("map_url") or built
+        if claimed and built:
+            try:
+                _notify_team_warning_map(alert, built)
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE warning_maps SET notified_at = %s WHERE nws_alert_id = %s",
+                            (int(time.time() * 1000), nws_id))
+            except Exception as e:
+                print(f"[warn-map] team notify failed: {e!r}", flush=True)
+        return built or ""
+    except Exception as e:
+        print(f"[warn-map] ledger failed: {e!r}", flush=True)
+        return ""
+
+
 def _auto_relay_warning(alert: dict, affected: list) -> int:
     """Option A core: text every affected subscriber the factual warning
     relay, once per (alert, subscriber). Template agreed with Timmy and
@@ -42445,53 +42520,7 @@ def _auto_relay_warning(alert: dict, affected: list) -> int:
         return 0
     sent = 0
     now_ms = int(time.time() * 1000)
-    # Warning map (fixed Aug 10, 2026): the once-per-warning memory lives
-    # in the warning_maps table, because alert dicts are rebuilt every
-    # scheduler tick. Exactly one build and one team email per warning,
-    # guaranteed by the primary key, even across worker races. A failed
-    # build stores '' and is never retried (the drill endpoint exists for
-    # verification on demand).
-    map_url = ""
-    if (alert.get("event") or "") in _MAP_EVENTS:
-        try:
-            with db() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT map_url FROM warning_maps WHERE nws_alert_id = %s",
-                                (alert.get("nws_id"),))
-                    row = cur.fetchone()
-            if row is not None:
-                map_url = row.get("map_url") or ""
-            else:
-                built = _warning_map_for_alert(alert) or ""
-                claimed = False
-                with db() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            """INSERT INTO warning_maps (nws_alert_id, map_url, created_at)
-                               VALUES (%s, %s, %s)
-                               ON CONFLICT (nws_alert_id) DO NOTHING
-                               RETURNING nws_alert_id""",
-                            (alert.get("nws_id"), built, now_ms))
-                        claimed = cur.fetchone() is not None
-                        if not claimed:
-                            cur.execute("SELECT map_url FROM warning_maps WHERE nws_alert_id = %s",
-                                        (alert.get("nws_id"),))
-                            r2 = cur.fetchone()
-                            built = (r2 or {}).get("map_url") or ""
-                map_url = built
-                if claimed and map_url:
-                    try:
-                        _notify_team_warning_map(alert, map_url)
-                        with db() as conn:
-                            with conn.cursor() as cur:
-                                cur.execute(
-                                    "UPDATE warning_maps SET notified_at = %s WHERE nws_alert_id = %s",
-                                    (int(time.time() * 1000), alert.get("nws_id")))
-                    except Exception as e:
-                        print(f"[warn-map] team notify failed: {e!r}", flush=True)
-        except Exception as e:
-            print(f"[warn-map] ledger failed: {e!r}", flush=True)
-            map_url = ""
+    map_url = _warning_map_url_for(alert)
     for sub in affected:
         try:
             with db() as conn:
