@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-256"
+BACKEND_BUILD = "0702-257"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -20868,7 +20868,7 @@ __WV_FOOTER__"""
 
 _MET_BRIEFS_SCRIPT = """<script>
 (function(){
-  var drafts=[], current=null, selected={};
+  var drafts=[], current=null, selected={}, dirty=false;
   function esc(t){var d=document.createElement('div');d.textContent=(t===null||t===undefined)?'':t;return d.innerHTML;}
   function say(kind,text){ var m=document.getElementById('msg');
     m.className='msg '+kind; m.innerHTML=text; m.style.display='block'; }
@@ -20905,6 +20905,9 @@ _MET_BRIEFS_SCRIPT = """<script>
      });
   }
 
+  function editorHidden(){
+    return document.getElementById('form').style.display!=='block';
+  }
   function wire(){
     Array.prototype.forEach.call(document.querySelectorAll('.d'),function(el){
       var id=Number(el.getAttribute('data-id'));
@@ -20914,39 +20917,80 @@ _MET_BRIEFS_SCRIPT = """<script>
         if(e.target.tagName==='INPUT'){
           if(e.target.checked){ selected[id]=true; el.className='d on'; }
           else { delete selected[id]; el.className='d'; }
+          // First pick with no editor yet: seed it so there is always a
+          // place to type. After that, checkboxes never touch the text.
+          if(e.target.checked && editorHidden()) open(d);
+          updateTargets();
           return;
         }
+        // Name click. Guard unsent typing with a choice, never a wipe.
+        if(!editorHidden() && dirty && current && current.id!==id){
+          if(!confirm("Load "+(d.subscriber_name||'this subscriber')
+              +"'s saved draft into the editor? Your unsent text here will be replaced. "
+              +"Cancel keeps your text and just adds them as a recipient.")){
+            if(!selected[id]){ selected[id]=true; el.className='d on';
+              var cb=el.querySelector('input'); if(cb) cb.checked=true; }
+            updateTargets();
+            return;
+          }
+        }
+        if(!selected[id]){ selected[id]=true; el.className='d on';
+          var cb2=el.querySelector('input'); if(cb2) cb2.checked=true; }
         open(d);
+        updateTargets();
       });
     });
   }
-
-  function open(d){
-    current=d;
-    hide();
-    document.getElementById('nosel').style.display='none';
-    document.getElementById('form').style.display='block';
+  function updateTargets(){
+    var n=Object.keys(selected).length; if(!n && current) n=1;
+    var sb=document.getElementById('send');
+    if(sb) sb.textContent = n>1 ? ('Send to '+n+' subscribers') : 'Send';
+    renderCtx();
+  }
+  function renderCtx(){
+    if(!current) return;
+    var d=current;
     var ctx='<b>'+esc(d.subscriber_name||'Subscriber')+'</b>';
     if(d.subscriber_business_role) ctx+=esc(d.subscriber_business_role)+'<br>';
     if(d.subscriber_weather_decisions) ctx+='Decides: '+esc(d.subscriber_weather_decisions)+'<br>';
     if(d.subscriber_peak_need_times) ctx+='Needs it by: '+esc(d.subscriber_peak_need_times)+'<br>';
     if(d.location_label) ctx+='Location: '+esc(d.location_label);
+    var names=Object.keys(selected).map(function(k){
+      var x=drafts.filter(function(y){return y.id===Number(k);})[0];
+      return x ? (x.subscriber_name||'a subscriber') : null;
+    }).filter(Boolean);
+    if(names.length>1){
+      ctx+='<br><span style="color:#7EB6FF;font-weight:700">This brief goes to '
+        +names.length+': '+esc(names.join(', '))+'</span>';
+    }
     document.getElementById('ctx').innerHTML=ctx;
+  }
+
+  function open(d){
+    current=d;
+    dirty=false;
+    hide();
+    document.getElementById('nosel').style.display='none';
+    document.getElementById('form').style.display='block';
     document.getElementById('f-bottom').value = d.bottom_line || d.met_snippet || d.ai_snippet || '';
     document.getElementById('f-weather').value = d.weather_details || d.met_body || d.ai_body || '';
     document.getElementById('f-ahead').value = d.whats_ahead || '';
     var v=(d.met_verdict||d.ai_verdict||'caution').toLowerCase();
     Array.prototype.forEach.call(document.querySelectorAll('#verd button'),function(b){
       b.className = (b.getAttribute('data-v')===v) ? 'on' : ''; });
-    document.getElementById('send').textContent =
-      (Object.keys(selected).length>1) ? 'Send to '+Object.keys(selected).length+' subscribers' : 'Send';
+    renderCtx();
+    updateTargets();
   }
+  ['f-bottom','f-weather','f-ahead'].forEach(function(fid){
+    document.getElementById(fid).addEventListener('input',function(){ dirty=true; });
+  });
 
   Array.prototype.forEach.call(document.querySelectorAll('#verd button'),function(b){
     b.addEventListener('click',function(){
       Array.prototype.forEach.call(document.querySelectorAll('#verd button'),
         function(x){ x.className=''; });
       b.className='on';
+      dirty=true;
     });
   });
 
@@ -20955,7 +20999,9 @@ _MET_BRIEFS_SCRIPT = """<script>
     var all = pending.every(function(d){ return selected[d.id]; });
     selected={};
     if(!all) pending.forEach(function(d){ selected[d.id]=true; });
+    if(!all && editorHidden() && pending.length) open(pending[0]);
     load();
+    updateTargets();
     this.textContent = all ? 'Select all' : 'Clear selection';
   });
 
@@ -21001,6 +21047,7 @@ _MET_BRIEFS_SCRIPT = """<script>
           + (lastError ? '<br>'+esc(lastError) : '')
           + '<br>The ones that failed are still marked waiting.');
         else say('good','Sent to '+done+(done===1?' subscriber.':' subscribers.'));
+        if(!failed) dirty=false;
         load();
         return;
       }
