@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-261"
+BACKEND_BUILD = "0702-262"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -19547,6 +19547,7 @@ def admin_tier_list():
                                           u.created_at, u.trial_ends_at, u.is_discounted,
                                           sr.name AS rep_name,
                                           sc.primary_met_id,
+                                          u.stripe_customer_id,
                                           (u.password_hash IS NOT NULL) AS has_password
                                      FROM users u
                                 LEFT JOIN sales_attributions sa ON sa.user_id = u.id
@@ -19905,18 +19906,32 @@ _ADMIN_SUBS_SCRIPT = """<script>
   // Pro and Crew rows get the support actions the old Command Center had:
   // change a phone number, set a password when somebody cannot get in,
   // extend a trial, mark them discounted, assign a rep, or nudge them.
+  function wvBadge(r){
+    if(r.trial_ends_at){
+      var dl=Math.ceil((r.trial_ends_at-Date.now())/86400000);
+      if(dl>0) return ' <span class="tag" style="background:rgba(255,196,107,.14);'
+        +'border:1px solid rgba(255,196,107,.5);color:#FFC46B">Free Trial &middot; '+dl+'d left</span>';
+      return ' <span class="tag" style="background:rgba(224,36,60,.14);'
+        +'border:1px solid rgba(224,36,60,.5);color:#FF8296">Trial expired</span>';
+    }
+    if(r.stripe_customer_id) return ' <span class="tag" style="background:rgba(126,226,168,.12);'
+      +'border:1px solid rgba(126,226,168,.45);color:#7EE2A8">Subscriber</span>';
+    return ' <span class="tag" style="background:rgba(255,255,255,.07);'
+      +'border:1px solid rgba(126,182,255,.25);color:#8FA6C6">User</span>';
+  }
   function personRow(r){
     var pro = tier==='pro';
     return '<tr data-uid="'+r.id+'">'
       +'<td class=name>'+esc(r.name||'(no name)')
         +(r.is_discounted?' <span class="tag int">Discounted</span>':'')
         +(r.has_password?'':' <span class="tag int">No password</span>')
+        +(pro?wvBadge(r):'')
         +'</td>'
       +'<td>'+esc(r.email||'')+'</td>'
       +'<td style="min-width:160px"><input class=pf data-k=phone value="'+esc(r.phone||'')+'"></td>'
       +(pro?'<td>'+esc(r.status||'')+(r.rep_name?'<br><span style="color:#8FA6C6;font-size:12.5px">Rep: '
           +esc(r.rep_name)+'</span>':'')
-          +'<br><select class=metsel style="margin-top:6px;max-width:150px;padding:5px 7px;'
+          +'<br><select class=metsel style="margin-top:6px;width:180px;padding:5px 7px;'
           +'font-size:12.5px;color:#EAF1FF;background:#0E1D3C;border:1px solid #2E4A7E;border-radius:7px">'
           +'<option value="">No Met</option>'
           +(window._mets||[]).map(function(m2){
@@ -33260,7 +33275,9 @@ document.getElementById('billing-go').addEventListener('click', function(){
         + (d.checked === 1 ? '' : 's') + ' checked.</b> '
         + d.billed.length + ' billed &middot; ' + d.past_due.length + ' past due &middot; '
         + d.canceled.length + ' canceled &middot; ' + d.unbilled.length + ' not billed at all &middot; '
-        + ((d.staff && d.staff.length) || 0) + ' staff.</div>';
+        + ((d.staff && d.staff.length) || 0) + ' staff.'
+        + (d.linked ? ' <span class=okp>Linked ' + d.linked + ' Stripe ID'
+           + (d.linked === 1 ? '' : 's') + ' to accounts.</span>' : '') + '</div>';
       if (d.unbilled.length) {
         h += '<div class=fcard><b><span class=warn>Receiving service, no billing found</span></b>'
            + '<div class=dim style="font-size:13px;margin-top:2px">Riders, comps, and pilots. '
@@ -33537,8 +33554,9 @@ def _stripe_billing_status(customer_id, email):
             found = stripe.Customer.list(email=email, limit=5)
             cids = [_wv_stripe_plain(c).get("id") for c in found]
             cids = [c for c in cids if c]
+        found_cid = None if customer_id else (cids[0] if cids else None)
         if not cids:
-            return "no-customer", "no Stripe customer under this id or email"
+            return "no-customer", "no Stripe customer under this id or email", None
         statuses, detail = [], ""
         for cid in cids[:5]:
             subs = stripe.Subscription.list(customer=cid, status="all",
@@ -33558,14 +33576,14 @@ def _stripe_billing_status(customer_id, email):
                     except Exception:
                         detail = st
         if any(st in ("active", "trialing") for st in statuses):
-            return "billed", detail
+            return "billed", detail, found_cid
         if any(st in ("past_due", "unpaid") for st in statuses):
-            return "past-due", detail or "payment failing"
+            return "past-due", detail or "payment failing", found_cid
         if statuses:
-            return "canceled", "subscription(s) canceled in Stripe"
-        return "no-subscription", "Stripe customer exists, zero subscriptions"
+            return "canceled", "subscription(s) canceled in Stripe", found_cid
+        return "no-subscription", "Stripe customer exists, zero subscriptions", found_cid
     except Exception as e:
-        return "error", str(e)[:120]
+        return "error", str(e)[:120], None
 
 
 @app.route("/api/v1/admin/billing-audit", methods=["OPTIONS"])
@@ -33636,8 +33654,26 @@ def admin_billing_audit():
 
     out = {"billed": [], "past_due": [], "canceled": [],
            "unbilled": [], "staff": [], "errors": []}
+    linked = 0
     for r in rows:
-        status, detail = _stripe_billing_status(r["cid"], r["email"])
+        status, detail, found_cid = _stripe_billing_status(r["cid"], r["email"])
+        # Self-heal (Aug 30, 2026): a payer found only by email lookup gets
+        # their Stripe id saved, so the Subscriber badge and future audits
+        # know them instantly.
+        if (found_cid and r["kind"] == "account" and not r["cid"]
+                and status in ("billed", "past-due", "canceled")):
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """UPDATE users SET stripe_customer_id = %s
+                                WHERE LOWER(email) = LOWER(%s)
+                                  AND stripe_customer_id IS NULL""",
+                            (found_cid, r["email"]))
+                        linked += cur.rowcount
+            except Exception as e:
+                print(f"[billing-audit] id link failed for {r['email']}: {e!r}",
+                      flush=True)
         entry = {"who": r["who"], "email": r["email"], "kind": r["kind"],
                  "what": r["what"], "detail": detail,
                  "roles": r.get("roles") or [],
@@ -33658,7 +33694,7 @@ def admin_billing_audit():
             entry["detail"] = detail
             out["unbilled"].append(entry)
 
-    return jsonify({"ok": True, "checked": len(rows), **out})
+    return jsonify({"ok": True, "checked": len(rows), "linked": linked, **out})
 
 
 @app.get("/portal/admin/find")
@@ -42131,6 +42167,18 @@ def _build_warning_map(alert: dict):
     import time as _t
     from PIL import Image as _Img, ImageDraw as _Draw, ImageFont as _Font
     deadline = _t.monotonic() + _MAP_BUDGET_S
+    # Tile providers (Aug 30, 2026): Carto began returning 'API key
+    # required' tiles, found live by Michael's drill button. Esri's
+    # dark-gray canvas is keyless and stable; env overrides let us swap
+    # providers without a deploy. Note Esri's path order is z/y/x.
+    base_tpl = os.environ.get(
+        "WV_MAP_BASE_TILES",
+        "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/"
+        "World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}")
+    label_tpl = os.environ.get(
+        "WV_MAP_LABEL_TILES",
+        "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/"
+        "World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}")
     rings = _polygon_rings(alert.get("geometry"))
     if not rings:
         return None
@@ -42169,7 +42217,7 @@ def _build_warning_map(alert: dict):
             # dark base WITHOUT labels, translucent radar, then a
             # labels-only layer ON TOP of the radar so city names stay
             # readable inside heavy returns. Polygon glows above all.
-            t = _fetch_tile(f"https://basemaps.cartocdn.com/dark_nolabels/{z}/{wrap_tx}/{ty}.png", deadline)
+            t = _fetch_tile(base_tpl.format(z=z, x=wrap_tx, y=ty), deadline)
             if t:
                 base.paste(t, (ox, oy))
             r = _fetch_tile(
@@ -42183,7 +42231,7 @@ def _build_warning_map(alert: dict):
                 except Exception:
                     pass
                 radar_layer.alpha_composite(r, (ox, oy))
-            lbl = _fetch_tile(f"https://basemaps.cartocdn.com/dark_only_labels/{z}/{wrap_tx}/{ty}.png", deadline)
+            lbl = _fetch_tile(label_tpl.format(z=z, x=wrap_tx, y=ty), deadline)
             if lbl:
                 labels_layer.alpha_composite(lbl, (ox, oy))
     base = _Img.alpha_composite(base, radar_layer)
@@ -42218,7 +42266,12 @@ def _build_warning_map(alert: dict):
     is_tor = alert.get("event") == "Tornado Warning"
     accent = (225, 29, 46, 255) if is_tor else (255, 150, 20, 255)
     hazard_yellow = (245, 195, 30, 255)
-    d.rectangle([0, 0, _SIDEBAR_W, _MAP_H], fill=(10, 20, 34, 255))
+    # Premium pass (Aug 30, 2026): vertical gradient instead of a flat
+    # slab, so the panel reads designed rather than default.
+    for gy in range(_MAP_H):
+        f = gy / max(1, _MAP_H - 1)
+        d.line([(0, gy), (_SIDEBAR_W, gy)],
+               fill=(int(6 + 12 * f), int(13 + 20 * f), int(28 + 40 * f), 255))
     d.rectangle([_SIDEBAR_W - 5, 0, _SIDEBAR_W, _MAP_H], fill=(30, 127, 255, 255))
     # Real logo top-left when the asset exists on the server; text fallback.
     y = 24
@@ -42236,6 +42289,13 @@ def _build_warning_map(alert: dict):
     except Exception:
         d.text((22, y), "WeatherValet", font=font(24), fill=(255, 255, 255, 255))
         y += 50
+    pill_t = "OFFICIAL NWS WARNING"
+    pf = font(13)
+    pw = int(d.textlength(pill_t, font=pf)) + 26
+    d.rounded_rectangle([22, y, 22 + pw, y + 27], radius=13,
+                        fill=(16, 30, 54, 255), outline=accent, width=1)
+    d.text((35, y + 6), pill_t, font=pf, fill=(205, 222, 245, 255))
+    y += 42
     max_w = _SIDEBAR_W - 44
     hazard_words = {"TORNADO", "THUNDERSTORM", "FLOOD"}
     for word in (alert.get("event") or "Warning").upper().split():
@@ -42290,8 +42350,9 @@ def _build_warning_map(alert: dict):
         except Exception:
             pass
     for label, value in rows:
-        d.rectangle([18, y, _SIDEBAR_W - 24, y + 58], fill=(18, 30, 48, 255),
-                    outline=(50, 70, 100, 255))
+        d.rounded_rectangle([18, y, _SIDEBAR_W - 24, y + 58], radius=10,
+                            fill=(16, 30, 54, 255), outline=(52, 84, 132, 255))
+        d.rounded_rectangle([18, y + 10, 22, y + 48], radius=2, fill=accent)
         d.text((30, y + 8), label, font=font(14, bold=False), fill=(140, 165, 195, 255))
         d.text((30, y + 27), value, font=font(21), fill=(255, 255, 255, 255))
         y += 68
@@ -42320,7 +42381,7 @@ def _build_warning_map(alert: dict):
     d.text((22, _MAP_H - 32), "WEATHERVALET.COM", font=font(16),
            fill=(30, 127, 255, 255))
     d.text((_SIDEBAR_W + 8, _MAP_H - 18),
-           "Map (c) OpenStreetMap contributors (c) CARTO - Radar: Iowa Environmental Mesonet",
+           "Map (c) Esri - Radar: Iowa Environmental Mesonet - Warning: NWS",
            font=font(11, bold=False), fill=(210, 220, 235, 210))
     import io as _io
     buf = _io.BytesIO()
