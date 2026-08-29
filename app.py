@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-246"
+BACKEND_BUILD = "0702-247"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -32453,6 +32453,7 @@ function billingRows(list, cls){
   list.forEach(function(r){
     h += '<li>' + fesc(r.who) + ' <span class=dim>&middot; ' + fesc(r.email) + '</span>'
        + ' &middot; ' + fesc(r.kind === 'stormline' ? 'Stormline: ' + r.what : r.what)
+       + (r.roles && r.roles.length > 1 ? ' <span class=dim>(' + fesc(r.roles.join(', ')) + ')</span>' : '')
        + (r.grandfathered ? ' <span class=dim>(grandfathered)</span>' : '')
        + (r.detail ? ' &middot; <span class=' + cls + '>' + fesc(r.detail) + '</span>' : '')
        + '</li>';
@@ -32474,10 +32475,17 @@ document.getElementById('billing-go').addEventListener('click', function(){
       var h = '<div class=fcard><b>' + d.checked + ' active subscriber'
         + (d.checked === 1 ? '' : 's') + ' checked.</b> '
         + d.billed.length + ' billed &middot; ' + d.past_due.length + ' past due &middot; '
-        + d.canceled.length + ' canceled &middot; ' + d.unbilled.length + ' not billed at all.</div>';
+        + d.canceled.length + ' canceled &middot; ' + d.unbilled.length + ' not billed at all &middot; '
+        + ((d.staff && d.staff.length) || 0) + ' staff.</div>';
       if (d.unbilled.length) {
         h += '<div class=fcard><b><span class=warn>Receiving service, no billing found</span></b>'
+           + '<div class=dim style="font-size:13px;margin-top:2px">Riders, comps, and pilots. '
+           + 'Each one is either a deliberate free account or a missed invoice: you decide which.</div>'
            + billingRows(d.unbilled, 'warn') + '</div>';
+      }
+      if (d.staff && d.staff.length) {
+        h += '<div class=fcard><b>Staff accounts</b> <span class=dim>(not expected to pay)</span>'
+           + billingRows(d.staff, 'dim') + '</div>';
       }
       if (d.canceled.length) {
         h += '<div class=fcard><b><span class=warn>Canceled in Stripe, still served</span></b>'
@@ -32721,30 +32729,42 @@ def admin_legacy_promote():
     return jsonify({"ok": True, **result})
 
 
+def _wv_stripe_plain(obj):
+    """Stripe objects stopped supporting dict-style .get(); normalize any
+    record to a plain dict before reading it."""
+    if hasattr(obj, "to_dict"):
+        return obj.to_dict()
+    return dict(obj)
+
+
 def _stripe_billing_status(customer_id, email):
     """Resolve one person's Stripe billing state. Returns
     (status, detail): status is 'billed' | 'past-due' | 'canceled' |
-    'no-subscription' | 'no-customer' | 'error'. Read-only."""
+    'no-subscription' | 'no-customer' | 'error'. Read-only. List objects
+    are iterated, never .get()'d: the installed stripe library's
+    ListObject rejects dict methods (found live, Aug 29, 2026)."""
     try:
         cids = []
         if customer_id:
             cids = [customer_id]
         elif email:
             found = stripe.Customer.list(email=email, limit=5)
-            cids = [c["id"] for c in found.get("data", [])]
+            cids = [_wv_stripe_plain(c).get("id") for c in found]
+            cids = [c for c in cids if c]
         if not cids:
             return "no-customer", "no Stripe customer under this id or email"
         statuses, detail = [], ""
         for cid in cids[:5]:
             subs = stripe.Subscription.list(customer=cid, status="all",
                                             limit=10)
-            for sub in subs.get("data", []):
-                st = sub.get("status") or ""
+            for sub in subs:
+                sd = _wv_stripe_plain(sub)
+                st = sd.get("status") or ""
                 statuses.append(st)
                 if st in ("active", "trialing", "past_due", "unpaid"):
                     try:
-                        item = sub["items"]["data"][0]
-                        price = item.get("price") or {}
+                        items = (sd.get("items") or {}).get("data") or []
+                        price = (items[0].get("price") or {}) if items else {}
                         amt = (price.get("unit_amount") or 0) / 100.0
                         iv = (price.get("recurring") or {}).get(
                             "interval") or ""
@@ -32784,9 +32804,15 @@ def admin_billing_audit():
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """SELECT u.email, COALESCE(u.name, '') AS name,
+                """SELECT u.id, u.email, COALESCE(u.name, '') AS name,
                           COALESCE(u.subscription_tier, '') AS tier,
-                          u.stripe_customer_id, u.is_discounted
+                          u.stripe_customer_id, u.is_discounted,
+                          ARRAY(SELECT ur2.role FROM user_roles ur2
+                                 WHERE ur2.user_id = u.id
+                                 ORDER BY ur2.role) AS roles,
+                          EXISTS (SELECT 1 FROM sales_reps sr
+                                   WHERE LOWER(sr.email) = LOWER(u.email))
+                              AS is_sales
                      FROM users u
                     WHERE u.is_active = TRUE
                       AND EXISTS (SELECT 1 FROM user_roles ur
@@ -32794,10 +32820,15 @@ def admin_billing_audit():
                                      AND ur.role = 'subscriber')
                     ORDER BY u.id LIMIT 100""")
             for r in cur.fetchall():
+                roles = list(r.get("roles") or [])
+                staff = bool(r.get("is_sales")) or bool(
+                    {"met", "admin"} & set(roles))
                 rows.append({"kind": "account",
                              "who": r["name"] or r["email"],
                              "email": r["email"],
                              "what": r["tier"] or "(no tier)",
+                             "roles": roles,
+                             "staff": staff,
                              "grandfathered": bool(r.get("is_discounted")),
                              "cid": r.get("stripe_customer_id")})
             cur.execute(
@@ -32813,15 +32844,17 @@ def admin_billing_audit():
                              "who": r["name"] or r["email"],
                              "email": r["email"],
                              "what": r["place"] or "Stormline",
+                             "roles": [], "staff": False,
                              "grandfathered": False,
                              "cid": r.get("stripe_customer_id")})
 
     out = {"billed": [], "past_due": [], "canceled": [],
-           "unbilled": [], "errors": []}
+           "unbilled": [], "staff": [], "errors": []}
     for r in rows:
         status, detail = _stripe_billing_status(r["cid"], r["email"])
         entry = {"who": r["who"], "email": r["email"], "kind": r["kind"],
                  "what": r["what"], "detail": detail,
+                 "roles": r.get("roles") or [],
                  "grandfathered": r["grandfathered"]}
         if status == "billed":
             out["billed"].append(entry)
@@ -32831,7 +32864,11 @@ def admin_billing_audit():
             out["canceled"].append(entry)
         elif status == "error":
             out["errors"].append(entry)
-        else:  # no-customer / no-subscription
+        elif r.get("staff"):
+            entry["detail"] = "staff account (" + ", ".join(
+                entry["roles"]) + ")"
+            out["staff"].append(entry)
+        else:  # no-customer / no-subscription, and not staff
             entry["detail"] = detail
             out["unbilled"].append(entry)
 
