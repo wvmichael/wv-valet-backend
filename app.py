@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-243"
+BACKEND_BUILD = "0702-246"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -3525,6 +3525,94 @@ def _backfill_welcome_sent_at() -> None:
             print(f"[welcome-backfill] marked {updated} subscribers as welcome-sent", flush=True)
     except Exception as e:
         print(f"[welcome-backfill] update failed: {e!r}", flush=True)
+
+
+# Legacy Stripe customers, grandfathered as Pro (Aug 27, 2026, Michael's
+# decision). These people paid before the current tier system existed and
+# were half-connected: severe warnings reached them (role-gated) while the
+# Pro list, the brief composer, and Totals could not see them (tier-gated).
+# Billing is not touched: their Stripe subscriptions keep their existing
+# prices. This only sets the entitlement so the product they pay for can
+# actually see them. is_discounted marks the grandfathered pricing in the
+# Command Center.
+_LEGACY_PRO_CUSTOMERS = {
+    "estoddard@usd105.org":    "Eric Stoddard",
+    "bobd@atwoodtv.net":       "Robert Dunker",
+    "johnrundel4@gmail.com":   "John A. Rundel",
+    "colesramek@gmail.com":    "Cole Sramek",
+    "longboard1811@msn.com":   "Sean Mckenna",
+    "asramek@ruraltel.net":    "Aaron Sramek",
+    "takesgrace@yahoo.com":    "Paul Hayden",
+    "bslipke@ruraltel.net":    "Raymond Slipke",
+    "brooks.brenn@icloud.com": "Brooks Brenn",
+    "pamalee@ruraltel.net":    "Leonard Vyzourek",
+    "kraigsiruta@icloud.com":  "Kraig Siruta",
+    "sss35@outlook.com":       "Steven Smith",
+}
+
+_PRO_TIERS = ("pro_single", "pro_multi", "pro_enterprise")
+
+
+def _grandfather_legacy_pros(only_emails=None) -> dict:
+    """Promote legacy Stripe customers to pro_single. NOT called at boot
+    (Michael's call, Aug 27, 2026): runs only from the admin Legacy review
+    promote button, after the facts are on screen. Idempotent; never
+    downgrades; billing untouched. Returns a summary for the UI and prints
+    the same for the log."""
+    now_ms = int(time.time() * 1000)
+    targets = dict(_LEGACY_PRO_CUSTOMERS)
+    if only_emails:
+        wanted = {e.strip().lower() for e in only_emails}
+        targets = {e: n for e, n in targets.items() if e.lower() in wanted}
+    created, promoted, untouched = [], [], []
+    with db() as conn:
+        with conn.cursor() as cur:
+            for email, name in targets.items():
+                cur.execute(
+                    """SELECT id, name, subscription_tier, is_active,
+                              is_discounted
+                         FROM users WHERE LOWER(email) = LOWER(%s)""",
+                    (email,))
+                row = cur.fetchone()
+                if row is None:
+                    cur.execute(
+                        """INSERT INTO users
+                             (email, name, subscription_tier, is_active,
+                              is_discounted, created_at)
+                           VALUES (%s, %s, 'pro_single', TRUE, TRUE, %s)
+                           RETURNING id""",
+                        (email, name, now_ms))
+                    uid = cur.fetchone()["id"]
+                    created.append(name)
+                else:
+                    uid = row["id"]
+                    tier = (row.get("subscription_tier") or "").strip()
+                    sets, args = [], []
+                    if tier not in _PRO_TIERS:
+                        sets.append("subscription_tier = 'pro_single'")
+                        promoted.append(f"{name} (was {tier or 'blank'})")
+                    if not row.get("is_active"):
+                        sets.append("is_active = TRUE")
+                    if not row.get("is_discounted"):
+                        sets.append("is_discounted = TRUE")
+                    if not (row.get("name") or "").strip():
+                        sets.append("name = %s")
+                        args.append(name)
+                    if sets:
+                        args.append(uid)
+                        cur.execute(
+                            f"UPDATE users SET {', '.join(sets)} WHERE id = %s",
+                            args)
+                    if tier in _PRO_TIERS:
+                        untouched.append(name)
+                cur.execute(
+                    """INSERT INTO user_roles (user_id, role, granted_at)
+                       VALUES (%s, 'subscriber', %s)
+                       ON CONFLICT DO NOTHING""", (uid, now_ms))
+    for label, names in (("created", created), ("promoted", promoted)):
+        if names:
+            print(f"[legacy-pro] {label}: {', '.join(names)}", flush=True)
+    return {"created": created, "promoted": promoted, "untouched": untouched}
 
 
 def _backfill_brief_preferences() -> None:
@@ -32136,6 +32224,23 @@ __ADMIN_NAV__
     <button id=audit-go style="width:auto">Run tier audit</button>
   </div>
   <div id=audit-out></div>
+  <div class=fh style="margin-top:30px">Legacy customers</div>
+  <div class=findnote>The Stripe base, one card each: account, tier, address on
+  file, and the briefs they actually received in the last 30 days, split into
+  Met-written and automated. Nothing changes until a Grandfather button is
+  clicked.</div>
+  <div class=findbar style="margin-top:6px">
+    <button id=legacy-go style="width:auto">Review the legacy base</button>
+  </div>
+  <div id=legacy-out></div>
+  <div class=fh style="margin-top:30px">Billing audit</div>
+  <div class=findnote>Checks everyone actively receiving service against Stripe,
+  live. Finds the quiet problem: people getting messages who are not being
+  invoiced. Read-only; changes nothing.</div>
+  <div class=findbar style="margin-top:6px">
+    <button id=billing-go style="width:auto">Run billing audit</button>
+  </div>
+  <div id=billing-out></div>
   <div id=find-empty>Nothing anywhere for that. Not in accounts, Stormline, Sidekick,
   or Watch. If they paid in Stripe, the purchase never reached this system: check the
   email on the Stripe customer against what was imported.</div>
@@ -32259,6 +32364,143 @@ function runFind(){
     });
 }
 document.getElementById('find-go').addEventListener('click', runFind);
+function legacyCard(cst){
+  var h = '<div class=fcard><b>' + fesc(cst.stripe_name) + '</b> <span class=dim>&middot; '
+        + fesc(cst.email) + '</span><br>';
+  if (!cst.account) {
+    h += '<span class=warn>No account under this email.</span> If they sign in and get '
+       + 'briefs, the account is under a different address: search the Find box above '
+       + 'by name or phone to locate it.';
+    h += '<br><button class=lg-promote style="width:auto;margin-top:10px;padding:9px 16px;font-size:13px" '
+       + 'data-email="' + fesc(cst.email) + '">Create and grandfather to Pro</button>';
+    return h + '</div>';
+  }
+  var a = cst.account;
+  h += 'Tier: ' + (a.tier_recognized ? '<span class=okp>' + fesc(a.tier) + '</span>'
+                                     : '<span class=warn>' + fesc(a.tier) + '</span>')
+     + ' &middot; ' + (a.is_active ? '<span class=okp>active</span>'
+                                   : '<span class=warn>inactive</span>')
+     + (a.is_discounted ? ' &middot; <span class=dim>grandfathered price</span>' : '')
+     + ' &middot; Roles: ' + fesc(a.roles.join(', ') || 'none');
+  if (a.locations.length) {
+    h += '<br><span class=dim>Address: ' + fesc(a.locations[0].address || a.locations[0].label)
+       + (a.locations[0].county ? ' (' + fesc(a.locations[0].county) + ')' : '') + '</span>';
+  } else {
+    h += '<br><span class=warn>No address on file: the daily brief has nothing to forecast.</span>';
+  }
+  if (a.prefs) {
+    h += '<br><span class=dim>Brief prefs: morning ' + (a.prefs.morning_enabled ? 'on' : 'off')
+       + ' &middot; channels ' + fesc(a.prefs.channels || 'none set') + '</span>';
+  } else {
+    h += '<br><span class=warn>No brief preferences row: the scheduler skips them.</span>';
+  }
+  h += '<br><b>Last 30 days:</b> ' + a.briefs_30d + ' brief' + (a.briefs_30d === 1 ? '' : 's')
+     + ' (' + a.met_briefs_30d + ' Met-written, ' + (a.briefs_30d - a.met_briefs_30d)
+     + ' automated)';
+  if (a.recent_briefs.length) {
+    h += '<ul>';
+    a.recent_briefs.forEach(function(b){
+      h += '<li>' + fesc(b.type) + ' &middot; ' + fesc(fdt(b.at)) + ' &middot; '
+         + (b.status === 'sent' ? fesc(b.channels || 'sent')
+                                : '<span class=warn>' + fesc(b.status) + '</span>')
+         + (b.met ? ' &middot; by ' + fesc(b.met) : ' &middot; <span class=dim>automated</span>')
+         + '</li>';
+    });
+    h += '</ul>';
+  } else {
+    h += '<br><span class=warn>No briefs on record, ever.</span>';
+  }
+  if (!a.tier_recognized || !a.is_active) {
+    h += '<button class=lg-promote style="width:auto;margin-top:10px;padding:9px 16px;font-size:13px" '
+       + 'data-email="' + fesc(cst.email) + '">Grandfather to Pro</button>';
+  }
+  return h + '</div>';
+}
+function loadLegacy(){
+  var btn = document.getElementById('legacy-go');
+  btn.disabled = true; btn.textContent = 'Loading...';
+  var out = document.getElementById('legacy-out');
+  fetch('/api/v1/admin/legacy-review', {credentials:'include'})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      btn.disabled = false; btn.textContent = 'Review the legacy base';
+      if (!d.ok) { out.innerHTML = '<div class=fcard>' + fesc(d.error || 'Failed.') + '</div>'; return; }
+      var h = '';
+      d.customers.forEach(function(c){ h += legacyCard(c); });
+      out.innerHTML = h;
+      Array.prototype.forEach.call(d.customers.length ? out.querySelectorAll('.lg-promote') : [],
+        function(b){
+          b.addEventListener('click', function(){
+            b.disabled = true; b.textContent = 'Working...';
+            fetch('/api/v1/admin/legacy-review/promote', {
+              method:'POST', credentials:'include',
+              headers:{'Content-Type':'application/json'},
+              body: JSON.stringify({email: b.getAttribute('data-email')})
+            }).then(function(r){ return r.json(); })
+              .then(function(){ loadLegacy(); })
+              .catch(function(){ b.disabled = false; b.textContent = 'Grandfather to Pro'; });
+          });
+        });
+    })
+    .catch(function(){
+      btn.disabled = false; btn.textContent = 'Review the legacy base';
+      out.innerHTML = '<div class=fcard>Connection problem. Try again.</div>';
+    });
+}
+document.getElementById('legacy-go').addEventListener('click', loadLegacy);
+function billingRows(list, cls){
+  var h = '<ul>';
+  list.forEach(function(r){
+    h += '<li>' + fesc(r.who) + ' <span class=dim>&middot; ' + fesc(r.email) + '</span>'
+       + ' &middot; ' + fesc(r.kind === 'stormline' ? 'Stormline: ' + r.what : r.what)
+       + (r.grandfathered ? ' <span class=dim>(grandfathered)</span>' : '')
+       + (r.detail ? ' &middot; <span class=' + cls + '>' + fesc(r.detail) + '</span>' : '')
+       + '</li>';
+  });
+  return h + '</ul>';
+}
+document.getElementById('billing-go').addEventListener('click', function(){
+  var btn = this; btn.disabled = true; btn.textContent = 'Checking Stripe...';
+  var out = document.getElementById('billing-out');
+  fetch('/api/v1/admin/billing-audit', {credentials:'include'})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      btn.disabled = false; btn.textContent = 'Run billing audit';
+      if (!d.ok) {
+        out.innerHTML = '<div class=fcard>' + fesc(d.error === 'stripe-not-configured'
+          ? 'Stripe is not configured on this server.' : (d.error || 'Audit failed.')) + '</div>';
+        return;
+      }
+      var h = '<div class=fcard><b>' + d.checked + ' active subscriber'
+        + (d.checked === 1 ? '' : 's') + ' checked.</b> '
+        + d.billed.length + ' billed &middot; ' + d.past_due.length + ' past due &middot; '
+        + d.canceled.length + ' canceled &middot; ' + d.unbilled.length + ' not billed at all.</div>';
+      if (d.unbilled.length) {
+        h += '<div class=fcard><b><span class=warn>Receiving service, no billing found</span></b>'
+           + billingRows(d.unbilled, 'warn') + '</div>';
+      }
+      if (d.canceled.length) {
+        h += '<div class=fcard><b><span class=warn>Canceled in Stripe, still served</span></b>'
+           + billingRows(d.canceled, 'warn') + '</div>';
+      }
+      if (d.past_due.length) {
+        h += '<div class=fcard><b><span class=warn>Past due</span></b>'
+           + billingRows(d.past_due, 'warn') + '</div>';
+      }
+      if (d.billed.length) {
+        h += '<div class=fcard><b><span class=okp>Billed and healthy</span></b>'
+           + billingRows(d.billed, 'okp') + '</div>';
+      }
+      if (d.errors.length) {
+        h += '<div class=fcard><b>Stripe lookup errors</b>' + billingRows(d.errors, 'dim') + '</div>';
+      }
+      out.innerHTML = h;
+    })
+    .catch(function(){
+      btn.disabled = false; btn.textContent = 'Run billing audit';
+      out.innerHTML = '<div class=fcard>Connection problem. Try again.</div>';
+    });
+});
 document.getElementById('audit-go').addEventListener('click', function(){
   var btn = this; btn.disabled = true; btn.textContent = 'Auditing...';
   var out = document.getElementById('audit-out');
@@ -32356,6 +32598,244 @@ def admin_tier_audit():
     return jsonify({"ok": True, "recognized": list(known),
                     "tier_counts": counts, "ghosts": ghosts,
                     "ghost_count": len(ghosts)})
+
+
+@app.route("/api/v1/admin/legacy-review", methods=["OPTIONS"])
+def _admin_legacy_review_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/legacy-review")
+def admin_legacy_review():
+    """The sit-down-and-dig view: for each legacy Stripe customer, what
+    account exists, what tier it carries, whether the system can serve
+    them (address, preferences), and the briefs they have actually
+    received lately, split into Met-written versus automated. Read-only.
+    """
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    out = []
+    with db() as conn:
+        with conn.cursor() as cur:
+            for email, stripe_name in _LEGACY_PRO_CUSTOMERS.items():
+                cur.execute(
+                    """SELECT id, name, phone, subscription_tier, is_active,
+                              is_discounted
+                         FROM users WHERE LOWER(email) = LOWER(%s)""",
+                    (email,))
+                u = cur.fetchone()
+                item = {"email": email, "stripe_name": stripe_name,
+                        "account": None}
+                if u:
+                    uid = u["id"]
+                    cur.execute(
+                        "SELECT role FROM user_roles WHERE user_id = %s",
+                        (uid,))
+                    roles = sorted(r["role"] for r in cur.fetchall())
+                    cur.execute(
+                        """SELECT label, address_text, county, is_primary
+                             FROM saved_locations WHERE user_id = %s
+                            ORDER BY is_primary DESC, id LIMIT 3""", (uid,))
+                    locs = [{"label": l.get("label") or "",
+                             "address": l.get("address_text") or "",
+                             "county": l.get("county") or ""}
+                            for l in cur.fetchall()]
+                    cur.execute(
+                        """SELECT morning_enabled, channels
+                             FROM brief_preferences WHERE user_id = %s""",
+                        (uid,))
+                    bp = cur.fetchone()
+                    cur.execute(
+                        """SELECT brief_type, delivered_at, delivery_status,
+                                  channels_used, is_met_touched, met_name
+                             FROM brief_history WHERE user_id = %s
+                            ORDER BY delivered_at DESC LIMIT 5""", (uid,))
+                    briefs = [{"type": b["brief_type"],
+                               "at": b["delivered_at"],
+                               "status": b["delivery_status"],
+                               "channels": b.get("channels_used") or "",
+                               "met": (b.get("met_name") or "")
+                                      if b.get("is_met_touched") else ""}
+                              for b in cur.fetchall()]
+                    cur.execute(
+                        """SELECT COUNT(*) AS n,
+                                  COUNT(*) FILTER (WHERE is_met_touched) AS met_n,
+                                  MAX(delivered_at) AS last_at
+                             FROM brief_history
+                            WHERE user_id = %s
+                              AND delivered_at > %s""",
+                        (uid, int(time.time() * 1000) - 30 * 86400 * 1000))
+                    m30 = cur.fetchone() or {}
+                    tier = (u.get("subscription_tier") or "").strip()
+                    item["account"] = {
+                        "id": uid,
+                        "name": u.get("name") or "",
+                        "phone": u.get("phone") or "",
+                        "tier": tier or "(blank)",
+                        "tier_recognized": tier in _PRO_TIERS,
+                        "is_active": bool(u.get("is_active")),
+                        "is_discounted": bool(u.get("is_discounted")),
+                        "roles": roles,
+                        "locations": locs,
+                        "prefs": ({"morning_enabled":
+                                       bool(bp.get("morning_enabled")),
+                                   "channels": bp.get("channels") or ""}
+                                  if bp else None),
+                        "briefs_30d": int(m30.get("n") or 0),
+                        "met_briefs_30d": int(m30.get("met_n") or 0),
+                        "last_brief_at": m30.get("last_at"),
+                        "recent_briefs": briefs,
+                    }
+                out.append(item)
+    return jsonify({"ok": True, "customers": out})
+
+
+@app.route("/api/v1/admin/legacy-review/promote", methods=["OPTIONS"])
+def _admin_legacy_promote_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/legacy-review/promote")
+def admin_legacy_promote():
+    """Admin-clicked grandfather action. Body: {"email": "..."} for one
+    person, or {"all": true} for the whole list. Logged to the boot log
+    style [legacy-pro] lines and returned for the UI."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    if data.get("all"):
+        result = _grandfather_legacy_pros()
+    else:
+        email = (data.get("email") or "").strip().lower()
+        if email not in {e.lower() for e in _LEGACY_PRO_CUSTOMERS}:
+            return jsonify({"ok": False, "error": "not-a-legacy-customer"}), 400
+        result = _grandfather_legacy_pros(only_emails=[email])
+    print(f"[legacy-pro] promote by {user.get('email')}: {result}", flush=True)
+    return jsonify({"ok": True, **result})
+
+
+def _stripe_billing_status(customer_id, email):
+    """Resolve one person's Stripe billing state. Returns
+    (status, detail): status is 'billed' | 'past-due' | 'canceled' |
+    'no-subscription' | 'no-customer' | 'error'. Read-only."""
+    try:
+        cids = []
+        if customer_id:
+            cids = [customer_id]
+        elif email:
+            found = stripe.Customer.list(email=email, limit=5)
+            cids = [c["id"] for c in found.get("data", [])]
+        if not cids:
+            return "no-customer", "no Stripe customer under this id or email"
+        statuses, detail = [], ""
+        for cid in cids[:5]:
+            subs = stripe.Subscription.list(customer=cid, status="all",
+                                            limit=10)
+            for sub in subs.get("data", []):
+                st = sub.get("status") or ""
+                statuses.append(st)
+                if st in ("active", "trialing", "past_due", "unpaid"):
+                    try:
+                        item = sub["items"]["data"][0]
+                        price = item.get("price") or {}
+                        amt = (price.get("unit_amount") or 0) / 100.0
+                        iv = (price.get("recurring") or {}).get(
+                            "interval") or ""
+                        detail = f"${amt:.2f}/{iv} ({st})"
+                    except Exception:
+                        detail = st
+        if any(st in ("active", "trialing") for st in statuses):
+            return "billed", detail
+        if any(st in ("past_due", "unpaid") for st in statuses):
+            return "past-due", detail or "payment failing"
+        if statuses:
+            return "canceled", "subscription(s) canceled in Stripe"
+        return "no-subscription", "Stripe customer exists, zero subscriptions"
+    except Exception as e:
+        return "error", str(e)[:120]
+
+
+@app.route("/api/v1/admin/billing-audit", methods=["OPTIONS"])
+def _admin_billing_audit_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/admin/billing-audit")
+def admin_billing_audit():
+    """Everyone actively receiving service, checked against Stripe live.
+    Internal watcher addresses are skipped. Capped at 100 rows per list
+    to keep the Stripe calls bounded; well above today's base."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    if stripe is None or not STRIPE_SECRET_KEY:
+        return jsonify({"ok": False, "error": "stripe-not-configured"}), 503
+
+    rows = []
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.email, COALESCE(u.name, '') AS name,
+                          COALESCE(u.subscription_tier, '') AS tier,
+                          u.stripe_customer_id, u.is_discounted
+                     FROM users u
+                    WHERE u.is_active = TRUE
+                      AND EXISTS (SELECT 1 FROM user_roles ur
+                                   WHERE ur.user_id = u.id
+                                     AND ur.role = 'subscriber')
+                    ORDER BY u.id LIMIT 100""")
+            for r in cur.fetchall():
+                rows.append({"kind": "account",
+                             "who": r["name"] or r["email"],
+                             "email": r["email"],
+                             "what": r["tier"] or "(no tier)",
+                             "grandfathered": bool(r.get("is_discounted")),
+                             "cid": r.get("stripe_customer_id")})
+            cur.execute(
+                """SELECT email, COALESCE(name, '') AS name,
+                          COALESCE(label, address) AS place,
+                          stripe_customer_id
+                     FROM sentry_subscribers
+                    WHERE status = 'active'
+                      AND COALESCE(is_internal, FALSE) = FALSE
+                    ORDER BY id LIMIT 100""")
+            for r in cur.fetchall():
+                rows.append({"kind": "stormline",
+                             "who": r["name"] or r["email"],
+                             "email": r["email"],
+                             "what": r["place"] or "Stormline",
+                             "grandfathered": False,
+                             "cid": r.get("stripe_customer_id")})
+
+    out = {"billed": [], "past_due": [], "canceled": [],
+           "unbilled": [], "errors": []}
+    for r in rows:
+        status, detail = _stripe_billing_status(r["cid"], r["email"])
+        entry = {"who": r["who"], "email": r["email"], "kind": r["kind"],
+                 "what": r["what"], "detail": detail,
+                 "grandfathered": r["grandfathered"]}
+        if status == "billed":
+            out["billed"].append(entry)
+        elif status == "past-due":
+            out["past_due"].append(entry)
+        elif status == "canceled":
+            out["canceled"].append(entry)
+        elif status == "error":
+            out["errors"].append(entry)
+        else:  # no-customer / no-subscription
+            entry["detail"] = detail
+            out["unbilled"].append(entry)
+
+    return jsonify({"ok": True, "checked": len(rows), **out})
 
 
 @app.get("/portal/admin/find")
