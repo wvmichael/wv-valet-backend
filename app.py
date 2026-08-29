@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-247"
+BACKEND_BUILD = "0702-248"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -3545,8 +3545,6 @@ _LEGACY_PRO_CUSTOMERS = {
     "takesgrace@yahoo.com":    "Paul Hayden",
     "bslipke@ruraltel.net":    "Raymond Slipke",
     "brooks.brenn@icloud.com": "Brooks Brenn",
-    "pamalee@ruraltel.net":    "Leonard Vyzourek",
-    "kraigsiruta@icloud.com":  "Kraig Siruta",
     "sss35@outlook.com":       "Steven Smith",
 }
 
@@ -32203,6 +32201,11 @@ __MET_CHROME__
 #find-empty{display:none;color:#8FA6C6;font-size:15px;margin-top:18px}
 #find-err{display:none;background:#FDECEC;border:1px solid #F3B4B4;color:#8A1F1F;
   border-radius:8px;padding:10px 12px;margin-top:12px;font-size:14px}
+.lg-promote{display:inline-block;width:auto;margin-top:12px;padding:11px 20px;
+  font-size:13.5px;font-weight:800;border:none;border-radius:9px;color:#fff;
+  cursor:pointer;background:linear-gradient(160deg,#3D8BFF,#1E5FE0);
+  box-shadow:0 10px 22px -10px rgba(30,107,255,.8)}
+.lg-promote:disabled{opacity:.6;cursor:default}
 </style></head><body>
 __ADMIN_NAV__
 <div class=wrap style="max-width:860px;margin:0 auto;padding:0 18px 60px">
@@ -32371,8 +32374,8 @@ function legacyCard(cst){
     h += '<span class=warn>No account under this email.</span> If they sign in and get '
        + 'briefs, the account is under a different address: search the Find box above '
        + 'by name or phone to locate it.';
-    h += '<br><button class=lg-promote style="width:auto;margin-top:10px;padding:9px 16px;font-size:13px" '
-       + 'data-email="' + fesc(cst.email) + '">Create and grandfather to Pro</button>';
+    h += '<br><button class=lg-promote data-email="' + fesc(cst.email)
+       + '">Create and grandfather to Pro</button>';
     return h + '</div>';
   }
   var a = cst.account;
@@ -32411,8 +32414,8 @@ function legacyCard(cst){
     h += '<br><span class=warn>No briefs on record, ever.</span>';
   }
   if (!a.tier_recognized || !a.is_active) {
-    h += '<button class=lg-promote style="width:auto;margin-top:10px;padding:9px 16px;font-size:13px" '
-       + 'data-email="' + fesc(cst.email) + '">Grandfather to Pro</button>';
+    h += '<button class=lg-promote data-email="' + fesc(cst.email)
+       + '">Grandfather to Pro</button>';
   }
   return h + '</div>';
 }
