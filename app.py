@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-252"
+BACKEND_BUILD = "0702-253"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -22213,6 +22213,7 @@ def _met_people_rows(met_id):
                           sc.primary_met_id,
                           sl.address_text, sl.label AS loc_label,
                           COALESCE(sl.county,'') AS county,
+                          sl.lat AS loc_lat, sl.lng AS loc_lng,
                           bp.morning_enabled, COALESCE(bp.channels,'') AS channels,
                           bh.delivered_at AS last_brief_at,
                           bh.is_met_touched AS last_brief_met,
@@ -22247,8 +22248,18 @@ def _met_people_card(r) -> str:
     addr = r.get("address_text") or r.get("loc_label")
     if addr:
         line = _html_escape(addr)
+        label = (r.get("loc_label") or "").strip()
+        if label and label.lower() not in (addr or "").lower():
+            line = "%s <span class=dim>(%s)</span>" % (line, _html_escape(label))
         if r.get("county"):
-            line += " <span class=dim>(%s)</span>" % _html_escape(r["county"])
+            line += " <span class=dim>&middot; %s</span>" % _html_escape(r["county"])
+        if r.get("loc_lat") is not None and r.get("loc_lng") is not None:
+            lat, lng = float(r["loc_lat"]), float(r["loc_lng"])
+            line += (' <span class=dim>&middot; %.4f, %.4f</span>'
+                     ' &middot; <a href="https://www.google.com/maps?q=%.5f,%.5f"'
+                     ' target=_blank rel=noopener>Map</a>' % (lat, lng, lat, lng))
+        else:
+            line += ' <span class=warn>&middot; no pin: severe matching cannot find this address</span>'
         bits.append("<br>Watching: " + line)
     else:
         bits.append('<br><span class=warn>No address on file: nothing to '
