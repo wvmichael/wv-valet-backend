@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-251"
+BACKEND_BUILD = "0702-252"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -20494,6 +20494,7 @@ def _met_nav(active: str, spa: str) -> str:
     # Messages is not rebuilt yet, so it opens the old portal rather than a
     # dead link. A nav item that 404s is worse than one that is honest.
     items = [("day", "My Day", "/portal/met"), ("all", "All Work", "/portal/met/all"),
+             ("people", "My People", "/portal/met/people"),
              ("messages", "Messages", "/portal/met/messages"),
              ("numbers", "My Numbers", "/portal/met/numbers")]
     links = "".join('<a class="%s" href="%s">%s</a>'
@@ -22166,6 +22167,152 @@ def portal_met_all():
                         for m in mets))
                     .replace("__ROWS__", html)
                     .replace("__WV_FOOTER__", _MET_ALL_SCRIPT + "\n__WV_FOOTER__"))
+
+
+_MET_PEOPLE_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>My People &middot; WeatherValet</title><meta name=robots content="noindex">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+__MET_CHROME__
+.wrapx{max-width:980px;margin:0 auto;padding:26px 22px 70px}
+h1{font-size:24px;font-weight:900;letter-spacing:-.02em;color:#fff;margin:0 0 4px}
+.psub{color:#B8C7DE;font-size:15px;margin:0 0 20px;line-height:1.6}
+.phead{font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;
+  color:#7EB6FF;margin:26px 0 10px}
+.pcard{background:#0E1D3C;border:1px solid #2E4A7E;border-radius:12px;color:#C9D8F0;
+  padding:15px 17px;margin-bottom:10px;font-size:14px;line-height:1.65}
+.pcard b{color:#fff}
+.pcard .dim{color:#8FA6C6}
+.pcard .warn{color:#FFC46B;font-weight:700}
+.pcard .okp{color:#7EE2A8;font-weight:700}
+.pcard a{color:#7EB6FF;font-weight:700}
+.pempty{color:#8FA6C6;font-size:15px;padding:16px 0}
+</style></head><body>
+__MET_NAV__
+<div class=wrapx>
+  <h1>My People</h1>
+  <div class=psub>Every subscriber assigned to you: who they are, where we watch,
+  how their briefs are set, and the last brief that actually went out.</div>
+__BODY__
+</div>
+__WV_FOOTER__"""
+
+
+def _met_people_rows(met_id):
+    """Roster rows for one Met, plus the unassigned list. Read-only."""
+    mine, unassigned = [], []
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.email, COALESCE(u.name,'') AS name,
+                          COALESCE(u.phone,'') AS phone,
+                          COALESCE(u.subscription_tier,'') AS tier,
+                          u.is_discounted,
+                          sc.primary_met_id,
+                          sl.address_text, sl.label AS loc_label,
+                          COALESCE(sl.county,'') AS county,
+                          bp.morning_enabled, COALESCE(bp.channels,'') AS channels,
+                          bh.delivered_at AS last_brief_at,
+                          bh.is_met_touched AS last_brief_met,
+                          COALESCE(bh.met_name,'') AS last_brief_by
+                     FROM users u
+                     JOIN user_roles ur ON ur.user_id = u.id
+                          AND ur.role = 'subscriber'
+                     LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
+                     LEFT JOIN saved_locations sl ON sl.user_id = u.id
+                          AND sl.is_primary = TRUE
+                     LEFT JOIN brief_preferences bp ON bp.user_id = u.id
+                     LEFT JOIN LATERAL (
+                          SELECT delivered_at, is_met_touched, met_name
+                            FROM brief_history b
+                           WHERE b.user_id = u.id
+                           ORDER BY delivered_at DESC LIMIT 1) bh ON TRUE
+                    WHERE u.is_active = TRUE
+                    ORDER BY COALESCE(u.name, u.email)""")
+            for r in cur.fetchall():
+                if r.get("primary_met_id") == met_id:
+                    mine.append(r)
+                elif r.get("primary_met_id") is None:
+                    unassigned.append(r)
+    return mine, unassigned
+
+
+def _met_people_card(r) -> str:
+    who = _html_escape(r["name"] or r["email"])
+    bits = ['<div class=pcard><b>%s</b> <span class=dim>&middot; %s%s</span>'
+            % (who, _html_escape(r["email"]),
+               (" &middot; " + _html_escape(r["phone"])) if r["phone"] else "")]
+    addr = r.get("address_text") or r.get("loc_label")
+    if addr:
+        line = _html_escape(addr)
+        if r.get("county"):
+            line += " <span class=dim>(%s)</span>" % _html_escape(r["county"])
+        bits.append("<br>Watching: " + line)
+    else:
+        bits.append('<br><span class=warn>No address on file: nothing to '
+                    'forecast, no severe matching.</span>')
+    prefs = []
+    if r.get("morning_enabled"):
+        prefs.append("morning brief on")
+    elif r.get("morning_enabled") is not None:
+        prefs.append("morning brief off")
+    if r.get("channels"):
+        prefs.append("via " + r["channels"])
+    if prefs:
+        bits.append('<br><span class=dim>%s</span>'
+                    % _html_escape(" &middot; ".join(prefs)).replace(
+                        "&amp;middot;", "&middot;"))
+    if r.get("last_brief_at"):
+        try:
+            when = datetime.fromtimestamp(
+                int(r["last_brief_at"]) / 1000, tz=timezone.utc
+            ).strftime("%b %d")
+        except Exception:
+            when = "?"
+        if r.get("last_brief_met") and r.get("last_brief_by"):
+            bits.append('<br>Last brief: %s &middot; <span class=okp>by %s</span>'
+                        % (when, _html_escape(r["last_brief_by"])))
+        else:
+            bits.append('<br>Last brief: %s &middot; <span class=dim>automated'
+                        ' (before the Met-only change)</span>' % when)
+    else:
+        bits.append('<br><span class=warn>No brief ever delivered.</span>')
+    bits.append("</div>")
+    return "".join(bits)
+
+
+@app.get("/portal/met/people")
+def portal_met_people():
+    user = _get_current_user()
+    if not user:
+        return redirect("/signin", code=302)
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return redirect("/portal", code=302)
+    spa = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+    mine, unassigned = _met_people_rows(user["id"])
+
+    body = ""
+    body += '<div class=phead>Assigned to me (%d)</div>' % len(mine)
+    if mine:
+        body += "".join(_met_people_card(r) for r in mine)
+    else:
+        body += ('<div class=pempty>Nobody is assigned to you yet. '
+                 'Assignments happen in the Command Center; ask Michael.</div>')
+    if unassigned:
+        body += ('<div class=phead>Active subscribers assigned to nobody '
+                 '(%d)</div>' % len(unassigned))
+        body += ('<div class=psub>These people are paying and no Meteorologist '
+                 'owns them. Worth a word with Michael.</div>')
+        body += "".join(_met_people_card(r) for r in unassigned)
+
+    return wv_shell(_MET_PEOPLE_PAGE
+                    .replace("__WV_TOKENS__", WV_TOKENS)
+                    .replace("__MET_CHROME__", _MET_CHROME_CSS)
+                    .replace("__MET_NAV__", _met_nav("people", spa))
+                    .replace("__BODY__", body))
 
 
 @app.get("/portal/met")
