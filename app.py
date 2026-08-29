@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-253"
+BACKEND_BUILD = "0702-255"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -2468,6 +2468,13 @@ CREATE INDEX IF NOT EXISTS idx_pro_brief_drafts_user
 -- sections, we also concatenate them into met_body so any legacy code
 -- paths that read met_body still get sensible content.
 ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS bottom_line TEXT;
+-- Expired-unsent alarm (Aug 29, 2026): stamp when the alarm email about
+-- this draft went out, so each expiry alarms exactly once.
+ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS expiry_notified_at BIGINT;
+-- Met attribution by id (Aug 29, 2026): met_name string-matching broke
+-- stats whenever a name was edited. New rows carry the id; old rows
+-- fall back to the name match.
+ALTER TABLE brief_history ADD COLUMN IF NOT EXISTS met_user_id INTEGER;
 ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS weather_details TEXT;
 ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS whats_ahead TEXT;
 ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS image_url TEXT;
@@ -20193,18 +20200,32 @@ def _met_day_cards(user: dict) -> list:
     try:
         with db() as conn:
             with conn.cursor() as cur:
-                cur.execute("""SELECT status, COUNT(*) AS n
+                # Status fix (Aug 29, 2026): drafts are created as
+                # 'pending-review'; the old 'pending' filter counted zero
+                # forever. Also grab the earliest window close for urgency.
+                cur.execute("""SELECT COUNT(*) AS n,
+                                      MIN(window_end_at) AS first_close
                                  FROM pro_brief_drafts
-                                WHERE status IN ('pending','claimed')
-                                  AND (claimed_by_user_id IS NULL OR claimed_by_user_id = %s)
-                             GROUP BY status""", (uid,))
-                rows = cur.fetchall() or []
-        pending = sum(r["n"] for r in rows)
+                                WHERE status IN ('pending-review','claimed')
+                                  AND (claimed_by_user_id IS NULL OR claimed_by_user_id = %s)""",
+                            (uid,))
+                agg = cur.fetchone() or {}
+        pending = int(agg.get("n") or 0)
         if pending:
+            sub = "Pick one subscriber, several, or all of them."
+            fc = agg.get("first_close")
+            if fc:
+                mins = int((int(fc) - int(time.time() * 1000)) / 60000)
+                if mins <= 0:
+                    sub = "A send window has already closed. Move."
+                elif mins < 120:
+                    sub = "Earliest send window closes in %d minutes." % mins
+                else:
+                    sub = "Earliest send window closes in about %d hours." % round(mins / 60)
             cards.append({
                 "kind": "briefs", "when": "today", "sort": 0,
                 "title": "%d brief%s to write" % (pending, "" if pending == 1 else "s"),
-                "sub": "Pick one subscriber, several, or all of them.",
+                "sub": sub,
                 "meta": "Pro", "href": "/portal/met/briefs", "urgent": pending > 0,
             })
     except Exception as e:
@@ -21061,8 +21082,10 @@ def _met_numbers(uid: int, days: int = 30) -> dict:
     # ── their work ─────────────────────────────────────────────────────
     q("briefs", """SELECT COUNT(*) AS n FROM brief_history
                     WHERE is_met_touched = TRUE AND delivered_at > %s
-                      AND met_name = (SELECT name FROM users WHERE id = %s)""",
-      (since, uid), mine, "briefs")
+                      AND (met_user_id = %s
+                           OR (met_user_id IS NULL
+                               AND met_name = (SELECT name FROM users WHERE id = %s)))""",
+      (since, uid, uid), mine, "briefs")
 
     q("reviews", """SELECT COUNT(*) AS n FROM verification_requests
                      WHERE claimed_by_user_id = %s AND status IN ('completed','sent')
@@ -22215,9 +22238,16 @@ def _met_people_rows(met_id):
                           COALESCE(sl.county,'') AS county,
                           sl.lat AS loc_lat, sl.lng AS loc_lng,
                           bp.morning_enabled, COALESCE(bp.channels,'') AS channels,
+                          COALESCE(u.timezone,'') AS tz,
+                          COALESCE(sc.business_role,'') AS business_role,
+                          COALESCE(sc.weather_decisions,'') AS weather_decisions,
+                          COALESCE(sc.peak_need_times,'') AS peak_need_times,
+                          COALESCE(sc.notes,'') AS coverage_notes,
                           bh.delivered_at AS last_brief_at,
                           bh.is_met_touched AS last_brief_met,
-                          COALESCE(bh.met_name,'') AS last_brief_by
+                          COALESCE(bh.met_name,'') AS last_brief_by,
+                          COALESCE(hh.bad, 0) AS recent_bad,
+                          COALESCE(hh.tot, 0) AS recent_tot
                      FROM users u
                      JOIN user_roles ur ON ur.user_id = u.id
                           AND ur.role = 'subscriber'
@@ -22230,6 +22260,14 @@ def _met_people_rows(met_id):
                             FROM brief_history b
                            WHERE b.user_id = u.id
                            ORDER BY delivered_at DESC LIMIT 1) bh ON TRUE
+                     LEFT JOIN LATERAL (
+                          SELECT COUNT(*) FILTER
+                                     (WHERE delivery_status NOT IN ('sent','pending')) AS bad,
+                                 COUNT(*) AS tot
+                            FROM (SELECT delivery_status
+                                    FROM brief_history b2
+                                   WHERE b2.user_id = u.id
+                                   ORDER BY delivered_at DESC LIMIT 3) last3) hh ON TRUE
                     WHERE u.is_active = TRUE
                     ORDER BY COALESCE(u.name, u.email)""")
             for r in cur.fetchall():
@@ -22275,6 +22313,28 @@ def _met_people_card(r) -> str:
         bits.append('<br><span class=dim>%s</span>'
                     % _html_escape(" &middot; ".join(prefs)).replace(
                         "&amp;middot;", "&middot;"))
+    if r.get("recent_bad") and int(r["recent_bad"]) >= 2:
+        bits.append('<br><span class=warn>Recent sends failing (%d of last %d). '
+                    'Their phone or email is broken: fix contact info before '
+                    'anything else.</span>'
+                    % (int(r["recent_bad"]), int(r["recent_tot"])))
+    ctx = []
+    if r.get("business_role"):
+        ctx.append(r["business_role"])
+    if r.get("weather_decisions"):
+        ctx.append("decides: " + r["weather_decisions"])
+    if r.get("peak_need_times"):
+        ctx.append("peak: " + r["peak_need_times"])
+    if ctx:
+        bits.append('<br><span class=dim>%s</span>'
+                    % _html_escape(" &middot; ".join(ctx)).replace(
+                        "&amp;middot;", "&middot;"))
+    if r.get("coverage_notes"):
+        bits.append('<br><span class=dim>Notes: %s</span>'
+                    % _html_escape(r["coverage_notes"][:200]))
+    if not (r.get("tz") or "").strip():
+        bits.append('<br><span class=dim>Timezone unset: brief windows '
+                    'default to Indiana time.</span>')
     if r.get("last_brief_at"):
         try:
             when = datetime.fromtimestamp(
@@ -22290,6 +22350,8 @@ def _met_people_card(r) -> str:
                         ' (before the Met-only change)</span>' % when)
     else:
         bits.append('<br><span class=warn>No brief ever delivered.</span>')
+    bits.append('<br><a href="/portal/met/messages">Message</a>'
+                ' <span class=dim>(search their name there)</span>')
     bits.append("</div>")
     return "".join(bits)
 
@@ -38089,7 +38151,90 @@ def _process_pending_briefs() -> None:
         _release_scheduler_lock(_lock_conn, _LOCK_KEY)
 
 
+def _alarm_expired_briefs() -> None:
+    """Expire overdue drafts and make the silence loud (Aug 29, 2026).
+
+    Flips pending/claimed drafts whose window closed >12h ago to
+    'expired', then emails Michael, plus each affected subscriber's
+    primary Met, a list of who got no brief. Each draft alarms once
+    (expiry_notified_at). Runs every scheduler tick; cheap when clean.
+    """
+    now_ms = int(time.time() * 1000)
+    grace = 12 * 60 * 60 * 1000
+    rows = []
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE pro_brief_drafts SET status = 'expired'
+                        WHERE status IN ('pending-review', 'claimed')
+                          AND window_end_at IS NOT NULL
+                          AND window_end_at < %s""", (now_ms - grace,))
+                cur.execute(
+                    """SELECT d.id, d.brief_type, d.window_end_at,
+                              u.email AS sub_email,
+                              COALESCE(u.name, u.email) AS sub_name,
+                              pm.email AS met_email,
+                              COALESCE(pm.name, '') AS met_name
+                         FROM pro_brief_drafts d
+                         JOIN users u ON u.id = d.user_id
+                         LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
+                         LEFT JOIN users pm ON pm.id = sc.primary_met_id
+                        WHERE d.status = 'expired'
+                          AND d.expiry_notified_at IS NULL
+                        ORDER BY d.window_end_at""")
+                rows = cur.fetchall()
+                if rows:
+                    cur.execute(
+                        """UPDATE pro_brief_drafts SET expiry_notified_at = %s
+                            WHERE id = ANY(%s)""",
+                        (now_ms, [r["id"] for r in rows]))
+    except Exception as e:
+        print(f"[brief-expiry-alarm] scan failed: {e!r}", flush=True)
+        return
+    if not rows:
+        return
+
+    lines = ["%s (%s) - %s brief expired unsent"
+             % (r["sub_name"], r["sub_email"], r["brief_type"]) for r in rows]
+    print("[brief-expiry-alarm] " + "; ".join(lines), flush=True)
+
+    api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    if not api_key:
+        return
+    from_addr = os.environ.get("RESEND_FROM_EMAIL",
+                               "WeatherValet <hello@weathervalet.ai>")
+    recipients = {"michael@weathervalet.com"}
+    for r in rows:
+        if r.get("met_email"):
+            recipients.add(r["met_email"])
+    n = len(rows)
+    subject = ("%d brief%s expired unsent - customers got nothing"
+               % (n, "" if n == 1 else "s"))
+    body_text = ("These subscribers were owed a brief and the send window "
+                 "closed with nothing sent:\n\n- "
+                 + "\n- ".join(lines)
+                 + "\n\nEvery brief now requires a Meteorologist to send it. "
+                 "An expired draft means a paying customer heard nothing "
+                 "that day.\n\nComposer: https://weathervalet.ai/portal/met/briefs")
+    for to in sorted(recipients):
+        try:
+            payload = json.dumps({"from": from_addr, "to": [to],
+                                  "subject": subject, "text": body_text}
+                                 ).encode("utf-8")
+            req = urllib.request.Request(
+                "https://api.resend.com/emails", data=payload, method="POST",
+                headers={"Authorization": f"Bearer {api_key}",
+                         "Content-Type": "application/json",
+                         "User-Agent": "WeatherValet-Backend/1.0 (+https://weathervalet.ai)"})
+            with urllib.request.urlopen(req, timeout=10):
+                pass
+        except Exception as e:
+            print(f"[brief-expiry-alarm] email to {to} failed: {e!r}", flush=True)
+
+
 def _process_pending_briefs_inner() -> None:
+    _alarm_expired_briefs()
     """Original body of _process_pending_briefs. Extracted May 22, 2026
     so the outer function can wrap it in an advisory lock without a
     massive indent change. Do not call this directly — use
@@ -47202,6 +47347,7 @@ def _can_met_see_pro_brief(met_user_id: int, draft_id: int, is_admin: bool) -> b
                    WHERE d.id = %s
                      AND (
                        sc.primary_met_id = %s
+                       OR sc.primary_met_id IS NULL
                        OR EXISTS (
                          SELECT 1
                          FROM met_territories t
@@ -48332,6 +48478,10 @@ def met_pro_briefs_list():
                          AND (
                            -- (a) I am the primary Met for this subscriber
                            sc.primary_met_id = %s
+                           -- (c) Nobody owns this subscriber (Aug 29, 2026):
+                           --     orphan drafts are an open pool for every
+                           --     Met, never invisible work that expires.
+                           OR sc.primary_met_id IS NULL
                            -- (b) I'm covering today: I have a non-drop shift
                            --     assignment in the primary Met's territory
                            OR EXISTS (
@@ -50872,15 +51022,15 @@ def met_pro_brief_send(draft_id):
                     """INSERT INTO brief_history
                        (user_id, brief_type, delivered_at, verdict, snippet,
                         full_body, delivery_status, channels_used,
-                        is_met_touched, met_name,
+                        is_met_touched, met_name, met_user_id,
                         predicted_high_f, predicted_low_f,
                         predicted_precip_in, predicted_max_wind_mph)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s,
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s, %s,
                                %s, %s, %s, %s)
                        RETURNING id""",
                     (row["user_id"], row["brief_type"], now_ms, final_verdict,
                      bottom_line[:200] if bottom_line else (final_snippet or legacy_body[:140]),
-                     full_body, "pending", "", met_name,
+                     full_body, "pending", "", met_name, user["id"],
                      pro_preds.get("predicted_high_f"),
                      pro_preds.get("predicted_low_f"),
                      pro_preds.get("predicted_precip_in"),
