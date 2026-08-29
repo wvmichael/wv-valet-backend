@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-258"
+BACKEND_BUILD = "0702-261"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -19546,12 +19546,15 @@ def admin_tier_list():
                                           u.subscription_tier AS status, u.is_active,
                                           u.created_at, u.trial_ends_at, u.is_discounted,
                                           sr.name AS rep_name,
+                                          sc.primary_met_id,
                                           (u.password_hash IS NOT NULL) AS has_password
                                      FROM users u
                                 LEFT JOIN sales_attributions sa ON sa.user_id = u.id
                                 LEFT JOIN sales_reps sr ON sr.slug = sa.rep_slug
+                                LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
                                     WHERE u.subscription_tier IN
                                           ('pro_single','pro_multi','pro_enterprise')
+                                      AND u.is_active = TRUE
                                  ORDER BY u.id DESC LIMIT 400""")
                 elif tier == "review":
                     cur.execute("""SELECT v.id, v.customer_email, v.customer_phone,
@@ -19574,7 +19577,23 @@ def admin_tier_list():
     except Exception as e:
         print(f"[subscribers] {tier} list failed: {e!r}", flush=True)
         return jsonify({"ok": False, "error": "Could not load that list."}), 500
-    return jsonify({"ok": True, "tier": tier, "count": len(rows), "rows": rows})
+    mets = []
+    if tier == "pro":
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT u.id, COALESCE(u.name, u.email) AS name
+                             FROM users u
+                             JOIN user_roles ur ON ur.user_id = u.id
+                                  AND ur.role = 'met'
+                            WHERE u.is_active = TRUE
+                            ORDER BY name""")
+                    mets = [dict(r) for r in cur.fetchall()]
+        except Exception as e:
+            print(f"[subscribers] met roster failed: {e!r}", flush=True)
+    return jsonify({"ok": True, "tier": tier, "count": len(rows),
+                    "rows": rows, "mets": mets})
 
 
 @app.post("/api/v1/admin/stormline/update")
@@ -19825,7 +19844,7 @@ _ADMIN_SUBS_SCRIPT = """<script>
      .then(function(r){return r.json();}).then(function(j){
         if(!j||!j.ok){ document.getElementById('out').innerHTML=
           '<div class=empty>'+esc((j&&j.error)||'Could not load that list.')+'</div>'; return; }
-        rows=j.rows||[]; render();
+        rows=j.rows||[]; window._mets=j.mets||[]; render();
      }).catch(function(){ document.getElementById('out').innerHTML=
         '<div class=empty>Network problem.</div>'; });
   }
@@ -19896,7 +19915,14 @@ _ADMIN_SUBS_SCRIPT = """<script>
       +'<td>'+esc(r.email||'')+'</td>'
       +'<td style="min-width:160px"><input class=pf data-k=phone value="'+esc(r.phone||'')+'"></td>'
       +(pro?'<td>'+esc(r.status||'')+(r.rep_name?'<br><span style="color:#8FA6C6;font-size:12.5px">Rep: '
-          +esc(r.rep_name)+'</span>':'')+'</td>':'')
+          +esc(r.rep_name)+'</span>':'')
+          +'<br><select class=metsel style="margin-top:6px;max-width:150px;padding:5px 7px;'
+          +'font-size:12.5px;color:#EAF1FF;background:#0E1D3C;border:1px solid #2E4A7E;border-radius:7px">'
+          +'<option value="">No Met</option>'
+          +(window._mets||[]).map(function(m2){
+              return '<option value="'+m2.id+'"'+(r.primary_met_id===m2.id?' selected':'')+'>'
+                +esc(m2.name)+'</option>'; }).join('')
+          +'</select></td>':'')
       +'<td>'+esc(when(r.created_at))+'</td>'
       +'<td style="min-width:300px"><div class=rowacts>'
         +'<button class="b save" data-act=phone>Save phone</button>'
@@ -19908,13 +19934,26 @@ _ADMIN_SUBS_SCRIPT = """<script>
           +'border:1px solid rgba(126,182,255,.3);color:#C3D2E6">'
           +(r.is_discounted?'Full price':'Discounted')+'</button>'
           +'<button class="b" data-act=nudge style="background:rgba(255,255,255,.08);'
-          +'border:1px solid rgba(126,182,255,.3);color:#C3D2E6">Nudge</button>':'')
+          +'border:1px solid rgba(126,182,255,.3);color:#C3D2E6">Nudge</button>'
+          +'<button class="b" data-act=deactivate style="background:rgba(224,36,60,.15);'
+          +'border:1px solid rgba(224,36,60,.5);color:#FF8296">Deactivate</button>':'')
         +'</div><div class=actmsg id="um'+r.id+'"></div></td></tr>';
   }
 
   function wirePeople(){
     Array.prototype.forEach.call(document.querySelectorAll('tr[data-uid]'),function(tr){
       var uid=Number(tr.getAttribute('data-uid'));
+      var ms=tr.querySelector('.metsel');
+      if(ms){ ms.addEventListener('change',function(){
+        ms.disabled=true;
+        fetch('/api/v1/admin/users/'+uid+'/primary-met',{method:'POST',credentials:'include',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({met_id: ms.value ? Number(ms.value) : null})})
+        .then(function(r2){return r2.json();})
+        .then(function(d2){ ms.disabled=false;
+          ms.style.borderColor = d2.ok ? '#2E7D4F' : '#E0243C'; })
+        .catch(function(){ ms.disabled=false; ms.style.borderColor='#E0243C'; });
+      }); }
       function tell(k,t){ var m=document.getElementById('um'+uid);
         m.className='actmsg '+k; m.innerHTML=t; m.style.display='block'; }
       Array.prototype.forEach.call(tr.querySelectorAll('[data-act]'),function(btn){
@@ -19935,6 +19974,19 @@ _ADMIN_SUBS_SCRIPT = """<script>
           } else if(act==='discount'){
             var turningOn = label.indexOf('Discounted')>=0;
             url='/api/v1/admin/users/'+uid+'/discounted'; body={value:turningOn};
+          } else if(act==='deactivate'){
+            if(!confirm('Turn this account OFF? They stop getting briefs and severe '
+              +'weather relays, they are signed out, and they leave this list. '
+              +'Their data is kept.')) return;
+            btn.disabled=true;
+            fetch('/api/v1/admin/users/'+uid,{method:'DELETE',credentials:'include'})
+              .then(function(r2){return r2.json();})
+              .then(function(d2){
+                if(d2.ok){ tell('good','Account turned off.'); load(); }
+                else { btn.disabled=false; tell('bad', d2.error||'Could not deactivate.'); }
+              })
+              .catch(function(){ btn.disabled=false; tell('bad','Connection problem.'); });
+            return;
           } else if(act==='nudge'){
             if(!confirm('Send them a reminder text?')) return;
             url='/api/v1/admin/users/'+uid+'/nudge-sms';
@@ -32942,6 +32994,14 @@ __ADMIN_NAV__
     <button id=billing-go style="width:auto">Run billing audit</button>
   </div>
   <div id=billing-out></div>
+  <div class=fh style="margin-top:30px">Warning map test</div>
+  <div class=findnote>Builds a sample radar warning map right now, the same graphic
+  that gets attached to Tornado and Severe Thunderstorm Warning texts. If a picture
+  appears below, map building works on this server and customers will get it.</div>
+  <div class=findbar style="margin-top:6px">
+    <button id=map-go style="width:auto">Build a test warning map</button>
+  </div>
+  <div id=map-out></div>
   <div id=find-empty>Nothing anywhere for that. Not in accounts, Stormline, Sidekick,
   or Watch. If they paid in Stripe, the purchase never reached this system: check the
   email on the Stripe customer against what was imported.</div>
@@ -33161,6 +33221,29 @@ function billingRows(list, cls){
   });
   return h + '</ul>';
 }
+document.getElementById('map-go').addEventListener('click', function(){
+  var btn = this; btn.disabled = true; btn.textContent = 'Building (up to 10 seconds)...';
+  var out = document.getElementById('map-out');
+  fetch('/api/v1/admin/test-warning-map', {method:'POST', credentials:'include'})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      btn.disabled = false; btn.textContent = 'Build a test warning map';
+      if (d.ok && d.url) {
+        out.innerHTML = '<div class=fcard><span class=okp>Map building works.</span> '
+          + 'This is what customers get with their warning text:</div>'
+          + '<img src="' + d.url + '" style="max-width:100%;border-radius:12px;'
+          + 'border:1px solid #2E4A7E" alt="test warning map">';
+      } else {
+        out.innerHTML = '<div class=fcard><span class=warn>Build failed'
+          + (d.error ? ': ' + fesc(d.error) : '') + '.</span> Map tiles may be slow or '
+          + 'blocked from this server; warning texts will send without the picture.</div>';
+      }
+    })
+    .catch(function(){
+      btn.disabled = false; btn.textContent = 'Build a test warning map';
+      out.innerHTML = '<div class=fcard>Connection problem. Try again.</div>';
+    });
+});
 document.getElementById('billing-go').addEventListener('click', function(){
   var btn = this; btn.disabled = true; btn.textContent = 'Checking Stripe...';
   var out = document.getElementById('billing-out');
@@ -38631,34 +38714,78 @@ def _alarm_expired_briefs() -> None:
                         WHERE status IN ('pending-review', 'claimed')
                           AND window_end_at IS NOT NULL
                           AND window_end_at < %s""", (now_ms - grace,))
+                # Historical mute (Aug 30, 2026, after the 1,160-row email):
+                # drafts whose window closed more than 48h ago predate this
+                # alarm and mostly belong to the old auto-send era, where
+                # the brief WAS delivered and only the draft row lingered.
+                # Stamp them silently; the alarm reports the present, not
+                # an audit of history.
+                cur.execute(
+                    """UPDATE pro_brief_drafts SET expiry_notified_at = %s
+                        WHERE status = 'expired'
+                          AND expiry_notified_at IS NULL
+                          AND window_end_at < %s""",
+                    (now_ms, now_ms - 48 * 60 * 60 * 1000))
+                # Candidates, each cross-checked against the delivery log:
+                # a brief_history row near the window means the customer
+                # DID hear from us (legacy auto-send or a Met), so it is
+                # not a miss.
                 cur.execute(
                     """SELECT d.id, d.brief_type, d.window_end_at,
                               u.email AS sub_email,
                               COALESCE(u.name, u.email) AS sub_name,
                               pm.email AS met_email,
-                              COALESCE(pm.name, '') AS met_name
+                              COALESCE(pm.name, '') AS met_name,
+                              EXISTS (
+                                SELECT 1 FROM brief_history bh
+                                 WHERE bh.user_id = d.user_id
+                                   AND bh.delivery_status = 'sent'
+                                   AND bh.delivered_at BETWEEN
+                                       d.window_end_at - %s
+                                       AND d.window_end_at + 2 * 3600 * 1000
+                              ) AS was_delivered
                          FROM pro_brief_drafts d
                          JOIN users u ON u.id = d.user_id
                          LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
                          LEFT JOIN users pm ON pm.id = sc.primary_met_id
                         WHERE d.status = 'expired'
                           AND d.expiry_notified_at IS NULL
-                        ORDER BY d.window_end_at""")
-                rows = cur.fetchall()
-                if rows:
+                        ORDER BY d.window_end_at""",
+                    (grace,))
+                scanned = cur.fetchall()
+                if scanned:
                     cur.execute(
                         """UPDATE pro_brief_drafts SET expiry_notified_at = %s
                             WHERE id = ANY(%s)""",
-                        (now_ms, [r["id"] for r in rows]))
+                        (now_ms, [r["id"] for r in scanned]))
+                rows = [r for r in scanned if not r.get("was_delivered")]
     except Exception as e:
         print(f"[brief-expiry-alarm] scan failed: {e!r}", flush=True)
         return
     if not rows:
         return
 
-    lines = ["%s (%s) - %s brief expired unsent"
-             % (r["sub_name"], r["sub_email"], r["brief_type"]) for r in rows]
-    print("[brief-expiry-alarm] " + "; ".join(lines), flush=True)
+    # Group per person: one line each, with the dates that were missed.
+    by_person = {}
+    for r in rows:
+        key = (r["sub_name"], r["sub_email"], r["met_email"], r["met_name"])
+        try:
+            day = datetime.fromtimestamp(
+                int(r["window_end_at"]) / 1000, tz=timezone.utc
+            ).strftime("%b %d")
+        except Exception:
+            day = "?"
+        by_person.setdefault(key, []).append(day)
+    lines = []
+    for (name, email, _me, _mn), days in by_person.items():
+        n = len(days)
+        shown = ", ".join(days[:6]) + (" and more" if n > 6 else "")
+        lines.append("%s (%s) - %d brief%s expired unsent (%s)"
+                     % (name, email, n, "" if n == 1 else "s", shown))
+    if len(lines) > 40:
+        extra = len(lines) - 40
+        lines = lines[:40] + [f"...and {extra} more subscribers"]
+    print("[brief-expiry-alarm] " + "; ".join(lines[:10]), flush=True)
 
     api_key = os.environ.get("RESEND_API_KEY", "").strip()
     if not api_key:
@@ -38669,8 +38796,8 @@ def _alarm_expired_briefs() -> None:
     for r in rows:
         if r.get("met_email"):
             recipients.add(r["met_email"])
-    n = len(rows)
-    subject = ("%d brief%s expired unsent - customers got nothing"
+    n = len(by_person)
+    subject = ("%d subscriber%s missed a brief - nothing was sent"
                % (n, "" if n == 1 else "s"))
     body_text = ("These subscribers were owed a brief and the send window "
                  "closed with nothing sent:\n\n- "
@@ -57240,6 +57367,45 @@ def admin_set_subscriber_coverage(subscriber_id):
                        updated_at = EXCLUDED.updated_at""",
                 (subscriber_id, primary_met_id, backup_met_id, notes, next_br_due, now_ms),
             )
+    return jsonify({"ok": True})
+
+
+@app.route("/api/v1/admin/users/<int:user_id>/primary-met", methods=["OPTIONS"])
+def _admin_primary_met_preflight(user_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/users/<int:user_id>/primary-met")
+def admin_set_primary_met(user_id):
+    """Set ONLY the primary Met (Aug 30, 2026, the missing dropdown).
+    Never touches backup Met, notes, or schedule, unlike the full
+    coverage endpoint, so a quick assignment cannot clobber anything."""
+    user = _get_current_user()
+    if user is None or "admin" not in (user.get("roles") or []):
+        return jsonify({"ok": False, "error": "not-authorized"}), 403
+    data = request.get_json(silent=True) or {}
+    met_id = data.get("met_id")
+    if met_id is not None:
+        met_id = int(met_id)
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            if met_id is not None:
+                cur.execute(
+                    """SELECT 1 FROM user_roles
+                        WHERE user_id = %s AND role = 'met'""", (met_id,))
+                if not cur.fetchone():
+                    return jsonify({"ok": False, "error": "not-a-met"}), 400
+            cur.execute(
+                """INSERT INTO subscriber_coverage
+                     (user_id, primary_met_id, updated_at)
+                   VALUES (%s, %s, %s)
+                   ON CONFLICT (user_id) DO UPDATE
+                   SET primary_met_id = EXCLUDED.primary_met_id,
+                       updated_at = EXCLUDED.updated_at""",
+                (user_id, met_id, now_ms))
+    print(f"[primary-met] admin {user.get('email')} set user {user_id} "
+          f"-> met {met_id}", flush=True)
     return jsonify({"ok": True})
 
 
