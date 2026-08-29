@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-248"
+BACKEND_BUILD = "0702-249"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -32182,15 +32182,16 @@ __MET_CHROME__
 <style>
 .findbar{display:flex;gap:10px;margin:18px 0 8px}
 .findbar input{flex:1;box-sizing:border-box;padding:13px 15px;font-size:16px;
-  border-radius:10px;border:1px solid rgba(126,182,255,.3);color:#EAF1FF;
-  background:rgba(255,255,255,.05)}
+  border-radius:10px;border:1px solid #2E4A7E;color:#EAF1FF;
+  background:#0E1D3C}
+.findbar input::placeholder{color:#7E93B8}
 .findbar button{width:auto;margin:0;padding:13px 22px;font-size:15px;font-weight:800;
   border:none;border-radius:10px;color:#fff;cursor:pointer;
   background:linear-gradient(160deg,#3D8BFF,#1E5FE0)}
 .findnote{font-size:13px;color:#8FA6C6;margin-bottom:16px}
 .fh{font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;
   color:#7EB6FF;margin:22px 0 8px}
-.fcard{background:rgba(255,255,255,.045);border:1px solid rgba(126,182,255,.18);
+.fcard{background:#0E1D3C;border:1px solid #2E4A7E;color:#C9D8F0;
   border-radius:12px;padding:14px 16px;margin-bottom:10px;font-size:14px;line-height:1.6}
 .fcard b{color:#fff}
 .fcard .dim{color:#8FA6C6}
