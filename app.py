@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-250"
+BACKEND_BUILD = "0702-251"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -3397,6 +3397,19 @@ def init_db() -> None:
     # subscribers. Idempotent — only inserts where missing. Defaults
     # morning_enabled=TRUE so subscribers get the standard 7:00-7:30 AM
     # brief window.
+    # Hobbyist tier retired (Michael, Aug 29, 2026): every subscriber is
+    # Pro. One-time flip, idempotent, logged.
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE users SET subscription_tier = 'pro_single'
+                        WHERE subscription_tier = 'hobbyist'""")
+                if cur.rowcount:
+                    print(f"[hobbyist-retire] moved {cur.rowcount} account(s) "
+                          f"to pro_single", flush=True)
+    except Exception as e:
+        print(f"[hobbyist-retire] failed: {e}", flush=True)
     try:
         _backfill_brief_preferences()
     except Exception as e:
@@ -10331,13 +10344,14 @@ def stripe_webhook_v2():
                     # forgiving fallback) and log loudly.
                     session_metadata = session.get("metadata") or {}
                     tier_key = (session_metadata.get("wv_tier") or "").strip()
-                    if tier_key not in ("hobbyist", "pro_single", "pro_multi"):
+                    if tier_key not in ("pro_single", "pro_multi", "pro_enterprise"):
                         print(
                             f"[stripe-webhook] missing/invalid wv_tier in metadata "
-                            f"(got '{tier_key}'), defaulting to hobbyist",
+                            f"(got '{tier_key}'), defaulting to pro_single "
+                            f"(hobbyist tier retired Aug 29, 2026)",
                             flush=True,
                         )
-                        tier_key = "hobbyist"
+                        tier_key = "pro_single"
                     with conn.cursor() as cur:
                         cur.execute(
                             "UPDATE users SET subscription_tier = %s WHERE id = %s",
@@ -32577,7 +32591,9 @@ def admin_tier_audit():
     if "admin" not in (user.get("roles") or []):
         return jsonify({"ok": False, "error": "forbidden"}), 403
 
-    known = ("pro_single", "pro_multi", "pro_enterprise", "hobbyist")
+    # hobbyist removed Aug 29, 2026: the tier is retired, so any account
+    # still carrying it should light up orange here.
+    known = ("pro_single", "pro_multi", "pro_enterprise")
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -38020,8 +38036,16 @@ def _process_pending_briefs_inner() -> None:
             # _already_sent_today checks brief_history. If a draft was created
             # but not yet sent, the next tick would re-create it. To prevent
             # that, we also check pro_brief_drafts for a pending row.
-            tier = c["subscription_tier"] or "hobbyist"
-            if tier in ("pro_single", "pro_multi", "pro_enterprise"):
+            tier = c["subscription_tier"] or "pro_single"
+            # Michael's decision (Aug 29, 2026): there is no hobbyist tier
+            # and no AI-sent briefs. Every subscriber takes the Met-review
+            # draft path below; a brief goes out only when a Meteorologist
+            # sends it. The only automated messages in the product are the
+            # NWS warning relays and the warning-expiry notices (plus the
+            # separately sold, clearly labeled Stormline Daily summary).
+            # The auto-send block after this branch is intentionally
+            # unreachable and kept only to avoid a risky mass deletion.
+            if True:  # every tier: Met-review drafts only
                 # Has a pending draft for today's morning already? If so, skip.
                 # We look back 18 hours so that an evening pre-generated draft
                 # (created the night before at 8 PM) is detected when the
