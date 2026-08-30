@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-263"
+BACKEND_BUILD = "0702-264"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -20659,6 +20659,7 @@ def _met_nav(active: str, spa: str) -> str:
     items = [("day", "My Day", "/portal/met"), ("all", "All Work", "/portal/met/all"),
              ("severe", "Severe", "/portal/met/severe"),
              ("people", "My People", "/portal/met/people"),
+             ("schedule", "Schedule", "/portal/met/schedule"),
              ("messages", "Messages", "/portal/met/messages"),
              ("numbers", "My Numbers", "/portal/met/numbers")]
     links = "".join('<a class="%s" href="%s">%s</a>'
@@ -22946,6 +22947,336 @@ def portal_met_severe():
                     .replace("__MET_CHROME__", _MET_CHROME_CSS)
                     .replace("__MET_NAV__", _met_nav("severe", spa))
                     .replace("__WV_FOOTER__", _MET_SEVERE_SCRIPT + "\n__WV_FOOTER__"))
+
+
+def _schedule_scope_label(scope, subscriber_name, set_owner_name):
+    if scope == "review_pool":
+        return "Review pool (all pending briefs)"
+    if scope == "subscriber_set":
+        return "Covering %s's people" % (set_owner_name or "a Met")
+    return "Brief for %s" % (subscriber_name or "a subscriber")
+
+
+@app.route("/api/v1/met/team-schedule", methods=["OPTIONS"])
+def _met_team_schedule_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/team-schedule")
+def met_team_schedule():
+    """The whole team's next 10 days, resolved: every Met's recurring
+    shifts for each weekday, minus their drops, plus their claims and
+    admin assigns. Read-only; feeds the Thursday planning meeting."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT mrs.met_user_id, mrs.day_of_week, mrs.scope_kind,
+                          COALESCE(mu.name, mu.email) AS met_name,
+                          su.name AS subscriber_name,
+                          COALESCE(so.name, so.email) AS set_owner_name
+                     FROM met_recurring_shifts mrs
+                     JOIN users mu ON mu.id = mrs.met_user_id
+                          AND mu.is_active = TRUE
+                     LEFT JOIN users su ON su.id = mrs.subscriber_user_id
+                     LEFT JOIN users so ON so.id = mrs.set_owner_met_id
+                    ORDER BY met_name""")
+            recurring = cur.fetchall()
+            today = datetime.now(timezone.utc).date()
+            end = today + timedelta(days=10)
+            cur.execute(
+                """SELECT mso.met_user_id, mso.shift_date, mso.scope_kind,
+                          mso.override_kind,
+                          COALESCE(mu.name, mu.email) AS met_name,
+                          su.name AS subscriber_name,
+                          COALESCE(so.name, so.email) AS set_owner_name
+                     FROM met_shift_overrides mso
+                     JOIN users mu ON mu.id = mso.met_user_id
+                     LEFT JOIN users su ON su.id = mso.subscriber_user_id
+                     LEFT JOIN users so ON so.id = mso.set_owner_met_id
+                    WHERE mso.shift_date >= %s AND mso.shift_date <= %s""",
+                (today.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")))
+            overrides = cur.fetchall()
+
+    days = []
+    for i in range(10):
+        d = today + timedelta(days=i)
+        dstr = d.strftime("%Y-%m-%d")
+        # Python: Monday=0..Sunday=6; schema: 0=Sun..6=Sat.
+        dow = (d.weekday() + 1) % 7
+        entries = []
+        for r in recurring:
+            if r["day_of_week"] != dow:
+                continue
+            dropped = any(
+                o["met_user_id"] == r["met_user_id"]
+                and str(o["shift_date"]) == dstr
+                and o["override_kind"] == "drop"
+                and o["scope_kind"] == r["scope_kind"]
+                for o in overrides)
+            if dropped:
+                continue
+            entries.append({
+                "met": r["met_name"],
+                "what": _schedule_scope_label(
+                    r["scope_kind"], r.get("subscriber_name"),
+                    r.get("set_owner_name")),
+            })
+        for o in overrides:
+            if str(o["shift_date"]) != dstr:
+                continue
+            if o["override_kind"] in ("claim", "assign"):
+                entries.append({
+                    "met": o["met_name"],
+                    "what": _schedule_scope_label(
+                        o["scope_kind"], o.get("subscriber_name"),
+                        o.get("set_owner_name"))
+                    + (" (added)" if o["override_kind"] == "claim"
+                       else " (assigned)"),
+                })
+        days.append({"date": dstr,
+                     "label": d.strftime("%a %b %d"),
+                     "entries": entries})
+    return jsonify({"ok": True, "days": days})
+
+
+@app.route("/api/v1/met/schedule-options", methods=["OPTIONS"])
+def _met_schedule_options_preflight():
+    return ("", 204)
+
+
+@app.get("/api/v1/met/schedule-options")
+def met_schedule_options():
+    """Dropdown data for the schedule forms: active Mets and active
+    subscriber accounts."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, COALESCE(u.name, u.email) AS name
+                     FROM users u
+                     JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'met'
+                    WHERE u.is_active = TRUE ORDER BY name""")
+            mets = [dict(r) for r in cur.fetchall()]
+            cur.execute(
+                """SELECT u.id, COALESCE(u.name, u.email) AS name
+                     FROM users u
+                     JOIN user_roles ur ON ur.user_id = u.id
+                          AND ur.role = 'subscriber'
+                    WHERE u.is_active = TRUE ORDER BY name""")
+            subs = [dict(r) for r in cur.fetchall()]
+    return jsonify({"ok": True, "mets": mets, "subscribers": subs})
+
+
+_MET_SCHEDULE_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Schedule &middot; WeatherValet</title><meta name=robots content="noindex">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+__MET_CHROME__
+.wrapx{max-width:980px;margin:0 auto;padding:26px 22px 70px}
+h1{font-size:24px;font-weight:900;letter-spacing:-.02em;color:#fff;margin:0 0 4px}
+.psub{color:#B8C7DE;font-size:15px;margin:0 0 20px;line-height:1.6}
+.phead{font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;
+  color:#7EB6FF;margin:26px 0 10px}
+.wk{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px}
+.dcard{background:#0E1D3C;border:1px solid #2E4A7E;border-radius:12px;color:#C9D8F0;
+  padding:12px 14px;font-size:13.5px;line-height:1.55;min-height:86px}
+.dcard.uncovered{border-color:#E0243C}
+.dcard b{color:#fff;display:block;margin-bottom:6px}
+.dcard .dim{color:#8FA6C6}
+.dcard .red{color:#FF8296;font-weight:700}
+.scard{background:#0E1D3C;border:1px solid #2E4A7E;border-radius:12px;color:#C9D8F0;
+  padding:15px 17px;margin-bottom:10px;font-size:14px;line-height:1.65}
+.scard b{color:#fff}
+.scard .dim{color:#8FA6C6}
+.scard select,.scard input{padding:9px 11px;font-size:14px;color:#EAF1FF;background:#0A1730;
+  border:1px solid #2E4A7E;border-radius:8px;margin:4px 6px 4px 0}
+.scard button{border:none;border-radius:9px;color:#fff;cursor:pointer;font-weight:800;
+  font-size:13px;padding:10px 16px;background:linear-gradient(160deg,#3D8BFF,#1E5FE0);margin:4px 6px 4px 0}
+.scard button.warn2{background:linear-gradient(160deg,#FF7A5C,#E0243C)}
+.scard button:disabled{opacity:.55;cursor:default}
+.shift-x{color:#FF8296;cursor:pointer;font-weight:800;margin-left:8px}
+#sc-msg{font-size:14px;margin-top:8px}
+</style></head><body>
+__MET_NAV__
+<div class=wrapx>
+  <h1>Schedule</h1>
+  <div class=psub>The whole team's coverage for the next 10 days, then your own
+  weekly pattern. Same schedule the old portal shows; edits here appear there
+  and the other way round. Bring this page to the Thursday meeting.</div>
+  <div class=phead>Team, next 10 days</div>
+  <div class=wk id=sc-week></div>
+  <div class=phead>My weekly pattern</div>
+  <div id=sc-mine></div>
+  <div class=scard>
+    <b>Add a recurring shift</b><br>
+    <select id=sc-day></select>
+    <select id=sc-scope>
+      <option value=review_pool>Review pool (all pending briefs)</option>
+      <option value=subscriber_set>A Met's whole roster</option>
+      <option value=subscriber>One subscriber</option>
+    </select>
+    <select id=sc-owner style="display:none"></select>
+    <select id=sc-sub style="display:none"></select>
+    <button id=sc-add>Add shift</button>
+  </div>
+  <div class=scard>
+    <b>One-off change</b> <span class=dim>(vacation day, extra day)</span><br>
+    <input type=date id=sc-odate>
+    <select id=sc-okind>
+      <option value=drop>I'm out that day (drop my shifts)</option>
+      <option value=claim>I'll cover the review pool that day</option>
+    </select>
+    <button id=sc-ogo class=warn2>Save change</button>
+  </div>
+  <div class=phead>My upcoming one-off changes</div>
+  <div id=sc-ovr class=scard><span class=dim>Loading...</span></div>
+  <div id=sc-msg></div>
+</div>
+__WV_FOOTER__"""
+
+
+_MET_SCHEDULE_SCRIPT = """<script>
+(function(){
+var DAYS=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+var opts={mets:[],subscribers:[]};
+function esc(t){var d=document.createElement('div');d.textContent=t==null?'':String(t);return d.innerHTML;}
+function say(k,t){document.getElementById('sc-msg').innerHTML=
+  '<span style="color:'+(k==='good'?'#7EE2A8':'#FF8296')+';font-weight:700">'+esc(t)+'</span>';}
+function scopeText(s){
+  if(s.scope_kind==='review_pool') return 'Review pool';
+  if(s.scope_kind==='subscriber_set') return "Covering "+esc(s.set_owner_name||'a Met')+"'s people";
+  return 'Brief for '+esc(s.subscriber_name||'a subscriber');
+}
+function loadTeam(){
+  fetch('/api/v1/met/team-schedule',{credentials:'include'})
+   .then(function(r){return r.json();})
+   .then(function(d){
+     if(!d.ok) return;
+     document.getElementById('sc-week').innerHTML = d.days.map(function(day){
+       var inner = day.entries.length
+         ? day.entries.map(function(e){
+             return '<div>'+esc(e.met)+' <span class=dim>&middot; '+esc(e.what)+'</span></div>';
+           }).join('')
+         : '<div class=red>No coverage</div>';
+       return '<div class="dcard'+(day.entries.length?'':' uncovered')+'"><b>'
+         + esc(day.label)+'</b>'+inner+'</div>';
+     }).join('');
+   }).catch(function(){});
+}
+function loadMine(){
+  fetch('/api/v1/met/my-schedule',{credentials:'include'})
+   .then(function(r){return r.json();})
+   .then(function(d){
+     if(!d.ok) return;
+     var rs=d.recurring_shifts||[];
+     document.getElementById('sc-mine').innerHTML = rs.length
+       ? rs.map(function(s){
+           return '<div class=scard>'+esc(DAYS[s.day_of_week])+': '+scopeText(s)
+             +'<span class=shift-x data-id="'+s.id+'" title="Remove">&#10005;</span></div>';
+         }).join('')
+       : '<div class=scard><span class=dim>No recurring shifts yet. Add one below; '
+         +'the review pool is where the morning briefs live.</span></div>';
+     Array.prototype.forEach.call(document.querySelectorAll('.shift-x'),function(x){
+       x.addEventListener('click',function(){
+         if(!confirm('Remove this recurring shift?')) return;
+         fetch('/api/v1/met/recurring-shifts/'+x.getAttribute('data-id'),
+               {method:'DELETE',credentials:'include'})
+           .then(function(r){return r.json();})
+           .then(function(d2){ if(d2.ok){ say('good','Shift removed.'); loadMine(); loadTeam(); }
+                               else say('bad',d2.error||'Could not remove.'); })
+           .catch(function(){ say('bad','Connection problem.'); });
+       });
+     });
+     var ov=d.overrides||[];
+     document.getElementById('sc-ovr').innerHTML = ov.length
+       ? ov.map(function(o){
+           return '<div>'+esc(o.shift_date)+': '
+             +(o.override_kind==='drop'?'Out':'Covering')+' <span class=dim>&middot; '
+             +scopeText(o)+'</span></div>';
+         }).join('')
+       : '<span class=dim>None.</span>';
+   }).catch(function(){});
+}
+function loadOpts(){
+  fetch('/api/v1/met/schedule-options',{credentials:'include'})
+   .then(function(r){return r.json();})
+   .then(function(d){
+     if(!d.ok) return;
+     opts=d;
+     document.getElementById('sc-owner').innerHTML =
+       d.mets.map(function(m){return '<option value="'+m.id+'">'+esc(m.name)+"'s people</option>";}).join('');
+     document.getElementById('sc-sub').innerHTML =
+       d.subscribers.map(function(u){return '<option value="'+u.id+'">'+esc(u.name)+'</option>';}).join('');
+   }).catch(function(){});
+}
+document.getElementById('sc-day').innerHTML =
+  DAYS.map(function(n,i){return '<option value="'+i+'">'+n+'</option>';}).join('');
+document.getElementById('sc-scope').addEventListener('change',function(){
+  document.getElementById('sc-owner').style.display = this.value==='subscriber_set'?'':'none';
+  document.getElementById('sc-sub').style.display = this.value==='subscriber'?'':'none';
+});
+document.getElementById('sc-add').addEventListener('click',function(){
+  var scope=document.getElementById('sc-scope').value;
+  var body={day_of_week:Number(document.getElementById('sc-day').value),scope_kind:scope};
+  if(scope==='subscriber_set') body.set_owner_met_id=Number(document.getElementById('sc-owner').value);
+  if(scope==='subscriber') body.subscriber_user_id=Number(document.getElementById('sc-sub').value);
+  var b=this; b.disabled=true;
+  fetch('/api/v1/met/recurring-shifts',{method:'POST',credentials:'include',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+   .then(function(r){return r.json();})
+   .then(function(d){ b.disabled=false;
+     if(d.ok){ say('good','Shift added.'); loadMine(); loadTeam(); }
+     else say('bad',d.error||'Could not add.'); })
+   .catch(function(){ b.disabled=false; say('bad','Connection problem.'); });
+});
+document.getElementById('sc-ogo').addEventListener('click',function(){
+  var dt=document.getElementById('sc-odate').value;
+  if(!dt){ say('bad','Pick the date first.'); return; }
+  var kind=document.getElementById('sc-okind').value;
+  var body={shift_date:dt,override_kind:kind,
+            scope_kind: kind==='claim' ? 'review_pool' : 'review_pool'};
+  var b=this; b.disabled=true;
+  fetch('/api/v1/met/shift-overrides',{method:'POST',credentials:'include',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+   .then(function(r){return r.json();})
+   .then(function(d){ b.disabled=false;
+     if(d.ok){ say('good','Saved.'); loadMine(); loadTeam(); }
+     else say('bad',d.error||'Could not save.'); })
+   .catch(function(){ b.disabled=false; say('bad','Connection problem.'); });
+});
+loadOpts(); loadMine(); loadTeam();
+})();
+</script>"""
+
+
+@app.get("/portal/met/schedule")
+def portal_met_schedule():
+    user = _get_current_user()
+    if not user:
+        return redirect("/signin", code=302)
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return redirect("/portal", code=302)
+    spa = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+    return wv_shell(_MET_SCHEDULE_PAGE
+                    .replace("__WV_TOKENS__", WV_TOKENS)
+                    .replace("__MET_CHROME__", _MET_CHROME_CSS)
+                    .replace("__MET_NAV__", _met_nav("schedule", spa))
+                    .replace("__WV_FOOTER__", _MET_SCHEDULE_SCRIPT + "\n__WV_FOOTER__"))
 
 
 @app.get("/portal/met/people")
@@ -57268,6 +57599,15 @@ def met_create_recurring_shift():
     with db() as conn:
         with conn.cursor() as cur:
             try:
+                cur.execute(
+                    """SELECT id FROM met_recurring_shifts
+                        WHERE met_user_id = %s AND day_of_week = %s
+                          AND scope_kind = %s
+                          AND subscriber_user_id IS NOT DISTINCT FROM %s
+                          AND set_owner_met_id IS NOT DISTINCT FROM %s""",
+                    (user["id"], dow, scope, subscriber_id, set_owner_id))
+                if cur.fetchone():
+                    return jsonify({"ok": True, "note": "already-exists"})
                 cur.execute(
                     """INSERT INTO met_recurring_shifts
                        (met_user_id, day_of_week, scope_kind,
