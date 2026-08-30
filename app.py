@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-264"
+BACKEND_BUILD = "0702-265"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -2486,6 +2486,11 @@ ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS expiry_notified_at BIGINT;
 -- stats whenever a name was edited. New rows carry the id; old rows
 -- fall back to the name match.
 ALTER TABLE brief_history ADD COLUMN IF NOT EXISTS met_user_id INTEGER;
+-- Meta match-quality cookies captured at Stormline signup (Aug 30, 2026),
+-- sent with the server-side Purchase so Meta can attribute the sale to
+-- the ad click even when the browser event is blocked.
+ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS meta_fbp TEXT;
+ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS meta_fbc TEXT;
 ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS weather_details TEXT;
 ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS whats_ahead TEXT;
 ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS image_url TEXT;
@@ -13216,7 +13221,7 @@ def _inject_purchase(html: str, value_dollars: float, content_name: str = "", ev
 
 def _meta_capi_purchase(email, phone, value_dollars, event_id,
                         source_url="https://weathervalet.ai/stormline",
-                        content_name="Stormline"):
+                        content_name="Stormline", fbp=None, fbc=None):
     """Server-side Purchase to Meta's Conversions API (Aug 30, 2026).
 
     The browser pixel already fires on the welcome page, but one ad
@@ -13245,6 +13250,10 @@ def _meta_capi_purchase(email, phone, value_dollars, event_id,
         if len(digits) == 10:
             digits = "1" + digits
         user_data["ph"] = [_h(digits)]
+    if fbp:
+        user_data["fbp"] = fbp
+    if fbc:
+        user_data["fbc"] = fbc
     payload = {"data": [{
         "event_name": "Purchase",
         "event_time": int(time.time()),
@@ -24728,6 +24737,11 @@ def sentry_checkout():
         pinned.append((addr, lbl, geo["lat"], geo["lng"]))
 
     now_ms = int(time.time() * 1000)
+    # Meta attribution cookies (Aug 30, 2026): the pixel sets _fbp for every
+    # visitor and _fbc when they arrived from an ad click. Saved here and
+    # attached to the server-side Purchase for full match quality.
+    meta_fbp = (request.cookies.get("_fbp") or "")[:120] or None
+    meta_fbc = (request.cookies.get("_fbc") or "")[:255] or None
     sentry_ids = []
     with db() as conn:
         with conn.cursor() as cur:
@@ -24736,11 +24750,13 @@ def sentry_checkout():
                     """INSERT INTO sentry_subscribers
                          (email, phone, phone2, name, address, label, lat, lng,
                           pack_allseason, daily, send_hour, tz_name, manage_token,
-                          gift_from, status, created_at, updated_at)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s) RETURNING id""",
+                          gift_from, status, created_at, updated_at,
+                          meta_fbp, meta_fbc)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s,%s,%s) RETURNING id""",
                     (email, phone, phone2, name, addr, (lbl or None), lat, lng,
                      pack_allseason, daily, send_hour, _tz_for_point(lat, lng),
-                     secrets.token_urlsafe(12), (gift_from or None), now_ms, now_ms))
+                     secrets.token_urlsafe(12), (gift_from or None), now_ms, now_ms,
+                     meta_fbp, meta_fbc))
                 sentry_ids.append(cur.fetchone()["id"])
             # Rows bought together share the first row's id as the group.
             cur.execute("UPDATE sentry_subscribers SET group_id = %s WHERE id = ANY(%s)",
@@ -24827,12 +24843,14 @@ def _activate_sentry_group(sentry_ids, stripe_customer_id: str) -> None:
         with db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """SELECT email, phone FROM sentry_subscribers
+                    """SELECT email, phone, meta_fbp, meta_fbc
+                         FROM sentry_subscribers
                         WHERE id = %s""", (ids[0],))
                 r0 = cur.fetchone() or {}
         _meta_capi_purchase(r0.get("email"), r0.get("phone"),
                             _sentry_purchase_value(ids[0]),
-                            event_id=f"sentry-{ids[0]}")
+                            event_id=f"sentry-{ids[0]}",
+                            fbp=r0.get("meta_fbp"), fbc=r0.get("meta_fbc"))
     except Exception as e:
         print(f"[meta-capi] hook failed: {e!r}", flush=True)
     row = rows[0]
