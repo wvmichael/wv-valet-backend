@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-270"
+BACKEND_BUILD = "0702-271"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -2490,6 +2490,9 @@ ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS bottom_line TEXT;
 -- Expired-unsent alarm (Aug 29, 2026): stamp when the alarm email about
 -- this draft went out, so each expiry alarms exactly once.
 ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS expiry_notified_at BIGINT;
+-- Ad-hoc drafts never expire (Michael, Aug 30, 2026): the window is a
+-- prompt, not a cage. NULL means 'send whenever'.
+ALTER TABLE pro_brief_drafts ALTER COLUMN window_end_at DROP NOT NULL;
 -- Met attribution by id (Aug 29, 2026): met_name string-matching broke
 -- stats whenever a name was edited. New rows carry the id; old rows
 -- fall back to the name match.
@@ -20982,6 +20985,11 @@ __MET_NAV__
     <div class=panel>
       <div class=listhead><b id=lh>Loading...</b>
         <button class=mini id=sel-all>Select all</button></div>
+      <div style="display:flex;gap:8px;margin:10px 0 4px;align-items:center">
+        <select id=nb-sub style="flex:1;padding:8px 10px;font-size:13.5px;color:#EAF1FF;
+          background:#0A1730;border:1px solid #2E4A7E;border-radius:8px">
+          <option value="">New message for...</option></select>
+        <button class=mini id=nb-go>Start</button></div>
       <div id=list></div>
     </div>
     <div class=panel id=editor>
@@ -21143,6 +21151,31 @@ _MET_BRIEFS_SCRIPT = """<script>
     });
   });
 
+  fetch('/api/v1/met/schedule-options',{credentials:'include'})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(!d.ok) return;
+      var sel=document.getElementById('nb-sub');
+      (d.subscribers||[]).forEach(function(u){
+        var o=document.createElement('option'); o.value=u.id; o.textContent=u.name;
+        sel.appendChild(o);
+      });
+    }).catch(function(){});
+  document.getElementById('nb-go').addEventListener('click',function(){
+    var sel=document.getElementById('nb-sub');
+    if(!sel.value){ return; }
+    var b=this; b.disabled=true;
+    fetch('/api/v1/met/pro-briefs/create',{method:'POST',credentials:'include',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({user_id:Number(sel.value)})})
+     .then(function(r){return r.json();})
+     .then(function(d){
+       b.disabled=false;
+       if(d.ok){ sel.value=''; selected={}; selected[d.id]=true; load(); }
+       else say('bad', d.error||'Could not start the message.');
+     })
+     .catch(function(){ b.disabled=false; say('bad','Connection problem.'); });
+  });
   document.getElementById('sel-all').addEventListener('click',function(){
     var pending=drafts.filter(function(d){return d.status!=='sent';});
     var all = pending.every(function(d){ return selected[d.id]; });
@@ -22598,6 +22631,66 @@ def _severe_affected(alert):
     else:
         subs = _find_pro_subscribers_by_county(alert)
     return subs, _severe_board_sentry(alert)
+
+
+@app.route("/api/v1/met/pro-briefs/create", methods=["OPTIONS"])
+def _met_brief_create_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/met/pro-briefs/create")
+def met_pro_brief_create():
+    """Ad-hoc brief, any subscriber, any time (Michael, Aug 30, 2026):
+    the forecast changing is reason enough for another message, so a Met
+    can open a fresh draft whenever, independent of the scheduler. No
+    send window: an ad-hoc draft never expires."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    try:
+        sub_id = int(data.get("user_id") or 0)
+    except (TypeError, ValueError):
+        sub_id = 0
+    if not sub_id:
+        return jsonify({"ok": False, "error": "user-id-required"}), 400
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, COALESCE(u.subscription_tier,'pro_single') AS tier,
+                          sl.label AS loc_label, sl.address_text,
+                          sl.lat, sl.lng,
+                          COALESCE(bp.channels,'sms,email') AS channels
+                     FROM users u
+                     JOIN user_roles ur ON ur.user_id = u.id
+                          AND ur.role = 'subscriber'
+                     LEFT JOIN saved_locations sl ON sl.user_id = u.id
+                          AND sl.is_primary = TRUE
+                     LEFT JOIN brief_preferences bp ON bp.user_id = u.id
+                    WHERE u.id = %s AND u.is_active = TRUE""", (sub_id,))
+            r = cur.fetchone()
+            if not r:
+                return jsonify({"ok": False, "error": "no-such-subscriber"}), 404
+            cur.execute(
+                """INSERT INTO pro_brief_drafts
+                     (user_id, brief_type, created_at, window_end_at, status,
+                      user_tier, location_label, location_lat, location_lng,
+                      channels, ai_verdict, ai_snippet, ai_body,
+                      claimed_by_user_id)
+                   VALUES (%s, 'update', %s, NULL, 'claimed', %s, %s, %s, %s,
+                           %s, '', '', '', %s)
+                   RETURNING id""",
+                (sub_id, now_ms, r["tier"],
+                 r.get("loc_label") or r.get("address_text") or "",
+                 r.get("lat"), r.get("lng"), r["channels"], user["id"]))
+            new_id = cur.fetchone()["id"]
+    print(f"[brief-create] {user.get('email')} opened ad-hoc draft "
+          f"{new_id} for user {sub_id}", flush=True)
+    return jsonify({"ok": True, "id": new_id})
 
 
 @app.route("/api/v1/met/severe/board", methods=["OPTIONS"])
@@ -52072,8 +52165,10 @@ def met_pro_brief_send(draft_id):
             "error": "already-auto-sent",
             "auto_sent_at": row["auto_sent_at"],
         }), 409
-    if row["status"] not in ("pending-review", "claimed"):
-        return jsonify({"ok": False, "error": "already-sent-or-expired", "status": row["status"]}), 409
+    # 'expired' is sendable (Michael, Aug 30, 2026): the window is a
+    # prompt, not a cage. A Met sending late is still a Met sending.
+    if row["status"] not in ("pending-review", "claimed", "expired"):
+        return jsonify({"ok": False, "error": "already-sent", "status": row["status"]}), 409
 
     # Resolve final content with backward compat
     final_verdict = (row["met_verdict"] or row["ai_verdict"] or "caution").strip()
