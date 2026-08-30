@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-265"
+BACKEND_BUILD = "0702-267"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -1530,6 +1530,14 @@ CREATE INDEX IF NOT EXISTS idx_bbd_subscriber_sent
 -- free-text label the Met enters (e.g. "Central Kansas" or "Boone
 -- County, IN") — we don't yet pin it to a strict geography. Tracking
 -- evolves with usage.
+CREATE TABLE IF NOT EXISTS met_day_assignments (
+    day          DATE    NOT NULL,
+    duty         TEXT    NOT NULL,   -- 'territory:<met_id>' | '<part>:reviews' | '<part>:watch'
+    met_user_id  INTEGER,
+    updated_at   BIGINT  NOT NULL,
+    PRIMARY KEY (day, duty)
+);
+
 CREATE TABLE IF NOT EXISTS severe_met_texts (
     id             SERIAL PRIMARY KEY,
     nws_alert_id   TEXT    NOT NULL,
@@ -22971,11 +22979,37 @@ def _met_team_schedule_preflight():
     return ("", 204)
 
 
+_WV_STATE_NAMES = {
+    "KS": "Kansas", "IN": "Indiana", "NJ": "New Jersey", "IL": "Illinois",
+    "OH": "Ohio", "KY": "Kentucky", "MO": "Missouri", "NE": "Nebraska",
+    "CO": "Colorado", "MI": "Michigan", "WI": "Wisconsin", "TN": "Tennessee",
+    "FL": "Florida", "TX": "Texas", "IA": "Iowa", "OK": "Oklahoma",
+}
+
+
+def _kickoff_daypart(kickoff):
+    try:
+        m2 = re.match(r"^\s*(\d{1,2})(?::\d{2})?\s*(AM|PM)", (kickoff or "").upper())
+        if not m2:
+            return "afternoon"
+        h = int(m2.group(1)) % 12
+        if m2.group(2) == "PM":
+            h += 12
+        if h < 12:
+            return "morning"
+        if h < 17:
+            return "afternoon"
+        return "evening"
+    except Exception:
+        return "afternoon"
+
+
 @app.get("/api/v1/met/team-schedule")
 def met_team_schedule():
-    """The whole team's next 10 days, resolved: every Met's recurring
-    shifts for each weekday, minus their drops, plus their claims and
-    admin assigns. Read-only; feeds the Thursday planning meeting."""
+    """The Schedule board (Michael's sketch, Aug 30, 2026): per day,
+    territory rows plus Morning/Afternoon/Evening sub-sections with
+    Reviews, Watch, and Sidekick rows, every row assignable by dropdown.
+    Territories default to the owning Met unless the board overrides."""
     user = _get_current_user()
     if user is None:
         return jsonify({"ok": False, "error": "not-authenticated"}), 401
@@ -22986,73 +23020,173 @@ def met_team_schedule():
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """SELECT mrs.met_user_id, mrs.day_of_week, mrs.scope_kind,
-                          COALESCE(mu.name, mu.email) AS met_name,
-                          su.name AS subscriber_name,
-                          COALESCE(so.name, so.email) AS set_owner_name
-                     FROM met_recurring_shifts mrs
-                     JOIN users mu ON mu.id = mrs.met_user_id
-                          AND mu.is_active = TRUE
-                     LEFT JOIN users su ON su.id = mrs.subscriber_user_id
-                     LEFT JOIN users so ON so.id = mrs.set_owner_met_id
-                    ORDER BY met_name""")
-            recurring = cur.fetchall()
-            today = datetime.now(timezone.utc).date()
-            end = today + timedelta(days=10)
+                """SELECT u.id, COALESCE(u.name, u.email) AS name
+                     FROM users u
+                     JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'met'
+                    WHERE u.is_active = TRUE ORDER BY name""")
+            mets = [dict(r) for r in cur.fetchall()]
             cur.execute(
-                """SELECT mso.met_user_id, mso.shift_date, mso.scope_kind,
-                          mso.override_kind,
+                """SELECT sc.primary_met_id AS met_id,
                           COALESCE(mu.name, mu.email) AS met_name,
-                          su.name AS subscriber_name,
-                          COALESCE(so.name, so.email) AS set_owner_name
-                     FROM met_shift_overrides mso
-                     JOIN users mu ON mu.id = mso.met_user_id
-                     LEFT JOIN users su ON su.id = mso.subscriber_user_id
-                     LEFT JOIN users so ON so.id = mso.set_owner_met_id
-                    WHERE mso.shift_date >= %s AND mso.shift_date <= %s""",
-                (today.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")))
-            overrides = cur.fetchall()
+                          COUNT(*) AS n,
+                          ARRAY_AGG(sl.address_text) AS addrs
+                     FROM subscriber_coverage sc
+                     JOIN users mu ON mu.id = sc.primary_met_id
+                          AND mu.is_active = TRUE
+                     JOIN users u ON u.id = sc.user_id AND u.is_active = TRUE
+                     LEFT JOIN saved_locations sl ON sl.user_id = u.id
+                          AND sl.is_primary = TRUE
+                    WHERE sc.primary_met_id IS NOT NULL
+                 GROUP BY sc.primary_met_id, met_name
+                 ORDER BY met_name""")
+            territories = cur.fetchall()
+            today = datetime.now(timezone.utc).date()
+            end = today + timedelta(days=9)
+            cur.execute(
+                """SELECT day, duty, met_user_id FROM met_day_assignments
+                    WHERE day >= %s AND day <= %s""", (today, end))
+            assigns = {(str(r["day"]), r["duty"]): r["met_user_id"]
+                       for r in cur.fetchall()}
+            cur.execute(
+                """SELECT g.id, g.game_date, g.opponent, g.kickoff,
+                          g.claimed_by
+                     FROM gameday_games g
+                    WHERE g.game_date >= %s AND g.game_date <= %s
+                    ORDER BY g.game_date""", (today, end))
+            games = cur.fetchall()
+            cur.execute(
+                """SELECT e.event_date, e.start_hour, e.what,
+                          COALESCE(u.name, u.email) AS sub_name
+                     FROM pro_watch_events e
+                     JOIN users u ON u.id = e.user_id
+                    WHERE e.event_date >= %s AND e.event_date <= %s""",
+                (today, end))
+            watch_events = cur.fetchall()
+
+    met_names = {m["id"]: m["name"] for m in mets}
+
+    def region_for(t):
+        counts = {}
+        for a in (t.get("addrs") or []):
+            m2 = None
+            for m3 in re.finditer(r",\s*([A-Z]{2})\b", a or ""):
+                m2 = m3
+            if m2:
+                counts[m2.group(1)] = counts.get(m2.group(1), 0) + 1
+        if not counts:
+            return "%s's" % t["met_name"].split(" ")[0]
+        ab = max(counts, key=counts.get)
+        return _WV_STATE_NAMES.get(ab, ab)
+
+    def resolved(dstr, duty, default_met_id=None):
+        if (dstr, duty) in assigns:
+            mid = assigns[(dstr, duty)]
+        else:
+            mid = default_met_id
+        return mid, (met_names.get(mid) if mid else None)
 
     days = []
-    for i in range(10):
-        d = today + timedelta(days=i)
+    for i2 in range(10):
+        d = today + timedelta(days=i2)
         dstr = d.strftime("%Y-%m-%d")
-        # Python: Monday=0..Sunday=6; schema: 0=Sun..6=Sat.
-        dow = (d.weekday() + 1) % 7
-        entries = []
-        for r in recurring:
-            if r["day_of_week"] != dow:
-                continue
-            dropped = any(
-                o["met_user_id"] == r["met_user_id"]
-                and str(o["shift_date"]) == dstr
-                and o["override_kind"] == "drop"
-                and o["scope_kind"] == r["scope_kind"]
-                for o in overrides)
-            if dropped:
-                continue
-            entries.append({
-                "met": r["met_name"],
-                "what": _schedule_scope_label(
-                    r["scope_kind"], r.get("subscriber_name"),
-                    r.get("set_owner_name")),
+        terr_rows = []
+        for t in territories:
+            duty = "territory:%d" % t["met_id"]
+            mid, mname = resolved(dstr, duty, t["met_id"])
+            terr_rows.append({
+                "duty": duty,
+                "label": "%s Pro Coverage (%d)" % (region_for(t), t["n"]),
+                "met_id": mid, "met_name": mname, "critical": True,
             })
-        for o in overrides:
-            if str(o["shift_date"]) != dstr:
-                continue
-            if o["override_kind"] in ("claim", "assign"):
-                entries.append({
-                    "met": o["met_name"],
-                    "what": _schedule_scope_label(
-                        o["scope_kind"], o.get("subscriber_name"),
-                        o.get("set_owner_name"))
-                    + (" (added)" if o["override_kind"] == "claim"
-                       else " (assigned)"),
-                })
-        days.append({"date": dstr,
-                     "label": d.strftime("%a %b %d"),
-                     "entries": entries})
-    return jsonify({"ok": True, "days": days})
+        parts = {}
+        for part in ("morning", "afternoon", "evening"):
+            rows = []
+            for kind, klabel in (("reviews", "Reviews"), ("watch", "Watch")):
+                duty = "%s:%s" % (part, kind)
+                mid, mname = resolved(dstr, duty)
+                label = klabel
+                if kind == "watch":
+                    evs = [w for w in watch_events
+                           if str(w["event_date"]) == dstr
+                           and (("morning" if (w.get("start_hour") or 13) < 12
+                                 else "afternoon" if (w.get("start_hour") or 13) < 17
+                                 else "evening") == part)]
+                    if evs:
+                        label = "Watch (%s)" % "; ".join(
+                            "%s: %s" % (w["sub_name"], (w["what"] or "event")[:24])
+                            for w in evs[:2])
+                rows.append({"duty": duty, "label": label,
+                             "met_id": mid, "met_name": mname,
+                             "critical": kind == "watch" and label != "Watch"})
+            for g in games:
+                if str(g["game_date"]) == dstr and _kickoff_daypart(g["kickoff"]) == part:
+                    rows.append({
+                        "duty": "game:%d" % g["id"],
+                        "label": "Sidekick: IU vs %s (%s)" % (
+                            g["opponent"], g["kickoff"] or "TBA"),
+                        "met_id": g["claimed_by"],
+                        "met_name": met_names.get(g["claimed_by"]),
+                        "critical": True,
+                    })
+            parts[part] = rows
+        days.append({
+            "date": dstr,
+            "headline": d.strftime("%A, %B %d, %Y"),
+            "territories": terr_rows,
+            "parts": parts,
+        })
+    return jsonify({"ok": True, "mets": mets, "days": days})
+
+
+@app.route("/api/v1/met/team-schedule/assign", methods=["OPTIONS"])
+def _met_board_assign_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/met/team-schedule/assign")
+def met_board_assign():
+    """Save one dropdown pick: {day, duty, met_id|null}. Game duties
+    write straight to gameday_games.claimed_by, so this IS the claim."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    day = (data.get("day") or "").strip()
+    duty = (data.get("duty") or "").strip()
+    met_id = data.get("met_id")
+    if met_id is not None:
+        met_id = int(met_id)
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", day) or not duty:
+        return jsonify({"ok": False, "error": "bad-request"}), 400
+    if met_id is not None:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT 1 FROM user_roles
+                                WHERE user_id = %s AND role = 'met'""", (met_id,))
+                if not cur.fetchone():
+                    return jsonify({"ok": False, "error": "not-a-met"}), 400
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            if duty.startswith("game:"):
+                cur.execute(
+                    "UPDATE gameday_games SET claimed_by = %s WHERE id = %s",
+                    (met_id, int(duty.split(":")[1])))
+            else:
+                cur.execute(
+                    """INSERT INTO met_day_assignments
+                         (day, duty, met_user_id, updated_at)
+                       VALUES (%s, %s, %s, %s)
+                       ON CONFLICT (day, duty) DO UPDATE
+                       SET met_user_id = EXCLUDED.met_user_id,
+                           updated_at = EXCLUDED.updated_at""",
+                    (day, duty, met_id, now_ms))
+    print(f"[schedule-board] {user.get('email')} set {day} {duty} "
+          f"-> {met_id}", flush=True)
+    return jsonify({"ok": True})
 
 
 @app.route("/api/v1/met/schedule-options", methods=["OPTIONS"])
@@ -23095,179 +23229,98 @@ _MET_SCHEDULE_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 __WV_TOKENS__
 :root{--accent:#1E6BFF}
 __MET_CHROME__
-.wrapx{max-width:980px;margin:0 auto;padding:26px 22px 70px}
+.wrapx{max-width:820px;margin:0 auto;padding:26px 22px 70px}
 h1{font-size:24px;font-weight:900;letter-spacing:-.02em;color:#fff;margin:0 0 4px}
 .psub{color:#B8C7DE;font-size:15px;margin:0 0 20px;line-height:1.6}
-.phead{font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;
-  color:#7EB6FF;margin:26px 0 10px}
-.wk{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px}
-.dcard{background:#0E1D3C;border:1px solid #2E4A7E;border-radius:12px;color:#C9D8F0;
-  padding:12px 14px;font-size:13.5px;line-height:1.55;min-height:86px}
-.dcard.uncovered{border-color:#E0243C}
-.dcard b{color:#fff;display:block;margin-bottom:6px}
-.dcard .dim{color:#8FA6C6}
-.dcard .red{color:#FF8296;font-weight:700}
-.scard{background:#0E1D3C;border:1px solid #2E4A7E;border-radius:12px;color:#C9D8F0;
-  padding:15px 17px;margin-bottom:10px;font-size:14px;line-height:1.65}
-.scard b{color:#fff}
-.scard .dim{color:#8FA6C6}
-.scard select,.scard input{padding:9px 11px;font-size:14px;color:#EAF1FF;background:#0A1730;
-  border:1px solid #2E4A7E;border-radius:8px;margin:4px 6px 4px 0}
-.scard button{border:none;border-radius:9px;color:#fff;cursor:pointer;font-weight:800;
-  font-size:13px;padding:10px 16px;background:linear-gradient(160deg,#3D8BFF,#1E5FE0);margin:4px 6px 4px 0}
-.scard button.warn2{background:linear-gradient(160deg,#FF7A5C,#E0243C)}
-.scard button:disabled{opacity:.55;cursor:default}
-.shift-x{color:#FF8296;cursor:pointer;font-weight:800;margin-left:8px}
-#sc-msg{font-size:14px;margin-top:8px}
+.dayblk{background:#0E1D3C;border:1px solid #2E4A7E;border-radius:14px;
+  padding:16px 18px 12px;margin-bottom:16px}
+.dayblk h2{font-size:17px;font-weight:900;color:#fff;margin:0 0 10px;
+  border-bottom:1px solid #24406E;padding-bottom:8px}
+.subhead{font-size:11.5px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;
+  color:#7EB6FF;margin:12px 0 4px}
+.drow{display:flex;align-items:center;justify-content:space-between;gap:10px;
+  padding:6px 0;font-size:14px;color:#C9D8F0;flex-wrap:wrap}
+.drow .lbl{flex:1;min-width:170px}
+.drow.crit-open .lbl{color:#FFC46B;font-weight:700}
+.drow select{padding:7px 9px;font-size:13.5px;color:#EAF1FF;background:#0A1730;
+  border:1px solid #2E4A7E;border-radius:8px;min-width:170px}
+.drow select.nobody{border-color:#E0243C;color:#FF8296}
+#sb-msg{font-size:14px;margin-top:8px}
 </style></head><body>
 __MET_NAV__
 <div class=wrapx>
   <h1>Schedule</h1>
-  <div class=psub>The whole team's coverage for the next 10 days, then your own
-  weekly pattern. Same schedule the old portal shows; edits here appear there
-  and the other way round. Bring this page to the Thursday meeting.</div>
-  <div class=phead>Team, next 10 days</div>
-  <div class=wk id=sc-week></div>
-  <div class=phead>My weekly pattern</div>
-  <div id=sc-mine></div>
-  <div class=scard>
-    <b>Add a recurring shift</b><br>
-    <select id=sc-day></select>
-    <select id=sc-scope>
-      <option value=review_pool>Review pool (all pending briefs)</option>
-      <option value=subscriber_set>A Met's whole roster</option>
-      <option value=subscriber>One subscriber</option>
-    </select>
-    <select id=sc-owner style="display:none"></select>
-    <select id=sc-sub style="display:none"></select>
-    <button id=sc-add>Add shift</button>
-  </div>
-  <div class=scard>
-    <b>One-off change</b> <span class=dim>(vacation day, extra day)</span><br>
-    <input type=date id=sc-odate>
-    <select id=sc-okind>
-      <option value=drop>I'm out that day (drop my shifts)</option>
-      <option value=claim>I'll cover the review pool that day</option>
-    </select>
-    <button id=sc-ogo class=warn2>Save change</button>
-  </div>
-  <div class=phead>My upcoming one-off changes</div>
-  <div id=sc-ovr class=scard><span class=dim>Loading...</span></div>
-  <div id=sc-msg></div>
+  <div class=psub>Every day, every duty, and who owns it. Pick names from the
+  dropdowns; picks save instantly and everyone sees the same board. Sidekick
+  rows are the real GameDay claims. Assigning a Met to a territory gives them
+  that day's briefs.</div>
+  <div id=sb-days><span style="color:#8FA6C6">Loading...</span></div>
+  <div id=sb-msg></div>
 </div>
 __WV_FOOTER__"""
 
 
 _MET_SCHEDULE_SCRIPT = """<script>
 (function(){
-var DAYS=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
-var opts={mets:[],subscribers:[]};
+var METS=[];
 function esc(t){var d=document.createElement('div');d.textContent=t==null?'':String(t);return d.innerHTML;}
-function say(k,t){document.getElementById('sc-msg').innerHTML=
+function say(k,t){document.getElementById('sb-msg').innerHTML=
   '<span style="color:'+(k==='good'?'#7EE2A8':'#FF8296')+';font-weight:700">'+esc(t)+'</span>';}
-function scopeText(s){
-  if(s.scope_kind==='review_pool') return 'Review pool';
-  if(s.scope_kind==='subscriber_set') return "Covering "+esc(s.set_owner_name||'a Met')+"'s people";
-  return 'Brief for '+esc(s.subscriber_name||'a subscriber');
+function rowHtml(day, r){
+  var sel='<select data-day="'+esc(day)+'" data-duty="'+esc(r.duty)+'"'
+    +(r.met_id?'':' class=nobody')+'>'
+    +'<option value="">Nobody yet</option>'
+    +METS.map(function(m){
+        return '<option value="'+m.id+'"'+(r.met_id===m.id?' selected':'')+'>'
+          +esc(m.name)+'</option>'; }).join('')
+    +'</select>';
+  return '<div class="drow'+((r.critical&&!r.met_id)?' crit-open':'')+'">'
+    +'<span class=lbl>'+esc(r.label)+':</span>'+sel+'</div>';
 }
-function loadTeam(){
+function load(){
   fetch('/api/v1/met/team-schedule',{credentials:'include'})
    .then(function(r){return r.json();})
    .then(function(d){
      if(!d.ok) return;
-     document.getElementById('sc-week').innerHTML = d.days.map(function(day){
-       var inner = day.entries.length
-         ? day.entries.map(function(e){
-             return '<div>'+esc(e.met)+' <span class=dim>&middot; '+esc(e.what)+'</span></div>';
-           }).join('')
-         : '<div class=red>No coverage</div>';
-       return '<div class="dcard'+(day.entries.length?'':' uncovered')+'"><b>'
-         + esc(day.label)+'</b>'+inner+'</div>';
-     }).join('');
-   }).catch(function(){});
-}
-function loadMine(){
-  fetch('/api/v1/met/my-schedule',{credentials:'include'})
-   .then(function(r){return r.json();})
-   .then(function(d){
-     if(!d.ok) return;
-     var rs=d.recurring_shifts||[];
-     document.getElementById('sc-mine').innerHTML = rs.length
-       ? rs.map(function(s){
-           return '<div class=scard>'+esc(DAYS[s.day_of_week])+': '+scopeText(s)
-             +'<span class=shift-x data-id="'+s.id+'" title="Remove">&#10005;</span></div>';
-         }).join('')
-       : '<div class=scard><span class=dim>No recurring shifts yet. Add one below; '
-         +'the review pool is where the morning briefs live.</span></div>';
-     Array.prototype.forEach.call(document.querySelectorAll('.shift-x'),function(x){
-       x.addEventListener('click',function(){
-         if(!confirm('Remove this recurring shift?')) return;
-         fetch('/api/v1/met/recurring-shifts/'+x.getAttribute('data-id'),
-               {method:'DELETE',credentials:'include'})
-           .then(function(r){return r.json();})
-           .then(function(d2){ if(d2.ok){ say('good','Shift removed.'); loadMine(); loadTeam(); }
-                               else say('bad',d2.error||'Could not remove.'); })
-           .catch(function(){ say('bad','Connection problem.'); });
+     METS=d.mets||[];
+     document.getElementById('sb-days').innerHTML = d.days.map(function(day){
+       var h='<div class=dayblk><h2>'+esc(day.headline)+'</h2>';
+       if(day.territories.length){
+         h+=day.territories.map(function(r){return rowHtml(day.date,r);}).join('');
+       } else {
+         h+='<div class=drow><span class=lbl style="color:#8FA6C6">No territories yet: '
+           +'assign Mets to subscribers in the Command Center first.</span></div>';
+       }
+       ['morning','afternoon','evening'].forEach(function(part){
+         h+='<div class=subhead>'+part.charAt(0).toUpperCase()+part.slice(1)+' Coverage</div>';
+         h+=day.parts[part].map(function(r){return rowHtml(day.date,r);}).join('');
        });
-     });
-     var ov=d.overrides||[];
-     document.getElementById('sc-ovr').innerHTML = ov.length
-       ? ov.map(function(o){
-           return '<div>'+esc(o.shift_date)+': '
-             +(o.override_kind==='drop'?'Out':'Covering')+' <span class=dim>&middot; '
-             +scopeText(o)+'</span></div>';
-         }).join('')
-       : '<span class=dim>None.</span>';
+       return h+'</div>';
+     }).join('');
+     wire();
    }).catch(function(){});
 }
-function loadOpts(){
-  fetch('/api/v1/met/schedule-options',{credentials:'include'})
-   .then(function(r){return r.json();})
-   .then(function(d){
-     if(!d.ok) return;
-     opts=d;
-     document.getElementById('sc-owner').innerHTML =
-       d.mets.map(function(m){return '<option value="'+m.id+'">'+esc(m.name)+"'s people</option>";}).join('');
-     document.getElementById('sc-sub').innerHTML =
-       d.subscribers.map(function(u){return '<option value="'+u.id+'">'+esc(u.name)+'</option>';}).join('');
-   }).catch(function(){});
+function wire(){
+  Array.prototype.forEach.call(document.querySelectorAll('.drow select'),function(sel){
+    sel.addEventListener('change',function(){
+      sel.disabled=true;
+      fetch('/api/v1/met/team-schedule/assign',{method:'POST',credentials:'include',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({day:sel.getAttribute('data-day'),
+                             duty:sel.getAttribute('data-duty'),
+                             met_id:sel.value?Number(sel.value):null})})
+       .then(function(r){return r.json();})
+       .then(function(d){
+         sel.disabled=false;
+         if(d.ok){ sel.classList.toggle('nobody', !sel.value);
+           sel.style.borderColor = sel.value ? '#2E7D4F' : '#E0243C'; }
+         else { say('bad', d.error||'Could not save.'); }
+       })
+       .catch(function(){ sel.disabled=false; say('bad','Connection problem.'); });
+    });
+  });
 }
-document.getElementById('sc-day').innerHTML =
-  DAYS.map(function(n,i){return '<option value="'+i+'">'+n+'</option>';}).join('');
-document.getElementById('sc-scope').addEventListener('change',function(){
-  document.getElementById('sc-owner').style.display = this.value==='subscriber_set'?'':'none';
-  document.getElementById('sc-sub').style.display = this.value==='subscriber'?'':'none';
-});
-document.getElementById('sc-add').addEventListener('click',function(){
-  var scope=document.getElementById('sc-scope').value;
-  var body={day_of_week:Number(document.getElementById('sc-day').value),scope_kind:scope};
-  if(scope==='subscriber_set') body.set_owner_met_id=Number(document.getElementById('sc-owner').value);
-  if(scope==='subscriber') body.subscriber_user_id=Number(document.getElementById('sc-sub').value);
-  var b=this; b.disabled=true;
-  fetch('/api/v1/met/recurring-shifts',{method:'POST',credentials:'include',
-    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-   .then(function(r){return r.json();})
-   .then(function(d){ b.disabled=false;
-     if(d.ok){ say('good','Shift added.'); loadMine(); loadTeam(); }
-     else say('bad',d.error||'Could not add.'); })
-   .catch(function(){ b.disabled=false; say('bad','Connection problem.'); });
-});
-document.getElementById('sc-ogo').addEventListener('click',function(){
-  var dt=document.getElementById('sc-odate').value;
-  if(!dt){ say('bad','Pick the date first.'); return; }
-  var kind=document.getElementById('sc-okind').value;
-  var body={shift_date:dt,override_kind:kind,
-            scope_kind: kind==='claim' ? 'review_pool' : 'review_pool'};
-  var b=this; b.disabled=true;
-  fetch('/api/v1/met/shift-overrides',{method:'POST',credentials:'include',
-    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-   .then(function(r){return r.json();})
-   .then(function(d){ b.disabled=false;
-     if(d.ok){ say('good','Saved.'); loadMine(); loadTeam(); }
-     else say('bad',d.error||'Could not save.'); })
-   .catch(function(){ b.disabled=false; say('bad','Connection problem.'); });
-});
-loadOpts(); loadMine(); loadTeam();
+load();
 })();
 </script>"""
 
@@ -48475,9 +48528,18 @@ def _can_met_see_pro_brief(met_user_id: int, draft_id: int, is_admin: bool) -> b
                            AND sa.is_drop = FALSE
                            AND sa.shift_date = %s
                        )
+                       -- (d) The Schedule board assigned me this territory
+                       --     today (Aug 30, 2026).
+                       OR EXISTS (
+                         SELECT 1 FROM met_day_assignments mda
+                         WHERE mda.met_user_id = %s
+                           AND mda.day::text = %s
+                           AND mda.duty = 'territory:' || sc.primary_met_id::text
+                       )
                      )
                    LIMIT 1""",
-                (draft_id, met_user_id, met_user_id, today_et),
+                (draft_id, met_user_id, met_user_id, today_et,
+                 met_user_id, today_et),
             )
             return cur.fetchone() is not None
 
@@ -49611,6 +49673,14 @@ def met_pro_briefs_list():
                                AND sa.is_drop = FALSE
                                AND sa.shift_date = ANY(%s)
                            )
+                           -- (d) The Schedule board assigned me this
+                           --     territory today (Aug 30, 2026).
+                           OR EXISTS (
+                             SELECT 1 FROM met_day_assignments mda
+                             WHERE mda.met_user_id = %s
+                               AND mda.day = ANY(%s)
+                               AND mda.duty = 'territory:' || sc.primary_met_id::text
+                           )
                          )
                        ORDER BY
                          CASE d.status
@@ -49623,6 +49693,7 @@ def met_pro_briefs_list():
                     (
                         int(time.time() * 1000) - 24 * 60 * 60 * 1000,
                         me_id, me_id, _met_coverage_shift_dates(),
+                        me_id, _met_coverage_shift_dates(),
                     ),
                 )
             rows = cur.fetchall()
