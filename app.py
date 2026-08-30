@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-267"
+BACKEND_BUILD = "0702-269"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -7940,7 +7940,7 @@ def _mark_paid_and_notify(request_id: int, *, payment_id: Optional[str] = None,
     # specific Met is decided later when one claims the review, so we
     # use generic "a meteorologist" here.)
     customer_msg = (
-        "WeatherValet: Got it, a meteorologist is reviewing your plan now "
+        "WeatherValet: Got it, a Meteorologist is reviewing your plan now "
         "and we'll text you when the call is ready (usually under 30 minutes). "
         "Reply STOP to opt out."
     )
@@ -11798,7 +11798,7 @@ def meteorologist_complete(claim_token: str):
     # the raw verdict key the workspace submits. See _compose_review_sms_lead.
     sms_lead = _compose_review_sms_lead(verdict, notes)
     customer_msg = (
-        f"WeatherValet: Your meteorologist's call is ready. "
+        f"WeatherValet: Your Meteorologist's call is ready. "
         f"{sms_lead} "
         f"View full brief + thank {completed_by_name}: "
         f"{FRONTEND_BASE_URL}/?review={customer_review_token}"
@@ -41483,16 +41483,16 @@ def _notify_crew_in_severe_alert(alert: dict) -> None:
 # (rosie_sms_inbound) and checks them in.
 _CREW_DAILY_NUDGE_MESSAGES = [
     "Good morning from WeatherValet! What does it look like outside, and what town are you in? Reply like: clear, Lebanon. Photos welcome!",
-    "Valet Crew check-in time! Reply with conditions and your town (like: rain, Whitestown) or a photo, and you're on the Crew map today.",
-    "Our WeatherValet Meteorologists need your eyes. What is the sky doing, and what town are you watching it from? Photos welcome!",
-    "Valet Crew: take a look outside. Reply with what you see and your town, like: cloudy, Zionsville. A photo says even more.",
-    "Daily WeatherValet update: conditions plus your town, please! Example: storm rolling in, Atwood. Photos land straight on the Crew map.",
+    "Valet Crew check-in time! Reply with conditions and your town (like: rain, Whitestown IN) or a photo, and you're on the Crew map today.",
+    "Our WeatherValet Meteorologists need your eyes. What is the sky doing, and what town and state are you watching it from? Photos welcome!",
+    "Valet Crew: take a look outside. Reply with what you see and your town, like: cloudy, Zionsville IN. A photo says even more.",
+    "Daily WeatherValet update: conditions plus your town, please! Example: storm rolling in, Atwood KS. Photos land straight on the Crew map.",
     "Weather check from the Valet Crew line! What is it doing outside, and where? A word and a town, or a picture.",
-    "WeatherValet here. Help us monitor conditions: what does the weather look like, and what town are you in?",
-    "Valet Crew: quick glance outside. Reply conditions plus town, like: clear, Lebanon. That is all it takes.",
-    "WeatherValet would love an update. Current conditions and your town, or a photo. Example: light rain, Thornton.",
-    "Ground truth matters to our Meteorologists. What does the sky look like, and what town is under it? Reply like: windy, Atwood.",
-    "It's WeatherValet! A quick observation helps: conditions and your town, like: cloudy, Jamestown. Or just send a photo.",
+    "WeatherValet here. Help us monitor conditions: what does the weather look like, and what town and state are you in?",
+    "Valet Crew: quick glance outside. Reply conditions plus town, like: clear, Lebanon IN. That is all it takes.",
+    "WeatherValet would love an update. Current conditions and your town, or a photo. Example: light rain, Thornton IN.",
+    "Ground truth matters to our Meteorologists. What does the sky look like, and what town and state are under it? Reply like: windy, Atwood KS.",
+    "It's WeatherValet! A quick observation helps: conditions and your town, like: cloudy, Jamestown IN. Or just send a photo.",
     "Valet Crew: what's happening outside your window, and what town is that window in? A word, a town, or a photo checks you in.",
     "Conditions change fast and the Valet Crew sees it first. What is the weather doing, and in what town? Example: storm, Lebanon.",
     "WeatherValet observation request: conditions plus your town, please. Like: clear and hot, Whitestown.",
