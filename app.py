@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-269"
+BACKEND_BUILD = "0702-270"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -39276,7 +39276,12 @@ def _alarm_expired_briefs() -> None:
                         """UPDATE pro_brief_drafts SET expiry_notified_at = %s
                             WHERE id = ANY(%s)""",
                         (now_ms, [r["id"] for r in scanned]))
-                rows = [r for r in scanned if not r.get("was_delivered")]
+                # The team writes evening briefs (Michael, Aug 30, 2026);
+                # 'morning' drafts are a legacy cadence nobody intends to
+                # send, so they retire without a report.
+                rows = [r for r in scanned
+                        if not r.get("was_delivered")
+                        and (r.get("brief_type") or "") != "morning"]
     except Exception as e:
         print(f"[brief-expiry-alarm] scan failed: {e!r}", flush=True)
         return
@@ -39310,10 +39315,9 @@ def _alarm_expired_briefs() -> None:
         return
     from_addr = os.environ.get("RESEND_FROM_EMAIL",
                                "WeatherValet <hello@weathervalet.ai>")
+    # Michael only (Aug 30, 2026): no accuracy or missed-forecast nag
+    # emails to Meteorologists.
     recipients = {"michael@weathervalet.com"}
-    for r in rows:
-        if r.get("met_email"):
-            recipients.add(r["met_email"])
     n = len(by_person)
     subject = ("%d subscriber%s missed a brief - nothing was sent"
                % (n, "" if n == 1 else "s"))
