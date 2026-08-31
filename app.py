@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-271"
+BACKEND_BUILD = "0702-275"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -1530,6 +1530,14 @@ CREATE INDEX IF NOT EXISTS idx_bbd_subscriber_sent
 -- free-text label the Met enters (e.g. "Central Kansas" or "Boone
 -- County, IN") — we don't yet pin it to a strict geography. Tracking
 -- evolves with usage.
+CREATE TABLE IF NOT EXISTS brief_images (
+    token         TEXT PRIMARY KEY,
+    content_type  TEXT NOT NULL,
+    data          BYTEA NOT NULL,
+    uploaded_by   INTEGER,
+    created_at    BIGINT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS met_day_assignments (
     day          DATE    NOT NULL,
     duty         TEXT    NOT NULL,   -- 'territory:<met_id>' | '<part>:reviews' | '<part>:watch'
@@ -21011,6 +21019,13 @@ __MET_NAV__
         <div class=acts>
           <button class=go id=send>Send</button>
           <button class=ghost id=save>Save without sending</button>
+          <span id=autosave style="color:#8FA6C6;font-size:12.5px;align-self:center"></span>
+        </div>
+        <div style="margin-top:10px">
+          <label class=mini style="cursor:pointer;display:inline-block">Attach image (JPG or PNG)
+            <input type=file id=f-img accept="image/jpeg,image/png" style="display:none"></label>
+          <span id=img-state style="color:#8FA6C6;font-size:12.5px;margin-left:8px"></span>
+          <div id=img-thumb style="margin-top:8px"></div>
         </div>
         <div id=msg class=msg></div>
       </div>
@@ -21137,9 +21152,79 @@ _MET_BRIEFS_SCRIPT = """<script>
       b.className = (b.getAttribute('data-v')===v) ? 'on' : ''; });
     renderCtx();
     updateTargets();
+    var st=document.getElementById('img-state'); if(st) st.textContent='';
+    showThumb(d.image_url||'');
+  }
+  var saveTimer=null, saveSeq=0;
+  function autosave(){
+    if(!current) return;
+    var payload={met_verdict:(document.querySelector('#verd button.on')||{}).getAttribute
+        ? (document.querySelector('#verd button.on').getAttribute('data-v')||'') : '',
+      bottom_line:document.getElementById('f-bottom').value,
+      weather_details:document.getElementById('f-weather').value,
+      whats_ahead:document.getElementById('f-ahead').value};
+    var seq=++saveSeq, id=current.id;
+    fetch('/api/v1/met/pro-briefs/'+id,{method:'PATCH',credentials:'include',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
+     .then(function(r){return r.json();})
+     .then(function(d){
+       if(seq!==saveSeq) return;
+       var el=document.getElementById('autosave');
+       if(el) el.textContent = d.ok ? 'Saved. The old composer sees this too.' : 'Not saved';
+     })
+     .catch(function(){
+       var el=document.getElementById('autosave');
+       if(el) el.textContent='Not saved (connection)';
+     });
+  }
+  function queueSave(){
+    dirty=true;
+    var el=document.getElementById('autosave');
+    if(el) el.textContent='Saving...';
+    if(saveTimer) clearTimeout(saveTimer);
+    saveTimer=setTimeout(autosave, 900);
   }
   ['f-bottom','f-weather','f-ahead'].forEach(function(fid){
-    document.getElementById(fid).addEventListener('input',function(){ dirty=true; });
+    document.getElementById(fid).addEventListener('input', queueSave);
+  });
+  function showThumb(url){
+    var t=document.getElementById('img-thumb');
+    if(!url){ t.innerHTML=''; return; }
+    t.innerHTML='<img src="'+url+'" style="max-width:220px;border-radius:10px;'
+      +'border:1px solid #2E4A7E;display:block"><a href="#" id=img-rm '
+      +'style="font-size:12.5px">Remove image</a>';
+    var rm=document.getElementById('img-rm');
+    if(rm) rm.addEventListener('click',function(e){
+      e.preventDefault();
+      if(!current) return;
+      fetch('/api/v1/met/pro-briefs/'+current.id,{method:'PATCH',credentials:'include',
+        headers:{'Content-Type':'application/json'},body:JSON.stringify({image_url:''})})
+       .then(function(r){return r.json();})
+       .then(function(d){ if(d.ok){ current.image_url=''; showThumb(''); } });
+    });
+  }
+  document.getElementById('f-img').addEventListener('change',function(){
+    var file=this.files && this.files[0];
+    this.value='';
+    if(!file || !current) return;
+    var st=document.getElementById('img-state');
+    st.textContent='Uploading...';
+    var fd=new FormData(); fd.append('image', file);
+    fetch('/api/v1/met/brief-images',{method:'POST',credentials:'include',body:fd})
+     .then(function(r){return r.json();})
+     .then(function(d){
+       if(!d.ok){ st.textContent=d.error||'Upload failed'; return; }
+       fetch('/api/v1/met/pro-briefs/'+current.id,{method:'PATCH',credentials:'include',
+         headers:{'Content-Type':'application/json'},
+         body:JSON.stringify({image_url:d.url})})
+        .then(function(r2){return r2.json();})
+        .then(function(d2){
+          if(d2.ok){ st.textContent='Attached. Goes out as a picture text.';
+            current.image_url=d.url; showThumb(d.url); }
+          else st.textContent=d2.error||'Could not attach';
+        });
+     })
+     .catch(function(){ st.textContent='Upload failed (connection)'; });
   });
 
   Array.prototype.forEach.call(document.querySelectorAll('#verd button'),function(b){
@@ -21147,7 +21232,7 @@ _MET_BRIEFS_SCRIPT = """<script>
       Array.prototype.forEach.call(document.querySelectorAll('#verd button'),
         function(x){ x.className=''; });
       b.className='on';
-      dirty=true;
+      queueSave();
     });
   });
 
@@ -22631,6 +22716,70 @@ def _severe_affected(alert):
     else:
         subs = _find_pro_subscribers_by_county(alert)
     return subs, _severe_board_sentry(alert)
+
+
+@app.route("/api/v1/met/brief-images", methods=["OPTIONS"])
+def _met_brief_image_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/met/brief-images")
+def met_brief_image_upload():
+    """Attach-an-image done right (Aug 31, 2026): the file is stored in
+    Postgres and served from our own domain, so Twilio fetches it like
+    the warning maps (which provably deliver) instead of a Google Drive
+    link that carriers filter. JPG and PNG only, 5 MB cap, validated by
+    magic bytes rather than filename."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    f = request.files.get("image")
+    blob = f.read() if f else request.get_data()
+    if not blob:
+        return jsonify({"ok": False, "error": "no-image"}), 400
+    if len(blob) > 5 * 1024 * 1024:
+        return jsonify({"ok": False, "error": "too-large-5mb-max"}), 400
+    if blob[:3] == b"\xff\xd8\xff":
+        ctype = "image/jpeg"
+    elif blob[:8] == b"\x89PNG\r\n\x1a\n":
+        ctype = "image/png"
+    else:
+        return jsonify({"ok": False, "error": "jpg-or-png-only"}), 400
+    token = secrets.token_urlsafe(12)
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO brief_images
+                     (token, content_type, data, uploaded_by, created_at)
+                   VALUES (%s, %s, %s, %s, %s)""",
+                (token, ctype, blob, user["id"], now_ms))
+    ext = "jpg" if ctype == "image/jpeg" else "png"
+    url = f"{PUBLIC_BASE_URL.rstrip('/')}/brief-images/{token}.{ext}"
+    print(f"[brief-image] {user.get('email')} uploaded {len(blob)}b "
+          f"{ctype} -> {token}", flush=True)
+    return jsonify({"ok": True, "url": url})
+
+
+@app.get("/brief-images/<token_ext>")
+def serve_brief_image(token_ext):
+    """Twilio and browsers fetch attached brief images here."""
+    token = token_ext.rsplit(".", 1)[0]
+    safe = "".join(ch for ch in token if ch.isalnum() or ch in "-_")
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT content_type, data FROM brief_images WHERE token = %s",
+                (safe,))
+            r = cur.fetchone()
+    if not r:
+        return ("Not found", 404)
+    from flask import Response
+    return Response(bytes(r["data"]), mimetype=r["content_type"],
+                    headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.route("/api/v1/met/pro-briefs/create", methods=["OPTIONS"])
@@ -39364,17 +39513,36 @@ def _alarm_expired_briefs() -> None:
                         ORDER BY d.window_end_at""",
                     (grace,))
                 scanned = cur.fetchall()
-                if scanned:
-                    cur.execute(
-                        """UPDATE pro_brief_drafts SET expiry_notified_at = %s
-                            WHERE id = ANY(%s)""",
-                        (now_ms, [r["id"] for r in scanned]))
                 # The team writes evening briefs (Michael, Aug 30, 2026);
                 # 'morning' drafts are a legacy cadence nobody intends to
-                # send, so they retire without a report.
+                # send. Those, plus anything actually delivered, retire
+                # silently right now. True misses stay unstamped until
+                # the daily digest goes out, so Michael gets ONE email a
+                # day instead of one per scheduler tick (Aug 31, 2026).
+                quiet_ids = [r["id"] for r in scanned
+                             if r.get("was_delivered")
+                             or (r.get("brief_type") or "") == "morning"]
+                if quiet_ids:
+                    cur.execute(
+                        """UPDATE pro_brief_drafts SET expiry_notified_at = %s
+                            WHERE id = ANY(%s)""", (now_ms, quiet_ids))
                 rows = [r for r in scanned
                         if not r.get("was_delivered")
                         and (r.get("brief_type") or "") != "morning"]
+        try:
+            digest_hour = datetime.now(
+                ZoneInfo("America/Indiana/Indianapolis")).hour
+        except Exception:
+            digest_hour = datetime.now(timezone.utc).hour
+        if rows and digest_hour != 9:
+            return
+        if rows:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """UPDATE pro_brief_drafts SET expiry_notified_at = %s
+                            WHERE id = ANY(%s)""",
+                        (now_ms, [r["id"] for r in rows]))
     except Exception as e:
         print(f"[brief-expiry-alarm] scan failed: {e!r}", flush=True)
         return
@@ -39388,7 +39556,7 @@ def _alarm_expired_briefs() -> None:
         try:
             day = datetime.fromtimestamp(
                 int(r["window_end_at"]) / 1000, tz=timezone.utc
-            ).strftime("%b %d")
+            ).strftime("%b %d") + " " + (r.get("brief_type") or "brief")
         except Exception:
             day = "?"
         by_person.setdefault(key, []).append(day)
@@ -40765,6 +40933,13 @@ def _coverage_check_escalations() -> None:
 
 
 def _coverage_check_escalations_inner() -> None:
+    # Retired (Michael, Aug 31, 2026): this system texted the assigned
+    # Met when a fixed brief deadline passed, then escalated to admins
+    # and the Chief Met. It nagged Chris every morning about a cadence
+    # the team no longer keeps. Briefs go out any time a Meteorologist
+    # decides; the only miss reporting is Michael's daily 9 AM digest.
+    # Body kept below (unreachable) to avoid a risky mass deletion.
+    return
     now_ms = int(time.time() * 1000)
     thirty_min_ms = 30 * 60 * 1000
 
@@ -43338,6 +43513,17 @@ def _auto_relay_warning(alert: dict, affected: list) -> int:
                 delivered = True
             except Exception as e:
                 print(f"[severe-relay] email failed user={sub['user_id']}: {e!r}", flush=True)
+        if alert.get("event") == "Tornado Warning" and phone:
+            try:
+                place_voice_call(
+                    phone,
+                    (("This is a rehearsal. No warning is in effect. ")
+                     if alert.get("is_rehearsal") else "") +
+                    f"This is WeatherValet. A tornado warning includes your "
+                    f"location{(' until ' + until) if until else ''}. Take shelter now "
+                    f"in an interior room on the lowest floor, away from windows.")
+            except Exception as e:
+                print(f"[severe-relay] voice call failed user={sub['user_id']}: {e!r}", flush=True)
         try:
             _record_brief_delivery(sub["user_id"], "severe", "risk",
                                    body[:200], body,
