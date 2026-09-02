@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-280"
+BACKEND_BUILD = "0702-281"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -17235,12 +17235,19 @@ h1{font-size:clamp(28px,5.5vw,40px);font-weight:900;letter-spacing:-.02em;color:
   conditions from the ground. Radar shows the storm; you show the truth. When a
   WeatherValet Meteorologist needs eyes somewhere, they ask the Crew.</p>
 
-  <div class=demo>
+  <div style="display:flex;justify-content:center;margin:6px 0 10px">
+  <div class=demo style="width:340px;max-width:100%;border-radius:30px;border:6px solid #10192E;
+    box-shadow:0 24px 50px -20px rgba(0,0,0,.7);position:relative;padding-top:26px">
+    <div style="position:absolute;top:8px;left:50%;transform:translateX(-50%);
+      width:90px;height:8px;border-radius:4px;background:#10192E"></div>
+    <div style="color:#5F729A;font-size:11px;text-align:center;margin-bottom:8px">
+      Text Message &middot; today 4:12 PM</div>
     <div class="dm in"><span class=who>Mission from Chris, WeatherValet Meteorologist:</span><br>
       Has the rain changed over to snow at your location?</div>
     <div class="dm out">All snow here, Atwood KS. Sticking on the grass.</div>
     <div class="dm in">That is exactly what we needed. Your report just helped us
       message 14 neighbors. Thank you.</div>
+  </div>
   </div>
 
   <div class=kh>How it works</div>
@@ -17255,9 +17262,40 @@ h1{font-size:clamp(28px,5.5vw,40px);font-weight:900;letter-spacing:-.02em;color:
     You'll know when your report helped.</div></div>
 
   <div class=kh>What you get</div>
-  <div class=kcard><b>The Crew map.</b> Live radar with Crew reports pinned across
-    the country. See what's heading your way, and what other members are saying
-    about the storm that's coming for them.</div>
+  <div class=kcard style="padding:0;overflow:hidden">
+    <svg viewBox="0 0 700 250" style="display:block;width:100%">
+      <rect width="700" height="250" fill="#0A1220"/>
+      <g stroke="#1B2A44" stroke-width="1">
+        <path d="M0 60 H700 M0 125 H700 M0 190 H700 M115 0 V250 M235 0 V250 M355 0 V250 M475 0 V250 M595 0 V250"/>
+      </g>
+      <g stroke="#2A3A58" stroke-width="1.4" fill="none">
+        <path d="M20 235 C 130 180, 240 200, 350 130 S 560 40, 690 30"/>
+        <path d="M5 100 C 130 108, 260 92, 390 98 S 620 112, 695 104"/>
+      </g>
+      <circle cx="250" cy="150" r="66" fill="#2f8f2f" opacity=".45"/>
+      <circle cx="236" cy="136" r="42" fill="#e8d33f" opacity=".6"/>
+      <circle cx="226" cy="126" r="22" fill="#e0662e" opacity=".8"/>
+      <circle cx="221" cy="120" r="9" fill="#c22323"/>
+      <circle cx="470" cy="90" r="34" fill="#2f8f2f" opacity=".4"/>
+      <circle cx="479" cy="84" r="16" fill="#e8d33f" opacity=".55"/>
+      <g>
+        <circle cx="300" cy="132" r="7" fill="#E0662E" stroke="#FFC46B" stroke-width="2"/>
+        <circle cx="342" cy="170" r="7" fill="#E0662E" stroke="#FFC46B" stroke-width="2"/>
+        <circle cx="520" cy="104" r="7" fill="#E0662E" stroke="#FFC46B" stroke-width="2"/>
+        <circle cx="150" cy="90" r="7" fill="#E0662E" stroke="#FFC46B" stroke-width="2"/>
+      </g>
+      <g font-family="sans-serif" font-size="12" fill="#C7D4E8">
+        <text x="312" y="128">Hail, Atwood KS</text>
+        <text x="354" y="188">High wind, Colby KS</text>
+        <text x="532" y="100">Rain, Lebanon IN</text>
+      </g>
+      <text x="14" y="238" font-family="sans-serif" font-size="10" fill="#5F729A">
+        Live radar + Crew reports, nationwide</text>
+    </svg>
+    <div style="padding:14px 20px 16px"><b>The Crew map.</b> Live radar with Crew
+    reports pinned across the country. See what's heading your way, and what other
+    members are saying about the storm that's coming for them.</div>
+  </div>
   <div class=kcard><b>The truth, both ways.</b> It's free. It's not a product, and
     it's always in beta. We won't pretend otherwise, and we won't waste your
     phone: every message you get was typed by a human with a name.</div>
@@ -18141,6 +18179,15 @@ h1{font-size:23px;font-weight:900;letter-spacing:-.02em;color:#fff;margin:0 0 4p
 .mine .dim{color:#8FA6C6;font-size:12.5px}
 .mine .ok{color:#7EE2A8;font-weight:700}
 </style></head><body>
+<div style="display:flex;align-items:center;justify-content:space-between;
+  padding:12px 18px;border-bottom:1px solid #1B2E52">
+  <a href="https://weathervalet.ai" style="color:#fff;font-weight:900;font-size:16px;
+    text-decoration:none">&#9889; WeatherValet</a>
+  <div style="display:flex;gap:16px;align-items:center">
+    <span style="color:#7EB6FF;font-size:13.5px;font-weight:700">Valet Crew</span>
+    <a href="#" id=cw-out style="color:#8FA6C6;font-size:13.5px;text-decoration:none">Sign out</a>
+  </div>
+</div>
 <div class=wrapc>
   <h1>Valet Crew</h1>
   <div class=csub>Live radar, and what Crew members are seeing on the ground,
@@ -18175,6 +18222,12 @@ _CREW_WS_SCRIPT = """<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet
 var TYPES=[['storm','Storm'],['hail','Hail'],['wind','High wind'],['flood','Flooding'],
   ['snow','Snow'],['fog','Fog'],['tornado','Tornado'],['other','Other']];
 var picked=null, myLat=null, myLng=null, photoUrl='', map=null, meMarker=null, missionId=null;
+var co=document.getElementById('cw-out');
+if(co) co.addEventListener('click',function(e){ e.preventDefault();
+  fetch('/api/v1/auth/logout',{method:'POST',credentials:'include'})
+   .then(function(){ location.href='https://weathervalet.ai'; })
+   .catch(function(){ location.href='https://weathervalet.ai'; });
+});
 fetch('/api/v1/crew/active-mission',{credentials:'include'})
  .then(function(r){return r.json();})
  .then(function(d){
@@ -22747,6 +22800,26 @@ def met_crew_mission_create():
         return jsonify({"ok": False, "error": "bad-target"}), 400
 
     recipient_ids = _mission_recipients(target_kind, tlat, tlng, tmi)
+    if not recipient_ids:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT COUNT(*) AS total,
+                              COUNT(*) FILTER (WHERE u.crew_home_lat IS NOT NULL)
+                                  AS located
+                         FROM users u
+                         JOIN user_roles ur ON ur.user_id = u.id
+                              AND ur.role = 'crew'
+                        WHERE u.is_active = TRUE
+                          AND COALESCE(u.crew_active, TRUE) = TRUE""")
+                cts = cur.fetchone() or {}
+        return jsonify({
+            "ok": False, "error": "no-recipients",
+            "message": ("Nobody matched. %d Crew member(s) total, %d with a "
+                        "home location on file. Try a wider radius, or "
+                        "Everyone." % (cts.get("total") or 0,
+                                       cts.get("located") or 0)),
+        }), 400
     met_name = user.get("name") or "your Meteorologist"
     now_ms = int(time.time() * 1000)
     with db() as conn:
@@ -42022,6 +42095,41 @@ def _page_met_for_alert(alert: dict, affected: list, page_token: str,
         return False
 
 
+def _backfill_crew_home_coords() -> None:
+    """One-time-ish boot pass (Sep 1, 2026): members with a home label
+    but no coordinates get geocoded so radius Missions can find them.
+    Small list, best effort, never fatal."""
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT u.id, u.crew_home_label
+                         FROM users u
+                         JOIN user_roles ur ON ur.user_id = u.id
+                              AND ur.role = 'crew'
+                        WHERE u.crew_home_lat IS NULL
+                          AND COALESCE(u.crew_home_label,'') <> ''
+                        LIMIT 40""")
+                rows = cur.fetchall()
+        for r in rows:
+            try:
+                geo = _geocode_address(r["crew_home_label"])
+                if not geo:
+                    continue
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """UPDATE users SET crew_home_lat=%s, crew_home_lng=%s
+                                WHERE id=%s AND crew_home_lat IS NULL""",
+                            (geo["lat"], geo["lng"], r["id"]))
+                print(f"[crew-backfill] home coords set for user {r['id']} "
+                      f"({r['crew_home_label']})", flush=True)
+            except Exception as e:
+                print(f"[crew-backfill] {r['id']} failed: {e!r}", flush=True)
+    except Exception as e:
+        print(f"[crew-backfill] pass failed: {e!r}", flush=True)
+
+
 def _notify_crew_in_severe_alert(alert: dict) -> None:
     # Retired (Michael, Sep 1, 2026): robots watching addresses is what
     # Stormline sells. Crew contact about weather comes from a
@@ -44199,6 +44307,10 @@ def _ensure_brief_scheduler_started() -> None:
         # see this line printed 2+ times (different PIDs). This is how we
         # confirm worker count without dashboard access. Look for
         # "[worker-startup]" in Render logs after deploy.
+        try:
+            _backfill_crew_home_coords()
+        except Exception as e:
+            print(f"[crew-backfill] boot call failed: {e!r}", flush=True)
         try:
             import socket
             host = socket.gethostname()
@@ -46886,6 +46998,14 @@ def crew_reports_submit():
                      lat, lng, notes or None, image_url, now_ms, mission_id),
                 )
                 new_id = cur.fetchone()["id"]
+                # Self-filling home base (Sep 1, 2026): members who joined
+                # before town+state signup have no coordinates, which made
+                # them invisible to radius Missions. Their first report
+                # from the field fixes that automatically.
+                cur.execute(
+                    """UPDATE users SET crew_home_lat = %s, crew_home_lng = %s
+                        WHERE id = %s AND crew_home_lat IS NULL""",
+                    (lat, lng, user["id"]))
     except Exception as e:
         print(f"[crew-report-submit] failed: {e!r}", flush=True)
         return jsonify({"ok": False, "error": "db-error"}), 500
