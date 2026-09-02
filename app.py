@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-275"
+BACKEND_BUILD = "0702-280"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -1538,6 +1538,12 @@ CREATE TABLE IF NOT EXISTS brief_images (
     created_at    BIGINT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS crew_mission_recipients (
+    mission_id    INTEGER NOT NULL,
+    user_id       INTEGER NOT NULL,
+    PRIMARY KEY (mission_id, user_id)
+);
+
 CREATE TABLE IF NOT EXISTS met_day_assignments (
     day          DATE    NOT NULL,
     duty         TEXT    NOT NULL,   -- 'territory:<met_id>' | '<part>:reviews' | '<part>:watch'
@@ -2853,6 +2859,7 @@ CREATE TABLE IF NOT EXISTS crew_reports (
 
 -- Met recognition (July 2026): a personal thanks sent from the Crew line.
 ALTER TABLE crew_reports ADD COLUMN IF NOT EXISTS thanked_at BIGINT;
+ALTER TABLE crew_reports ADD COLUMN IF NOT EXISTS mission_id INTEGER;
 ALTER TABLE crew_reports ADD COLUMN IF NOT EXISTS thanked_by_name TEXT;
 CREATE INDEX IF NOT EXISTS idx_crew_reports_user
     ON crew_reports(user_id, created_at DESC);
@@ -17183,226 +17190,141 @@ document.getElementById('a-go').addEventListener('click', function(){
 
 _CREW_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>Valet Crew - report what you see from your corner of the sky</title>
-<meta name=description content="Free to join. Report real conditions from where you are and help our Meteorologists see the ground. No cost, no obligation.">
+<title>Valet Crew &middot; WeatherValet</title>
+<meta name=description content="A volunteer community reporting real weather conditions from the ground. A Meteorologist asks; you tell us what you see.">
 <style>
 __WV_TOKENS__
-:root{--accent:#1E6BFF;--grass:#1E6BFF}
-header{background:rgba(4,7,14,.85);border-bottom:1px solid rgba(126,182,255,.18)}
-header .logo span{color:#7EB6FF}
-.nl:hover{background:rgba(126,182,255,.1)}
-.dd{background:#080D18;border-color:rgba(126,182,255,.2)}
-.dd a:hover{background:rgba(30,107,255,.28)}
-footer{background:#04070E;border-color:rgba(126,182,255,.16)}
-footer h6{color:#7EB6FF}
-.head{padding:66px 0 22px;
-  background:radial-gradient(130% 100% at 50% -30%,#12234A 0%,#0A1020 46%,#04070E 100%)}
-body{background:#04070E}
-.eyebrow{font-size:12px;letter-spacing:.24em;text-transform:uppercase;color:#7EB6FF;font-weight:800;margin-bottom:12px}
-h1{font-size:clamp(32px,5.6vw,52px);font-weight:900;letter-spacing:-.03em;line-height:1.03;margin:0 0 14px;
-  background:linear-gradient(98deg,#fff 22%,#7EB6FF 92%);-webkit-background-clip:text;background-clip:text;color:transparent}
-.lede{color:#B9CAE4;font-size:17px;max-width:600px;margin:0 0 10px}
-.free{display:inline-block;background:var(--grass);color:#fff;border-radius:999px;
-  padding:9px 22px;font-weight:800;font-size:17px;margin-top:14px}
-.sec{padding:64px 0;border-top:1px solid rgba(255,255,255,.06)}
-.s-night{background:#04070E}
-.s-green{background:linear-gradient(180deg,#0B1428 0%,#123163 55%,#0C1D3E 100%)}
-.s-paper{background:linear-gradient(180deg,#F2F6FD 0%,#E4EDFB 100%);color:#0B1220}
-.s-paper h2,.s-paper h3,.s-paper b,.s-paper strong{color:#08101F}
-.s-paper p,.s-paper li,.s-paper label{color:#41536F}
-.inner{max-width:680px;margin:0 auto}
-h2{font-size:clamp(24px,4vw,34px);font-weight:900;letter-spacing:-.025em;color:#fff;margin:0 0 14px}
-.sub{color:#B9CAE4;font-size:16.5px;max-width:620px;margin:0 0 26px}
-ul.feat{list-style:none;padding:0;margin:0}
-ul.feat li{padding:10px 0 10px 28px;position:relative;font-size:15.5px;line-height:1.6;color:#C4D3EC}
-ul.feat li:before{content:"✓";position:absolute;left:2px;color:#7EB6FF;font-weight:800}
-ul.feat li b{color:#fff}
-.s-paper ul.feat li{color:#41536F}
-.s-paper ul.feat li b{color:#08101F}
-.s-paper ul.feat li:before{color:#1E4FBF}
-label{display:block;font-size:12.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
-  color:#93A6C2;margin:16px 0 6px}
-input,select{width:100%;box-sizing:border-box;padding:12px;border-radius:9px;font-size:16px;
-  font-family:inherit;border:1px solid rgba(126,182,255,.26);background:#0C1424;color:#EAF1FF}
-.row{display:flex;gap:10px}.row>div{flex:1}
-.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
-.chip{border:1px solid rgba(126,182,255,.28);background:rgba(255,255,255,.04);color:#D6E4FA;
-  border-radius:999px;padding:9px 15px;font-size:14.5px;cursor:pointer;transition:.16s}
-.chip:hover{border-color:#7EB6FF}
-.chip.on{background:var(--grass);border-color:var(--grass);color:#fff;font-weight:700}
-button.go{width:100%;margin-top:22px;background:var(--grass);color:#fff;border:none;border-radius:10px;
-  padding:15px;font-size:17px;font-weight:800;cursor:pointer;transition:.18s}
-button.go:hover{filter:brightness(1.1);transform:translateY(-1px)}
-button.go:disabled{opacity:.6;transform:none}
-.err{display:none;background:#3A1220;border:1px solid #7C2740;color:#FFC2CE;border-radius:9px;
-  padding:11px 13px;margin-top:14px;font-size:14.5px}
-.ok{display:none;background:#0F2A4A;border:1px solid #1E6BFF;color:#BBD8FF;border-radius:11px;
-  padding:18px 20px;margin-top:18px;font-size:16px;line-height:1.6}
-.ok b{color:#fff}
-.fine{font-size:12.5px;color:#93A6C2;margin-top:12px;line-height:1.6;text-align:center}
-.quote{border-left:3px solid var(--grass);padding:4px 0 4px 18px;margin:22px 0;color:#C4D3EC;
-  font-size:17px;line-height:1.65}
-
-/* Interaction polish. Every field tells you when you are in it, and the
-   primary action has weight. Applied on every page that takes money or a
-   signup, so they all feel like the same product. */
-input:hover,select:hover,textarea:hover{border-color:rgba(30,107,255,.5)}
-input:focus,select:focus,textarea:focus{outline:none;border-color:#1E6BFF;
-  box-shadow:0 0 0 3px rgba(30,107,255,.26)}
-select option{background:#0C1424}
-button.go,button#c-go,button#r-go,button#p-go,button#go-pw,button#go-link{
-  box-shadow:0 12px 30px -12px rgba(30,107,255,.8);
-  transition:transform .18s,box-shadow .18s,filter .18s}
-button.go:hover,button#c-go:hover,button#r-go:hover,button#p-go:hover,
-button#go-pw:hover,button#go-link:hover{filter:brightness(1.09);transform:translateY(-1px);
-  box-shadow:0 16px 38px -12px rgba(30,107,255,.95)}
-button.go:active{transform:translateY(0)}
-button.go:disabled{opacity:.55;transform:none;box-shadow:none}
+:root{--accent:#1E6BFF}
+.wrapk{max-width:760px;margin:0 auto;padding:34px 20px 70px}
+h1{font-size:clamp(28px,5.5vw,40px);font-weight:900;letter-spacing:-.02em;color:#fff;
+  margin:0 0 10px;line-height:1.15}
+.klead{color:#B8C7DE;font-size:17px;line-height:1.65;margin:0 0 26px}
+.kh{font-size:13px;font-weight:800;letter-spacing:.13em;text-transform:uppercase;
+  color:#7EB6FF;margin:34px 0 12px}
+.kcard{background:#0E1D3C;border:1px solid #2E4A7E;border-radius:16px;
+  padding:18px 20px;margin-bottom:12px;color:#C9D8F0;font-size:15px;line-height:1.65}
+.kcard b{color:#fff}
+.demo{background:#0A1730;border:1px solid #2E4A7E;border-radius:16px;padding:16px;margin:0 0 8px}
+.dm{max-width:92%;border-radius:16px;padding:10px 14px;font-size:14px;line-height:1.5;margin-bottom:8px}
+.dm.in{background:#182A4E;color:#EAF1FF;border-bottom-left-radius:5px}
+.dm.out{background:#1E6BFF;color:#fff;margin-left:auto;border-bottom-right-radius:5px;max-width:75%}
+.dm .who{color:#FFC46B;font-weight:800}
+.step{display:flex;gap:14px;margin-bottom:14px;align-items:flex-start}
+.stepn{flex:none;width:34px;height:34px;border-radius:50%;background:linear-gradient(160deg,#3D8BFF,#1E5FE0);
+  color:#fff;font-weight:900;display:flex;align-items:center;justify-content:center;font-size:16px}
+.step div{color:#C9D8F0;font-size:15px;line-height:1.6;padding-top:4px}
+.step b{color:#fff}
+.jform{background:#0E1D3C;border:1px solid #2E4A7E;border-radius:16px;padding:20px}
+.jform label{display:block;color:#8FA6C6;font-size:13px;margin:12px 0 5px;font-weight:700}
+.jform input{width:100%;box-sizing:border-box;padding:12px 13px;font-size:16px;color:#EAF1FF;
+  background:#0A1730;border:1px solid #2E4A7E;border-radius:9px}
+.jrow{display:flex;gap:10px}
+.jrow div{flex:1}
+.jrow div.small{flex:0 0 90px}
+.consent{color:#8FA6C6;font-size:13px;line-height:1.55;margin:14px 0}
+.jgo{width:100%;border:none;border-radius:11px;color:#fff;cursor:pointer;font-weight:800;
+  font-size:16.5px;padding:15px;background:linear-gradient(160deg,#3D8BFF,#1E5FE0);margin-top:4px}
+.jgo:disabled{opacity:.55;cursor:default}
+#j-msg{margin-top:12px;font-size:15px;line-height:1.55}
+.faq b{display:block;color:#fff;margin-bottom:3px}
+.faq p{margin:0 0 16px;color:#C9D8F0;font-size:15px;line-height:1.6}
 </style></head><body>
-__WV_HEADER__
-<div class=head><div class=wrap>
-  <div class=eyebrow>&#9889; WeatherValet</div>
-  <h1>You already watch the sky. Tell us what you see.</h1>
-  <p class=lede>The Valet Crew is people all over the country reporting real conditions from
-  where they actually are. Radar guesses. You know.</p>
-  <div class=free>Free to join, always</div>
-</div></div>
+<div class=wrapk>
+  <h1>You already watch the sky.<br>Tell us what you see.</h1>
+  <p class=klead>The Valet Crew is a volunteer community that reports real
+  conditions from the ground. Radar shows the storm; you show the truth. When a
+  WeatherValet Meteorologist needs eyes somewhere, they ask the Crew.</p>
 
-<section class="sec s-night"><div class=wrap><div class=inner>
-  <h2>Why the ground matters</h2>
-  <p class=sub>Radar sees a signature seven thousand feet up and infers what is happening
-  underneath it. That inference is usually close and sometimes badly wrong.</p>
-  <div class=quote>The rain stopped at my fence line. Radar had the whole township covered.</div>
-  <p class=sub style="margin-bottom:0">One person standing in it beats a model every single
-  time. That is the whole idea. Our Meteorologists use Crew reports while they are writing to
-  paying subscribers, which means what you saw in your driveway can change what somebody a
-  county over gets told.</p>
-</div></div></section>
-
-<section class="sec s-paper"><div class=wrap><div class=inner>
-  <h2>What being on the Crew is like</h2>
-  <ul class=feat>
-    <li><b>Report when you feel like it.</b> No quota, no schedule, no obligation. Quiet weeks
-    are fine.</li>
-    <li><b>It takes seconds.</b> Hail the size of a nickel. Water over the road at County Line.
-    Wind took a limb down. That is a report.</li>
-    <li><b>See what everyone else is seeing.</b> The Crew map and feed show live reports from
-    around you.</li>
-    <li><b>A Meteorologist may thank you by name</b> or cite your report in a brief that goes
-    out to subscribers.</li>
-    <li><b>It costs nothing, ever.</b> This is not a trial and there is no upsell waiting at
-    the end.</li>
-  </ul>
-</div></div></section>
-
-<section class="sec s-green"><div class=wrap><div class=inner>
-  <h2>Join the Crew</h2>
-  <p class=sub>Tell us where you are and what you are willing to watch for. You are in as soon
-  as you hit the button.</p>
-  <div id=ok class=ok></div>
-  <div id=form>
-    <div class=row>
-      <div><label for=c-name>Your name</label><input id=c-name autocomplete=name></div>
-      <div><label for=c-handle>Handle (optional)</label><input id=c-handle placeholder="@yourname"></div>
-    </div>
-    <label for=c-email>Email</label><input id=c-email type=email autocomplete=email>
-    <label for=c-phone>Mobile (optional)</label><input id=c-phone type=tel placeholder="317-555-0123">
-    <div class=row>
-      <div><label for=c-county>County</label><input id=c-county placeholder="Boone County"></div>
-      <div><label for=c-state>State</label><input id=c-state placeholder="Indiana"></div>
-    </div>
-    <label for=c-zip>Zip (optional, helps us place you)</label><input id=c-zip placeholder="46052">
-    <label>What are you willing to report on?</label>
-    <div class=chips id=chips></div>
-    <label for=c-hours>When are you usually around?</label>
-    <select id=c-hours>
-      <option value=all>Any time</option>
-      <option value=weekdays-day>Weekdays, daytime</option>
-      <option value=weekdays-evening>Weekdays, evenings</option>
-      <option value=weekends>Weekends</option>
-    </select>
-    <div id=err class=err></div>
-    <button class=go id=c-go>Join the Crew</button>
-    <div class=fine>Free forever, and you are in the moment you hit the button.
-    We never sell your information.</div>
+  <div class=demo>
+    <div class="dm in"><span class=who>Mission from Chris, WeatherValet Meteorologist:</span><br>
+      Has the rain changed over to snow at your location?</div>
+    <div class="dm out">All snow here, Atwood KS. Sticking on the grass.</div>
+    <div class="dm in">That is exactly what we needed. Your report just helped us
+      message 14 neighbors. Thank you.</div>
   </div>
-</div></div></section>
 
-<section class="sec s-night"><div class=wrap><div class=inner>
-  <h2>Straight answers</h2>
-  <p class=sub style="margin-bottom:10px"><b style="color:#fff">Do I need equipment?</b><br>
-  No. Your eyes and your phone. A rain gauge is a bonus, not a requirement.</p>
-  <p class=sub style="margin-bottom:10px"><b style="color:#fff">Do I need to be a
-  spotter?</b><br>No. Trained spotters are welcome and so is anyone who pays attention. If you
-  are trained, tell us when you sign up.</p>
-  <p class=sub style="margin-bottom:10px"><b style="color:#fff">Am I on the hook during
-  storms?</b><br>Never. Report if you are safe and want to. Take shelter first, always. Nothing
-  you report to us is worth standing outside for.</p>
-  <p class=sub style="margin-bottom:0"><b style="color:#fff">Will you try to sell me
-  something?</b><br>No. Crew is free and stays free. If you want a paid product you will have to
-  go find it yourself.</p>
-</div></div></section>
+  <div class=kh>How it works</div>
+  <div class=step><div class=stepn>1</div><div><b>A Meteorologist asks.</b>
+    When weather is doing something near you, you may get a Mission by text: one
+    plain question, signed with a real name. Some weeks there are none.</div></div>
+  <div class=step><div class=stepn>2</div><div><b>You answer with what you see.</b>
+    Reply to the text, or use the Crew page with its live radar map. Your town and
+    state, a few words, a photo if you have one.</div></div>
+  <div class=step><div class=stepn>3</div><div><b>Your report reaches real people.</b>
+    A Meteorologist reads it and uses it to message neighbors in the storm's path.
+    You'll know when your report helped.</div></div>
+
+  <div class=kh>What you get</div>
+  <div class=kcard><b>The Crew map.</b> Live radar with Crew reports pinned across
+    the country. See what's heading your way, and what other members are saying
+    about the storm that's coming for them.</div>
+  <div class=kcard><b>The truth, both ways.</b> It's free. It's not a product, and
+    it's always in beta. We won't pretend otherwise, and we won't waste your
+    phone: every message you get was typed by a human with a name.</div>
+
+  <div class=kh>Join the Crew</div>
+  <div class=jform>
+    <label>Your name</label>
+    <input id=j-name autocomplete=name placeholder="Dale Ottinger">
+    <label>Email</label>
+    <input id=j-email type=email autocomplete=email placeholder="you@example.com">
+    <label>Mobile phone</label>
+    <input id=j-phone type=tel autocomplete=tel placeholder="317-555-0123">
+    <div class=jrow>
+      <div><label>Town</label><input id=j-town placeholder="Atwood"></div>
+      <div class=small><label>State</label><input id=j-state maxlength=2 placeholder="KS"></div>
+    </div>
+    <div class=consent>We'll text you when a Meteorologist has a real question for
+    your area, usually a few times a month, sometimes not at all. Message and data
+    rates may apply. Reply STOP any time to leave.</div>
+    <button class=jgo id=j-go>Join the Crew</button>
+    <div id=j-msg></div>
+  </div>
+
+  <div class=kh>Straight answers</div>
+  <div class=faq>
+    <b>Is this a job?</b>
+    <p>No. No pay, no schedule, no quota. You look out the window when asked and
+    tell the truth about what you see.</p>
+    <b>How often will you text me?</b>
+    <p>Only when a Meteorologist has a real question for your area. In quiet
+    weather, that can be zero.</p>
+    <b>Do I need an app?</b>
+    <p>There is no app. Texts, and one webpage with the map. Works on any phone.</p>
+    <b>Can I quit?</b>
+    <p>Reply STOP to any message, any time. No questions, no guilt.</p>
+  </div>
+</div>
 __WV_FOOTER__"""
 
 _CREW_SCRIPT = """<script>
 (function(){
-  var INTERESTS=[['storms','Storms'],['hail','Hail'],['wind','Wind'],
-                 ['rain','Rain and flooding'],['winter','Winter weather'],['general','Anything']];
-  var picked={};
-  var box=document.getElementById('chips');
-  INTERESTS.forEach(function(pair){
-    var b=document.createElement('button');
-    b.className='chip'; b.type='button'; b.textContent=pair[1];
-    b.addEventListener('click',function(){
-      picked[pair[0]]=!picked[pair[0]];
-      b.className='chip'+(picked[pair[0]]?' on':'');
-    });
-    box.appendChild(b);
-  });
-  document.getElementById('c-go').addEventListener('click',function(){
-    var btn=this, err=document.getElementById('err');
-    err.style.display='none';
-    var name=document.getElementById('c-name').value.trim();
-    var email=document.getElementById('c-email').value.trim();
-    if(name.length<2){ err.textContent='Tell us your name.'; err.style.display='block'; return; }
-    if(!email||email.indexOf('@')<1){ err.textContent='Enter an email we can reach you at.';
-      err.style.display='block'; return; }
-    var list=[]; for(var k in picked){ if(picked[k]) list.push(k); }
-    btn.disabled=true; btn.textContent='Sending...';
-    fetch('/api/v1/crew/signup',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name:name,email:email,
-        handle:document.getElementById('c-handle').value,
-        phone:document.getElementById('c-phone').value,
-        county:document.getElementById('c-county').value,
-        state:document.getElementById('c-state').value,
-        zip:document.getElementById('c-zip').value,
-        mission_interests:list,
-        hours:document.getElementById('c-hours').value,
-        notify:'email'})})
-     .then(function(r){ return r.json().then(function(j){ return {s:r.status,j:j}; }); })
-     .then(function(res){
-        if(res.j&&res.j.ok){
-          document.getElementById('form').style.display='none';
-          var ok=document.getElementById('ok');
-          // Signing up twice just refreshes the same account, so this is
-          // safe to show either way.
-          ok.innerHTML = '<b>Welcome to the Crew.</b><br>You are in. Check your email for a '
-            + 'link to set a password and open your Crew workspace, where you can see the map, '
-            + 'the feed, and post your first report.';
-          ok.style.display='block';
-          ok.scrollIntoView({behavior:'smooth',block:'center'});
-          return;
-        }
-        var e=(res.j&&res.j.error)||'';
-        if(e==='valid-email-required'){ err.textContent='That email does not look right.'; }
-        else if(e==='name-required'){ err.textContent='Tell us your name.'; }
-        else { err.textContent='Something went wrong. Try again, or email hello@weathervalet.ai.'; }
-        err.style.display='block'; btn.disabled=false; btn.textContent='Join the Crew';
-     }).catch(function(){
-        err.textContent='Network problem. Try again.';
-        err.style.display='block'; btn.disabled=false; btn.textContent='Join the Crew';
-     });
-  });
+document.getElementById('j-go').addEventListener('click',function(){
+  var b=this, msg=document.getElementById('j-msg');
+  var body={
+    name:document.getElementById('j-name').value.trim(),
+    email:document.getElementById('j-email').value.trim(),
+    phone:document.getElementById('j-phone').value.trim(),
+    town:document.getElementById('j-town').value.trim(),
+    state:document.getElementById('j-state').value.trim().toUpperCase()
+  };
+  if(!body.name){ msg.innerHTML='<span style="color:#FF8296">Your name, please.</span>'; return; }
+  if(!body.email || body.email.indexOf('@')<1){ msg.innerHTML='<span style="color:#FF8296">A real email, please; it is how you sign in.</span>'; return; }
+  if(!body.phone){ msg.innerHTML='<span style="color:#FF8296">Your mobile number, please; Missions arrive by text.</span>'; return; }
+  if(!body.town || !body.state){ msg.innerHTML='<span style="color:#FF8296">Town and state, please, so Missions near you find you.</span>'; return; }
+  b.disabled=true; msg.innerHTML='<span style="color:#8FA6C6">Joining...</span>';
+  fetch('/api/v1/crew/signup',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+   .then(function(r){return r.json();})
+   .then(function(d){
+     b.disabled=false;
+     if(d.ok){ msg.innerHTML='<span style="color:#7EE2A8;font-weight:700">Welcome to the Crew.</span> '
+       +'Check your email for a sign-in link; the Crew map is waiting.'; }
+     else msg.innerHTML='<span style="color:#FF8296">'+((d.error||'Could not join.')+'').replace(/</g,'&lt;')+'</span>';
+   })
+   .catch(function(){ b.disabled=false;
+     msg.innerHTML='<span style="color:#FF8296">Connection problem. Try again.</span>'; });
+});
 })();
 </script>"""
 
@@ -17432,6 +17354,7 @@ def crew_signup():
     phone = normalize_phone(phone_raw) if phone_raw else None
     county = (data.get("county") or "").strip()[:120] or None
     state = (data.get("state") or "").strip()[:60] or None
+    town = (data.get("town") or "").strip()[:120] or None
     zip_code = (data.get("zip") or "").strip()[:10] or None
     if zip_code:
         m = re.match(r"^(\d{5})", zip_code)
@@ -17457,6 +17380,23 @@ def crew_signup():
                                 (name, user_id))
                 if phone:
                     cur.execute("UPDATE users SET phone = %s WHERE id = %s", (phone, user_id))
+                # Home base from town + state (Sep 1, 2026): geocoded at
+                # signup so radius Missions can find this member on day one.
+                if town or county:
+                    try:
+                        q = ", ".join([x for x in ((town or county), state) if x])
+                        geo = _geocode_address(q)
+                        if geo:
+                            cur.execute(
+                                """UPDATE users
+                                    SET crew_home_lat = %s, crew_home_lng = %s,
+                                        crew_home_label = %s
+                                  WHERE id = %s
+                                    AND (crew_home_lat IS NULL OR crew_home_label IS NULL)""",
+                                (geo["lat"], geo["lng"], q, user_id))
+                    except Exception as e:
+                        print(f"[crew-signup] home base geocode failed: {e!r}",
+                              flush=True)
                 cur.execute("""INSERT INTO user_roles (user_id, role, granted_at)
                                VALUES (%s, 'crew', %s)
                                ON CONFLICT (user_id, role) DO NOTHING""",
@@ -18164,193 +18104,204 @@ __WV_FOOTER__"""
 
 _CREW_WS_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>Valet Crew workspace</title><meta name=robots content="noindex">
+<title>Valet Crew &middot; WeatherValet</title><meta name=robots content="noindex">
+<link rel=stylesheet href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <style>
 __WV_TOKENS__
 :root{--accent:#1E6BFF}
-.wrapx{max-width:820px;margin:0 auto;padding:50px 22px 80px}
-h1{font-size:clamp(27px,4.4vw,40px);font-weight:900;letter-spacing:-.03em;color:#fff;margin:0 0 6px}
-.sub{color:#B8C7DE;font-size:16px;line-height:1.6;margin:0 0 30px}
-.back{display:inline-block;color:var(--sky);font-size:14px;font-weight:700;margin-bottom:18px}
-.head{font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:#A9B4C6;
-  font-weight:800;margin:34px 0 12px}
-.panel{border:1.5px solid rgba(30,107,255,.5);border-radius:16px;padding:22px;
-  background:linear-gradient(168deg,#18213A 0%,#0E1526 100%);
-  box-shadow:0 14px 38px -18px rgba(0,0,0,.9)}
-label{display:block;font-size:12px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;
-  color:#8FA6C6;margin:16px 0 7px}
-textarea,input{width:100%;box-sizing:border-box;padding:14px 15px;font-size:16px;font-family:inherit;
-  color:#EAF1FF;border-radius:10px;background:rgba(255,255,255,.05);
-  border:1px solid rgba(126,182,255,.26)}
-textarea{min-height:78px;resize:vertical}
-textarea:focus,input:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 3px rgba(30,107,255,.24)}
-.types{display:flex;flex-wrap:wrap;gap:8px}
-.type{border:1px solid rgba(126,182,255,.3);background:rgba(255,255,255,.04);color:#D6E4FA;
-  border-radius:999px;padding:10px 16px;font-size:14.5px;cursor:pointer;transition:.16s}
-.type:hover{border-color:var(--blue)}
-.type.on{background:var(--blue);border-color:var(--blue);color:#fff;font-weight:700}
-button.go{width:100%;margin-top:20px;background:var(--blue);color:#fff;border:none;border-radius:11px;
-  padding:16px;font-size:16.5px;font-weight:800;cursor:pointer;
-  box-shadow:0 12px 30px -12px rgba(30,107,255,.8);transition:.18s}
-button.go:hover{filter:brightness(1.1);transform:translateY(-1px)}
-button.go:disabled{opacity:.55;transform:none;box-shadow:none}
-.msg{display:none;border-radius:10px;padding:12px 14px;margin-top:14px;font-size:14.5px;line-height:1.55}
-.msg.bad{background:#3A1220;border:1px solid #7C2740;color:#FFC2CE}
-.msg.good{background:#0F2A4A;border:1px solid var(--blue);color:#BBD8FF}
-.rep{border:1px solid rgba(126,182,255,.2);border-radius:13px;padding:16px 18px;margin-bottom:10px;
-  background:rgba(255,255,255,.035)}
-.rep .top{display:flex;justify-content:space-between;gap:12px;align-items:baseline}
-.rep .kind{font-size:11px;letter-spacing:.13em;text-transform:uppercase;font-weight:800;color:#7FB0FF}
-.rep .when{font-size:12.5px;color:#8FA6C6;white-space:nowrap}
-.rep p{margin:7px 0 0;color:#D6E1F0;font-size:15px;line-height:1.6}
-.rep .who{margin-top:9px;font-size:13px;color:#8FA6C6}
-.rep .cited{display:inline-block;margin-top:9px;font-size:11px;letter-spacing:.1em;
-  text-transform:uppercase;font-weight:800;padding:4px 9px;border-radius:999px;
-  background:rgba(30,107,255,.18);color:#7FB0FF;border:1px solid rgba(30,107,255,.45)}
-.empty{border:1px dashed rgba(126,182,255,.3);border-radius:13px;padding:20px;color:#B8C7DE;font-size:15px}
-.fine{font-size:12.5px;color:#8FA6C6;margin-top:12px;line-height:1.6}
-.note{border:1px solid rgba(30,107,255,.35);background:rgba(30,107,255,.08);border-radius:13px;
-  padding:18px 20px;margin-top:28px;color:#D5E2F5;font-size:15px;line-height:1.65}
-.note b{color:#fff}
-.note a{color:var(--sky);font-weight:700}
+.wrapc{max-width:900px;margin:0 auto;padding:20px 16px 70px}
+h1{font-size:23px;font-weight:900;letter-spacing:-.02em;color:#fff;margin:0 0 4px}
+.csub{color:#B8C7DE;font-size:14.5px;margin:0 0 14px;line-height:1.55}
+#crewmap{height:52vh;min-height:330px;border-radius:14px;border:1px solid #2E4A7E;
+  background:#0A1730}
+.map-note{color:#8FA6C6;font-size:12px;margin:6px 2px 18px}
+.rcard{background:#0E1D3C;border:1px solid #2E4A7E;border-radius:14px;
+  padding:16px 16px 14px;margin-bottom:14px}
+.rcard b{color:#fff;font-size:15.5px}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
+.chips button{padding:9px 14px;border-radius:20px;border:1px solid #2E4A7E;
+  background:#0A1730;color:#C9D8F0;font-size:13.5px;cursor:pointer;font-weight:700}
+.chips button.on{background:linear-gradient(160deg,#3D8BFF,#1E5FE0);color:#fff;border-color:#3D8BFF}
+.rcard textarea{width:100%;box-sizing:border-box;min-height:56px;padding:10px 12px;
+  font-size:14px;color:#EAF1FF;background:#0A1730;border:1px solid #2E4A7E;border-radius:9px;
+  font-family:inherit;resize:vertical}
+.locline{color:#8FA6C6;font-size:13px;margin:8px 0}
+.locline b{color:#C9D8F0}
+.racts{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}
+.rgo{border:none;border-radius:10px;color:#fff;cursor:pointer;font-weight:800;font-size:14.5px;
+  padding:12px 22px;background:linear-gradient(160deg,#3D8BFF,#1E5FE0)}
+.rgo:disabled{opacity:.55;cursor:default}
+.rmini{padding:9px 13px;border-radius:9px;border:1px solid #2E4A7E;background:transparent;
+  color:#9FC0EE;font-size:13px;cursor:pointer}
+#r-state{color:#8FA6C6;font-size:13px}
+.phead{font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;
+  color:#7EB6FF;margin:22px 0 8px}
+.mine{background:#0E1D3C;border:1px solid #2E4A7E;border-radius:12px;padding:12px 15px;
+  margin-bottom:8px;color:#C9D8F0;font-size:14px;line-height:1.55}
+.mine .dim{color:#8FA6C6;font-size:12.5px}
+.mine .ok{color:#7EE2A8;font-weight:700}
 </style></head><body>
-__WV_HEADER__
-<div class=wrapx>
-  <a class=back href="/portal">&larr; Your portal</a>
+<div class=wrapc>
   <h1>Valet Crew</h1>
-  <p class=sub>What you see from where you are. Our Meteorologists read these while
-  they are writing to paying subscribers.</p>
-
-  <div class=panel>
-    <label>What are you seeing?</label>
-    <div class=types id=types></div>
-    <label for=r-notes>Tell us about it</label>
-    <textarea id=r-notes placeholder="Nickel-sized hail, coming down hard, about 5 minutes so far"></textarea>
-    <label for=r-where>Where are you?</label>
-    <input id=r-where placeholder="Lebanon, IN">
-    <div class=fine id=geo>We will use your phone's location if you allow it, which is more
-    accurate than a town name. Otherwise type where you are.</div>
-    <div id=msg class=msg></div>
-    <button class=go id=r-go>File this report</button>
-    <div class=fine><b style="color:#fff">Take shelter first, always.</b> Nothing you report
-    to us is worth standing outside for.</div>
+  <div class=csub>Live radar, and what Crew members are seeing on the ground,
+  nationwide. Zoom to your county. File what you see; a Meteorologist reads it.</div>
+  <div id=cm-mission style="display:none;background:#241B08;border:1px solid #FFC46B;
+    border-radius:14px;padding:14px 16px;margin-bottom:12px;color:#F5E3C0;
+    font-size:14.5px;line-height:1.55"></div>
+  <div id=crewmap></div>
+  <div class=map-note>Radar: Iowa Environmental Mesonet &middot; Map (c) Esri
+  &middot; Pins show reports from the last 48 hours at town-level accuracy.</div>
+  <div class=rcard>
+    <b>What are you seeing right now?</b>
+    <div class=chips id=r-chips></div>
+    <textarea id=r-notes placeholder="Optional: a few words. Pea size hail, coming down hard."></textarea>
+    <div class=locline id=r-loc>Finding your location...</div>
+    <div class=racts>
+      <button class=rgo id=r-go disabled>File this report</button>
+      <label class=rmini style="cursor:pointer">Add a photo
+        <input type=file id=r-img accept="image/jpeg,image/png" style="display:none"></label>
+      <span id=r-state></span>
+    </div>
+    <div id=r-thumb style="margin-top:8px"></div>
   </div>
-
-  <div class=head>Recent reports</div>
-  <div id=feed><div class=empty>Loading the feed...</div></div>
-
-  <div class=note><b>Looking for the map?</b> The live Crew map is still on the old
-  workspace while we rebuild it here. <a href="__SPA__/crew/workspace">Open the map</a>.
-  Everything you file on this page shows up there too; it is the same feed.</div>
+  <div class=phead>My recent reports</div>
+  <div id=r-mine><span style="color:#8FA6C6;font-size:14px">Loading...</span></div>
 </div>
 __WV_FOOTER__"""
 
-_CREW_WS_SCRIPT = """<script>
+_CREW_WS_SCRIPT = """<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
 (function(){
-  var TYPES=[['storm','Storm'],['hail','Hail'],['wind','Wind'],['rain','Rain'],
-             ['flood','Flooding'],['snow','Snow'],['fog','Fog'],['tornado','Tornado'],
-             ['other','Something else']];
-  var chosen=null, coords=null;
-  var box=document.getElementById('types');
-  TYPES.forEach(function(t){
-    var b=document.createElement('button');
-    b.type='button'; b.className='type'; b.textContent=t[1];
-    b.addEventListener('click',function(){
-      chosen=t[0];
-      Array.prototype.forEach.call(box.children,function(c){c.className='type';});
-      b.className='type on';
-    });
-    box.appendChild(b);
+var TYPES=[['storm','Storm'],['hail','Hail'],['wind','High wind'],['flood','Flooding'],
+  ['snow','Snow'],['fog','Fog'],['tornado','Tornado'],['other','Other']];
+var picked=null, myLat=null, myLng=null, photoUrl='', map=null, meMarker=null, missionId=null;
+fetch('/api/v1/crew/active-mission',{credentials:'include'})
+ .then(function(r){return r.json();})
+ .then(function(d){
+   if(d.ok && d.mission){
+     missionId=d.mission.id;
+     var el=document.getElementById('cm-mission');
+     el.style.display='block';
+     el.innerHTML='<b style="color:#FFC46B">Mission from '
+       +(''+d.mission.met_name).replace(/</g,'&lt;')
+       +', WeatherValet Meteorologist:</b><br>'
+       +(''+d.mission.question).replace(/</g,'&lt;')
+       +'<br><span style="color:#B99A5C;font-size:12.5px">File a report below to answer.</span>';
+   }
+ }).catch(function(){});
+function esc(t){var d=document.createElement('div');d.textContent=t==null?'':String(t);return d.innerHTML;}
+function ago(ms){var m=Math.round((Date.now()-ms)/60000);
+  if(m<60) return m+' min ago'; var h=Math.round(m/60);
+  if(h<36) return h+' hr ago'; return Math.round(h/24)+' d ago';}
+var chipbox=document.getElementById('r-chips');
+TYPES.forEach(function(t){
+  var b=document.createElement('button'); b.textContent=t[1]; b.setAttribute('data-t',t[0]);
+  b.addEventListener('click',function(){
+    picked=t[0];
+    Array.prototype.forEach.call(chipbox.children,function(c){c.className='';});
+    b.className='on'; gate();
   });
-
-  // A phone's own position beats a typed town name, so ask for it, but
-  // never require it: plenty of people will decline and should still be
-  // able to file.
-  if(navigator.geolocation){
-    navigator.geolocation.getCurrentPosition(function(p){
-      coords={lat:p.coords.latitude,lng:p.coords.longitude};
-      document.getElementById('geo').innerHTML='Using your location. Accurate to about '
-        +Math.round(p.coords.accuracy)+' metres.';
-    },function(){},{timeout:8000});
+  chipbox.appendChild(b);
+});
+function gate(){ document.getElementById('r-go').disabled = !(picked && myLat!==null); }
+function setLoc(lat,lng,label){
+  myLat=lat; myLng=lng;
+  document.getElementById('r-loc').innerHTML='Reporting from: <b>'+esc(label)+'</b> '
+    +'<span style="color:#5F729A">(tap the map to move your pin)</span>';
+  if(map){ if(meMarker) meMarker.remove();
+    meMarker=L.circleMarker([lat,lng],{radius:7,color:'#fff',weight:2,fillColor:'#1E6BFF',fillOpacity:1}).addTo(map);
   }
-
-  function show(kind,text){
-    var m=document.getElementById('msg');
-    m.className='msg '+kind; m.innerHTML=text; m.style.display='block';
-  }
-  function ago(ms){
-    var s=Math.round((Date.now()-ms)/1000);
-    if(s<90) return 'just now';
-    if(s<3600) return Math.round(s/60)+' min ago';
-    if(s<86400) return Math.round(s/3600)+' hr ago';
-    return Math.round(s/86400)+' d ago';
-  }
-  function esc(t){var d=document.createElement('div');d.textContent=t||'';return d.innerHTML;}
-
-  function loadFeed(){
-    fetch('/api/v1/crew/reports?minutes=1440&limit=40',{credentials:'include'})
-     .then(function(r){return r.json();}).then(function(j){
-        var el=document.getElementById('feed');
-        var list=(j&&j.reports)||[];
-        if(!list.length){
-          el.innerHTML='<div class=empty>Nothing reported in the last day. '
-            +'If you are seeing something, you would be the first.</div>';
-          return;
-        }
-        el.innerHTML=list.map(function(r){
-          return '<div class=rep><div class=top>'
-            +'<span class=kind>'+esc(r.report_type)+'</span>'
-            +'<span class=when>'+ago(r.created_at)+'</span></div>'
-            +(r.notes?'<p>'+esc(r.notes)+'</p>':'')
-            +'<div class=who>'+esc(r.user_name||'Anonymous')+'</div>'
-            +(r.cited?'<span class=cited>Used by a Meteorologist</span>':'')
-            +'</div>';
-        }).join('');
-     }).catch(function(){
-        document.getElementById('feed').innerHTML=
-          '<div class=empty>Could not load the feed just now.</div>';
+  gate();
+}
+if(window.L){
+  map=L.map('crewmap',{zoomControl:true}).setView([39.5,-95.0],4);
+  L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',
+    {maxZoom:15}).addTo(map);
+  L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}',
+    {maxZoom:15,opacity:.9}).addTo(map);
+  L.tileLayer('https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/nexrad-n0q-900913/{z}/{x}/{y}.png',
+    {opacity:.55,maxZoom:15}).addTo(map);
+  map.on('click',function(e){ setLoc(e.latlng.lat,e.latlng.lng,
+    e.latlng.lat.toFixed(2)+', '+e.latlng.lng.toFixed(2)); });
+  loadPins();
+} else {
+  document.getElementById('crewmap').innerHTML='<div style="padding:30px;color:#8FA6C6">'
+    +'Map could not load. Reports still work below.</div>';
+}
+function loadPins(){
+  fetch('/api/v1/crew/reports?minutes=2880&limit=400',{credentials:'include'})
+   .then(function(r){return r.json();})
+   .then(function(d){
+     (d.reports||[]).forEach(function(rp){
+       if(rp.lat==null) return;
+       var m=L.circleMarker([rp.lat,rp.lng],{radius:6,color:'#FFC46B',weight:1.5,
+         fillColor:'#E0662E',fillOpacity:.85}).addTo(map);
+       m.bindPopup('<b>'+esc(rp.report_type||rp.type)+'</b> &middot; '+esc(rp.name||'Crew member')
+         +'<br>'+esc(rp.notes||'')
+         +(rp.image_url?'<br><img src="'+esc(rp.image_url)+'" style="max-width:150px;border-radius:6px;margin-top:4px">':'')
+         +'<br><span style="color:#666">'+ago(rp.created_at)+'</span>');
      });
-  }
-  loadFeed();
-
-  document.getElementById('r-go').addEventListener('click',function(){
-    var btn=this;
-    document.getElementById('msg').style.display='none';
-    if(!chosen){ show('bad','Pick what you are seeing first.'); return; }
-    var notes=document.getElementById('r-notes').value.trim();
-    if(notes.length<4){ show('bad','Tell us a little about it.'); return; }
-    if(!coords){
-      show('bad','We need your location to place this report. Allow location in your '
-        +'browser, or open this page on the phone you are standing with.');
-      return;
-    }
-    btn.disabled=true; btn.textContent='Filing...';
-    fetch('/api/v1/crew/reports',{method:'POST',credentials:'include',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({report_type:chosen,lat:coords.lat,lng:coords.lng,notes:notes})})
-     .then(function(r){return r.json().then(function(j){return {s:r.status,j:j};});})
-     .then(function(res){
-        btn.disabled=false; btn.textContent='File this report';
-        if(res.j&&res.j.ok){
-          show('good','<b>Filed. Thank you.</b><br>It is in the feed now, and a '
-            +'Meteorologist may use it while writing today.');
-          document.getElementById('r-notes').value='';
-          chosen=null;
-          Array.prototype.forEach.call(box.children,function(c){c.className='type';});
-          loadFeed();
-          return;
-        }
-        var e=(res.j&&res.j.error)||'';
-        if(e==='not-crew'){ show('bad','This account is not on the Crew yet. '
-          +'<a href="/crew" style="color:#7FB0FF">Join free</a>.'); }
-        else if(e==='not-authenticated'){ show('bad','Your session expired. '
-          +'<a href="/signin" style="color:#7FB0FF">Sign in again</a>.'); }
-        else { show('bad','Could not file that. Try again in a moment.'); }
-     }).catch(function(){
-        btn.disabled=false; btn.textContent='File this report';
-        show('bad','Network problem. Try again.');
-     });
-  });
+   }).catch(function(){});
+}
+if(navigator.geolocation){
+  navigator.geolocation.getCurrentPosition(function(p){
+    setLoc(p.coords.latitude,p.coords.longitude,'your location');
+    if(map) map.setView([p.coords.latitude,p.coords.longitude],9);
+  },function(){
+    document.getElementById('r-loc').textContent='Tap the map to set where you are.';
+  },{timeout:8000});
+} else {
+  document.getElementById('r-loc').textContent='Tap the map to set where you are.';
+}
+document.getElementById('r-img').addEventListener('change',function(){
+  var f=this.files&&this.files[0]; this.value='';
+  if(!f) return;
+  var st=document.getElementById('r-state'); st.textContent='Uploading photo...';
+  var fd=new FormData(); fd.append('image',f);
+  fetch('/api/v1/crew/report-images',{method:'POST',credentials:'include',body:fd})
+   .then(function(r){return r.json();})
+   .then(function(d){
+     if(d.ok){ photoUrl=d.url; st.textContent='Photo attached.';
+       document.getElementById('r-thumb').innerHTML='<img src="'+d.url
+         +'" style="max-width:170px;border-radius:9px;border:1px solid #2E4A7E">'; }
+     else st.textContent=d.error||'Photo failed';
+   }).catch(function(){ st.textContent='Photo failed (connection)'; });
+});
+document.getElementById('r-go').addEventListener('click',function(){
+  var b=this; b.disabled=true;
+  var st=document.getElementById('r-state'); st.textContent='Filing...';
+  fetch('/api/v1/crew/reports',{method:'POST',credentials:'include',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({report_type:picked,lat:myLat,lng:myLng,
+      notes:document.getElementById('r-notes').value,image_url:photoUrl,
+      mission_id:missionId})})
+   .then(function(r){return r.json();})
+   .then(function(d){
+     b.disabled=false;
+     if(d.ok){ st.textContent='Filed. A Meteorologist will see it.';
+       document.getElementById('r-notes').value=''; photoUrl='';
+       document.getElementById('r-thumb').innerHTML='';
+       loadMine(); if(map) loadPins(); }
+     else st.textContent=d.error||'Could not file.';
+   })
+   .catch(function(){ b.disabled=false; st.textContent='Connection problem.'; });
+});
+function loadMine(){
+  fetch('/api/v1/crew/reports?minutes=20160&limit=200',{credentials:'include'})
+   .then(function(r){return r.json();})
+   .then(function(d){
+     var mine=(d.reports||[]).filter(function(x){return x.is_mine;}).slice(0,10);
+     document.getElementById('r-mine').innerHTML = mine.length
+       ? mine.map(function(x){
+           return '<div class=mine><b>'+esc(x.report_type||x.type)+'</b> &middot; '
+             +'<span class=dim>'+ago(x.created_at)+'</span>'
+             +(x.notes?'<br>'+esc(x.notes):'')
+             +(x.verified_count?'<br><span class=ok>Confirmed by a Meteorologist</span>':'')
+             +'</div>'; }).join('')
+       : '<div class=mine><span class=dim>No reports yet. Your first one is one tap away.</span></div>';
+   }).catch(function(){});
+}
+loadMine();
 })();
 </script>"""
 
@@ -20331,6 +20282,7 @@ def portal_crew():
         return redirect("/crew", code=302)
     spa = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
     return wv_shell(_CREW_WS_PAGE
+                    .replace("__WV_TOKENS__", WV_TOKENS)
                     .replace("__SPA__", spa)
                     .replace("__WV_FOOTER__", _CREW_WS_SCRIPT + "\n__WV_FOOTER__"))
 
@@ -20688,6 +20640,7 @@ def _met_nav(active: str, spa: str) -> str:
              ("severe", "Severe", "/portal/met/severe"),
              ("people", "My People", "/portal/met/people"),
              ("schedule", "Schedule", "/portal/met/schedule"),
+             ("crew", "Crew", "/portal/met/crew"),
              ("messages", "Messages", "/portal/met/messages"),
              ("numbers", "My Numbers", "/portal/met/numbers")]
     links = "".join('<a class="%s" href="%s">%s</a>'
@@ -22718,6 +22671,251 @@ def _severe_affected(alert):
     return subs, _severe_board_sentry(alert)
 
 
+def _mission_recipients(target_kind, tlat, tlng, tmi):
+    """Active Crew members with phones, optionally within tmi miles of
+    their home base."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT u.id, u.phone, u.crew_home_lat, u.crew_home_lng
+                     FROM users u
+                     JOIN user_roles ur ON ur.user_id = u.id
+                          AND ur.role = 'crew'
+                    WHERE u.is_active = TRUE
+                      AND COALESCE(u.crew_active, TRUE) = TRUE""")
+            rows = cur.fetchall()
+    if target_kind != "radius":
+        return [r["id"] for r in rows]
+    out = []
+    for r in rows:
+        if r.get("crew_home_lat") is None or r.get("crew_home_lng") is None:
+            continue
+        d = _haversine_miles(tlat, tlng, r["crew_home_lat"], r["crew_home_lng"])
+        if d <= tmi:
+            out.append(r["id"])
+    return out
+
+
+def _haversine_miles(lat1, lng1, lat2, lng2):
+    import math
+    rl1, rl2 = math.radians(lat1), math.radians(lat2)
+    dlat = rl2 - rl1
+    dlng = math.radians(lng2 - lng1)
+    a = (math.sin(dlat / 2) ** 2
+         + math.cos(rl1) * math.cos(rl2) * math.sin(dlng / 2) ** 2)
+    return 3958.8 * 2 * math.asin(min(1, math.sqrt(a)))
+
+
+@app.route("/api/v1/met/crew-missions", methods=["OPTIONS"])
+def _met_crew_missions_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/met/crew-missions")
+def met_crew_mission_create():
+    """A Meteorologist asks the Crew a question (Sep 1, 2026)."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    question = (data.get("question") or "").strip()
+    if len(question) < 8:
+        return jsonify({"ok": False, "error": "question-too-short"}), 400
+    if len(question) > 300:
+        return jsonify({"ok": False, "error": "question-too-long"}), 400
+    target_kind = (data.get("target_kind") or "all").strip()
+    tlat = tlng = tmi = None
+    place = None
+    if target_kind == "radius":
+        place = (data.get("place") or "").strip()
+        try:
+            tmi = float(data.get("radius_mi") or 75)
+        except (TypeError, ValueError):
+            tmi = 75.0
+        tmi = max(5.0, min(tmi, 500.0))
+        geo = _geocode_address(place) if place else None
+        if not geo:
+            return jsonify({"ok": False,
+                            "error": "place-not-found",
+                            "message": "Could not place that town. Try "
+                                       "'Atwood, KS' style."}), 400
+        tlat, tlng = geo["lat"], geo["lng"]
+    elif target_kind != "all":
+        return jsonify({"ok": False, "error": "bad-target"}), 400
+
+    recipient_ids = _mission_recipients(target_kind, tlat, tlng, tmi)
+    met_name = user.get("name") or "your Meteorologist"
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO crew_missions
+                     (title, description, created_by_user_id,
+                      created_by_role, creator_name, target_county,
+                      target_lat, target_lng, target_radius_mi,
+                      starts_at, expires_at, is_active, created_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s)
+                   RETURNING id""",
+                (question[:80], question, user["id"],
+                 "admin" if "admin" in roles and "met" not in roles else "met",
+                 met_name, place, tlat, tlng, tmi,
+                 now_ms, now_ms + 24 * 3600 * 1000, now_ms))
+            mission_id = cur.fetchone()["id"]
+            for uid in recipient_ids:
+                cur.execute(
+                    """INSERT INTO crew_mission_recipients (mission_id, user_id)
+                       VALUES (%s, %s) ON CONFLICT DO NOTHING""",
+                    (mission_id, uid))
+    body = (f"Mission from {met_name}, WeatherValet Meteorologist: "
+            f"{question} Reply with what you see and your town and state. "
+            f"A photo helps.")
+    sent = 0
+    for uid in recipient_ids:
+        try:
+            _notify_crew_member(uid, "notify_on_severe_alert",
+                                "Mission from your Meteorologist", body,
+                                actor_user_id=user["id"])
+            sent += 1
+        except Exception as e:
+            print(f"[mission] notify failed user={uid}: {e!r}", flush=True)
+    print(f"[mission] {met_name} sent mission {mission_id} to {sent} "
+          f"Crew member(s), target={target_kind} {place or ''}", flush=True)
+    return jsonify({"ok": True, "id": mission_id, "sent": sent})
+
+
+@app.get("/api/v1/met/crew-missions")
+def met_crew_missions_list():
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT m.id, m.description AS question,
+                          m.creator_name AS met_name,
+                          m.target_county AS target_place,
+                          m.target_radius_mi AS target_mi,
+                          CASE WHEN m.target_radius_mi IS NULL
+                               THEN 'all' ELSE 'radius' END AS target_kind,
+                          m.created_at,
+                          (SELECT COUNT(*) FROM crew_mission_recipients r
+                            WHERE r.mission_id = m.id) AS sent_count,
+                          (SELECT COUNT(*) FROM crew_reports cr
+                            WHERE cr.mission_id = m.id) AS page_replies
+                     FROM crew_missions m
+                    ORDER BY m.id DESC LIMIT 20""")
+            missions = [dict(r) for r in cur.fetchall()]
+    return jsonify({"ok": True, "missions": missions})
+
+
+@app.get("/api/v1/met/crew-missions/<int:mission_id>/replies")
+def met_crew_mission_replies(mission_id):
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT created_at FROM crew_missions WHERE id = %s",
+                        (mission_id,))
+            m = cur.fetchone()
+            if not m:
+                return jsonify({"ok": False, "error": "no-such-mission"}), 404
+            cur.execute(
+                """SELECT cr.id, cr.user_name, cr.report_type, cr.notes,
+                          cr.image_url, cr.created_at
+                     FROM crew_reports cr
+                    WHERE cr.mission_id = %s AND cr.is_hidden = FALSE
+                    ORDER BY cr.created_at DESC LIMIT 200""", (mission_id,))
+            page_replies = [dict(r) for r in cur.fetchall()]
+            cur.execute(
+                """SELECT TRIM(COALESCE(cc.conditions,'') || ' ' ||
+                               COALESCE(cc.notes,'')) AS body,
+                          cc.checked_in_at AS created_at,
+                          COALESCE(u.name, 'Crew member') AS user_name
+                     FROM crew_checkins cc
+                     JOIN crew_mission_recipients r
+                          ON r.user_id = cc.user_id
+                          AND r.mission_id = %s
+                     LEFT JOIN users u ON u.id = cc.user_id
+                    WHERE cc.checked_in_at >= %s
+                    ORDER BY cc.checked_in_at DESC LIMIT 200""",
+                (mission_id, m["created_at"]))
+            text_replies = [dict(r) for r in cur.fetchall()]
+    return jsonify({"ok": True, "page_replies": page_replies,
+                    "text_replies": text_replies})
+
+
+@app.get("/api/v1/crew/active-mission")
+def crew_active_mission():
+    """The newest open mission addressed to this member, if any."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT m.id, m.creator_name AS met_name,
+                          m.description AS question, m.created_at
+                     FROM crew_missions m
+                     JOIN crew_mission_recipients r ON r.mission_id = m.id
+                    WHERE r.user_id = %s AND m.is_active = TRUE
+                      AND %s BETWEEN m.starts_at AND m.expires_at
+                    ORDER BY m.id DESC LIMIT 1""",
+                (user["id"], int(time.time() * 1000)))
+            m = cur.fetchone()
+    return jsonify({"ok": True, "mission": dict(m) if m else None})
+
+
+@app.route("/api/v1/crew/report-images", methods=["OPTIONS"])
+def _crew_report_image_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/crew/report-images")
+def crew_report_image_upload():
+    """Crew photo for a report: JPG/PNG by magic bytes, 5 MB cap, stored
+    in Postgres, served from our own domain (Sep 1, 2026)."""
+    user = _get_current_user()
+    if user is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    roles = user.get("roles") or []
+    if not any(r in roles for r in ("crew", "met", "admin")):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    f = request.files.get("image")
+    blob = f.read() if f else request.get_data()
+    if not blob:
+        return jsonify({"ok": False, "error": "no-image"}), 400
+    if len(blob) > 5 * 1024 * 1024:
+        return jsonify({"ok": False, "error": "too-large-5mb-max"}), 400
+    if blob[:3] == b"\xff\xd8\xff":
+        ctype = "image/jpeg"
+    elif blob[:8] == b"\x89PNG\r\n\x1a\n":
+        ctype = "image/png"
+    else:
+        return jsonify({"ok": False, "error": "jpg-or-png-only"}), 400
+    token = secrets.token_urlsafe(12)
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO brief_images
+                     (token, content_type, data, uploaded_by, created_at)
+                   VALUES (%s, %s, %s, %s, %s)""",
+                (token, ctype, blob, user["id"], now_ms))
+    ext = "jpg" if ctype == "image/jpeg" else "png"
+    return jsonify({"ok": True,
+                    "url": f"{PUBLIC_BASE_URL.rstrip('/')}/brief-images/{token}.{ext}"})
+
+
 @app.route("/api/v1/met/brief-images", methods=["OPTIONS"])
 def _met_brief_image_preflight():
     return ("", 204)
@@ -23565,6 +23763,156 @@ function wire(){
 load();
 })();
 </script>"""
+
+
+_MET_CREW_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Crew Missions &middot; WeatherValet</title><meta name=robots content="noindex">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+__MET_CHROME__
+.wrapx{max-width:760px;margin:0 auto;padding:26px 22px 70px}
+h1{font-size:24px;font-weight:900;letter-spacing:-.02em;color:#fff;margin:0 0 4px}
+.psub{color:#B8C7DE;font-size:15px;margin:0 0 18px;line-height:1.6}
+.mcard{background:#0E1D3C;border:1px solid #2E4A7E;border-radius:14px;
+  padding:16px 18px;margin-bottom:12px;color:#C9D8F0;font-size:14.5px;line-height:1.6}
+.mcard textarea{width:100%;box-sizing:border-box;min-height:64px;padding:10px 12px;
+  font-size:14.5px;color:#EAF1FF;background:#0A1730;border:1px solid #2E4A7E;
+  border-radius:9px;font-family:inherit}
+.mcard input{padding:9px 11px;font-size:14px;color:#EAF1FF;background:#0A1730;
+  border:1px solid #2E4A7E;border-radius:8px;margin:4px 6px 4px 0}
+.mcard label{margin-right:14px;font-size:14px}
+.mgo{border:none;border-radius:10px;color:#fff;cursor:pointer;font-weight:800;
+  font-size:14.5px;padding:11px 20px;background:linear-gradient(160deg,#3D8BFF,#1E5FE0)}
+.mgo:disabled{opacity:.55;cursor:default}
+#m-state{font-size:13.5px;margin-left:10px;color:#8FA6C6}
+.mrow{border-top:1px solid #21375E;padding-top:10px;margin-top:10px}
+.mrow b{color:#fff}
+.mrow .dim{color:#8FA6C6;font-size:12.5px}
+.mrow .rep{background:#0A1730;border:1px solid #21375E;border-radius:9px;
+  padding:8px 11px;margin-top:6px;font-size:13.5px}
+.showr{color:#7EB6FF;cursor:pointer;font-size:13px}
+</style></head><body>
+__MET_NAV__
+<div class=wrapx>
+  <h1>Crew Missions</h1>
+  <div class=psub>Ask the Valet Crew a question. It goes out as a text signed with
+  your name; their answers collect here. Weather questions only, and the Crew
+  always replies with town and state.</div>
+  <div class=mcard>
+    <b style="color:#fff">New mission</b><br>
+    <textarea id=m-q placeholder="Has the rain changed over to snow at your location?"></textarea>
+    <div style="margin-top:8px">
+      <label><input type=radio name=m-t value=all checked> Everyone</label>
+      <label><input type=radio name=m-t value=radius> Near a place</label>
+      <span id=m-place-wrap style="display:none">
+        <input id=m-place placeholder="Atwood, KS" style="width:150px">
+        <input id=m-mi type=number value=75 min=5 max=500 style="width:70px"> miles
+      </span>
+    </div>
+    <div style="margin-top:10px">
+      <button class=mgo id=m-go>Send mission</button><span id=m-state></span>
+    </div>
+  </div>
+  <div id=m-list><span style="color:#8FA6C6">Loading...</span></div>
+</div>
+__WV_FOOTER__"""
+
+
+_MET_CREW_SCRIPT = """<script>
+(function(){
+function esc(t){var d=document.createElement('div');d.textContent=t==null?'':String(t);return d.innerHTML;}
+function when(ms){ms=Number(ms); if(ms<1e12) ms*=1000;
+  return new Date(ms).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});}
+Array.prototype.forEach.call(document.querySelectorAll('input[name=m-t]'),function(r){
+  r.addEventListener('change',function(){
+    document.getElementById('m-place-wrap').style.display =
+      document.querySelector('input[name=m-t]:checked').value==='radius'?'':'none';
+  });
+});
+document.getElementById('m-go').addEventListener('click',function(){
+  var b=this, st=document.getElementById('m-state');
+  var kind=document.querySelector('input[name=m-t]:checked').value;
+  var body={question:document.getElementById('m-q').value, target_kind:kind};
+  if(kind==='radius'){ body.place=document.getElementById('m-place').value;
+    body.radius_mi=Number(document.getElementById('m-mi').value)||75; }
+  b.disabled=true; st.textContent='Sending...';
+  fetch('/api/v1/met/crew-missions',{method:'POST',credentials:'include',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+   .then(function(r){return r.json();})
+   .then(function(d){
+     b.disabled=false;
+     if(d.ok){ st.textContent='Sent to '+d.sent+' Crew member'+(d.sent===1?'':'s')+'.';
+       document.getElementById('m-q').value=''; load(); }
+     else st.textContent=d.message||d.error||'Could not send.';
+   })
+   .catch(function(){ b.disabled=false; st.textContent='Connection problem.'; });
+});
+function load(){
+  fetch('/api/v1/met/crew-missions',{credentials:'include'})
+   .then(function(r){return r.json();})
+   .then(function(d){
+     if(!d.ok) return;
+     var ms=d.missions||[];
+     document.getElementById('m-list').innerHTML = ms.length
+       ? '<div class=mcard>'+ms.map(function(m){
+           var tgt = m.target_kind==='radius'
+             ? 'within '+Math.round(m.target_mi)+' mi of '+esc(m.target_place||'')
+             : 'everyone';
+           return '<div class=mrow><b>'+esc(m.question)+'</b><br>'
+             +'<span class=dim>'+esc(m.met_name)+' &middot; '+when(m.created_at)
+             +' &middot; '+tgt+' &middot; sent to '+m.sent_count
+             +' &middot; '+m.page_replies+' page repl'+(m.page_replies===1?'y':'ies')
+             +'</span><br><span class=showr data-id="'+m.id+'">Show replies</span>'
+             +'<div id=reps-'+m.id+'></div></div>';
+         }).join('')+'</div>'
+       : '<div class=mcard><span style="color:#8FA6C6">No missions yet. '
+         +'The Crew is waiting for a good question.</span></div>';
+     Array.prototype.forEach.call(document.querySelectorAll('.showr'),function(x){
+       x.addEventListener('click',function(){
+         var id=x.getAttribute('data-id');
+         fetch('/api/v1/met/crew-missions/'+id+'/replies',{credentials:'include'})
+          .then(function(r){return r.json();})
+          .then(function(d2){
+            if(!d2.ok) return;
+            var h='';
+            (d2.page_replies||[]).forEach(function(p){
+              h+='<div class=rep><b>'+esc(p.user_name||'Crew')+'</b>: '
+                +esc(p.report_type)+(p.notes?' - '+esc(p.notes):'')
+                +(p.image_url?' <a href="'+esc(p.image_url)+'" target=_blank>photo</a>':'')
+                +' <span class=dim>'+when(p.created_at)+'</span></div>';
+            });
+            (d2.text_replies||[]).forEach(function(t){
+              h+='<div class=rep><b>'+esc(t.user_name)+'</b> (text): '
+                +esc(t.body)+' <span class=dim>'+when(t.created_at)+'</span></div>';
+            });
+            document.getElementById('reps-'+id).innerHTML =
+              h || '<div class=rep><span class=dim>No replies yet.</span></div>';
+          });
+       });
+     });
+   }).catch(function(){});
+}
+load();
+})();
+</script>"""
+
+
+@app.get("/portal/met/crew")
+def portal_met_crew():
+    user = _get_current_user()
+    if not user:
+        return redirect("/signin", code=302)
+    roles = user.get("roles") or []
+    if "met" not in roles and "admin" not in roles:
+        return redirect("/portal", code=302)
+    spa = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+    return wv_shell(_MET_CREW_PAGE
+                    .replace("__WV_TOKENS__", WV_TOKENS)
+                    .replace("__MET_CHROME__", _MET_CHROME_CSS)
+                    .replace("__MET_NAV__", _met_nav("crew", spa))
+                    .replace("__WV_FOOTER__", _MET_CREW_SCRIPT + "\n__WV_FOOTER__"))
 
 
 @app.get("/portal/met/schedule")
@@ -39499,19 +39847,23 @@ def _alarm_expired_briefs() -> None:
                               EXISTS (
                                 SELECT 1 FROM brief_history bh
                                  WHERE bh.user_id = d.user_id
-                                   AND bh.delivery_status = 'sent'
-                                   AND bh.delivered_at BETWEEN
-                                       d.window_end_at - %s
-                                       AND d.window_end_at + 2 * 3600 * 1000
-                              ) AS was_delivered
+                                   AND bh.delivery_status IN ('sent','delivered')
+                                   AND (to_timestamp((CASE WHEN bh.delivered_at < 1000000000000
+                                            THEN bh.delivered_at * 1000
+                                            ELSE bh.delivered_at END) / 1000.0)
+                                        AT TIME ZONE 'America/Indiana/Indianapolis')::date
+                                     = (to_timestamp(d.window_end_at / 1000.0)
+                                        AT TIME ZONE 'America/Indiana/Indianapolis')::date
+                              ) AS was_delivered,
+                              EXTRACT(DOW FROM (to_timestamp(d.window_end_at / 1000.0)
+                                  AT TIME ZONE 'America/Indiana/Indianapolis')) AS wv_dow
                          FROM pro_brief_drafts d
                          JOIN users u ON u.id = d.user_id
                          LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
                          LEFT JOIN users pm ON pm.id = sc.primary_met_id
                         WHERE d.status = 'expired'
                           AND d.expiry_notified_at IS NULL
-                        ORDER BY d.window_end_at""",
-                    (grace,))
+                        ORDER BY d.window_end_at""")
                 scanned = cur.fetchall()
                 # The team writes evening briefs (Michael, Aug 30, 2026);
                 # 'morning' drafts are a legacy cadence nobody intends to
@@ -39521,14 +39873,16 @@ def _alarm_expired_briefs() -> None:
                 # day instead of one per scheduler tick (Aug 31, 2026).
                 quiet_ids = [r["id"] for r in scanned
                              if r.get("was_delivered")
-                             or (r.get("brief_type") or "") == "morning"]
+                             or (r.get("brief_type") or "") == "morning"
+                             or int(-1 if r.get("wv_dow") is None else r.get("wv_dow")) in (0, 6)]
                 if quiet_ids:
                     cur.execute(
                         """UPDATE pro_brief_drafts SET expiry_notified_at = %s
                             WHERE id = ANY(%s)""", (now_ms, quiet_ids))
                 rows = [r for r in scanned
                         if not r.get("was_delivered")
-                        and (r.get("brief_type") or "") != "morning"]
+                        and (r.get("brief_type") or "") != "morning"
+                        and int(-1 if r.get("wv_dow") is None else r.get("wv_dow")) not in (0, 6)]
         try:
             digest_hour = datetime.now(
                 ZoneInfo("America/Indiana/Indianapolis")).hour
@@ -39554,8 +39908,14 @@ def _alarm_expired_briefs() -> None:
     for r in rows:
         key = (r["sub_name"], r["sub_email"], r["met_email"], r["met_name"])
         try:
+            # Label in Indiana time (Sep 1, 2026: UTC put last night's
+            # evening briefs on "tomorrow's" date in Michael's inbox).
+            try:
+                _tz = ZoneInfo("America/Indiana/Indianapolis")
+            except Exception:
+                _tz = timezone.utc
             day = datetime.fromtimestamp(
-                int(r["window_end_at"]) / 1000, tz=timezone.utc
+                int(r["window_end_at"]) / 1000, tz=_tz
             ).strftime("%b %d") + " " + (r.get("brief_type") or "brief")
         except Exception:
             day = "?"
@@ -41663,6 +42023,11 @@ def _page_met_for_alert(alert: dict, affected: list, page_token: str,
 
 
 def _notify_crew_in_severe_alert(alert: dict) -> None:
+    # Retired (Michael, Sep 1, 2026): robots watching addresses is what
+    # Stormline sells. Crew contact about weather comes from a
+    # Meteorologist's Mission, not an automated blast. Body kept below,
+    # unreachable.
+    return
     """Notify opted-in Crew whose home base falls inside a severe alert
     polygon.
 
@@ -41852,6 +42217,10 @@ def _tz_from_latlng(lat, lng):
 
 
 def _crew_daily_checkin_nudge() -> None:
+    # Retired (Sep 1, 2026): automated look-outside prompts are replaced
+    # by Met Missions. Every Crew contact is now a signed human
+    # question. Body kept below, unreachable.
+    return
     """Each tick, text opted-in Crew for whom it is now the 8 AM hour in
     THEIR local timezone and who have not checked in yet.
 
@@ -41942,6 +42311,9 @@ def _crew_daily_checkin_nudge() -> None:
 
 
 def _send_crew_all_clears() -> None:
+    # Retired with the severe notifier (Sep 1, 2026). Its header was
+    # "All clear in your area", the exact phrase the brand refuses.
+    return
     """Relief half of severe weather (#C14): when an alert we notified Crew
     about has passed its effective time, tell those same members the storm
     has cleared.
@@ -46301,8 +46673,10 @@ def crew_reports_list():
             "id": r["id"],
             "user_name": r.get("user_name") or "Anonymous",
             "report_type": r["report_type"],
-            "lat": r["latitude"],
-            "lng": r["longitude"],
+            # Town-ish precision for the public map (Sep 1, 2026):
+            # never anyone's driveway.
+            "lat": round(float(r["latitude"]), 2),
+            "lng": round(float(r["longitude"]), 2),
             "notes": r.get("notes") or "",
             "image_url": r.get("image_url") or "",
             "verified_count": r.get("verified_count", 0),
@@ -46492,6 +46866,10 @@ def crew_reports_submit():
     if len(notes) > 500:
         notes = notes[:500]
     image_url = _normalize_image_url((data.get("image_url") or "").strip()) or None
+    try:
+        mission_id = int(data.get("mission_id")) if data.get("mission_id") else None
+    except (TypeError, ValueError):
+        mission_id = None
     now_ms = int(time.time() * 1000)
 
     try:
@@ -46500,11 +46878,12 @@ def crew_reports_submit():
                 cur.execute(
                     """INSERT INTO crew_reports
                          (user_id, user_name, report_type, latitude, longitude,
-                          notes, image_url, verified_count, is_hidden, created_at)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, 0, FALSE, %s)
+                          notes, image_url, verified_count, is_hidden, created_at,
+                          mission_id)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, 0, FALSE, %s, %s)
                        RETURNING id""",
                     (user["id"], user.get("name") or "", report_type,
-                     lat, lng, notes or None, image_url, now_ms),
+                     lat, lng, notes or None, image_url, now_ms, mission_id),
                 )
                 new_id = cur.fetchone()["id"]
     except Exception as e:
