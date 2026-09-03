@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-281"
+BACKEND_BUILD = "0702-284"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -259,7 +259,7 @@ def _phone_last10(raw: str) -> str:
 # The on-duty meteorologist's phone, in E.164 format (+15555550101).
 # When you have multiple, swap this for a routing function.
 METEOROLOGIST_PHONE = os.environ.get("METEOROLOGIST_PHONE", "")
-METEOROLOGIST_NAME = os.environ.get("METEOROLOGIST_NAME", "your meteorologist")
+METEOROLOGIST_NAME = os.environ.get("METEOROLOGIST_NAME", "your Meteorologist")
 
 # Discord webhooks — Rosie posts to team channels.
 # Each is a webhook URL Discord generated for a specific channel. Set
@@ -7953,7 +7953,7 @@ def _mark_paid_and_notify(request_id: int, *, payment_id: Optional[str] = None,
 
     # Customer SMS — the standby promise. Keep it short, warm, time-bounded.
     # (Fixed May 22, 2026 — was using a legacy single-Met name var that
-    # defaulted to "your meteorologist", producing awkward output like
+    # defaulted to "your Meteorologist", producing awkward output like
     # "Your is reviewing your plan now". With a multi-Met team, the
     # specific Met is decided later when one claims the review, so we
     # use generic "a meteorologist" here.)
@@ -11811,7 +11811,7 @@ def meteorologist_complete(claim_token: str):
         )
 
     # Customer SMS — verdict ready. We link to the customer review page
-    # which shows the verdict + a "thank your meteorologist" tip button.
+    # which shows the verdict + a "thank your Meteorologist" tip button.
     # Lead with a readable line (verdict word + bottom line) instead of
     # the raw verdict key the workspace submits. See _compose_review_sms_lead.
     sms_lead = _compose_review_sms_lead(verdict, notes)
@@ -12281,7 +12281,7 @@ Full brief: weathervalet.ai/brief/k3p9
             <div class="section-label">What to watch</div>
             <div>Storms could trigger earlier if the cap breaks — I'm watching a 1 PM window. I'll text if it shifts.</div>
 
-            <div class="met-sig">— Chris, your meteorologist</div>
+            <div class="met-sig">— Chris, your Meteorologist</div>
 
             <div class="reply-hint">
               💬 Reply to this email or text the SMS to talk to Chris directly.
@@ -12322,7 +12322,7 @@ Full brief: weathervalet.ai/brief/k3p9
               <a href="#" style="color: #2563eb; text-decoration: none;">📜 Past briefs</a>
             </div>
 
-            <div class="met-sig">— Chris, your meteorologist</div>
+            <div class="met-sig">— Chris, your Meteorologist</div>
           </div>
         </div>
       </div>
@@ -12385,7 +12385,7 @@ Full brief: weathervalet.ai/brief/m7q2
             <div class="section-label">What to watch</div>
             <div>Storms could fire earlier (1 PM trigger possible). I'll text immediately if first lightning strike is within 10 miles of the school. NWS may issue Severe T-Storm Watch by noon.</div>
 
-            <div class="met-sig">— Chris, your meteorologist</div>
+            <div class="met-sig">— Chris, your Meteorologist</div>
 
             <div class="reply-hint">
               💬 Reply to this email or text the SMS to talk to Chris directly.
@@ -12427,7 +12427,7 @@ Full brief: weathervalet.ai/brief/m7q2
               <a href="#" style="color: #2563eb; text-decoration: none;">📜 Past briefs</a>
             </div>
 
-            <div class="met-sig">— Chris, your meteorologist</div>
+            <div class="met-sig">— Chris, your Meteorologist</div>
           </div>
         </div>
       </div>
@@ -12490,7 +12490,7 @@ Full brief: weathervalet.ai/brief/v4n7
             <div class="section-label">What to watch</div>
             <div>Long-range models hint at a Thursday-Friday rain event, 0.5-1.0&quot; possible. If you have any wrap-up to do this week, today and tomorrow are your windows.</div>
 
-            <div class="met-sig">— Chris, your meteorologist</div>
+            <div class="met-sig">— Chris, your Meteorologist</div>
 
             <div class="reply-hint">
               💬 Reply to this email or text the SMS to talk to Chris directly.
@@ -12532,7 +12532,7 @@ Full brief: weathervalet.ai/brief/v4n7
               <a href="#" style="color: #2563eb; text-decoration: none;">📜 Past briefs</a>
             </div>
 
-            <div class="met-sig">— Chris, your meteorologist</div>
+            <div class="met-sig">— Chris, your Meteorologist</div>
           </div>
         </div>
       </div>
@@ -16503,7 +16503,7 @@ TERMS_BODY = """<h1>Terms of Service</h1>
     </ul>
     <h2>Payment and refunds</h2>
     <ul>
-      <li><strong>$19 reviews</strong> are charged at the time of purchase. If your meteorologist does not deliver the review within the stated service window, contact us within 7 days for a refund.</li>
+      <li><strong>$19 reviews</strong> are charged at the time of purchase. If your Meteorologist does not deliver the review within the stated service window, contact us within 7 days for a refund.</li>
       <li><strong>Subscription plans</strong> (Stormline, Pro) are billed on their stated cycle (Stormline annually, Pro monthly). You can cancel any time via the Stripe portal in your subscriber settings. Cancellation stops future billing; no partial-month refunds are issued for the current period unless required by law.</li>
       <li><strong>Tips</strong> to meteorologists are non-refundable except in cases of clear customer error (e.g., extra zero on the amount). Email us within 24 hours.</li>
       <li>All payments are processed by Stripe. We do not store credit card numbers.</li>
@@ -39640,7 +39640,7 @@ def _render_pro_brief_email_html(
 
   <!-- Footer -->
   <div style="padding:18px 24px;background:#f8f9fa;color:#9ca3af;font-size:11px;line-height:1.5;text-align:center;">
-    WeatherValet: your meteorologist on call.<br>
+    WeatherValet: your Meteorologist on call.<br>
     Adjust preferences in your <a href="https://weathervalet.ai/?portal=1" style="color:#2563eb;text-decoration:none;">subscriber portal</a>.
   </div>
 
@@ -39912,7 +39912,7 @@ def _alarm_expired_briefs() -> None:
                 # DID hear from us (legacy auto-send or a Met), so it is
                 # not a miss.
                 cur.execute(
-                    """SELECT d.id, d.brief_type, d.window_end_at,
+                    """SELECT d.id, d.user_id, d.brief_type, d.window_end_at,
                               u.email AS sub_email,
                               COALESCE(u.name, u.email) AS sub_name,
                               pm.email AS met_email,
@@ -39952,10 +39952,22 @@ def _alarm_expired_briefs() -> None:
                     cur.execute(
                         """UPDATE pro_brief_drafts SET expiry_notified_at = %s
                             WHERE id = ANY(%s)""", (now_ms, quiet_ids))
+                # Staff accounts (met/admin roles) can hold test drafts;
+                # they are not customers who "heard nothing" (Sep 2, 2026,
+                # after Michael and Timmy appeared in their own digest).
+                staff_ids = set()
+                try:
+                    cur.execute(
+                        """SELECT DISTINCT user_id FROM user_roles
+                            WHERE role IN ('met', 'admin')""")
+                    staff_ids = {x["user_id"] for x in cur.fetchall()}
+                except Exception:
+                    pass
                 rows = [r for r in scanned
                         if not r.get("was_delivered")
                         and (r.get("brief_type") or "") != "morning"
-                        and int(-1 if r.get("wv_dow") is None else r.get("wv_dow")) not in (0, 6)]
+                        and int(-1 if r.get("wv_dow") is None else r.get("wv_dow")) not in (0, 6)
+                        and r.get("user_id") not in staff_ids]
         try:
             digest_hour = datetime.now(
                 ZoneInfo("America/Indiana/Indianapolis")).hour
@@ -43351,7 +43363,7 @@ def _relay_area_label(alert: dict, sub: dict) -> str:
 # image isn't ready, the plain text goes alone.
 # ═══════════════════════════════════════════════════════════════════
 
-_MAP_EVENTS = ("Tornado Warning", "Severe Thunderstorm Warning")
+_MAP_EVENTS = ("Tornado Warning", "Severe Thunderstorm Warning", "Snow Squall Warning")
 _MAP_BUDGET_S = 8.0
 _MAP_TILE_TIMEOUT_S = 2.5
 WARNING_MAP_DIR = os.environ.get("WARNING_MAP_DIR", "/tmp/wv-warning-maps")
@@ -43673,6 +43685,7 @@ _SENTRY_EVENTS = ("Tornado Warning", "Severe Thunderstorm Warning", "Flash Flood
 # season were left out: a pack that cries wolf gets the whole service muted.
 _SENTRY_PACK_EVENTS = (
     "Winter Storm Warning", "Ice Storm Warning", "Blizzard Warning",
+    "Snow Squall Warning",
     "Freeze Warning", "Hard Freeze Warning", "Frost Advisory",
     "Extreme Heat Warning", "Excessive Heat Warning", "High Wind Warning",
 )
@@ -43685,6 +43698,7 @@ _SENTRY_SAFETY = {
     "Winter Storm Warning": "Travel will be difficult. Keep a charged phone and warm layers in the car.",
     "Ice Storm Warning": "Ice brings down limbs and power lines. Avoid travel and expect outages.",
     "Blizzard Warning": "Blowing snow will cut visibility to near zero. Do not travel.",
+    "Snow Squall Warning": "Sudden whiteout and icy roads. If driving, slow down, use lights, and exit when safe. Never stop on the roadway.",
     "Freeze Warning": "Cover or bring in tender plants and protect outdoor pipes and spigots.",
     "Hard Freeze Warning": "A hard freeze kills unprotected plants. Bring in what you can and drain hoses.",
     "Frost Advisory": "Frost is likely tonight. Cover tender plants or move pots under shelter.",
@@ -49685,7 +49699,8 @@ def met_daily_brief_audience_count():
                            WHERE u.is_active = TRUE
                              AND loc.county IS NOT NULL
                              AND loc.address_text ILIKE %s
-                             AND u.subscription_tier = 'hobbyist'
+                             -- Hobbyist retired; this dialog now reaches
+                             -- every active subscriber (Sep 2, 2026).
                              AND EXISTS (
                                SELECT 1 FROM user_roles ur
                                WHERE ur.user_id = u.id AND ur.role = 'subscriber'
@@ -50005,7 +50020,8 @@ def met_broadcast_brief_send():
                            WHERE u.is_active = TRUE
                              AND loc.county IS NOT NULL
                              AND loc.address_text ILIKE %s
-                             AND u.subscription_tier = 'hobbyist'
+                             -- Hobbyist retired; this dialog now reaches
+                             -- every active subscriber (Sep 2, 2026).
                              AND EXISTS (
                                SELECT 1 FROM user_roles ur
                                WHERE ur.user_id = u.id AND ur.role = 'subscriber'
@@ -50130,7 +50146,7 @@ def met_broadcast_brief_send():
         f"<p><strong>{headline_html}</strong></p>"
         f"<p>{summary_html}</p>"
         + (f"<p><em>Timing:</em> {time_windows_html}</p>" if time_windows else "")
-        + f"<p style='color:#666;font-size:12px;'>Sent by your meteorologist via WeatherValet.</p>"
+        + f"<p style='color:#666;font-size:12px;'>Sent by your Meteorologist via WeatherValet.</p>"
     )
 
     # Send to each candidate. Small delay between sends to avoid rate
@@ -51489,7 +51505,7 @@ def _autosend_pro_brief_draft(draft_id: int) -> tuple[bool, str]:
 
     channels_used = []
     any_success = False
-    transparency_line = "Auto-sent while your meteorologist is unavailable."
+    transparency_line = "Auto-sent while your Meteorologist is unavailable."
 
     for ch in channels:
         if ch == "sms" and row.get("sub_phone"):
@@ -53686,7 +53702,7 @@ def met_pro_brief_compose_update():
                 f"<p><strong>{snippet}</strong></p>"
                 f"<p>{email_body_html}</p>"
                 f"{_img_html}"
-                f"<p style='color:#666;font-size:12px;'>Sent by your meteorologist via WeatherValet.</p>"
+                f"<p style='color:#666;font-size:12px;'>Sent by your Meteorologist via WeatherValet.</p>"
             )
             ok = _send_brief_email(sub["email"], update_subject, email_body_full, reply_to=update_reply_to)
             if ok:
@@ -59279,7 +59295,7 @@ def met_subscriber_message(subscriber_id):
     if not prefs:
         prefs = ["sms", "email"]
 
-    sender_name = user.get("name") or (user.get("email") or "").split("@")[0] or "your meteorologist"
+    sender_name = user.get("name") or (user.get("email") or "").split("@")[0] or "your Meteorologist"
     delivered = []
     skipped = []
 
@@ -59569,7 +59585,7 @@ def review_get(review_token: str):
             "verdict": r["meteorologist_verdict"],
             "notes": r["meteorologist_notes"],
             "completed_at": r["completed_at"],
-            "met_name": r.get("completed_by_name") or "your meteorologist",
+            "met_name": r.get("completed_by_name") or "your Meteorologist",
             "met_user_id": r.get("completed_by_user_id"),
             "tip_eligible": bool(r.get("completed_by_user_id")),
         },
@@ -59710,7 +59726,7 @@ def review_tip(review_token: str):
                     "currency": "usd",
                     "unit_amount": amount_cents,
                     "product_data": {
-                        "name": f"Tip for {r.get('completed_by_name') or 'your meteorologist'}",
+                        "name": f"Tip for {r.get('completed_by_name') or 'your Meteorologist'}",
                         "description": "Thank-you for your WeatherValet review",
                     },
                 },
