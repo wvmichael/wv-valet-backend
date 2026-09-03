@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-284"
+BACKEND_BUILD = "0702-285"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -21004,6 +21004,7 @@ __MET_NAV__
           background:#0A1730;border:1px solid #2E4A7E;border-radius:8px">
           <option value="">New message for...</option></select>
         <button class=mini id=nb-go>Start</button></div>
+      <div id=st-chips style="display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 6px"></div>
       <div id=list></div>
     </div>
     <div class=panel id=editor>
@@ -21046,7 +21047,36 @@ __WV_FOOTER__"""
 
 _MET_BRIEFS_SCRIPT = """<script>
 (function(){
-  var drafts=[], current=null, selected={}, dirty=false;
+  var drafts=[], current=null, selected={}, dirty=false, stateFilter='';
+  function visDrafts(){
+    return stateFilter ? drafts.filter(function(d){return d.state===stateFilter;}) : drafts;
+  }
+  function renderChips(){
+    var box=document.getElementById('st-chips');
+    if(!box) return;
+    var counts={};
+    drafts.forEach(function(d){ if(d.state && d.status!=='sent') counts[d.state]=(counts[d.state]||0)+1; });
+    var keys=Object.keys(counts).sort();
+    if(keys.length<2){ box.innerHTML=''; stateFilter=''; return; }
+    function chip(st,label){
+      var on = stateFilter===st;
+      return '<button class=mini data-st="'+st+'" style="'
+        +(on?'background:#1E5FE0;color:#fff;border-color:#3D8BFF':'')+'">'+label+'</button>';
+    }
+    var h=chip('','All');
+    keys.forEach(function(k){ h+=chip(k, k+' ('+counts[k]+')'); });
+    box.innerHTML=h;
+    Array.prototype.forEach.call(box.querySelectorAll('button'),function(b){
+      b.addEventListener('click',function(){
+        stateFilter=b.getAttribute('data-st')||'';
+        Object.keys(selected).forEach(function(k){
+          var x=drafts.filter(function(y){return y.id===Number(k);})[0];
+          if(stateFilter && x && x.state!==stateFilter) delete selected[k];
+        });
+        renderChips(); load();
+      });
+    });
+  }
   function esc(t){var d=document.createElement('div');d.textContent=(t===null||t===undefined)?'':t;return d.innerHTML;}
   function say(kind,text){ var m=document.getElementById('msg');
     m.className='msg '+kind; m.innerHTML=text; m.style.display='block'; }
@@ -21065,7 +21095,8 @@ _MET_BRIEFS_SCRIPT = """<script>
         document.getElementById('lh').textContent =
           pending.length ? pending.length+(pending.length===1?' brief to write':' briefs to write')
                          : 'Nothing waiting';
-        var html=drafts.map(function(d){
+        renderChips();
+        var html=visDrafts().map(function(d){
           var sent = d.status==='sent';
           return '<div class="d'+(selected[d.id]?' on':'')+'" data-id="'+d.id+'">'
             +'<input type=checkbox '+(selected[d.id]?'checked':'')+(sent?' disabled':'')+'>'
@@ -21268,7 +21299,7 @@ _MET_BRIEFS_SCRIPT = """<script>
      .catch(function(){ b.disabled=false; say('bad','Connection problem.'); });
   });
   document.getElementById('sel-all').addEventListener('click',function(){
-    var pending=drafts.filter(function(d){return d.status!=='sent';});
+    var pending=visDrafts().filter(function(d){return d.status!=='sent';});
     var all = pending.every(function(d){ return selected[d.id]; });
     selected={};
     if(!all) pending.forEach(function(d){ selected[d.id]=true; });
@@ -50396,6 +50427,7 @@ def met_pro_briefs_list():
                 # Admins see all drafts. The visibility CTE collapses to all-true.
                 cur.execute(
                     """SELECT d.*,
+                              sl.address_text AS sub_address,
                               u.email AS subscriber_email, u.name AS subscriber_name,
                               u.phone AS subscriber_phone,
                               sc.business_role, sc.weather_decisions,
@@ -50407,6 +50439,8 @@ def met_pro_briefs_list():
                        JOIN users u ON u.id = d.user_id
                        LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
                        LEFT JOIN users pm ON pm.id = sc.primary_met_id
+                       LEFT JOIN saved_locations sl ON sl.user_id = u.id
+                            AND sl.is_primary = TRUE
                        WHERE (d.status IN ('pending-review', 'claimed')
                               AND (d.window_end_at IS NULL
                                    OR d.window_end_at > (EXTRACT(EPOCH FROM now()) * 1000 - 6*3600*1000))
@@ -50434,6 +50468,7 @@ def met_pro_briefs_list():
                 # NOT covering; they don't grant coverage to anyone).
                 cur.execute(
                     """SELECT d.*,
+                              sl.address_text AS sub_address,
                               u.email AS subscriber_email, u.name AS subscriber_name,
                               u.phone AS subscriber_phone,
                               sc.business_role, sc.weather_decisions,
@@ -50445,6 +50480,8 @@ def met_pro_briefs_list():
                        JOIN users u ON u.id = d.user_id
                        LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
                        LEFT JOIN users pm ON pm.id = sc.primary_met_id
+                       LEFT JOIN saved_locations sl ON sl.user_id = u.id
+                            AND sl.is_primary = TRUE
                        WHERE (d.status IN ('pending-review', 'claimed')
                               AND (d.window_end_at IS NULL
                                    OR d.window_end_at > (EXTRACT(EPOCH FROM now()) * 1000 - 6*3600*1000))
@@ -50500,9 +50537,14 @@ def met_pro_briefs_list():
     for r in rows:
         primary_met_id = r.get("primary_met_id")
         is_covering = (not is_admin) and primary_met_id is not None and primary_met_id != me_id
+        _st = ""
+        for _m in re.finditer(r",\s*([A-Z]{2})\b",
+                              (r.get("sub_address") or r.get("location_label") or "")):
+            _st = _m.group(1)
         drafts.append({
             "id": r["id"],
             "user_id": r["user_id"],
+            "state": _st,
             "brief_type": r.get("brief_type") or "morning",
             "subscriber_email": r["subscriber_email"],
             "subscriber_name": r.get("subscriber_name") or "",
