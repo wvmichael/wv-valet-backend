@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-285"
+BACKEND_BUILD = "0702-286"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -30080,6 +30080,55 @@ def admin_update_user(user_id):
     return jsonify(response)
 
 
+@app.route("/api/v1/admin/users/<int:user_id>/restore-subscriber", methods=["OPTIONS"])
+def _admin_restore_subscriber_preflight(user_id):
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/users/<int:user_id>/restore-subscriber")
+def admin_restore_subscriber(user_id):
+    admin = _get_current_user()
+    if admin is None:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    if "admin" not in (admin.get("roles") or []):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    try:
+        days = int(data.get("days") or 7)
+    except (TypeError, ValueError):
+        days = 7
+    days = max(1, min(days, 60))
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, email FROM users WHERE id = %s", (user_id,))
+            u = cur.fetchone()
+            if not u:
+                return jsonify({"ok": False, "error": "no-such-user"}), 404
+            cur.execute(
+                """UPDATE users
+                    SET is_active = TRUE,
+                        subscription_tier = COALESCE(subscription_tier, 'pro_single'),
+                        trial_ends_at = %s
+                  WHERE id = %s""",
+                (now_ms + days * 24 * 3600 * 1000, user_id))
+            cur.execute(
+                """INSERT INTO user_roles (user_id, role, granted_at)
+                   VALUES (%s, 'subscriber', %s)
+                   ON CONFLICT (user_id, role) DO NOTHING""",
+                (user_id, now_ms))
+    try:
+        _audit_log(admin["id"], admin.get("name"),
+                   "user.restore_subscriber", target_type="user",
+                   target_id=user_id,
+                   details={"days": days, "tier": "pro_single"})
+    except Exception:
+        pass
+    print(f"[admin] {admin.get('email')} restored user {user_id} "
+          f"({u['email']}) as Pro trial subscriber, {days} days", flush=True)
+    return jsonify({"ok": True, "days": days})
+
+
 @app.delete("/api/v1/admin/users/<int:user_id>")
 @require_role("admin")
 def admin_deactivate_user(user_id):
@@ -34223,6 +34272,23 @@ function fsends(list){
 }
 function renderFind(d){
   var out = document.getElementById('find-out');
+  window.__wvRestore = function(uid, el){
+    el.disabled = true;
+    fetch('/api/v1/admin/users/' + uid + '/restore-subscriber', {
+      method: 'POST', credentials: 'include',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({days: 7})
+    }).then(function(r){ return r.json(); }).then(function(d2){
+      var m = document.querySelector('[data-restore-msg="' + uid + '"]');
+      if (d2.ok) {
+        if (m) m.textContent = 'Restored. They are back in the Subscribers tab and the composer picker.';
+        el.style.display = 'none';
+      } else {
+        el.disabled = false;
+        if (m) m.textContent = d2.error || 'Could not restore.';
+      }
+    }).catch(function(){ el.disabled = false; });
+  };
   var html = '';
   if (d.users.length) {
     html += '<div class=fh>Accounts</div>';
@@ -34235,7 +34301,10 @@ function renderFind(d){
       if (u.primary_met) { html += ' &middot; Met: ' + fesc(u.primary_met); }
       if (u.hidden_from_subscribers_because.length) {
         html += '<br><span class=warn>Missing from the Subscribers tab: '
-          + fesc(u.hidden_from_subscribers_because.join(' and ')) + '.</span>';
+          + fesc(u.hidden_from_subscribers_because.join(' and ')) + '.</span>'
+          + ' <button class=mini data-restore="' + u.id + '">'
+          + 'Restore as Pro trial (7 days)</button>'
+          + ' <span class=dim data-restore-msg="' + u.id + '"></span>';
       }
       if (u.locations.length) {
         html += '<br><span class=dim>Saved locations:</span><ul>';
@@ -34289,6 +34358,9 @@ function renderFind(d){
     });
   }
   out.innerHTML = html;
+  Array.prototype.forEach.call(out.querySelectorAll('[data-restore]'), function(b){
+    b.addEventListener('click', function(){ window.__wvRestore(b.getAttribute('data-restore'), b); });
+  });
   document.getElementById('find-empty').style.display = d.found_anything ? 'none' : 'block';
 }
 function runFind(){
