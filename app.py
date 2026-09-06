@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-288"
+BACKEND_BUILD = "0702-289"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -30374,6 +30374,15 @@ def admin_restore_subscriber(user_id):
                 """INSERT INTO user_roles (user_id, role, granted_at)
                    VALUES (%s, 'subscriber', %s)
                    ON CONFLICT (user_id, role) DO NOTHING""",
+                (user_id, now_ms))
+            # Without this row the draft scheduler never sees them
+            # (inner join); half-created accounts lack it (Sep 3, 2026).
+            cur.execute(
+                """INSERT INTO brief_preferences
+                     (user_id, morning_enabled, evening_enabled,
+                      evening_window_start, evening_window_end, updated_at)
+                   VALUES (%s, FALSE, TRUE, '18:00', '20:30', %s)
+                   ON CONFLICT (user_id) DO NOTHING""",
                 (user_id, now_ms))
     try:
         _audit_log(admin["id"], admin.get("name"),
