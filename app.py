@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-290"
+BACKEND_BUILD = "0702-292"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -24668,21 +24668,46 @@ __WV_FOOTER__"""
 
 _WEATHER_LIVE_SCRIPT = """<script>
 (function(){
-var CH=__CHANNELS__;
 var tabs=document.getElementById('ltabs'), player=document.getElementById('lplayer');
-function pick(i){
-  Array.prototype.forEach.call(tabs.children,function(b,j){ b.className=(i===j)?'on':''; });
-  player.src='https://www.youtube.com/embed/live_stream?channel='+encodeURIComponent(CH[i].id)+'&autoplay=0';
+var current=null, streams=[];
+function pick(vid){
+  current=vid;
+  Array.prototype.forEach.call(tabs.children,function(b){
+    b.className=(b.getAttribute('data-v')===vid)?'on':'';
+  });
+  player.src='https://www.youtube.com/embed/'+vid+'?autoplay=0';
 }
-CH.forEach(function(c,i){
-  var b=document.createElement('button'); b.textContent=c.name;
-  b.addEventListener('click',function(){ pick(i); });
-  tabs.appendChild(b);
-});
-if(CH.length){ pick(0); }
-else {
-  document.querySelector('.lframe').innerHTML='<div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#8FA6C6;padding:20px;text-align:center">Streams are being set up. Check back soon.</div>';
+function render(){
+  tabs.innerHTML='';
+  if(!streams.length){
+    player.removeAttribute('src');
+    document.querySelector('.lframe').setAttribute('data-off','1');
+    var off=document.getElementById('loffmsg');
+    if(!off){ off=document.createElement('div'); off.id='loffmsg';
+      off.style.cssText='position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#8FA6C6;padding:20px;text-align:center';
+      off.textContent='No live streams at the moment. During active weather, coverage runs right here.';
+      document.querySelector('.lframe').appendChild(off); }
+    off.style.display='flex';
+    return;
+  }
+  var off=document.getElementById('loffmsg'); if(off) off.style.display='none';
+  streams.forEach(function(st){
+    var b=document.createElement('button'); b.textContent=st.name;
+    b.setAttribute('data-v', st.video_id); b.title=st.title;
+    b.addEventListener('click',function(){ pick(st.video_id); });
+    tabs.appendChild(b);
+  });
+  var still = streams.some(function(st){ return st.video_id===current; });
+  pick(still ? current : streams[0].video_id);
 }
+function load(){
+  fetch('/api/v1/weather/live-streams')
+   .then(function(r){return r.json();})
+   .then(function(d){ if(d.ok){ streams=d.streams||[]; render(); } })
+   .catch(function(){});
+}
+load();
+setInterval(load, 150000);
 })();
 </script>"""
 
@@ -24916,18 +24941,103 @@ def weather_watches_page():
     return wv_shell(page.replace("__WV_FOOTER__", script + "\n__WV_FOOTER__"))
 
 
+_WV_LIVE_DEFAULT_CHANNEL = "UC4pnY0iCz5xqInNpyVAi-xg"  # WeatherValet's channel
+_LIVE_STREAMS_CACHE = {"at": 0, "streams": []}
+
+
+def _fetch_live_streams():
+    now_ms = int(time.time() * 1000)
+    if now_ms - _LIVE_STREAMS_CACHE["at"] < 120_000:
+        return _LIVE_STREAMS_CACHE["streams"]
+    cid = (os.environ.get("WV_LIVE_CHANNEL") or _WV_LIVE_DEFAULT_CHANNEL).strip()
+    url = f"https://www.youtube.com/channel/{cid}/streams"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (WeatherValet site)",
+        "Accept-Language": "en-US,en;q=0.9"})
+    streams = []
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            html = resp.read(2_500_000).decode("utf-8", "ignore")
+        for chunk in html.split('"videoRenderer":')[1:]:
+            chunk = chunk[:6000]
+            if ('BADGE_STYLE_TYPE_LIVE_NOW' not in chunk
+                    and '"style":"LIVE"' not in chunk):
+                continue
+            vid = re.search(r'"videoId":"([\w-]{11})"', chunk)
+            title = re.search(r'"title":\{"runs":\[\{"text":"((?:[^"\\]|\\.)*)"', chunk)
+            if vid:
+                t = (title.group(1) if title else "Live").replace('\\"', '"')
+                if not any(x["video_id"] == vid.group(1) for x in streams):
+                    streams.append({"video_id": vid.group(1), "title": t})
+    except Exception as e:
+        print(f"[live] streams fetch failed: {e!r}", flush=True)
+        return _LIVE_STREAMS_CACHE["streams"]
+    _LIVE_STREAMS_CACHE["at"] = now_ms
+    _LIVE_STREAMS_CACHE["streams"] = streams
+    return streams
+
+
+def _live_tab_name(title):
+    t = (title or "").lower()
+    if "indiana" in t:
+        return "Indiana Weather"
+    if "kansas" in t:
+        return "Kansas Weather"
+    return "US Weather"
+
+
+@app.get("/api/v1/weather/live-streams")
+def weather_live_streams():
+    streams = _fetch_live_streams()
+    tabs, used = [], set()
+    for st in streams:
+        name = _live_tab_name(st["title"])
+        if name in used:
+            name = st["title"][:28] or "Live"
+        used.add(name)
+        tabs.append({"name": name, "video_id": st["video_id"],
+                     "title": st["title"][:120]})
+    order = {"US Weather": 0, "Indiana Weather": 1, "Kansas Weather": 2}
+    tabs.sort(key=lambda x: order.get(x["name"], 9))
+    return jsonify({"ok": True, "streams": tabs})
+
+
+_YT_HANDLE_CACHE = {}
+
+
+def _resolve_youtube_channel(value):
+    """Accepts a UC... channel id OR an @handle (Sep 3, 2026: YouTube
+    hides the id behind shifting menus, but everyone knows their
+    handle). Handles resolve by reading the public channel page once,
+    then cache for the process lifetime."""
+    v = (value or "").strip()
+    if not v:
+        return None
+    if v.startswith("UC") and len(v) >= 20 and " " not in v:
+        return v
+    handle = v if v.startswith("@") else "@" + v
+    if handle in _YT_HANDLE_CACHE:
+        return _YT_HANDLE_CACHE[handle]
+    try:
+        req = urllib.request.Request(
+            f"https://www.youtube.com/{handle}",
+            headers={"User-Agent": "Mozilla/5.0 (WeatherValet site)"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            html = resp.read(400_000).decode("utf-8", "ignore")
+        mt = re.search(r'"channelId":"(UC[0-9A-Za-z_-]{16,})"', html)
+        cid = mt.group(1) if mt else None
+    except Exception as e:
+        print(f"[live] handle resolve failed for {handle}: {e!r}", flush=True)
+        cid = None
+    if cid:
+        _YT_HANDLE_CACHE[handle] = cid
+    return cid
+
+
 @app.get("/weather/live")
 def weather_live_page():
-    chans = []
-    for env_key, label in (("WV_LIVE_US_CHANNEL", "US Weather"),
-                           ("WV_LIVE_IN_CHANNEL", "Indiana Weather"),
-                           ("WV_LIVE_KS_CHANNEL", "Kansas Weather")):
-        cid = (os.environ.get(env_key) or "").strip()
-        if cid:
-            chans.append({"id": cid, "name": label})
-    script = _WEATHER_LIVE_SCRIPT.replace("__CHANNELS__", json.dumps(chans))
     return wv_shell(_WEATHER_LIVE_PAGE
-                    .replace("__WV_FOOTER__", script + "\n__WV_FOOTER__"))
+                    .replace("__WV_FOOTER__", _WEATHER_LIVE_SCRIPT + "\n__WV_FOOTER__"))
 
 
 @app.get("/crew")
