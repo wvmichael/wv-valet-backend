@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-292"
+BACKEND_BUILD = "0702-293"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -45180,10 +45180,14 @@ def _ensure_brief_scheduler_started() -> None:
         # see this line printed 2+ times (different PIDs). This is how we
         # confirm worker count without dashboard access. Look for
         # "[worker-startup]" in Render logs after deploy.
+        # Background thread (Sep 6, 2026): this geocodes over the
+        # network and MUST NOT block boot. Running it inline tripped
+        # Render's 5-second health check.
         try:
-            _backfill_crew_home_coords()
+            threading.Thread(target=_backfill_crew_home_coords,
+                             daemon=True).start()
         except Exception as e:
-            print(f"[crew-backfill] boot call failed: {e!r}", flush=True)
+            print(f"[crew-backfill] boot thread failed: {e!r}", flush=True)
         try:
             import socket
             host = socket.gethostname()
