@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-287"
+BACKEND_BUILD = "0702-288"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -13118,6 +13118,10 @@ WV_FOOTER = """<footer>
      <a href="/watch">Watch</a>
      <a href="/pro">Pro</a>
      <a href="/crew">Valet Crew</a></div>
+   <div><h6>Weather</h6>
+     <a href="/weather/warnings">Live Warnings map</a>
+     <a href="/weather/watches">Watches &amp; Advisories</a>
+     <a href="/weather/live">LIVE streams</a></div>
    <div><h6>Support</h6>
      <a href="/contact">Contact us</a>
      <a href="/contact">Manage your Stormline</a>
@@ -22979,6 +22983,60 @@ def crew_active_mission():
     return jsonify({"ok": True, "mission": dict(m) if m else None})
 
 
+_NATL_ALERTS_CACHE = {"at": 0, "features": []}
+
+
+def _fetch_national_alerts():
+    now_ms = int(time.time() * 1000)
+    if now_ms - _NATL_ALERTS_CACHE["at"] < 90_000:
+        return _NATL_ALERTS_CACHE["features"]
+    url = "https://api.weather.gov/alerts/active?status=actual&limit=500"
+    headers = {"User-Agent": "WeatherValet (michael@weathervalet.com)",
+               "Accept": "application/geo+json"}
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    feats = data.get("features") or []
+    _NATL_ALERTS_CACHE["at"] = now_ms
+    _NATL_ALERTS_CACHE["features"] = feats
+    return feats
+
+
+@app.get("/api/v1/weather/active-alerts")
+def weather_active_alerts():
+    """Public. kind=warnings -> events ending in Warning; kind=watches ->
+    Watches plus Advisories. Lean payload; polygon geometry when NWS
+    provides it, else areaDesc for the side list."""
+    kind = (request.args.get("kind") or "warnings").strip()
+    try:
+        feats = _fetch_national_alerts()
+    except Exception as e:
+        print(f"[weather-alerts] fetch failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "nws-unavailable"}), 503
+    out = []
+    for f in feats:
+        p = f.get("properties") or {}
+        ev = (p.get("event") or "").strip()
+        if not ev:
+            continue
+        if kind == "watches":
+            if not (ev.endswith("Watch") or ev.endswith("Advisory")):
+                continue
+        else:
+            if not ev.endswith("Warning"):
+                continue
+        out.append({
+            "id": p.get("id") or f.get("id") or "",
+            "event": ev,
+            "headline": (p.get("headline") or "")[:200],
+            "area": (p.get("areaDesc") or "")[:300],
+            "expires": p.get("expires") or "",
+            "geometry": f.get("geometry"),
+        })
+    return jsonify({"ok": True, "kind": kind, "alerts": out,
+                    "fetched_at": _NATL_ALERTS_CACHE["at"]})
+
+
 @app.route("/api/v1/crew/report-images", methods=["OPTIONS"])
 def _crew_report_image_preflight():
     return ("", 204)
@@ -24293,6 +24351,206 @@ def portal_home():
 @app.get("/login")
 def signin_page():
     return wv_shell(_SIGNIN_PAGE.replace("__WV_FOOTER__", _SIGNIN_SCRIPT + "\n__WV_FOOTER__"))
+
+
+_WEATHER_MAP_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>__TITLE__ &middot; WeatherValet</title>
+<meta name=description content="Live United States __TITLE__ map from National Weather Service data, updated continuously.">
+<link rel=stylesheet href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+.wrapw{max-width:1000px;margin:0 auto;padding:22px 16px 70px}
+h1{font-size:24px;font-weight:900;letter-spacing:-.02em;color:#fff;margin:0 0 4px}
+.wsub{color:#B8C7DE;font-size:14.5px;margin:0 0 12px;line-height:1.55}
+#wmap{height:60vh;min-height:380px;border-radius:14px;border:1px solid #2E4A7E;background:#0A1730}
+.wnote{color:#8FA6C6;font-size:12px;margin:6px 2px 12px}
+#wfilters{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0}
+#wfilters label{display:flex;align-items:center;gap:6px;padding:7px 12px;border-radius:18px;
+  border:1px solid #2E4A7E;background:#0E1D3C;color:#C9D8F0;font-size:13px;cursor:pointer}
+#wfilters .sw{width:11px;height:11px;border-radius:3px;display:inline-block}
+.wlist{background:#0E1D3C;border:1px solid #2E4A7E;border-radius:12px;padding:12px 15px;
+  color:#C9D8F0;font-size:13.5px;line-height:1.6;margin-top:10px}
+.wlist b{color:#fff}
+</style></head><body>
+<div class=wrapw>
+  <h1>__TITLE__</h1>
+  <div class=wsub>Every active National Weather Service __KINDWORD__ across the
+  country, straight from the source. Uncheck any type to hide it. Updates about
+  every two minutes.</div>
+  <div id=wfilters></div>
+  <div id=wmap></div>
+  <div class=wnote>Data: National Weather Service &middot; Map (c) Esri &middot;
+  Some __KINDWORD__s cover counties or zones without a drawn shape; those are
+  listed below the map.</div>
+  <div id=wlist></div>
+</div>
+__WV_FOOTER__"""
+
+
+_WEATHER_MAP_SCRIPT = """<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+(function(){
+var KIND='__KIND__';
+var COLORS={'Tornado Warning':'#E02424','Severe Thunderstorm Warning':'#F59E0B',
+  'Flash Flood Warning':'#16A34A','Flood Warning':'#22C55E','Snow Squall Warning':'#7DD3FC',
+  'Winter Storm Warning':'#60A5FA','Blizzard Warning':'#A5B4FC','Ice Storm Warning':'#C4B5FD',
+  'Tornado Watch':'#F87171','Severe Thunderstorm Watch':'#FBBF24','Winter Storm Watch':'#93C5FD',
+  'Flood Watch':'#4ADE80'};
+function colorFor(ev){ if(COLORS[ev]) return COLORS[ev];
+  if(ev.indexOf('Winter')>=0||ev.indexOf('Snow')>=0||ev.indexOf('Ice')>=0||ev.indexOf('Freez')>=0||ev.indexOf('Frost')>=0||ev.indexOf('Cold')>=0||ev.indexOf('Chill')>=0) return '#7FB3F5';
+  if(ev.indexOf('Flood')>=0) return '#34D399';
+  if(ev.indexOf('Fire')>=0||ev.indexOf('Red Flag')>=0) return '#FB7185';
+  if(ev.indexOf('Heat')>=0) return '#FDBA74';
+  if(ev.indexOf('Wind')>=0||ev.indexOf('Gale')>=0) return '#FCD34D';
+  if(ev.indexOf('Fog')>=0||ev.indexOf('Smoke')>=0) return '#9CA3AF';
+  if(ev.indexOf('Marine')>=0||ev.indexOf('Surf')>=0||ev.indexOf('Rip')>=0||ev.indexOf('Coastal')>=0) return '#67E8F9';
+  return '#94A3B8'; }
+function esc(t){var d=document.createElement('div');d.textContent=t==null?'':String(t);return d.innerHTML;}
+var map=null, layerByType={}, hidden={}, lastAlerts=[];
+if(window.L){
+  map=L.map('wmap').setView([39.5,-96.5],4);
+  L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',{maxZoom:12}).addTo(map);
+  L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}',{maxZoom:12,opacity:.9}).addTo(map);
+} else {
+  document.getElementById('wmap').innerHTML='<div style="padding:28px;color:#8FA6C6">Map could not load. Active items are listed below.</div>';
+}
+function draw(){
+  if(map){ Object.keys(layerByType).forEach(function(k){ map.removeLayer(layerByType[k]); }); }
+  layerByType={};
+  var counts={}, unmapped=[];
+  lastAlerts.forEach(function(a){
+    counts[a.event]=(counts[a.event]||0)+1;
+    if(hidden[a.event]) return;
+    if(a.geometry && map){
+      if(!layerByType[a.event]) layerByType[a.event]=L.layerGroup().addTo(map);
+      try{
+        L.geoJSON(a.geometry,{style:{color:colorFor(a.event),weight:1.5,fillOpacity:.28}})
+         .bindPopup('<b>'+esc(a.event)+'</b><br>'+esc(a.headline||a.area))
+         .addTo(layerByType[a.event]);
+      }catch(e){}
+    } else if(!a.geometry){ unmapped.push(a); }
+  });
+  var f=document.getElementById('wfilters'); f.innerHTML='';
+  Object.keys(counts).sort().forEach(function(ev){
+    var l=document.createElement('label');
+    l.innerHTML='<input type=checkbox '+(hidden[ev]?'':'checked')+'> '
+      +'<span class=sw style="background:'+colorFor(ev)+'"></span> '
+      +esc(ev)+' ('+counts[ev]+')';
+    l.querySelector('input').addEventListener('change',function(){
+      hidden[ev]=!this.checked; draw();
+    });
+    f.appendChild(l);
+  });
+  var wl=document.getElementById('wlist');
+  var vis=unmapped.filter(function(a){return !hidden[a.event];});
+  wl.innerHTML = vis.length
+    ? '<div class=wlist>'+vis.slice(0,80).map(function(a){
+        return '<b>'+esc(a.event)+'</b> &middot; '+esc(a.area)+'<br>';
+      }).join('')+'</div>'
+    : '';
+  if(!lastAlerts.length){
+    wl.innerHTML='<div class=wlist><b>Quiet right now.</b> No active '
+      +(KIND==='watches'?'watches or advisories':'warnings')
+      +' anywhere in the country. Enjoy it.</div>';
+  }
+}
+function load(){
+  fetch('/api/v1/weather/active-alerts?kind='+KIND)
+   .then(function(r){return r.json();})
+   .then(function(d){ if(d.ok){ lastAlerts=d.alerts||[]; draw(); } })
+   .catch(function(){});
+}
+load();
+setInterval(load, 120000);
+})();
+</script>"""
+
+
+_WEATHER_LIVE_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>LIVE &middot; WeatherValet</title>
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+.wrapl{max-width:900px;margin:0 auto;padding:24px 16px 70px}
+h1{font-size:24px;font-weight:900;color:#fff;margin:0 0 4px}
+.lsub{color:#B8C7DE;font-size:14.5px;margin:0 0 16px;line-height:1.55}
+.ltabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.ltabs button{padding:9px 15px;border-radius:20px;border:1px solid #2E4A7E;background:#0E1D3C;
+  color:#C9D8F0;font-size:13.5px;cursor:pointer;font-weight:700}
+.ltabs button.on{background:linear-gradient(160deg,#3D8BFF,#1E5FE0);color:#fff;border-color:#3D8BFF}
+.lframe{position:relative;padding-top:56.25%;border-radius:14px;overflow:hidden;
+  border:1px solid #2E4A7E;background:#0A1730}
+.lframe iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
+.loff{color:#8FA6C6;font-size:14px;margin-top:10px;line-height:1.55}
+</style></head><body>
+<div class=wrapl>
+  <h1>WeatherValet LIVE</h1>
+  <div class=lsub>Live weather coverage, streaming right here. If a channel is
+  between broadcasts, the player shows it as offline; check back when weather
+  is moving.</div>
+  <div class=ltabs id=ltabs></div>
+  <div class=lframe><iframe id=lplayer allow="autoplay; encrypted-media" allowfullscreen
+    referrerpolicy="strict-origin-when-cross-origin"></iframe></div>
+  <div class=loff>Streams are produced by WeatherValet. During severe weather,
+  coverage is live and continuous.</div>
+</div>
+__WV_FOOTER__"""
+
+
+_WEATHER_LIVE_SCRIPT = """<script>
+(function(){
+var CH=__CHANNELS__;
+var tabs=document.getElementById('ltabs'), player=document.getElementById('lplayer');
+function pick(i){
+  Array.prototype.forEach.call(tabs.children,function(b,j){ b.className=(i===j)?'on':''; });
+  player.src='https://www.youtube.com/embed/live_stream?channel='+encodeURIComponent(CH[i].id)+'&autoplay=0';
+}
+CH.forEach(function(c,i){
+  var b=document.createElement('button'); b.textContent=c.name;
+  b.addEventListener('click',function(){ pick(i); });
+  tabs.appendChild(b);
+});
+if(CH.length){ pick(0); }
+else {
+  document.querySelector('.lframe').innerHTML='<div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#8FA6C6;padding:20px;text-align:center">Streams are being set up. Check back soon.</div>';
+}
+})();
+</script>"""
+
+
+@app.get("/weather/warnings")
+def weather_warnings_page():
+    page = (_WEATHER_MAP_PAGE
+            .replace("__TITLE__", "Live Warnings Map")
+            .replace("__KINDWORD__", "warning"))
+    script = _WEATHER_MAP_SCRIPT.replace("__KIND__", "warnings")
+    return wv_shell(page.replace("__WV_FOOTER__", script + "\n__WV_FOOTER__"))
+
+
+@app.get("/weather/watches")
+def weather_watches_page():
+    page = (_WEATHER_MAP_PAGE
+            .replace("__TITLE__", "Watches and Advisories Map")
+            .replace("__KINDWORD__", "watch and advisory"))
+    script = _WEATHER_MAP_SCRIPT.replace("__KIND__", "watches")
+    return wv_shell(page.replace("__WV_FOOTER__", script + "\n__WV_FOOTER__"))
+
+
+@app.get("/weather/live")
+def weather_live_page():
+    chans = []
+    for env_key, label in (("WV_LIVE_US_CHANNEL", "US Weather"),
+                           ("WV_LIVE_IN_CHANNEL", "Indiana Weather"),
+                           ("WV_LIVE_KS_CHANNEL", "Kansas Weather")):
+        cid = (os.environ.get(env_key) or "").strip()
+        if cid:
+            chans.append({"id": cid, "name": label})
+    script = _WEATHER_LIVE_SCRIPT.replace("__CHANNELS__", json.dumps(chans))
+    return wv_shell(_WEATHER_LIVE_PAGE
+                    .replace("__WV_FOOTER__", script + "\n__WV_FOOTER__"))
 
 
 @app.get("/crew")
