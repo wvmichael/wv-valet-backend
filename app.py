@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-286"
+BACKEND_BUILD = "0702-287"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -42440,10 +42440,10 @@ def _tz_from_latlng(lat, lng):
 
 
 def _crew_daily_checkin_nudge() -> None:
-    # Retired (Sep 1, 2026): automated look-outside prompts are replaced
-    # by Met Missions. Every Crew contact is now a signed human
-    # question. Body kept below, unreachable.
-    return
+    # Restored (Michael, Sep 2, 2026) after a one-day retirement:
+    # the morning conditions roll call is back by his direction, with
+    # Missions as the storm-time channel. Skips anyone who already
+    # reported today; each member gets a morning hour of their own.
     """Each tick, text opted-in Crew for whom it is now the 8 AM hour in
     THEIR local timezone and who have not checked in yet.
 
@@ -42463,9 +42463,9 @@ def _crew_daily_checkin_nudge() -> None:
                     """SELECT u.id, u.phone, u.timezone, u.crew_home_lat, u.crew_home_lng
                        FROM users u
                        JOIN user_roles ur ON ur.user_id = u.id AND ur.role = 'crew'
-                       JOIN crew_notification_prefs p ON p.user_id = u.id
-                            AND p.notify_on_daily_checkin = TRUE
+                       LEFT JOIN crew_notification_prefs p ON p.user_id = u.id
                        WHERE u.is_active = TRUE
+                         AND COALESCE(p.notify_on_daily_checkin, TRUE) = TRUE
                          AND u.phone IS NOT NULL AND u.phone != ''
                          AND NOT EXISTS (
                            SELECT 1 FROM crew_checkins c
@@ -42503,7 +42503,9 @@ def _crew_daily_checkin_nudge() -> None:
         else:
             tz = (r.get("timezone") or "").strip() or _approx_us_tz_from_lng(lng)
         local_now = _local_now_for_user(tz)
-        if local_now.hour != 8:
+        # Stable per-member morning hour (7, 8, or 9 local) so the whole
+        # Crew never buzzes at the same minute (Sep 2, 2026).
+        if local_now.hour != 7 + (int(r["id"]) % 3):
             continue
 
         # Claim the per-day slot first so a re-run cannot double-send.
