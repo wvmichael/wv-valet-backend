@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-289"
+BACKEND_BUILD = "0702-290"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -13119,6 +13119,8 @@ WV_FOOTER = """<footer>
      <a href="/pro">Pro</a>
      <a href="/crew">Valet Crew</a></div>
    <div><h6>Weather</h6>
+     <a href="/weather/forecast">Forecast</a>
+     <a href="/weather/outlook">Severe Outlooks</a>
      <a href="/weather/warnings">Live Warnings map</a>
      <a href="/weather/watches">Watches &amp; Advisories</a>
      <a href="/weather/live">LIVE streams</a></div>
@@ -23002,6 +23004,170 @@ def _fetch_national_alerts():
     return feats
 
 
+_WX_CODE_TEXT = {
+    0: "Clear", 1: "Mostly clear", 2: "Partly cloudy", 3: "Cloudy",
+    45: "Fog", 48: "Freezing fog", 51: "Light drizzle", 53: "Drizzle",
+    55: "Heavy drizzle", 56: "Freezing drizzle", 57: "Freezing drizzle",
+    61: "Light rain", 63: "Rain", 65: "Heavy rain", 66: "Freezing rain",
+    67: "Freezing rain", 71: "Light snow", 73: "Snow", 75: "Heavy snow",
+    77: "Snow grains", 80: "Rain showers", 81: "Rain showers",
+    82: "Heavy rain showers", 85: "Snow showers", 86: "Heavy snow showers",
+    95: "Thunderstorms", 96: "Thunderstorms with hail",
+    99: "Thunderstorms with large hail",
+}
+
+_ZIP_FORECAST_CACHE = {}
+
+
+@app.get("/api/v1/weather/zip-forecast")
+def weather_zip_forecast():
+    """Public. zip -> current conditions + automated day text + 5-day.
+    Open-Meteo data, geocoded once, cached 10 minutes per zip. Every
+    word is automated and labeled that way; no Meteorologist reviews
+    this page (Sep 3, 2026, Weather section build two)."""
+    zipq = (request.args.get("zip") or "").strip()
+    if not (zipq.isdigit() and len(zipq) == 5):
+        return jsonify({"ok": False, "error": "five-digit-zip-required"}), 400
+    now_ms = int(time.time() * 1000)
+    hit = _ZIP_FORECAST_CACHE.get(zipq)
+    if hit and now_ms - hit["at"] < 600_000:
+        return jsonify(hit["payload"])
+    geo = _geocode_address(f"{zipq}, USA")
+    if not geo:
+        return jsonify({"ok": False, "error": "zip-not-found"}), 404
+    url = ("https://api.open-meteo.com/v1/forecast"
+           f"?latitude={geo['lat']}&longitude={geo['lng']}"
+           "&current=temperature_2m,apparent_temperature,weather_code,"
+           "wind_speed_10m,wind_direction_10m,relative_humidity_2m"
+           "&daily=weather_code,temperature_2m_max,temperature_2m_min,"
+           "precipitation_probability_max,wind_speed_10m_max"
+           "&temperature_unit=fahrenheit&wind_speed_unit=mph"
+           "&timezone=auto&forecast_days=6")
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "WeatherValet-Backend/1.0 (+https://weathervalet.ai)"})
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[zip-forecast] fetch failed for {zipq}: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "weather-data-unavailable"}), 503
+
+    cur = data.get("current") or {}
+    daily = data.get("daily") or {}
+
+    def compass(deg):
+        try:
+            dirs = ["north", "northeast", "east", "southeast",
+                    "south", "southwest", "west", "northwest"]
+            return dirs[int(((float(deg) + 22.5) % 360) // 45)]
+        except Exception:
+            return ""
+
+    code = int(cur.get("weather_code") or 0)
+    sky = _WX_CODE_TEXT.get(code, "Mixed conditions")
+    today_hi = (daily.get("temperature_2m_max") or [None])[0]
+    today_lo = (daily.get("temperature_2m_min") or [None])[0]
+    pprob = (daily.get("precipitation_probability_max") or [None])[0]
+    wmax = (daily.get("wind_speed_10m_max") or [None])[0]
+    bits = [f"{sky} today."]
+    if today_hi is not None:
+        bits.append(f"High near {round(today_hi)}, low around "
+                    f"{round(today_lo)}." if today_lo is not None
+                    else f"High near {round(today_hi)}.")
+    if pprob:
+        bits.append(f"About a {int(pprob)} percent chance of "
+                    f"precipitation.")
+    if wmax and wmax >= 15:
+        bits.append(f"Wind gusting toward {round(wmax)} mph.")
+    today_text = " ".join(bits)
+
+    days = []
+    times = daily.get("time") or []
+    for i in range(1, min(6, len(times))):
+        dcode = int((daily.get("weather_code") or [0]*9)[i] or 0)
+        days.append({
+            "date": times[i],
+            "sky": _WX_CODE_TEXT.get(dcode, "Mixed"),
+            "hi": (daily.get("temperature_2m_max") or [None]*9)[i],
+            "lo": (daily.get("temperature_2m_min") or [None]*9)[i],
+            "precip": (daily.get("precipitation_probability_max") or [None]*9)[i],
+        })
+    payload = {
+        "ok": True, "zip": zipq,
+        "place": geo.get("label") or geo.get("name") or zipq,
+        "current": {
+            "temp": cur.get("temperature_2m"),
+            "feels": cur.get("apparent_temperature"),
+            "sky": sky,
+            "wind": f"{compass(cur.get('wind_direction_10m'))} "
+                    f"{round(float(cur.get('wind_speed_10m') or 0))} mph".strip(),
+            "humidity": cur.get("relative_humidity_2m"),
+        },
+        "today_text": today_text,
+        "days": days,
+    }
+    _ZIP_FORECAST_CACHE[zipq] = {"at": now_ms, "payload": payload}
+    if len(_ZIP_FORECAST_CACHE) > 500:
+        _ZIP_FORECAST_CACHE.clear()
+    return jsonify(payload)
+
+
+_SPC_CACHE = {}
+
+
+def _spc_url(day, layer):
+    base = "https://www.spc.noaa.gov/products"
+    if day in (1, 2):
+        name = {"cat": "cat", "torn": "torn", "wind": "wind",
+                "hail": "hail"}.get(layer)
+        if not name:
+            return None
+        return f"{base}/outlook/day{day}otlk_{name}.nolyr.geojson"
+    if day == 3:
+        name = {"cat": "cat", "prob": "prob"}.get(layer)
+        if not name:
+            return None
+        return f"{base}/outlook/day3otlk_{name}.nolyr.geojson"
+    if 4 <= day <= 8 and layer == "prob":
+        return f"{base}/exper/day4-8/day{day}prob.nolyr.geojson"
+    return None
+
+
+@app.get("/api/v1/weather/spc-outlook")
+def weather_spc_outlook():
+    """Public. Storm Prediction Center outlook layers, proxied with a
+    10-minute cache. We show exactly what SPC issues: per-threat maps
+    exist for days 1 and 2 only; day 3 is combined; days 4-8 are a
+    single severe-probability area (Michael, Sep 2, 2026: 'just show
+    the data we receive')."""
+    try:
+        day = int(request.args.get("day") or 1)
+    except (TypeError, ValueError):
+        day = 1
+    layer = (request.args.get("layer") or "cat").strip()
+    url = _spc_url(day, layer)
+    if not url:
+        return jsonify({"ok": False, "error": "layer-not-issued",
+                        "message": "SPC does not issue that layer for "
+                                   "that day."}), 400
+    key = f"{day}:{layer}"
+    now_ms = int(time.time() * 1000)
+    hit = _SPC_CACHE.get(key)
+    if hit and now_ms - hit["at"] < 600_000:
+        return jsonify(hit["payload"])
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "WeatherValet-Backend/1.0 (+https://weathervalet.ai)"})
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            gj = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[spc] fetch failed {key}: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "spc-unavailable"}), 503
+    payload = {"ok": True, "day": day, "layer": layer, "geojson": gj}
+    _SPC_CACHE[key] = {"at": now_ms, "payload": payload}
+    return jsonify(payload)
+
+
 @app.get("/api/v1/weather/active-alerts")
 def weather_active_alerts():
     """Public. kind=warnings -> events ending in Warning; kind=watches ->
@@ -24519,6 +24685,217 @@ else {
 }
 })();
 </script>"""
+
+
+_WEATHER_FORECAST_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Forecast &middot; WeatherValet</title>
+<meta name=description content="Current conditions and a five day automated forecast for any US zip code.">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+.wrapf{max-width:760px;margin:0 auto;padding:26px 16px 70px}
+h1{font-size:24px;font-weight:900;color:#fff;margin:0 0 4px}
+.fsub{color:#B8C7DE;font-size:14.5px;margin:0 0 16px;line-height:1.55}
+.fbar{display:flex;gap:10px;margin-bottom:14px}
+.fbar input{flex:1;max-width:220px;padding:12px 14px;font-size:17px;color:#EAF1FF;
+  background:#0E1D3C;border:1px solid #2E4A7E;border-radius:10px}
+.fbar button{border:none;border-radius:10px;color:#fff;cursor:pointer;font-weight:800;
+  font-size:15px;padding:12px 22px;background:linear-gradient(160deg,#3D8BFF,#1E5FE0)}
+.fcard{background:#0E1D3C;border:1px solid #2E4A7E;border-radius:14px;
+  padding:16px 18px;margin-bottom:12px;color:#C9D8F0;font-size:15px;line-height:1.6}
+.fcard b{color:#fff}
+.fnow{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+.fnow .big{font-size:44px;font-weight:900;color:#fff}
+.fdays{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}
+.fday{background:#0A1730;border:1px solid #21375E;border-radius:11px;padding:10px 12px;
+  font-size:13.5px;color:#C9D8F0}
+.fday b{color:#fff;display:block}
+.ai-note{color:#8FA6C6;font-size:12.5px;margin-top:10px;line-height:1.5}
+#f-msg{color:#FF8296;font-size:14px;margin:8px 0}
+</style></head><body>
+<div class=wrapf>
+  <h1>Forecast</h1>
+  <div class=fsub>Current conditions and the next five days for any US zip code.
+  This page is automated. When weather matters to your plans, a real
+  Meteorologist is one tier away.</div>
+  <div class=fbar>
+    <input id=f-zip inputmode=numeric maxlength=5 placeholder="Zip code">
+    <button id=f-go>Get forecast</button>
+  </div>
+  <div id=f-msg></div>
+  <div id=f-out></div>
+  <div class=ai-note>Automated forecast generated by WeatherValet from National
+  Weather Service and Open-Meteo data. No Meteorologist has reviewed this page.</div>
+</div>
+__WV_FOOTER__"""
+
+
+_WEATHER_FORECAST_SCRIPT = """<script>
+(function(){
+function esc(t){var d=document.createElement('div');d.textContent=t==null?'':String(t);return d.innerHTML;}
+function dayname(iso){ try{ return new Date(iso+'T12:00:00').toLocaleDateString(undefined,{weekday:'short'});}catch(e){return iso;} }
+function go(){
+  var z=document.getElementById('f-zip').value.trim();
+  var msg=document.getElementById('f-msg'); msg.textContent='';
+  if(!/^[0-9]{5}$/.test(z)){ msg.textContent='Five digits, please.'; return; }
+  document.getElementById('f-out').innerHTML='<div class=fcard>Looking at the sky over '+esc(z)+'...</div>';
+  fetch('/api/v1/weather/zip-forecast?zip='+z)
+   .then(function(r){return r.json();})
+   .then(function(d){
+     if(!d.ok){ document.getElementById('f-out').innerHTML='';
+       msg.textContent = d.error==='zip-not-found'?'Could not place that zip.':'Weather data is unavailable right now.'; return; }
+     var c=d.current||{};
+     var h='<div class=fcard><b>'+esc(d.place)+'</b><div class=fnow>'
+       +'<span class=big>'+Math.round(c.temp)+'&deg;</span>'
+       +'<span>'+esc(c.sky)+'</span>'
+       +'<span>Feels like '+Math.round(c.feels)+'&deg;</span>'
+       +'<span>Wind '+esc(c.wind)+'</span>'
+       +'<span>Humidity '+esc(c.humidity)+'%</span></div></div>';
+     h+='<div class=fcard><b>Today</b><br>'+esc(d.today_text)+'</div>';
+     h+='<div class=fcard><b>Next five days</b><div class=fdays style="margin-top:8px">'
+       +(d.days||[]).map(function(x){
+          return '<div class=fday><b>'+dayname(x.date)+'</b>'+esc(x.sky)
+            +'<br>'+Math.round(x.hi)+'&deg; / '+Math.round(x.lo)+'&deg;'
+            +(x.precip?'<br>'+x.precip+'% precip':'')+'</div>';
+        }).join('')+'</div></div>';
+     document.getElementById('f-out').innerHTML=h;
+   })
+   .catch(function(){ msg.textContent='Connection problem.'; });
+}
+document.getElementById('f-go').addEventListener('click',go);
+document.getElementById('f-zip').addEventListener('keydown',function(e){ if(e.key==='Enter') go(); });
+})();
+</script>"""
+
+
+_WEATHER_OUTLOOK_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Severe Weather Outlooks &middot; WeatherValet</title>
+<meta name=description content="Storm Prediction Center severe weather outlooks: categorical, tornado, wind, and hail, days 1 through 8.">
+<link rel=stylesheet href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+.wrapo{max-width:1000px;margin:0 auto;padding:22px 16px 70px}
+h1{font-size:24px;font-weight:900;color:#fff;margin:0 0 4px}
+.osub{color:#B8C7DE;font-size:14.5px;margin:0 0 12px;line-height:1.55}
+.ochips{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0}
+.ochips button{padding:8px 13px;border-radius:18px;border:1px solid #2E4A7E;background:#0E1D3C;
+  color:#C9D8F0;font-size:13px;cursor:pointer;font-weight:700}
+.ochips button.on{background:linear-gradient(160deg,#3D8BFF,#1E5FE0);color:#fff;border-color:#3D8BFF}
+.ochips button:disabled{opacity:.35;cursor:default}
+#omap{height:58vh;min-height:360px;border-radius:14px;border:1px solid #2E4A7E;background:#0A1730;margin-top:8px}
+.onote{color:#8FA6C6;font-size:12px;margin:6px 2px}
+#olegend{display:flex;gap:10px;flex-wrap:wrap;color:#C9D8F0;font-size:12.5px;margin-top:6px}
+#olegend .sw{width:12px;height:12px;border-radius:3px;display:inline-block;margin-right:4px;vertical-align:-1px}
+</style></head><body>
+<div class=wrapo>
+  <h1>Severe Weather Outlooks</h1>
+  <div class=osub>Storm Prediction Center outlooks, exactly as issued. Days 1 and
+  2 break out tornado, wind, and hail threats; day 3 is a combined severe
+  probability; days 4 through 8 show where severe weather is possible.</div>
+  <div class=ochips id=o-days></div>
+  <div class=ochips id=o-layers></div>
+  <div id=omap></div>
+  <div id=olegend></div>
+  <div class=onote>Data: NOAA Storm Prediction Center &middot; Map (c) Esri &middot;
+  Outlooks update several times daily.</div>
+</div>
+__WV_FOOTER__"""
+
+
+_WEATHER_OUTLOOK_SCRIPT = """<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+(function(){
+var day=1, layer='cat', map=null, shapes=null;
+var LAYERS_BY_DAY=function(d){
+  if(d<=2) return [['cat','Categorical'],['torn','Tornado'],['wind','Wind'],['hail','Hail'],['all','All threats']];
+  if(d===3) return [['cat','Categorical'],['prob','Any severe %']];
+  return [['prob','Severe possible']];
+};
+function esc(t){var d2=document.createElement('div');d2.textContent=t==null?'':String(t);return d2.innerHTML;}
+if(window.L){
+  map=L.map('omap').setView([38.5,-96.5],4);
+  L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',{maxZoom:10}).addTo(map);
+  L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}',{maxZoom:10,opacity:.9}).addTo(map);
+  shapes=L.layerGroup().addTo(map);
+} else {
+  document.getElementById('omap').innerHTML='<div style="padding:28px;color:#8FA6C6">Map could not load.</div>';
+}
+function chips(el, items, active, cb){
+  el.innerHTML='';
+  items.forEach(function(it){
+    var b=document.createElement('button');
+    b.textContent=it[1]; if(it[0]===active) b.className='on';
+    b.addEventListener('click',function(){ cb(it[0]); });
+    el.appendChild(b);
+  });
+}
+function legendFrom(feats){
+  var seen={}, out='';
+  feats.forEach(function(f){
+    var p=f.properties||{};
+    var lab=p.LABEL2||p.LABEL||''; var fill=p.fill||'#94A3B8';
+    if(lab && !seen[lab]){ seen[lab]=1;
+      out+='<span><span class=sw style="background:'+esc(fill)+'"></span>'+esc(lab)+'</span>'; }
+  });
+  document.getElementById('olegend').innerHTML=out;
+}
+function drawOne(gj){
+  (gj.features||[]).forEach(function(f){
+    var p=f.properties||{};
+    try{
+      L.geoJSON(f,{style:{color:p.stroke||p.fill||'#94A3B8',weight:1.2,
+        fillColor:p.fill||'#94A3B8',fillOpacity:.35}})
+       .bindPopup('<b>'+esc(p.LABEL2||p.LABEL||'Outlook area')+'</b>')
+       .addTo(shapes);
+    }catch(e){}
+  });
+}
+function load(){
+  if(shapes) shapes.clearLayers();
+  document.getElementById('olegend').innerHTML='';
+  var wanted = (layer==='all') ? ['torn','wind','hail'] : [layer];
+  var all=[];
+  Promise.all(wanted.map(function(ly){
+    return fetch('/api/v1/weather/spc-outlook?day='+day+'&layer='+ly)
+      .then(function(r){return r.json();})
+      .then(function(d){ if(d.ok && d.geojson){ drawOne(d.geojson);
+        all=all.concat(d.geojson.features||[]); } })
+      .catch(function(){});
+  })).then(function(){ legendFrom(all);
+    if(!all.length){ document.getElementById('olegend').innerHTML=
+      '<span style="color:#8FA6C6">Nothing outlined for this day. Quiet is good.</span>'; }
+  });
+}
+function setDay(d){ day=d;
+  var avail=LAYERS_BY_DAY(d).map(function(x){return x[0];});
+  if(avail.indexOf(layer)<0) layer=avail[0];
+  render();
+}
+function setLayer(l){ layer=l; render(); }
+function render(){
+  var dayItems=[]; for(var i=1;i<=8;i++) dayItems.push([i,'Day '+i]);
+  chips(document.getElementById('o-days'), dayItems, day, setDay);
+  chips(document.getElementById('o-layers'), LAYERS_BY_DAY(day), layer, setLayer);
+  load();
+}
+render();
+})();
+</script>"""
+
+
+@app.get("/weather/forecast")
+def weather_forecast_page():
+    return wv_shell(_WEATHER_FORECAST_PAGE
+                    .replace("__WV_FOOTER__", _WEATHER_FORECAST_SCRIPT + "\n__WV_FOOTER__"))
+
+
+@app.get("/weather/outlook")
+def weather_outlook_page():
+    return wv_shell(_WEATHER_OUTLOOK_PAGE
+                    .replace("__WV_FOOTER__", _WEATHER_OUTLOOK_SCRIPT + "\n__WV_FOOTER__"))
 
 
 @app.get("/weather/warnings")
