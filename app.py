@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-293"
+BACKEND_BUILD = "0702-294"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -13064,6 +13064,14 @@ WV_HEADER = """<header>
       <a href="/watch"><b>Watch</b><i>$49/day &middot; one Met, one event</i></a>
       <a href="/pro"><b>Pro</b><i>from $99/mo</i></a>
     </div></div>
+  <div class=nl>Weather &#9662;
+    <div class=dd>
+      <a href="/weather/forecast"><b>Forecast</b><i>any US zip, free</i></a>
+      <a href="/weather/outlook"><b>Severe Outlooks</b><i>SPC days 1-8</i></a>
+      <a href="/weather/warnings"><b>Live Warnings map</b></a>
+      <a href="/weather/watches"><b>Watches &amp; Advisories</b></a>
+      <a href="/weather/live"><b>LIVE</b><i>streaming coverage</i></a>
+    </div></div>
   <div class=nl>Who it's for &#9662;
     <div class=dd>
       <a href="/for/families"><b>Families and homeowners</b></a>
@@ -24952,16 +24960,21 @@ def _fetch_live_streams():
     cid = (os.environ.get("WV_LIVE_CHANNEL") or _WV_LIVE_DEFAULT_CHANNEL).strip()
     url = f"https://www.youtube.com/channel/{cid}/streams"
     req = urllib.request.Request(url, headers={
-        "User-Agent": "Mozilla/5.0 (WeatherValet site)",
-        "Accept-Language": "en-US,en;q=0.9"})
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/126.0 Safari/537.36"),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cookie": "CONSENT=YES+1; SOCS=CAI"})
     streams = []
     try:
         with urllib.request.urlopen(req, timeout=12) as resp:
             html = resp.read(2_500_000).decode("utf-8", "ignore")
         for chunk in html.split('"videoRenderer":')[1:]:
-            chunk = chunk[:6000]
+            chunk = chunk[:24000]
             if ('BADGE_STYLE_TYPE_LIVE_NOW' not in chunk
-                    and '"style":"LIVE"' not in chunk):
+                    and '"style":"LIVE"' not in chunk
+                    and '"iconType":"LIVE"' not in chunk
+                    and '"text":"LIVE"' not in chunk):
                 continue
             vid = re.search(r'"videoId":"([\w-]{11})"', chunk)
             title = re.search(r'"title":\{"runs":\[\{"text":"((?:[^"\\]|\\.)*)"', chunk)
@@ -24988,6 +25001,35 @@ def _live_tab_name(title):
 
 @app.get("/api/v1/weather/live-streams")
 def weather_live_streams():
+    if request.args.get("wvdebug") == "stormy2026":
+        cid = (os.environ.get("WV_LIVE_CHANNEL")
+               or _WV_LIVE_DEFAULT_CHANNEL).strip()
+        url = f"https://www.youtube.com/channel/{cid}/streams"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/126.0 Safari/537.36"),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cookie": "CONSENT=YES+1; SOCS=CAI"})
+        try:
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                html = resp.read(2_500_000).decode("utf-8", "ignore")
+            return jsonify({
+                "ok": True, "debug": True, "url": url,
+                "html_len": len(html),
+                "video_renderers": html.count('"videoRenderer":'),
+                "live_now_badges": html.count("BADGE_STYLE_TYPE_LIVE_NOW"),
+                "style_live": html.count('"style":"LIVE"'),
+                "icon_live": html.count('"iconType":"LIVE"'),
+                "consent_wall": "consent.youtube.com" in html,
+                "video_ids_seen": list(dict.fromkeys(
+                    re.findall(r'"videoId":"([\w-]{11})"', html)))[:10],
+                "parsed": _fetch_live_streams.__wrapped__()
+                          if hasattr(_fetch_live_streams, "__wrapped__")
+                          else None,
+            })
+        except Exception as e:
+            return jsonify({"ok": False, "debug": True, "error": repr(e)})
     streams = _fetch_live_streams()
     tabs, used = [], set()
     for st in streams:
