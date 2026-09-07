@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-294"
+BACKEND_BUILD = "0702-295"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -23176,6 +23176,36 @@ def weather_spc_outlook():
     return jsonify(payload)
 
 
+@app.get("/api/v1/overlay/crew-reports")
+def overlay_crew_reports():
+    """Public, for the stream overlay (Sep 6, 2026): first name plus
+    last initial, home label, condition, age. Nothing precise."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT cr.user_name, cr.report_type, cr.notes,
+                          cr.created_at, u.crew_home_label
+                     FROM crew_reports cr
+                     LEFT JOIN users u ON u.id = cr.user_id
+                    WHERE cr.is_hidden = FALSE
+                      AND cr.created_at > %s
+                    ORDER BY cr.created_at DESC LIMIT 6""",
+                (int(time.time() * 1000) - 3 * 3600 * 1000,))
+            rows = cur.fetchall()
+    out = []
+    for r in rows:
+        name = (r.get("user_name") or "Crew member").strip()
+        parts = name.split()
+        short = parts[0] + (" " + parts[-1][0] + "." if len(parts) > 1 else "")
+        note = (r.get("notes") or r.get("report_type") or "").strip()
+        out.append({"name": short,
+                    "place": (r.get("crew_home_label") or "").strip(),
+                    "text": note[:60],
+                    "type": r.get("report_type") or "",
+                    "at": r.get("created_at")})
+    return jsonify({"ok": True, "reports": out})
+
+
 @app.get("/api/v1/weather/active-alerts")
 def weather_active_alerts():
     """Public. kind=warnings -> events ending in Warning; kind=watches ->
@@ -24917,6 +24947,240 @@ function render(){
 render();
 })();
 </script>"""
+
+
+_OVERLAY_CSS = """
+<style>
+html,body{margin:0;padding:0;background:transparent;overflow:hidden;
+  font-family:'Segoe UI',system-ui,Arial,sans-serif;
+  -webkit-font-smoothing:antialiased}
+.ovcard{background:rgba(10,20,44,.92);border:1px solid #2E4A7E;
+  border-radius:12px;color:#EAF1FF;box-sizing:border-box}
+.ovh{font-size:13px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;
+  color:#fff;padding:10px 14px;border-bottom:1px solid #21375E;
+  display:flex;justify-content:space-between;align-items:center}
+.ovh .cnt{background:#E02424;color:#fff;border-radius:8px;padding:1px 10px;
+  font-size:14px}
+</style>"""
+
+
+_OVERLAY_HEADER = """<!doctype html><html><head><meta charset=utf-8>__CSS__
+<style>
+.bar{display:flex;align-items:center;justify-content:space-between;
+  background:linear-gradient(180deg,#0B1830,#0A1428);border-bottom:2px solid #1E6BFF;
+  padding:10px 22px;height:78px;box-sizing:border-box}
+.brand{display:flex;align-items:baseline;gap:14px}
+.brand .wv{font-size:30px;font-weight:900;color:#fff;letter-spacing:-.02em}
+.brand .wv span{color:#3D8BFF}
+.brand .tag{font-size:11px;font-weight:800;letter-spacing:.22em;color:#8FA6C6}
+.mid{font-size:13px;font-weight:700;letter-spacing:.14em;color:#C9D8F0;
+  text-transform:uppercase;text-align:center;line-height:1.5}
+.mid b{color:#3D8BFF}
+.right{text-align:right}
+.live{display:inline-flex;align-items:center;gap:7px;background:#E02424;color:#fff;
+  font-weight:900;font-size:14px;letter-spacing:.1em;border-radius:7px;padding:3px 12px}
+.live i{width:8px;height:8px;background:#fff;border-radius:50%;display:inline-block;
+  animation:bl 1.4s infinite}
+@keyframes bl{50%{opacity:.25}}
+.clock{color:#fff;font-size:19px;font-weight:800;margin-top:3px}
+.date{color:#8FA6C6;font-size:12px;font-weight:700;letter-spacing:.08em}
+</style></head><body>
+<div class=bar>
+  <div class=brand><span class=wv>&#9889; Weather<span>Valet</span></span>
+    <span class=tag>KNOW MORE. WORRY LESS.</span></div>
+  <div class=mid>Real Meteorologists. Real answers. Nationwide.<br>
+    <b>Robots watch addresses. Meteorologists watch your plans.</b></div>
+  <div class=right><span class=live><i></i>LIVE</span>
+    <div class=clock id=clk></div><div class=date id=dt></div></div>
+</div>
+<script>
+function tick(){var n=new Date();
+  document.getElementById('clk').textContent=n.toLocaleTimeString('en-US',
+    {hour:'numeric',minute:'2-digit',second:'2-digit',timeZone:'America/Indiana/Indianapolis'})+' ET';
+  document.getElementById('dt').textContent=n.toLocaleDateString('en-US',
+    {weekday:'short',month:'short',day:'numeric',year:'numeric',
+     timeZone:'America/Indiana/Indianapolis'}).toUpperCase();}
+tick(); setInterval(tick,1000);
+</script></body></html>"""
+
+
+_OVERLAY_WARNPANEL = """<!doctype html><html><head><meta charset=utf-8>__CSS__
+<style>
+.wrap{width:340px}
+.row{display:flex;align-items:center;justify-content:space-between;
+  padding:8px 14px;font-size:15px;font-weight:700;color:#EAF1FF}
+.row .n{background:#13234A;border:1px solid #2E4A7E;border-radius:8px;
+  min-width:26px;text-align:center;padding:1px 8px;font-size:15px}
+.row.tor{color:#FF7B7B}.row.svr{color:#FFC46B}.row.ffw{color:#7EE2A8}
+.watchhead{background:#13234A}
+.watch{padding:6px 14px;font-size:13.5px;color:#C9D8F0}
+.quiet{padding:12px 14px;font-size:13.5px;color:#8FA6C6}
+</style></head><body>
+<div class="ovcard wrap">
+  <div class=ovh>Active Warnings <span class=cnt id=w-total>0</span></div>
+  <div id=w-rows></div>
+  <div class="ovh watchhead">Active Watches <span class=cnt id=t-total
+    style="background:#1E5FE0">0</span></div>
+  <div id=t-rows></div>
+</div>
+<script>
+function esc(t){var d=document.createElement('div');d.textContent=t==null?'':String(t);return d.innerHTML;}
+function load(){
+  Promise.all([
+    fetch('/api/v1/weather/active-alerts?kind=warnings').then(function(r){return r.json();}),
+    fetch('/api/v1/weather/active-alerts?kind=watches').then(function(r){return r.json();})
+  ]).then(function(res){
+    var w=res[0].ok?res[0].alerts:[], t=res[1].ok?res[1].alerts:[];
+    var counts={};
+    w.forEach(function(a){counts[a.event]=(counts[a.event]||0)+1;});
+    var order=['Tornado Warning','Severe Thunderstorm Warning','Flash Flood Warning','Snow Squall Warning'];
+    var keys=Object.keys(counts).sort(function(a,b){
+      var ia=order.indexOf(a), ib=order.indexOf(b);
+      return (ia<0?9:ia)-(ib<0?9:ib) || counts[b]-counts[a];});
+    document.getElementById('w-total').textContent=w.length;
+    document.getElementById('w-rows').innerHTML = keys.length
+      ? keys.slice(0,5).map(function(k){
+          var cls=k==='Tornado Warning'?'tor':(k==='Severe Thunderstorm Warning'?'svr':(k.indexOf('Flood')>=0?'ffw':''));
+          return '<div class="row '+cls+'"><span>'+esc(k.replace(' Warning',''))+'</span><span class=n>'+counts[k]+'</span></div>';
+        }).join('')
+      : '<div class=quiet>No active warnings nationwide.</div>';
+    var tc={}; t.filter(function(a){return a.event.slice(-5)==='Watch';})
+      .forEach(function(a){tc[a.event]=1;});
+    var tk=Object.keys(tc);
+    document.getElementById('t-total').textContent=tk.length;
+    document.getElementById('t-rows').innerHTML = tk.length
+      ? tk.slice(0,4).map(function(k){return '<div class=watch>'+esc(k)+'</div>';}).join('')
+      : '<div class=quiet>None in effect.</div>';
+  }).catch(function(){});
+}
+load(); setInterval(load,90000);
+</script></body></html>"""
+
+
+_OVERLAY_CREW = """<!doctype html><html><head><meta charset=utf-8>__CSS__
+<style>
+.wrap{width:340px}
+.rep{padding:9px 14px;border-bottom:1px solid #17294E}
+.rep:last-child{border-bottom:none}
+.rep .top{display:flex;justify-content:space-between;font-size:13.5px}
+.rep .who{color:#7EB6FF;font-weight:800}
+.rep .ago{color:#8FA6C6;font-size:12px}
+.rep .what{color:#EAF1FF;font-size:14px;margin-top:2px}
+.rep .where{color:#C9D8F0;font-size:12.5px}
+.quiet{padding:12px 14px;font-size:13.5px;color:#8FA6C6}
+</style></head><body>
+<div class="ovcard wrap">
+  <div class=ovh>Valet Crew Reports</div>
+  <div id=c-rows><div class=quiet>Loading...</div></div>
+</div>
+<script>
+function esc(t){var d=document.createElement('div');d.textContent=t==null?'':String(t);return d.innerHTML;}
+function ago(ms){var m=Math.max(1,Math.round((Date.now()-ms)/60000));
+  return m<60? m+' min ago' : Math.round(m/60)+' hr ago';}
+function load(){
+  fetch('/api/v1/overlay/crew-reports')
+   .then(function(r){return r.json();})
+   .then(function(d){
+     var rows=d.reports||[];
+     document.getElementById('c-rows').innerHTML = rows.length
+       ? rows.map(function(x){
+           return '<div class=rep><div class=top><span class=who>'+esc(x.name)
+             +'</span><span class=ago>'+ago(x.at)+'</span></div>'
+             +'<div class=what>'+esc(x.text||x.type)+'</div>'
+             +(x.place?'<div class=where>'+esc(x.place)+'</div>':'')+'</div>';
+         }).join('')
+       : '<div class=quiet>The Crew is watching. Reports appear here.</div>';
+   }).catch(function(){});
+}
+load(); setInterval(load,60000);
+</script></body></html>"""
+
+
+_OVERLAY_BANNER = """<!doctype html><html><head><meta charset=utf-8>__CSS__
+<style>
+.ban{display:none;align-items:center;gap:18px;height:96px;box-sizing:border-box;
+  padding:0 24px;border-radius:12px;border:2px solid;
+  font-family:inherit}
+.ban.tor{display:flex;background:linear-gradient(90deg,#3D0A0A,#5C0F0F);border-color:#E02424}
+.ban.svr{display:flex;background:linear-gradient(90deg,#3A2A05,#5C430A);border-color:#F59E0B}
+.ban.oth{display:flex;background:linear-gradient(90deg,#0A2038,#0E2E52);border-color:#1E6BFF}
+.icon{font-size:40px}
+.main .ev{font-size:26px;font-weight:900;color:#fff;letter-spacing:.01em}
+.main .ar{font-size:15px;font-weight:700;color:#F5D9D9}
+.act{margin-left:auto;text-align:left;border-left:1px solid rgba(255,255,255,.25);
+  padding-left:18px}
+.act .do{font-size:19px;font-weight:900;color:#fff}
+.act .how{font-size:13px;color:#F0DEDE}
+.exp{min-width:120px;text-align:right}
+.exp .t{font-size:22px;font-weight:900;color:#fff}
+.exp .l{font-size:11px;color:#EAC9C9;letter-spacing:.1em;text-transform:uppercase}
+</style></head><body>
+<div class=ban id=ban>
+  <div class=icon id=b-icon></div>
+  <div class=main><div class=ev id=b-ev></div><div class=ar id=b-ar></div></div>
+  <div class=act id=b-act></div>
+  <div class=exp><div class=t id=b-exp></div><div class=l>Until (local)</div></div>
+</div>
+<script>
+var SAFE={'Tornado Warning':['TAKE SHELTER NOW','Interior room. Lowest floor. Away from windows.'],
+ 'Severe Thunderstorm Warning':['GET INSIDE','Wind and hail arrive fast. Stay away from windows.'],
+ 'Flash Flood Warning':['NEVER DRIVE INTO WATER','Turn around. Two feet of water floats a truck.'],
+ 'Snow Squall Warning':['DELAY TRAVEL','Sudden whiteout and icy roads. Do not stop on the roadway.']};
+var RANK=['Tornado Warning','Snow Squall Warning','Severe Thunderstorm Warning','Flash Flood Warning'];
+function esc(t){var d=document.createElement('div');d.textContent=t==null?'':String(t);return d.innerHTML;}
+function load(){
+  fetch('/api/v1/weather/active-alerts?kind=warnings')
+   .then(function(r){return r.json();})
+   .then(function(d){
+     var ban=document.getElementById('ban');
+     var a=(d.alerts||[]).slice().sort(function(x,y){
+       var rx=RANK.indexOf(x.event), ry=RANK.indexOf(y.event);
+       return (rx<0?9:rx)-(ry<0?9:ry);})[0];
+     if(!a){ ban.className='ban'; return; }
+     ban.className='ban '+(a.event==='Tornado Warning'?'tor':
+       (a.event==='Severe Thunderstorm Warning'?'svr':'oth'));
+     document.getElementById('b-icon').textContent =
+       a.event==='Tornado Warning'?'🌪':'⚠';
+     document.getElementById('b-ev').textContent=a.event.toUpperCase();
+     var area=(a.area||'').split(';')[0].split(',').slice(0,2).join(',');
+     document.getElementById('b-ar').textContent=area;
+     var sf=SAFE[a.event]||['STAY WEATHER AWARE','Details at weathervalet.com'];
+     document.getElementById('b-act').innerHTML='<div class=do>'+esc(sf[0])
+       +'</div><div class=how>'+esc(sf[1])+'</div>';
+     var t='';
+     try{ t=new Date(a.expires).toLocaleTimeString('en-US',
+       {hour:'numeric',minute:'2-digit'}); }catch(e){}
+     document.getElementById('b-exp').textContent=t;
+   }).catch(function(){});
+}
+load(); setInterval(load,45000);
+</script></body></html>"""
+
+
+def _overlay(page):
+    from flask import Response
+    return Response(page.replace("__CSS__", _OVERLAY_CSS),
+                    mimetype="text/html")
+
+
+@app.get("/overlay/header")
+def overlay_header():
+    return _overlay(_OVERLAY_HEADER)
+
+
+@app.get("/overlay/warnings-panel")
+def overlay_warnings_panel():
+    return _overlay(_OVERLAY_WARNPANEL)
+
+
+@app.get("/overlay/crew-reports")
+def overlay_crew_reports_page():
+    return _overlay(_OVERLAY_CREW)
+
+
+@app.get("/overlay/alert-banner")
+def overlay_alert_banner():
+    return _overlay(_OVERLAY_BANNER)
 
 
 @app.get("/weather/forecast")
