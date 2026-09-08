@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-295"
+BACKEND_BUILD = "0702-296"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -17243,6 +17243,7 @@ h1{font-size:clamp(28px,5.5vw,40px);font-weight:900;letter-spacing:-.02em;color:
 .faq b{display:block;color:#fff;margin-bottom:3px}
 .faq p{margin:0 0 16px;color:#C9D8F0;font-size:15px;line-height:1.6}
 </style></head><body>
+__WV_HEADER__
 <div class=wrapk>
   <h1>You already watch the sky.<br>Tell us what you see.</h1>
   <p class=klead>The Valet Crew is a volunteer community that reports real
@@ -24578,6 +24579,7 @@ h1{font-size:24px;font-weight:900;letter-spacing:-.02em;color:#fff;margin:0 0 4p
   color:#C9D8F0;font-size:13.5px;line-height:1.6;margin-top:10px}
 .wlist b{color:#fff}
 </style></head><body>
+__WV_HEADER__
 <div class=wrapw>
   <h1>__TITLE__</h1>
   <div class=wsub>Every active National Weather Service __KINDWORD__ across the
@@ -24690,6 +24692,7 @@ h1{font-size:24px;font-weight:900;color:#fff;margin:0 0 4px}
 .lframe iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
 .loff{color:#8FA6C6;font-size:14px;margin-top:10px;line-height:1.55}
 </style></head><body>
+__WV_HEADER__
 <div class=wrapl>
   <h1>WeatherValet LIVE</h1>
   <div class=lsub>Live weather coverage, streaming right here. If a channel is
@@ -24777,6 +24780,7 @@ h1{font-size:24px;font-weight:900;color:#fff;margin:0 0 4px}
 .ai-note{color:#8FA6C6;font-size:12.5px;margin-top:10px;line-height:1.5}
 #f-msg{color:#FF8296;font-size:14px;margin:8px 0}
 </style></head><body>
+__WV_HEADER__
 <div class=wrapf>
   <h1>Forecast</h1>
   <div class=fsub>Current conditions and the next five days for any US zip code.
@@ -24853,6 +24857,7 @@ h1{font-size:24px;font-weight:900;color:#fff;margin:0 0 4px}
 #olegend{display:flex;gap:10px;flex-wrap:wrap;color:#C9D8F0;font-size:12.5px;margin-top:6px}
 #olegend .sw{width:12px;height:12px;border-radius:3px;display:inline-block;margin-right:4px;vertical-align:-1px}
 </style></head><body>
+__WV_HEADER__
 <div class=wrapo>
   <h1>Severe Weather Outlooks</h1>
   <div class=osub>Storm Prediction Center outlooks, exactly as issued. Days 1 and
