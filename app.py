@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-296"
+BACKEND_BUILD = "0702-297"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -23242,6 +23242,59 @@ def weather_active_alerts():
                     "fetched_at": _NATL_ALERTS_CACHE["at"]})
 
 
+def _optimize_image_for_mms(raw: bytes, ctype: str):
+    """Downscale and compress so carriers actually deliver the picture.
+    Returns (data, content_type, ext). Falls back to the original bytes
+    if Pillow is unavailable, matching the July uploaded_media path."""
+    ext = "jpg" if ctype == "image/jpeg" else "png"
+    try:
+        import io
+        from PIL import Image
+        Image.MAX_IMAGE_PIXELS = 40_000_000
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+        MAX_DIM = 1600
+        if max(img.width, img.height) > MAX_DIM:
+            r = MAX_DIM / float(max(img.width, img.height))
+            img = img.resize((max(1, int(img.width * r)),
+                              max(1, int(img.height * r))), Image.LANCZOS)
+        has_alpha = False
+        if img.mode in ("RGBA", "LA"):
+            try:
+                has_alpha = img.getchannel("A").getextrema()[0] < 255
+            except Exception:
+                has_alpha = True
+        elif img.mode == "P":
+            has_alpha = "transparency" in img.info
+        TARGET = 900 * 1024
+        data = raw
+        if has_alpha:
+            out = io.BytesIO()
+            img.save(out, format="PNG", optimize=True)
+            data, ctype, ext = out.getvalue(), "image/png", "png"
+            if len(data) > TARGET:
+                base = Image.new("RGB", img.size, (255, 255, 255))
+                base.paste(img.convert("RGBA"),
+                           mask=img.convert("RGBA").getchannel("A"))
+                img, has_alpha = base, False
+        if not has_alpha:
+            rgb = img.convert("RGB")
+            for q in (85, 76, 68, 60, 52):
+                out = io.BytesIO()
+                rgb.save(out, format="JPEG", quality=q, optimize=True)
+                data = out.getvalue()
+                if len(data) <= TARGET:
+                    break
+            ctype, ext = "image/jpeg", "jpg"
+        print(f"[image-opt] {len(raw)//1024}KB -> {len(data)//1024}KB "
+              f"({ctype})", flush=True)
+        return data, ctype, ext
+    except Exception as e:
+        print(f"[image-opt] unavailable or failed ({e!r}); storing raw "
+              f"{len(raw)//1024}KB", flush=True)
+        return raw, ctype, ext
+
+
 @app.route("/api/v1/crew/report-images", methods=["OPTIONS"])
 def _crew_report_image_preflight():
     return ("", 204)
@@ -23269,6 +23322,7 @@ def crew_report_image_upload():
         ctype = "image/png"
     else:
         return jsonify({"ok": False, "error": "jpg-or-png-only"}), 400
+    blob, ctype, ext = _optimize_image_for_mms(blob, ctype)
     token = secrets.token_urlsafe(12)
     now_ms = int(time.time() * 1000)
     with db() as conn:
@@ -23278,7 +23332,6 @@ def crew_report_image_upload():
                      (token, content_type, data, uploaded_by, created_at)
                    VALUES (%s, %s, %s, %s, %s)""",
                 (token, ctype, blob, user["id"], now_ms))
-    ext = "jpg" if ctype == "image/jpeg" else "png"
     return jsonify({"ok": True,
                     "url": f"{PUBLIC_BASE_URL.rstrip('/')}/brief-images/{token}.{ext}"})
 
@@ -23313,6 +23366,7 @@ def met_brief_image_upload():
         ctype = "image/png"
     else:
         return jsonify({"ok": False, "error": "jpg-or-png-only"}), 400
+    blob, ctype, ext = _optimize_image_for_mms(blob, ctype)
     token = secrets.token_urlsafe(12)
     now_ms = int(time.time() * 1000)
     with db() as conn:
@@ -23322,7 +23376,6 @@ def met_brief_image_upload():
                      (token, content_type, data, uploaded_by, created_at)
                    VALUES (%s, %s, %s, %s, %s)""",
                 (token, ctype, blob, user["id"], now_ms))
-    ext = "jpg" if ctype == "image/jpeg" else "png"
     url = f"{PUBLIC_BASE_URL.rstrip('/')}/brief-images/{token}.{ext}"
     print(f"[brief-image] {user.get('email')} uploaded {len(blob)}b "
           f"{ctype} -> {token}", flush=True)
