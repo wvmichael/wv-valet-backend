@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-297"
+BACKEND_BUILD = "0702-298"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -51318,6 +51318,8 @@ def met_broadcast_brief_send():
     # Create the broadcast row first so we can attach delivery rows to it
     now_ms = int(time.time() * 1000)
     sender_name = user.get("name") or user.get("email") or "Met"
+    # Replies to a broadcast go to the Met who sent it (Sep 9, 2026).
+    _broadcast_reply_to = (user.get("email") or "").strip() or None
     broadcast_id = None
     try:
         with db() as conn:
@@ -51407,7 +51409,9 @@ def met_broadcast_brief_send():
                     error_msgs.append(f"sms-err:{e!r}")
             elif ch == "email" and r["email"]:
                 try:
-                    ok = _send_brief_email(r["email"], email_subject, email_html)
+                    ok = _send_brief_email(r["email"], email_subject,
+                                           email_html,
+                                           reply_to=_broadcast_reply_to)
                     if ok:
                         channels_used.append("email")
                         any_success = True
