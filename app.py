@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-299"
+BACKEND_BUILD = "0702-300"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -2558,6 +2558,8 @@ ALTER TABLE brief_history ADD COLUMN IF NOT EXISTS met_user_id INTEGER;
 -- sent with the server-side Purchase so Meta can attribute the sale to
 -- the ad click even when the browser event is blocked.
 ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS school_id INTEGER;
+ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS renews_at BIGINT;
+ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS renewal_notice_ym TEXT;
 ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS meta_fbp TEXT;
 ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS meta_fbc TEXT;
 ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS weather_details TEXT;
@@ -10698,6 +10700,22 @@ def stripe_webhook_v2():
     # ────────────────────────────────────────────────────────────────
     if event_type in ("invoice.payment_succeeded", "invoice.paid"):
         inv = (event.get("data") or {}).get("object") or {}
+        # Push the next renewal date forward so the reminder pass keeps
+        # working year after year (Sep 12, 2026).
+        try:
+            _cust = inv.get("customer") or ""
+            _pe = inv.get("period_end") or 0
+            if _cust and _pe:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """UPDATE sentry_subscribers
+                                  SET renews_at = %s, updated_at = %s
+                                WHERE stripe_customer_id = %s""",
+                            (int(_pe) * 1000 + 365 * 86400000,
+                             int(time.time() * 1000), _cust))
+        except Exception as e:
+            print(f"[renewal-notice] date update failed: {e!r}", flush=True)
         if (inv.get("billing_reason") or "") == "subscription_cycle":
             cust = inv.get("customer") or ""
             amount = inv.get("amount_paid") or 0
@@ -42768,6 +42786,10 @@ def _brief_scheduler_loop() -> None:
             _stormline_daily_pass()
         except Exception as e:
             print(f"[stormline-daily] tick failed: {e!r}", flush=True)
+        try:
+            _stormline_renewal_notice_pass()
+        except Exception as e:
+            print(f"[renewal-notice] tick failed: {e!r}", flush=True)
 
         try:
             _dedupe_primary_locations_once()
@@ -44930,6 +44952,110 @@ def _nws_point_forecast(lat: float, lng: float) -> dict:
     except Exception as e:
         print(f"[stormline-daily] forecast fetch failed {lat},{lng}: {e!r}", flush=True)
         return {}
+
+
+def _stormline_renewal_notice_pass() -> int:
+    """Warn Stormline subscribers about two weeks before their annual
+    charge (Sep 12, 2026). Uses renews_at when Stripe gave us one,
+    otherwise one year from signup. One notice per renewal cycle."""
+    now_ms = int(time.time() * 1000)
+    try:
+        tz = ZoneInfo("America/Indiana/Indianapolis")
+    except Exception:
+        tz = timezone.utc
+    hour = datetime.fromtimestamp(now_ms / 1000, tz=tz).hour
+    if hour < 9 or hour > 18:
+        return 0
+    window_start = now_ms + 12 * 86400 * 1000
+    window_end = now_ms + 16 * 86400 * 1000
+    sent = 0
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT s.id, s.email, s.phone, s.name, s.address,
+                              s.label, s.pack_allseason, s.manage_token,
+                              s.renews_at, s.created_at, s.group_id,
+                              sc.name AS school_name
+                         FROM sentry_subscribers s
+                         LEFT JOIN schools sc ON sc.id = s.school_id
+                        WHERE s.status = 'active'
+                          AND COALESCE(s.is_internal, FALSE) = FALSE
+                          AND COALESCE(s.renews_at,
+                                       s.created_at + 365*86400000)
+                              BETWEEN %s AND %s
+                          AND (s.group_id IS NULL OR s.group_id = s.id)
+                       """, (window_start, window_end))
+                rows = cur.fetchall() or []
+    except Exception as e:
+        print(f"[renewal-notice] query failed: {e!r}", flush=True)
+        return 0
+
+    for r in rows:
+        renews = r.get("renews_at") or (r["created_at"] + 365 * 86400000)
+        cycle_ym = _school_period_ym(renews)
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """UPDATE sentry_subscribers
+                              SET renewal_notice_ym = %s
+                            WHERE id = %s
+                              AND COALESCE(renewal_notice_ym,'') <> %s""",
+                        (cycle_ym, r["id"], cycle_ym))
+                    claimed = cur.rowcount == 1
+        except Exception as e:
+            print(f"[renewal-notice] claim failed id={r['id']}: {e!r}", flush=True)
+            continue
+        if not claimed:
+            continue
+
+        when = datetime.fromtimestamp(renews / 1000, tz=tz).strftime("%B %-d")
+        price = "$21" if r.get("pack_allseason") else "$12"
+        where = (r.get("label") or "").strip() or (r.get("address") or "").strip()
+        manage = ""
+        if r.get("manage_token"):
+            manage = f"{PUBLIC_BASE_URL.rstrip('/')}/stormline/manage/{r['manage_token']}"
+        school_line = ""
+        if r.get("school_name"):
+            school_line = (f" A quarter of it goes to {r['school_name']} "
+                           f"again this year.")
+
+        body = (f"WeatherValet: your Stormline renews on {when} for {price}. "
+                f"We are still watching {where}.{school_line} "
+                f"Nothing to do if you want to keep it. "
+                f"To change or cancel, reply to this text or email "
+                f"hello@weathervalet.ai.")
+        try:
+            if r.get("phone"):
+                send_sms(r["phone"], body)
+        except Exception as e:
+            print(f"[renewal-notice] sms failed id={r['id']}: {e!r}", flush=True)
+        try:
+            if r.get("email"):
+                html = (f"<p>Your Stormline subscription renews on "
+                        f"<b>{_html_escape(when)}</b> for <b>{price}</b>.</p>"
+                        f"<p>We are still watching "
+                        f"<b>{_html_escape(where)}</b> for official National "
+                        f"Weather Service warnings, day and night."
+                        f"{_html_escape(school_line)}</p>"
+                        f"<p>You do not need to do anything to keep it. To "
+                        f"change your settings"
+                        + (f", visit <a href=\"{manage}\">your settings page</a>"
+                           if manage else "")
+                        + f", or to cancel, just reply to this email.</p>"
+                        f"<p>Thank you for letting us keep watch.</p>")
+                _send_brief_email(r["email"],
+                                  f"Your Stormline renews {when}",
+                                  html, html=True)
+        except Exception as e:
+            print(f"[renewal-notice] email failed id={r['id']}: {e!r}", flush=True)
+        sent += 1
+        print(f"[renewal-notice] warned id={r['id']} renews={when} "
+              f"price={price}", flush=True)
+    if sent:
+        print(f"[renewal-notice] sent {sent} notice(s)", flush=True)
+    return sent
 
 
 def _stormline_daily_body(fc: dict, where: str) -> str:
