@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-300"
+BACKEND_BUILD = "0702-301"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -23319,6 +23319,31 @@ def overlay_crew_reports():
     return jsonify({"ok": True, "reports": out})
 
 
+@app.post("/api/v1/schools/interest")
+def schools_interest():
+    """A parent group asking to run the fundraiser (Sep 12, 2026)."""
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()[:120]
+    school = (data.get("school") or "").strip()[:160]
+    role = (data.get("role") or "").strip()[:80]
+    email = (data.get("email") or "").strip()[:200]
+    phone = (data.get("phone") or "").strip()[:40]
+    note = (data.get("note") or "").strip()[:1200]
+    if not name or not school or not email:
+        return jsonify({"ok": False, "error": "name-school-email-required"}), 400
+    lines = [f"Name: {name}", f"School or group: {school}", f"Role: {role}",
+             f"Email: {email}", f"Phone: {phone}", "", note]
+    text = "\n".join(lines)
+    html = "<p>" + "<br>".join(_html_escape(x) for x in lines) + "</p>"
+    try:
+        _send_brief_email("michael@weathervalet.com",
+                          f"PTO interest: {school}", html, html=True)
+    except Exception as e:
+        print(f"[schools] interest email failed: {e!r}", flush=True)
+    print(f"[schools] interest from {school} ({email})", flush=True)
+    return jsonify({"ok": True})
+
+
 @app.get("/api/v1/schools")
 def schools_list_public():
     """Active schools for the fundraiser dropdown."""
@@ -25711,6 +25736,236 @@ document.getElementById('a-go').addEventListener('click',function(){
 });
 })();
 </script>"""
+
+
+_PTO_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>A fundraiser families actually use &middot; WeatherValet</title>
+<meta name=description content="A year-round fundraiser for parent groups. No inventory, no order forms. Families protect an address they care about for $12 a year and 25 percent goes to your school, every year.">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+.wrapP{max-width:820px;margin:0 auto;padding:34px 20px 70px}
+h1{font-size:clamp(28px,5.2vw,40px);font-weight:900;letter-spacing:-.02em;color:#fff;
+  margin:0 0 12px;line-height:1.16}
+.lead{color:#B8C7DE;font-size:17.5px;line-height:1.65;margin:0 0 8px}
+.kh{font-size:13px;font-weight:800;letter-spacing:.13em;text-transform:uppercase;
+  color:#7EB6FF;margin:36px 0 12px}
+.card{background:#0E1D3C;border:1px solid #2E4A7E;border-radius:16px;
+  padding:18px 20px;margin-bottom:12px;color:#C9D8F0;font-size:15.5px;line-height:1.65}
+.card b{color:#fff}
+.big{font-size:22px;font-weight:900;color:#fff;line-height:1.4;margin:0 0 8px}
+.quote{border-left:3px solid #3D8BFF;padding:4px 0 4px 16px;margin:18px 0;
+  color:#EAF1FF;font-size:19px;font-weight:700;line-height:1.5}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px}
+.use{background:#0A1730;border:1px solid #21375E;border-radius:12px;padding:13px 15px;
+  color:#C9D8F0;font-size:14.5px;line-height:1.55}
+.use b{color:#fff;display:block;margin-bottom:2px;font-size:14.5px}
+table.t{width:100%;border-collapse:collapse;margin-top:4px;font-size:15.5px}
+table.t th,table.t td{padding:9px 10px;text-align:left;border-bottom:1px solid #21375E;color:#C9D8F0}
+table.t th{color:#8FA6C6;font-size:12px;text-transform:uppercase;letter-spacing:.08em}
+table.t td.n{color:#7EE2A8;font-weight:800}
+.steps{counter-reset:s}
+.step{display:flex;gap:14px;margin-bottom:14px;align-items:flex-start}
+.stepn{flex:none;width:32px;height:32px;border-radius:50%;
+  background:linear-gradient(160deg,#3D8BFF,#1E5FE0);color:#fff;font-weight:900;
+  display:flex;align-items:center;justify-content:center;font-size:15px}
+.step div{color:#C9D8F0;font-size:15.5px;line-height:1.6;padding-top:3px}
+.step b{color:#fff}
+.form{background:#0E1D3C;border:1px solid #2E4A7E;border-radius:16px;padding:20px}
+.form label{display:block;color:#8FA6C6;font-size:13px;margin:12px 0 5px;font-weight:700}
+.form input,.form textarea{width:100%;box-sizing:border-box;padding:12px 13px;font-size:16px;
+  color:#EAF1FF;background:#0A1730;border:1px solid #2E4A7E;border-radius:9px;font-family:inherit}
+.form textarea{min-height:80px;resize:vertical}
+.go{width:100%;border:none;border-radius:11px;color:#fff;cursor:pointer;font-weight:800;
+  font-size:16.5px;padding:15px;background:linear-gradient(160deg,#3D8BFF,#1E5FE0);margin-top:16px}
+.fine{color:#8FA6C6;font-size:12.5px;line-height:1.55;margin-top:14px}
+#p-msg{margin-top:12px;font-size:15px;line-height:1.55}
+.faq b{display:block;color:#fff;margin-bottom:3px}
+.faq p{margin:0 0 16px;color:#C9D8F0;font-size:15px;line-height:1.6}
+</style></head><body>
+__WV_HEADER__
+<div class=wrapP>
+  <h1>A fundraiser your families<br>will actually use.</h1>
+  <p class=lead>No catalogs. No cookie dough. No boxes in the gym. No money for
+  kids to carry. Families spend $12 once a year on something they keep, and $3
+  of it goes to your group. Every year it renews, you earn again.</p>
+
+  <div class=quote>Stormline watches an address, not you.</div>
+
+  <div class=card>Stormline is a WeatherValet service that watches <b>one exact
+  address</b>, around the clock, for official National Weather Service warnings.
+  When a Tornado, Severe Thunderstorm, or Flash Flood Warning covers that
+  address, we send a text with the radar. Tornado Warnings also ring the phone,
+  because a notification banner is easy to sleep through.<br><br>
+  It does not follow anyone's phone around. You name the place, and we watch it
+  whether you are standing there or three states away. That is the part people
+  do not expect, and it is the reason one family often buys more than one.</div>
+
+  <div class=kh>The question that sells it</div>
+  <div class=card>
+    <div class=big>Your house is one address. What about the other places you
+    care about?</div>
+    Mom's house. Your daughter's apartment at school. Dad's assisted living
+    facility. The lake cabin. Your husband's shop. The kennel where the dog
+    stays while you are gone. At $12 a year, that stops being another
+    subscription and starts being a list.
+  </div>
+
+  <div class=kh>Why families say yes</div>
+  <div class=grid>
+    <div class=use><b>Aging parents</b>Know when a warning covers their home,
+      even when they would never think to tell you.</div>
+    <div class=use><b>A college student</b>Their dorm or apartment, watched from
+      three states away.</div>
+    <div class=use><b>Someone living alone</b>The tornado phone call matters most
+      for the person nobody is there to wake.</div>
+    <div class=use><b>A parent in assisted living</b>The facility has its plan.
+      This is so you know what they are facing and can call.</div>
+    <div class=use><b>The lake house or cabin</b>You do not have to be there to
+      find out something hit it.</div>
+    <div class=use><b>A camper or seasonal site</b>One address, parked all
+      season, watched all season.</div>
+    <div class=use><b>The boat at the marina</b>Watch the marina, not the water.</div>
+    <div class=use><b>A rental property</b>Landlords hear about the storm before
+      the tenant calls.</div>
+    <div class=use><b>A short-term rental</b>Especially when the owner lives
+      somewhere else entirely.</div>
+    <div class=use><b>The farm</b>The farmhouse, the barn, the livestock, the
+      equipment yard.</div>
+    <div class=use><b>A small business</b>Watch the shop while you are home, or
+      away for the weekend.</div>
+    <div class=use><b>A spouse's workplace</b>Overnight shifts are the reason
+      this one comes up so often.</div>
+    <div class=use><b>Your church</b>Wednesday nights, Sunday mornings, whenever
+      people are gathered in the building.</div>
+    <div class=use><b>The kennel or stable</b>You are on vacation. Something
+      should still be watching where the animals are.</div>
+    <div class=use><b>A storage unit</b>Where the equipment, the vehicles, or the
+      things you could not replace are sitting.</div>
+    <div class=use><b>A job site</b>Watch the address when nobody is standing on
+      it.</div>
+    <div class=use><b>A wedding venue</b>Put it on the venue for the month before
+      the day.</div>
+    <div class=use><b>The vacation rental</b>Everyone is driving toward it.
+      Something should be watching it.</div>
+  </div>
+
+  <div class=kh>What your group earns</div>
+  <div class=card style="padding-bottom:14px">
+    <table class=t>
+      <tr><th>Subscriptions sold</th><th>Your group earns</th><th>And again next year</th></tr>
+      <tr><td>100</td><td class=n>$300</td><td class=n>$300</td></tr>
+      <tr><td>250</td><td class=n>$750</td><td class=n>$750</td></tr>
+      <tr><td>500</td><td class=n>$1,500</td><td class=n>$1,500</td></tr>
+      <tr><td>1,000</td><td class=n>$3,000</td><td class=n>$3,000</td></tr>
+    </table>
+    <div class=fine>25% of every payment, for as long as each subscription stays
+    active. Families who add our all-season pack pay $21, and your share of those
+    is $5.25.</div>
+  </div>
+
+  <div class=kh>How it works</div>
+  <div class=steps>
+    <div class=step><div class=stepn>1</div><div><b>We give you a link and a QR
+      code.</b> Yours alone. Put it in the newsletter, the Facebook group, the
+      folder that goes home Friday.</div></div>
+    <div class=step><div class=stepn>2</div><div><b>Families sign up
+      themselves.</b> They pick the address, enter two phone numbers, and pay us
+      directly. Nobody collects money. Nobody delivers anything.</div></div>
+    <div class=step><div class=stepn>3</div><div><b>You watch the total go up.</b>
+      Your treasurer gets a dashboard showing how many signed up and exactly what
+      you have earned.</div></div>
+    <div class=step><div class=stepn>4</div><div><b>We pay you monthly.</b> We
+      total it on the first and send a check. No invoicing, no chasing.</div></div>
+  </div>
+
+  <div class=kh>Straight answers</div>
+  <div class=faq>
+    <b>Is 25% competitive?</b>
+    <p>Catalog fundraisers often quote 40 or 50 percent, on a one-time sale, after
+    your volunteers spend weeks collecting forms, sorting boxes and handing out
+    product. This is 25 percent with none of that, and it comes back every year
+    without anyone doing it again.</p>
+    <b>Who can buy, just parents?</b>
+    <p>Anyone. Grandparents, aunts and uncles, neighbors, alumni, local
+    businesses. It is a link, so it travels.</p>
+    <b>Does the school have to approve it?</b>
+    <p>That is between your group and your district, and we would rather you ask
+    first than explain later. We are glad to answer questions from an
+    administrator directly.</p>
+    <b>Do you give us families' information?</b>
+    <p>No. Your dashboard shows counts and dollars. Supporter emails are partly
+    masked. We do not hand over a parent list, to you or to anyone.</p>
+    <b>What if a family wants to cancel?</b>
+    <p>They email us and we take care of it. We also text and email every
+    subscriber about two weeks before their renewal so nobody is ever surprised
+    by a charge.</p>
+    <b>How new is this?</b>
+    <p>New. We are a small Indiana company and we would rather tell you that than
+    pretend otherwise. If being early bothers you, wait a season and ask us for
+    references then.</p>
+  </div>
+
+  <div class=kh>Start a conversation</div>
+  <div class=form>
+    <label for=p-name>Your name</label><input id=p-name autocomplete=name>
+    <label for=p-school>School or group</label><input id=p-school>
+    <label for=p-role>Your role</label><input id=p-role placeholder="President, treasurer, principal...">
+    <label for=p-email>Email</label><input id=p-email type=email autocomplete=email>
+    <label for=p-phone>Phone (optional)</label><input id=p-phone type=tel>
+    <label for=p-note>Anything you want us to know</label><textarea id=p-note></textarea>
+    <button class=go id=p-go>Send</button>
+    <div id=p-msg></div>
+    <div class=fine>Or email hello@weathervalet.ai. A real person answers.</div>
+  </div>
+  <div class=fine>Message delivery depends on the mobile carrier and is not
+  guaranteed. Stormline reports official National Weather Service warnings and is
+  not a substitute for any school, facility or employer emergency plan. Never
+  rely on a single service, including this one, as your only source of weather
+  information. WeatherValet is an independent service and is not affiliated with
+  or endorsed by the National Weather Service or any school or school
+  district.</div>
+</div>
+__WV_FOOTER__"""
+
+
+_PTO_SCRIPT = """<script>
+(function(){
+document.getElementById('p-go').addEventListener('click',function(){
+  var b=this, msg=document.getElementById('p-msg');
+  var body={name:document.getElementById('p-name').value.trim(),
+    school:document.getElementById('p-school').value.trim(),
+    role:document.getElementById('p-role').value.trim(),
+    email:document.getElementById('p-email').value.trim(),
+    phone:document.getElementById('p-phone').value.trim(),
+    note:document.getElementById('p-note').value.trim()};
+  if(!body.name || !body.school || !body.email){
+    msg.innerHTML='<span style="color:#FF8296">Name, school and email, please.</span>';
+    return;
+  }
+  b.disabled=true; msg.innerHTML='<span style="color:#8FA6C6">Sending...</span>';
+  fetch('/api/v1/schools/interest',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+   .then(function(r){return r.json();})
+   .then(function(d){
+     b.disabled=false;
+     if(d.ok){ msg.innerHTML='<span style="color:#7EE2A8;font-weight:700">Got it.</span> '
+       +'We will be in touch within a day.'; }
+     else msg.innerHTML='<span style="color:#FF8296">Something went wrong. '
+       +'Email hello@weathervalet.ai instead.</span>';
+   })
+   .catch(function(){ b.disabled=false;
+     msg.innerHTML='<span style="color:#FF8296">Connection problem.</span>'; });
+});
+})();
+</script>"""
+
+
+@app.get("/school/pto")
+def school_pto_page():
+    return wv_shell(_PTO_PAGE
+                    .replace("__WV_FOOTER__", _PTO_SCRIPT + "\n__WV_FOOTER__"))
 
 
 @app.get("/school")
