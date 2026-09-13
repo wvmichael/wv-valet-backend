@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-298"
+BACKEND_BUILD = "0702-299"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -1538,6 +1538,49 @@ CREATE TABLE IF NOT EXISTS brief_images (
     created_at    BIGINT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS schools (
+    id              SERIAL PRIMARY KEY,
+    name            TEXT NOT NULL,
+    slug            TEXT NOT NULL UNIQUE,
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+    contact_name    TEXT,
+    contact_email   TEXT,
+    contact_phone   TEXT,
+    mailing_address TEXT,
+    ein             TEXT,
+    admin_pin       TEXT,
+    onboarded_at    BIGINT,
+    created_at      BIGINT NOT NULL
+);
+
+-- One row per successful Stormline payment attributed to a school.
+-- dedup_key stops a webhook replay from paying twice.
+CREATE TABLE IF NOT EXISTS school_credits (
+    id            SERIAL PRIMARY KEY,
+    school_id     INTEGER NOT NULL,
+    dedup_key     TEXT NOT NULL UNIQUE,
+    kind          TEXT NOT NULL,          -- 'signup' | 'renewal'
+    gross_cents   INTEGER NOT NULL,
+    credit_cents  INTEGER NOT NULL,
+    subscriber_email TEXT,
+    period_ym     TEXT NOT NULL,          -- '2026-09', Indiana time
+    occurred_at   BIGINT NOT NULL
+);
+
+-- Monthly rollup Michael marks paid after cutting the check.
+CREATE TABLE IF NOT EXISTS school_payouts (
+    id            SERIAL PRIMARY KEY,
+    school_id     INTEGER NOT NULL,
+    period_ym     TEXT NOT NULL,
+    amount_cents  INTEGER NOT NULL,
+    credit_count  INTEGER NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending',   -- pending | paid
+    paid_at       BIGINT,
+    note          TEXT,
+    created_at    BIGINT NOT NULL,
+    UNIQUE (school_id, period_ym)
+);
+
 CREATE TABLE IF NOT EXISTS crew_mission_recipients (
     mission_id    INTEGER NOT NULL,
     user_id       INTEGER NOT NULL,
@@ -2514,6 +2557,7 @@ ALTER TABLE brief_history ADD COLUMN IF NOT EXISTS met_user_id INTEGER;
 -- Meta match-quality cookies captured at Stormline signup (Aug 30, 2026),
 -- sent with the server-side Purchase so Meta can attribute the sale to
 -- the ad click even when the browser event is blocked.
+ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS school_id INTEGER;
 ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS meta_fbp TEXT;
 ALTER TABLE sentry_subscribers ADD COLUMN IF NOT EXISTS meta_fbc TEXT;
 ALTER TABLE pro_brief_drafts ADD COLUMN IF NOT EXISTS weather_details TEXT;
@@ -10301,7 +10345,9 @@ def stripe_webhook_v2():
     #   - checkout.session.completed       → subscription signup (Phase 4)
     #   - customer.subscription.deleted    → subscription cancellation (Phase 1)
     # Other event types ack with 200 (so Stripe doesn't retry) but do nothing.
-    if event_type not in ("checkout.session.completed", "customer.subscription.deleted"):
+    if event_type not in ("checkout.session.completed",
+                          "customer.subscription.deleted",
+                          "invoice.payment_succeeded", "invoice.paid"):
         print(f"[stripe-webhook] unhandled event type: {event_type} (id={event_id})", flush=True)
         # Record it anyway so we don't reprocess on retries
         _stripe_event_record(event_id, event_type, payload)
@@ -10334,7 +10380,14 @@ def stripe_webhook_v2():
             if (md.get("wv_product") or "") == "sentry":
                 try:
                     _sids = (md.get("sentry_ids") or md.get("sentry_id") or "")
-                    _activate_sentry_group(str(_sids).split(","), stripe_customer_id)
+                    _sid_list = str(_sids).split(",")
+                    _activate_sentry_group(_sid_list, stripe_customer_id)
+                    _sch_id, _sub_email = _school_id_for_sentry_ids(_sid_list)
+                    if _sch_id:
+                        _credit_school(
+                            _sch_id, f"session:{session.get('id')}",
+                            "signup", session.get("amount_total") or 0,
+                            _sub_email or email)
                 except Exception as e:
                     print(f"[stripe-webhook] sentry activation failed: {e!r}", flush=True)
                 _stripe_event_record(event_id, event_type, payload)
@@ -10643,6 +10696,31 @@ def stripe_webhook_v2():
     # ────────────────────────────────────────────────────────────────
     # customer.subscription.deleted — subscription cancellation (Phase 1)
     # ────────────────────────────────────────────────────────────────
+    if event_type in ("invoice.payment_succeeded", "invoice.paid"):
+        inv = (event.get("data") or {}).get("object") or {}
+        if (inv.get("billing_reason") or "") == "subscription_cycle":
+            cust = inv.get("customer") or ""
+            amount = inv.get("amount_paid") or 0
+            if cust and amount:
+                try:
+                    with db() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """SELECT school_id, email
+                                     FROM sentry_subscribers
+                                    WHERE stripe_customer_id = %s
+                                      AND school_id IS NOT NULL
+                                    LIMIT 1""", (cust,))
+                            r = cur.fetchone()
+                    if r:
+                        _credit_school(
+                            r["school_id"], f"invoice:{inv.get('id')}",
+                            "renewal", amount, r.get("email") or "")
+                except Exception as e:
+                    print(f"[schools] renewal credit failed: {e!r}", flush=True)
+        _stripe_event_record(event_id, event_type, payload)
+        return jsonify({"ok": True})
+
     if event_type == "customer.subscription.deleted":
         # Sentry cancellations (Aug 15, 2026): match by customer id first.
         try:
@@ -15221,6 +15299,21 @@ document.getElementById('s-next').addEventListener('click', function(){
   wvSync();
   wvShowStep(2);
 });
+  (function(){
+    var sl=(new URLSearchParams(location.search)).get('school')||'';
+    if(!sl) return;
+    fetch('/api/v1/schools').then(function(r){return r.json();}).then(function(d){
+      var m=(d.schools||[]).filter(function(x){return x.slug===sl;})[0];
+      if(!m) return;
+      var b=document.createElement('div');
+      b.style.cssText='background:#123C28;border:1px solid #7EE2A8;border-radius:12px;'
+        +'padding:12px 16px;margin:0 0 16px;color:#CFF3E0;font-size:14.5px';
+      b.innerHTML='Supporting <b style="color:#fff">'+
+        (''+m.name).replace(/</g,'&lt;')+'</b> &middot; $3 of this goes to their PTO.';
+      var host=document.querySelector('.wrap')||document.body;
+      host.insertBefore(b, host.firstChild);
+    }).catch(function(){});
+  })();
 document.getElementById('s-back').addEventListener('click', function(){ wvShowStep(1); });
 document.getElementById('s-go').addEventListener('click', function(){
   var btn = this;
@@ -15256,7 +15349,8 @@ document.getElementById('s-go').addEventListener('click', function(){
       gift_from: document.getElementById('s-gift').checked
         ? document.getElementById('s-giftfrom').value : '',
       daily: document.getElementById('s-daily').checked,
-      send_hour: parseInt(document.getElementById('s-hour').value, 10)
+      send_hour: parseInt(document.getElementById('s-hour').value, 10),
+      school: (new URLSearchParams(location.search)).get('school') || ''
     })
   }).then(function(r){ return r.json(); }).then(function(d){
     if (d.ok && d.url) { window.location.href = d.url; return; }
@@ -23207,6 +23301,125 @@ def overlay_crew_reports():
     return jsonify({"ok": True, "reports": out})
 
 
+@app.get("/api/v1/schools")
+def schools_list_public():
+    """Active schools for the fundraiser dropdown."""
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT slug, name FROM schools
+                        WHERE is_active = TRUE ORDER BY name""")
+                rows = [{"slug": r["slug"], "name": r["name"]}
+                        for r in cur.fetchall()]
+    except Exception as e:
+        print(f"[schools] list failed: {e!r}", flush=True)
+        rows = []
+    return jsonify({"ok": True, "schools": rows})
+
+
+@app.post("/api/v1/schools/admin-login")
+def schools_admin_login():
+    """PTO dashboard access: school + PIN. Low-stakes data (counts and
+    dollars owed to them), so a shared PIN per school is proportionate."""
+    data = request.get_json(silent=True) or {}
+    slug = (data.get("school") or "").strip()
+    pin = (data.get("pin") or "").strip()
+    if not slug or not pin:
+        return jsonify({"ok": False, "error": "school-and-pin-required"}), 400
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, name, admin_pin FROM schools
+                    WHERE slug = %s AND is_active = TRUE""", (slug,))
+            sch = cur.fetchone()
+    if not sch or not (sch.get("admin_pin") or "").strip():
+        return jsonify({"ok": False, "error": "not-set-up",
+                        "message": "This school is not set up yet. "
+                                   "Email hello@weathervalet.ai."}), 403
+    if not secrets.compare_digest(pin, sch["admin_pin"].strip()):
+        return jsonify({"ok": False, "error": "bad-pin"}), 403
+    token = _issue_school_token(sch["id"])
+    return jsonify({"ok": True, "token": token, "name": sch["name"]})
+
+
+_SCHOOL_TOKENS = {}
+
+
+def _issue_school_token(school_id: int) -> str:
+    tok = secrets.token_urlsafe(24)
+    _SCHOOL_TOKENS[tok] = {"school_id": school_id,
+                           "expires": time.time() + 12 * 3600}
+    if len(_SCHOOL_TOKENS) > 500:
+        now = time.time()
+        for k in [k for k, v in _SCHOOL_TOKENS.items() if v["expires"] < now]:
+            _SCHOOL_TOKENS.pop(k, None)
+    return tok
+
+
+def _school_from_token(tok: str):
+    rec = _SCHOOL_TOKENS.get((tok or "").strip())
+    if not rec or rec["expires"] < time.time():
+        return None
+    return rec["school_id"]
+
+
+@app.get("/api/v1/schools/dashboard")
+def schools_dashboard():
+    school_id = _school_from_token(request.args.get("token") or "")
+    if not school_id:
+        return jsonify({"ok": False, "error": "not-authenticated"}), 401
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT name FROM schools WHERE id = %s", (school_id,))
+            sch = cur.fetchone()
+            cur.execute(
+                """SELECT COUNT(*) AS n,
+                          COALESCE(SUM(credit_cents),0) AS earned,
+                          COALESCE(SUM(gross_cents),0) AS gross
+                     FROM school_credits WHERE school_id = %s""", (school_id,))
+            tot = cur.fetchone() or {}
+            cur.execute(
+                """SELECT period_ym, COUNT(*) AS n,
+                          COALESCE(SUM(credit_cents),0) AS earned
+                     FROM school_credits WHERE school_id = %s
+                    GROUP BY period_ym ORDER BY period_ym DESC LIMIT 24""",
+                (school_id,))
+            months = [dict(r) for r in cur.fetchall()]
+            cur.execute(
+                """SELECT kind, subscriber_email, gross_cents, credit_cents,
+                          occurred_at
+                     FROM school_credits WHERE school_id = %s
+                    ORDER BY occurred_at DESC LIMIT 100""", (school_id,))
+            recent = [dict(r) for r in cur.fetchall()]
+            cur.execute(
+                """SELECT period_ym, amount_cents, credit_count, status, paid_at
+                     FROM school_payouts WHERE school_id = %s
+                    ORDER BY period_ym DESC LIMIT 24""", (school_id,))
+            payouts = [dict(r) for r in cur.fetchall()]
+            cur.execute(
+                """SELECT COALESCE(SUM(amount_cents),0) AS paid
+                     FROM school_payouts
+                    WHERE school_id = %s AND status = 'paid'""", (school_id,))
+            paid = (cur.fetchone() or {}).get("paid") or 0
+    # Privacy: supporters are shown by masked email, never full contact.
+    for r in recent:
+        e = r.get("subscriber_email") or ""
+        if "@" in e:
+            u, d = e.split("@", 1)
+            r["subscriber_email"] = (u[:2] + "***@" + d) if len(u) > 2 else ("***@" + d)
+    return jsonify({
+        "ok": True,
+        "school": (sch or {}).get("name", ""),
+        "signups": tot.get("n", 0),
+        "earned_cents": tot.get("earned", 0),
+        "gross_cents": tot.get("gross", 0),
+        "paid_cents": paid,
+        "owed_cents": (tot.get("earned", 0) or 0) - (paid or 0),
+        "months": months, "recent": recent, "payouts": payouts,
+    })
+
+
 @app.get("/api/v1/weather/active-alerts")
 def weather_active_alerts():
     """Public. kind=warnings -> events ending in Warning; kind=watches ->
@@ -25241,6 +25454,259 @@ def overlay_alert_banner():
     return _overlay(_OVERLAY_BANNER)
 
 
+_SCHOOL_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Stormline for Schools &middot; WeatherValet</title>
+<meta name=description content="A year-round PTO fundraiser. Families protect an address they care about for $12 a year and 25 percent goes to your school.">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+.wrapS{max-width:780px;margin:0 auto;padding:32px 20px 70px}
+h1{font-size:clamp(27px,5vw,38px);font-weight:900;letter-spacing:-.02em;color:#fff;
+  margin:0 0 10px;line-height:1.18}
+.lead{color:#B8C7DE;font-size:17px;line-height:1.65;margin:0 0 26px}
+.kh{font-size:13px;font-weight:800;letter-spacing:.13em;text-transform:uppercase;
+  color:#7EB6FF;margin:32px 0 12px}
+.card{background:#0E1D3C;border:1px solid #2E4A7E;border-radius:16px;
+  padding:18px 20px;margin-bottom:12px;color:#C9D8F0;font-size:15px;line-height:1.65}
+.card b{color:#fff}
+table.t{width:100%;border-collapse:collapse;margin-top:6px;font-size:15px}
+table.t th,table.t td{padding:8px 10px;text-align:left;border-bottom:1px solid #21375E;color:#C9D8F0}
+table.t th{color:#8FA6C6;font-size:12px;text-transform:uppercase;letter-spacing:.08em}
+table.t td.n{color:#7EE2A8;font-weight:800}
+.form{background:#0E1D3C;border:1px solid #2E4A7E;border-radius:16px;padding:20px}
+.form label{display:block;color:#8FA6C6;font-size:13px;margin:12px 0 5px;font-weight:700}
+.form select,.form input{width:100%;box-sizing:border-box;padding:12px 13px;font-size:16px;
+  color:#EAF1FF;background:#0A1730;border:1px solid #2E4A7E;border-radius:9px}
+.go{width:100%;border:none;border-radius:11px;color:#fff;cursor:pointer;font-weight:800;
+  font-size:16.5px;padding:15px;background:linear-gradient(160deg,#3D8BFF,#1E5FE0);margin-top:16px}
+.fine{color:#8FA6C6;font-size:12.5px;line-height:1.55;margin-top:12px}
+#s-msg{margin-top:12px;font-size:15px;line-height:1.55}
+.faq b{display:block;color:#fff;margin-bottom:3px}
+.faq p{margin:0 0 16px;color:#C9D8F0;font-size:15px;line-height:1.6}
+</style></head><body>
+__WV_HEADER__
+<div class=wrapS>
+  <h1>Protect a place you care about.<br>Support a school you care about.</h1>
+  <p class=lead>Stormline watches one exact address around the clock for official
+  National Weather Service warnings. It costs $12 a year, and $3 of every
+  subscription goes straight to the school you choose. When it renews next year,
+  your school earns again.</p>
+
+  <div class=kh>What your $12 watches</div>
+  <div class=card>You pick the address. Your home, your child's school, a
+  grandparent's house, a spouse's workplace, a college apartment, a daycare, a
+  lake house. <b>Stormline does not follow a phone around.</b> It watches the
+  place you named, whether you are standing there or three states away.</div>
+  <div class=card>When that address falls inside a Tornado Warning, Severe
+  Thunderstorm Warning, or Flash Flood Warning, you get a text with the radar.
+  <b>Tornado Warnings also ring your phone</b>, because a banner is easy to sleep
+  through. Each subscription covers <b>two phone numbers</b> at no extra cost, so
+  you and Grandma can both be told about Grandma's house.</div>
+
+  <div class=kh>What the school earns</div>
+  <div class=card style="padding-bottom:14px">
+    <table class=t>
+      <tr><th>Subscriptions</th><th>School earns</th></tr>
+      <tr><td>100</td><td class=n>$300</td></tr>
+      <tr><td>250</td><td class=n>$750</td></tr>
+      <tr><td>500</td><td class=n>$1,500</td></tr>
+      <tr><td>1,000</td><td class=n>$3,000</td></tr>
+    </table>
+    <div class=fine>25% of every payment, every year, for as long as the
+    subscription stays active. No inventory, no order forms, no money for
+    students to carry.</div>
+  </div>
+
+  <div class=kh>Choose your school and start</div>
+  <div class=form>
+    <label for=s-school>Which school should this support? (required)</label>
+    <select id=s-school>
+      <option value="" selected>Choose a school...</option>
+    </select>
+    <button class=go id=s-go>Continue to sign up</button>
+    <div id=s-msg></div>
+    <div class=fine>You will finish on our normal Stormline signup page, where you
+    enter the address to watch and your phone numbers. Your school stays attached
+    to the order.</div>
+  </div>
+
+  <div class=kh>Straight answers</div>
+  <div class=faq>
+    <b>Does my phone already do this?</b>
+    <p>Your phone warns you where you are standing. Stormline watches the address
+    you name, even when nobody is there, and works on any phone with no app to
+    install.</p>
+    <b>Can I buy it for someone else?</b>
+    <p>Yes. Many people buy it for a parent or a college student. You choose the
+    address and add both phone numbers.</p>
+    <b>How does the school get paid?</b>
+    <p>We total it monthly and pay the PTO directly. Their treasurer can see the
+    running count any time.</p>
+    <b>Can I cancel?</b>
+    <p>Yes, any time. Email hello@weathervalet.ai and we will take care of it.</p>
+  </div>
+  <div class=fine>Message delivery depends on your mobile carrier and is not
+  guaranteed. Never rely on any single service, including this one, as your only
+  source of weather information. WeatherValet is an independent service and is
+  not affiliated with or endorsed by the National Weather Service or any school
+  or school district.</div>
+</div>
+__WV_FOOTER__"""
+
+
+_SCHOOL_SCRIPT = """<script>
+(function(){
+var sel=document.getElementById('s-school');
+fetch('/api/v1/schools').then(function(r){return r.json();}).then(function(d){
+  (d.schools||[]).forEach(function(s){
+    var o=document.createElement('option'); o.value=s.slug; o.textContent=s.name;
+    sel.appendChild(o);
+  });
+}).catch(function(){});
+document.getElementById('s-go').addEventListener('click',function(){
+  var msg=document.getElementById('s-msg');
+  if(!sel.value){
+    msg.innerHTML='<span style="color:#FF8296">Please choose a school first.</span>';
+    sel.focus(); return;
+  }
+  location.href='/stormline?school='+encodeURIComponent(sel.value);
+});
+})();
+</script>"""
+
+
+_SCHOOL_ADMIN_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>PTO Dashboard &middot; WeatherValet</title><meta name=robots content="noindex">
+<style>
+__WV_TOKENS__
+:root{--accent:#1E6BFF}
+.wrapA{max-width:860px;margin:0 auto;padding:28px 20px 70px}
+h1{font-size:24px;font-weight:900;color:#fff;margin:0 0 4px}
+.sub{color:#B8C7DE;font-size:14.5px;margin:0 0 18px;line-height:1.55}
+.box{background:#0E1D3C;border:1px solid #2E4A7E;border-radius:14px;padding:18px 20px;
+  margin-bottom:12px;color:#C9D8F0;font-size:14.5px;line-height:1.6}
+.box label{display:block;color:#8FA6C6;font-size:13px;margin:10px 0 5px;font-weight:700}
+.box select,.box input{width:100%;box-sizing:border-box;padding:11px 12px;font-size:16px;
+  color:#EAF1FF;background:#0A1730;border:1px solid #2E4A7E;border-radius:9px}
+.go{border:none;border-radius:10px;color:#fff;cursor:pointer;font-weight:800;font-size:15px;
+  padding:12px 22px;background:linear-gradient(160deg,#3D8BFF,#1E5FE0);margin-top:14px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:12px}
+.stat{background:#0E1D3C;border:1px solid #2E4A7E;border-radius:12px;padding:14px 16px}
+.stat .v{font-size:27px;font-weight:900;color:#fff}
+.stat .l{color:#8FA6C6;font-size:12px;text-transform:uppercase;letter-spacing:.08em;margin-top:2px}
+.stat.g .v{color:#7EE2A8}
+table.d{width:100%;border-collapse:collapse;font-size:14px}
+table.d th,table.d td{padding:8px 10px;text-align:left;border-bottom:1px solid #21375E;color:#C9D8F0}
+table.d th{color:#8FA6C6;font-size:11.5px;text-transform:uppercase;letter-spacing:.08em}
+.pill{font-size:11.5px;font-weight:800;border-radius:20px;padding:2px 10px}
+.pill.paid{background:#123C28;color:#7EE2A8}
+.pill.pending{background:#3A2A05;color:#FFC46B}
+#a-msg{color:#FF8296;font-size:14px;margin-top:10px}
+</style></head><body>
+__WV_HEADER__
+<div class=wrapA>
+  <h1>PTO Dashboard</h1>
+  <div class=sub id=a-sub>Sign in to see your school's Stormline fundraiser.</div>
+  <div class=box id=a-login>
+    <label for=a-school>School</label>
+    <select id=a-school><option value="">Choose a school...</option></select>
+    <label for=a-pin>Access code</label>
+    <input id=a-pin type=password autocomplete="one-time-code" placeholder="Provided by WeatherValet">
+    <button class=go id=a-go>Sign in</button>
+    <div id=a-msg></div>
+  </div>
+  <div id=a-dash style="display:none"></div>
+</div>
+__WV_FOOTER__"""
+
+
+_SCHOOL_ADMIN_SCRIPT = """<script>
+(function(){
+var sel=document.getElementById('a-school');
+fetch('/api/v1/schools').then(function(r){return r.json();}).then(function(d){
+  (d.schools||[]).forEach(function(s){
+    var o=document.createElement('option'); o.value=s.slug; o.textContent=s.name;
+    sel.appendChild(o);
+  });
+}).catch(function(){});
+function money(c){ return '$'+((c||0)/100).toFixed(2); }
+function esc(t){var e=document.createElement('div');e.textContent=t==null?'':String(t);return e.innerHTML;}
+function when(ms){ms=Number(ms); if(ms<1e12) ms*=1000;
+  return new Date(ms).toLocaleDateString(undefined,{month:'short',day:'numeric',year:'numeric'});}
+function show(d){
+  document.getElementById('a-login').style.display='none';
+  document.getElementById('a-sub').textContent=d.school+' - Stormline fundraiser';
+  var h='<div class=stats>'
+    +'<div class=stat><div class=v>'+d.signups+'</div><div class=l>Payments</div></div>'
+    +'<div class="stat g"><div class=v>'+money(d.earned_cents)+'</div><div class=l>Earned total</div></div>'
+    +'<div class=stat><div class=v>'+money(d.paid_cents)+'</div><div class=l>Paid to you</div></div>'
+    +'<div class="stat g"><div class=v>'+money(d.owed_cents)+'</div><div class=l>Owed to you</div></div>'
+    +'</div>';
+  if((d.months||[]).length){
+    h+='<div class=box><b style="color:#fff">By month</b><table class=d>'
+      +'<tr><th>Month</th><th>Payments</th><th>Earned</th></tr>'
+      +d.months.map(function(m){
+        return '<tr><td>'+esc(m.period_ym)+'</td><td>'+m.n+'</td><td>'+money(m.earned)+'</td></tr>';
+      }).join('')+'</table></div>';
+  }
+  if((d.payouts||[]).length){
+    h+='<div class=box><b style="color:#fff">Payouts</b><table class=d>'
+      +'<tr><th>Month</th><th>Amount</th><th>Status</th></tr>'
+      +d.payouts.map(function(p){
+        return '<tr><td>'+esc(p.period_ym)+'</td><td>'+money(p.amount_cents)+'</td>'
+          +'<td><span class="pill '+(p.status==='paid'?'paid':'pending')+'">'
+          +esc(p.status)+'</span></td></tr>';
+      }).join('')+'</table></div>';
+  }
+  h+='<div class=box><b style="color:#fff">Recent supporters</b>'
+    +((d.recent||[]).length
+      ? '<table class=d><tr><th>Date</th><th>Supporter</th><th>Type</th><th>Your share</th></tr>'
+        +d.recent.map(function(r){
+          return '<tr><td>'+when(r.occurred_at)+'</td><td>'+esc(r.subscriber_email)+'</td>'
+            +'<td>'+esc(r.kind)+'</td><td>'+money(r.credit_cents)+'</td></tr>';
+        }).join('')+'</table>'
+      : '<div style="color:#8FA6C6;margin-top:6px">No subscriptions yet. '
+        +'Share your school link and they will appear here.</div>')
+    +'</div>';
+  document.getElementById('a-dash').innerHTML=h;
+  document.getElementById('a-dash').style.display='block';
+}
+document.getElementById('a-go').addEventListener('click',function(){
+  var b=this, msg=document.getElementById('a-msg');
+  msg.textContent='';
+  if(!sel.value){ msg.textContent='Choose your school.'; return; }
+  b.disabled=true;
+  fetch('/api/v1/schools/admin-login',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({school:sel.value,pin:document.getElementById('a-pin').value})})
+   .then(function(r){return r.json();})
+   .then(function(d){
+     b.disabled=false;
+     if(!d.ok){ msg.textContent=d.message||'That code did not work.'; return; }
+     return fetch('/api/v1/schools/dashboard?token='+encodeURIComponent(d.token))
+       .then(function(r2){return r2.json();})
+       .then(function(dash){ if(dash.ok) show(dash); });
+   })
+   .catch(function(){ b.disabled=false; msg.textContent='Connection problem.'; });
+});
+})();
+</script>"""
+
+
+@app.get("/school")
+def school_fundraiser_page():
+    return wv_shell(_SCHOOL_PAGE
+                    .replace("__WV_FOOTER__", _SCHOOL_SCRIPT + "\n__WV_FOOTER__"))
+
+
+@app.get("/school/admin")
+def school_admin_page():
+    return wv_shell(_SCHOOL_ADMIN_PAGE
+                    .replace("__WV_FOOTER__", _SCHOOL_ADMIN_SCRIPT + "\n__WV_FOOTER__"))
+
+
 @app.get("/weather/forecast")
 def weather_forecast_page():
     return wv_shell(_WEATHER_FORECAST_PAGE
@@ -26555,6 +27021,21 @@ def sentry_checkout():
     pack_allseason = bool(data.get("pack_allseason"))
     daily = bool(data.get("daily"))
     gift_from = (data.get("gift_from") or "").strip()[:60]
+    # PTO fundraiser attribution (Sep 12, 2026).
+    school_slug = (data.get("school") or "").strip()[:80]
+    school_id = None
+    if school_slug:
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id FROM schools WHERE slug = %s AND is_active = TRUE",
+                        (school_slug,))
+                    _sr = cur.fetchone()
+                    if _sr:
+                        school_id = _sr["id"]
+        except Exception as e:
+            print(f"[schools] slug lookup failed: {e!r}", flush=True)
     try:
         send_hour = int(data.get("send_hour") or 7)
     except Exception:
@@ -26615,6 +27096,10 @@ def sentry_checkout():
                      meta_fbp, meta_fbc))
                 sentry_ids.append(cur.fetchone()["id"])
             # Rows bought together share the first row's id as the group.
+            if school_id:
+                cur.execute(
+                    "UPDATE sentry_subscribers SET school_id = %s WHERE id = ANY(%s)",
+                    (school_id, sentry_ids))
             cur.execute("UPDATE sentry_subscribers SET group_id = %s WHERE id = ANY(%s)",
                         (sentry_ids[0], sentry_ids))
     sentry_id = sentry_ids[0]
@@ -43328,6 +43813,87 @@ def _page_met_for_alert(alert: dict, affected: list, page_token: str,
         return False
 
 
+_WV_SEED_SCHOOLS = [
+    ("Central Elementary", "central-elementary"),
+    ("Harney Elementary", "harney-elementary"),
+    ("Hattie B Stokes Elementary", "hattie-b-stokes-elementary"),
+    ("Perry-Worth Elementary", "perry-worth-elementary"),
+]
+
+
+def _seed_schools() -> None:
+    """Idempotent. Adding a school later is an INSERT, not a deploy."""
+    try:
+        now_ms = int(time.time() * 1000)
+        with db() as conn:
+            with conn.cursor() as cur:
+                for name, slug in _WV_SEED_SCHOOLS:
+                    cur.execute(
+                        """INSERT INTO schools (name, slug, created_at)
+                           VALUES (%s, %s, %s)
+                           ON CONFLICT (slug) DO NOTHING""",
+                        (name, slug, now_ms))
+    except Exception as e:
+        print(f"[schools] seed failed: {e!r}", flush=True)
+
+
+def _school_period_ym(ms: int) -> str:
+    try:
+        tz = ZoneInfo("America/Indiana/Indianapolis")
+    except Exception:
+        tz = timezone.utc
+    return datetime.fromtimestamp(ms / 1000, tz=tz).strftime("%Y-%m")
+
+
+def _credit_school(school_id, dedup_key, kind, gross_cents,
+                   subscriber_email=""):
+    """Write one 25% credit. Silently ignores duplicates."""
+    if not school_id or not gross_cents:
+        return
+    try:
+        credit = int(round(int(gross_cents) * 0.25))
+        now_ms = int(time.time() * 1000)
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO school_credits
+                         (school_id, dedup_key, kind, gross_cents,
+                          credit_cents, subscriber_email, period_ym,
+                          occurred_at)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT (dedup_key) DO NOTHING""",
+                    (int(school_id), dedup_key, kind, int(gross_cents),
+                     credit, subscriber_email or "",
+                     _school_period_ym(now_ms), now_ms))
+        print(f"[schools] credited school={school_id} {kind} "
+              f"gross={gross_cents} credit={credit} key={dedup_key}",
+              flush=True)
+    except Exception as e:
+        print(f"[schools] credit failed ({dedup_key}): {e!r}", flush=True)
+
+
+def _school_id_for_sentry_ids(sentry_ids):
+    try:
+        ids = [int(x) for x in sentry_ids if str(x).strip().isdigit()]
+    except Exception:
+        return None, ""
+    if not ids:
+        return None, ""
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT school_id, email FROM sentry_subscribers
+                        WHERE id = ANY(%s) AND school_id IS NOT NULL
+                        LIMIT 1""", (ids,))
+                r = cur.fetchone()
+                if r:
+                    return r["school_id"], (r.get("email") or "")
+    except Exception as e:
+        print(f"[schools] lookup failed: {e!r}", flush=True)
+    return None, ""
+
+
 def _backfill_crew_home_coords() -> None:
     """One-time-ish boot pass (Sep 1, 2026): members with a home label
     but no coordinates get geocoded so radius Missions can find them.
@@ -45547,6 +46113,10 @@ def _ensure_brief_scheduler_started() -> None:
         # Background thread (Sep 6, 2026): this geocodes over the
         # network and MUST NOT block boot. Running it inline tripped
         # Render's 5-second health check.
+        try:
+            _seed_schools()
+        except Exception as e:
+            print(f"[schools] seed call failed: {e!r}", flush=True)
         try:
             threading.Thread(target=_backfill_crew_home_coords,
                              daemon=True).start()
