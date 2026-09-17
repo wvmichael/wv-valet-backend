@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-301"
+BACKEND_BUILD = "0702-302"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -9002,9 +9002,10 @@ def _met_day_digest() -> None:
         with db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """SELECT u.id, u.phone, u.timezone, u.name FROM users u
+                    """SELECT u.id, u.phone, u.email, u.timezone, u.name FROM users u
                         JOIN user_roles ur ON ur.user_id = u.id AND ur.role='met'
-                       WHERE u.is_active = TRUE AND u.phone IS NOT NULL AND u.phone <> ''""")
+                       WHERE u.is_active = TRUE
+                         AND COALESCE(u.email,'') <> ''""")
                 mets = cur.fetchall()
         for m in mets:
             tz_name = m.get("timezone") or "America/Indiana/Indianapolis"
@@ -9055,7 +9056,13 @@ def _met_day_digest() -> None:
                    + "\n".join(lines)
                    + "\nFull board: weathervalet.ai (Met portal, Today tab)")
             try:
-                send_sms(m["phone"], msg)
+                # Email instead of SMS (Sep 16, 2026): same digest,
+                # no per-message carrier cost.
+                if m.get("email"):
+                    _send_brief_email(
+                        m["email"], "Your WeatherValet day",
+                        "<p>" + _html_escape(msg).replace("\n", "<br>")
+                        + "</p>", html=True)
                 print(f"[met-digest] sent to met={m['id']} items={len(evs)}", flush=True)
             except Exception as e:
                 print(f"[met-digest] send failed met={m['id']}: {e!r}", flush=True)
@@ -44401,6 +44408,10 @@ def _tz_from_latlng(lat, lng):
 
 
 def _crew_daily_checkin_nudge() -> None:
+    # Retired again (Michael, Sep 16, 2026): two weeks live and not one
+    # member replied to a daily prompt. Met Missions stay as the Crew
+    # channel. Body kept below, unreachable.
+    return
     # Restored (Michael, Sep 2, 2026) after a one-day retirement:
     # the morning conditions roll call is back by his direction, with
     # Missions as the storm-time channel. Skips anyone who already
