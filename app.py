@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-302"
+BACKEND_BUILD = "0702-304"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -1555,6 +1555,19 @@ CREATE TABLE IF NOT EXISTS schools (
 
 -- One row per successful Stormline payment attributed to a school.
 -- dedup_key stops a webhook replay from paying twice.
+CREATE TABLE IF NOT EXISTS winter_watch_state (
+    id                SERIAL PRIMARY KEY,
+    sentry_id         INTEGER NOT NULL UNIQUE,
+    storm_day         TEXT,          -- 'YYYY-MM-DD' local, the peak day
+    told_snow_in      DOUBLE PRECISION DEFAULT 0,
+    told_ice_in       DOUBLE PRECISION DEFAULT 0,
+    told_stage        INTEGER DEFAULT 0,   -- 2 = watching, 3 = amounts
+    last_sent_at      BIGINT,
+    first_snow_season INTEGER,       -- year of the season already greeted
+    grid_url          TEXT,
+    updated_at        BIGINT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS school_credits (
     id            SERIAL PRIMARY KEY,
     school_id     INTEGER NOT NULL,
@@ -25969,6 +25982,93 @@ document.getElementById('p-go').addEventListener('click',function(){
 </script>"""
 
 
+@app.get("/brief/<token>")
+def brief_web_view(token):
+    """Read a delivered brief on the web. The link in every brief email
+    points here. Token-authenticated, no login, because the recipient
+    got the token in their own inbox."""
+    tok = "".join(ch for ch in (token or "") if ch.isalnum() or ch in "-_")
+    if not tok:
+        return ("<h1>That link is not valid.</h1>", 404)
+    now_ms = int(time.time() * 1000)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT h.id, h.brief_type, h.delivered_at, h.verdict,
+                          h.snippet, h.full_body, h.met_name,
+                          u.name AS sub_name
+                     FROM brief_access_tokens t
+                     JOIN brief_history h ON h.id = t.history_id
+                     LEFT JOIN users u ON u.id = t.subscriber_user_id
+                    WHERE t.token = %s""", (tok,))
+            row = cur.fetchone()
+            if row:
+                cur.execute(
+                    """UPDATE brief_access_tokens
+                          SET last_viewed_at_ms = %s,
+                              view_count = view_count + 1
+                        WHERE token = %s""", (now_ms, tok))
+    if not row:
+        return ("<h1>That link is not valid.</h1>"
+                "<p>It may have expired. Email hello@weathervalet.ai and "
+                "we will send it again.</p>", 404)
+
+    try:
+        tz = ZoneInfo("America/Indiana/Indianapolis")
+    except Exception:
+        tz = timezone.utc
+    when = ""
+    try:
+        ms = int(row.get("delivered_at") or 0)
+        if ms and ms < 1e12:
+            ms *= 1000
+        if ms:
+            when = datetime.fromtimestamp(ms / 1000, tz=tz).strftime(
+                "%A, %B %-d, %Y")
+    except Exception:
+        pass
+
+    verdict = (row.get("verdict") or "").lower()
+    vlabel = {"clear": "CLEAR", "caution": "CAUTION",
+              "risk": "RISK"}.get(verdict, verdict.upper() or "UPDATE")
+    vcolor = {"clear": "#7EE2A8", "caution": "#FFC46B",
+              "risk": "#FF8296"}.get(verdict, "#7EB6FF")
+    body = (row.get("full_body") or row.get("snippet") or "").strip()
+    met = (row.get("met_name") or "").strip()
+
+    page = f"""<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Your WeatherValet brief</title><meta name=robots content="noindex">
+<style>
+__WV_TOKENS__
+.wrapB{{max-width:680px;margin:0 auto;padding:28px 20px 70px}}
+h1{{font-size:23px;font-weight:900;color:#fff;margin:0 0 2px}}
+.meta{{color:#8FA6C6;font-size:13.5px;margin:0 0 18px}}
+.vpill{{display:inline-block;font-size:12px;font-weight:900;letter-spacing:.12em;
+  border-radius:20px;padding:4px 14px;margin-bottom:14px;
+  color:{vcolor};border:1px solid {vcolor}}}
+.bcard{{background:#0E1D3C;border:1px solid #2E4A7E;border-radius:14px;
+  padding:18px 20px;color:#EAF1FF;font-size:16px;line-height:1.7;
+  white-space:pre-wrap}}
+.sig{{color:#C9D8F0;font-size:14.5px;margin-top:16px}}
+.fine{{color:#8FA6C6;font-size:12.5px;line-height:1.55;margin-top:22px}}
+</style></head><body>
+__WV_HEADER__
+<div class=wrapB>
+  <h1>Your WeatherValet brief</h1>
+  <div class=meta>{_html_escape(when)}</div>
+  <div class=vpill>{_html_escape(vlabel)}</div>
+  <div class=bcard>{_html_escape(body)}</div>
+  {f'<div class=sig>Signed, {_html_escape(met)}, WeatherValet</div>' if met else ''}
+  <div class=fine>This is the brief that was sent to you. To reply, answer the
+  text or email it came in. Message delivery depends on your mobile carrier and
+  is not guaranteed. Never rely on any single service, including this one, as
+  your only source of weather information.</div>
+</div>
+__WV_FOOTER__"""
+    return wv_shell(page)
+
+
 @app.get("/school/pto")
 def school_pto_page():
     return wv_shell(_PTO_PAGE
@@ -43052,6 +43152,10 @@ def _brief_scheduler_loop() -> None:
             _stormline_renewal_notice_pass()
         except Exception as e:
             print(f"[renewal-notice] tick failed: {e!r}", flush=True)
+        try:
+            _winter_watch_pass()
+        except Exception as e:
+            print(f"[winter-watch] tick failed: {e!r}", flush=True)
 
         try:
             _dedupe_primary_locations_once()
@@ -45218,6 +45322,249 @@ def _nws_point_forecast(lat: float, lng: float) -> dict:
     except Exception as e:
         print(f"[stormline-daily] forecast fetch failed {lat},{lng}: {e!r}", flush=True)
         return {}
+
+
+_NWS_UA = {"User-Agent": "WeatherValet (michael@weathervalet.com)",
+           "Accept": "application/geo+json"}
+
+# What counts as worth a text. Ice is deliberately tiny: a tenth of an
+# inch does more damage than six inches of snow (Michael, Sep 2026).
+_WW_SNOW_IN = 1.0
+_WW_ICE_IN = 0.01
+_WW_FIRST_SNOW_IN = 0.1
+
+
+def _nws_grid_url(lat, lng, cached=None):
+    """lat/lng -> the NWS gridpoint forecast URL. Cached per subscriber
+    because it never changes for a fixed address."""
+    if cached:
+        return cached
+    try:
+        req = urllib.request.Request(
+            f"https://api.weather.gov/points/{float(lat):.4f},{float(lng):.4f}",
+            headers=_NWS_UA)
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            d = json.loads(resp.read().decode("utf-8"))
+        return ((d.get("properties") or {}).get("forecastGridData") or "") or None
+    except Exception as e:
+        print(f"[winter-watch] grid lookup failed {lat},{lng}: {e!r}", flush=True)
+        return None
+
+
+def _nws_winter_totals(grid_url, tz_name):
+    """Return {day 'YYYY-MM-DD': {'snow': inches, 'ice': inches}} for the
+    next 7 days, from the official NWS gridpoint forecast. Values arrive
+    in mm over ISO-8601 intervals."""
+    try:
+        req = urllib.request.Request(grid_url, headers=_NWS_UA)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            props = (json.loads(resp.read().decode("utf-8"))
+                     .get("properties") or {})
+    except Exception as e:
+        print(f"[winter-watch] grid fetch failed: {e!r}", flush=True)
+        return {}
+    try:
+        tz = ZoneInfo(tz_name or "America/Chicago")
+    except Exception:
+        tz = timezone.utc
+    out = {}
+    for key, field in (("snowfallAmount", "snow"), ("iceAccumulation", "ice")):
+        blk = props.get(key) or {}
+        uom = (blk.get("uom") or "").lower()
+        # wmoUnit:mm is what NWS publishes for both of these.
+        to_in = (1.0 / 25.4) if "mm" in uom else 1.0
+        for v in (blk.get("values") or []):
+            try:
+                amount = v.get("value")
+                if amount is None:
+                    continue
+                start = (v.get("validTime") or "").split("/")[0]
+                when = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                day = when.astimezone(tz).strftime("%Y-%m-%d")
+                out.setdefault(day, {"snow": 0.0, "ice": 0.0})
+                out[day][field] += float(amount) * to_in
+            except Exception:
+                continue
+    return out
+
+
+def _ww_phrase_amount(inches):
+    """A wide, honest range. NWS publishes one number; at these lead
+    times presenting it as a point value would overstate confidence."""
+    lo = max(1, int(round(inches * 0.6)))
+    hi = max(lo + 1, int(round(inches * 1.4)))
+    return f"{lo} to {hi} inches"
+
+
+def _ww_ice_phrase(inches):
+    if inches >= 0.25:
+        return "a quarter inch or more of ice"
+    if inches >= 0.1:
+        return "around a tenth of an inch of ice"
+    return "a light glaze of ice"
+
+
+def _winter_watch_pass() -> int:
+    """Automated snow and ice heads-up for All-Season subscribers, from
+    NWS gridpoint data. Speaks on meaningful change, not on a schedule
+    (Michael, Sep 2026). Stages: 3-7 days = a system is showing up,
+    1-2 days = amounts. Ice at any measurable amount. The first
+    measurable snow of the season always sends, because nobody has
+    recalibrated their driving yet."""
+    now_ms = int(time.time() * 1000)
+    try:
+        tz_local = ZoneInfo("America/Indiana/Indianapolis")
+    except Exception:
+        tz_local = timezone.utc
+    if datetime.fromtimestamp(now_ms / 1000, tz=tz_local).hour not in range(8, 21):
+        return 0
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT s.id, s.phone, s.email, s.label, s.address,
+                              s.lat, s.lng, s.tz_name, s.manage_token,
+                              w.storm_day, w.told_snow_in, w.told_ice_in,
+                              w.told_stage, w.last_sent_at,
+                              w.first_snow_season, w.grid_url
+                         FROM sentry_subscribers s
+                         LEFT JOIN winter_watch_state w ON w.sentry_id = s.id
+                        WHERE s.status = 'active'
+                          AND COALESCE(s.pack_allseason, FALSE) = TRUE
+                          AND COALESCE(s.is_internal, FALSE) = FALSE
+                          AND s.lat IS NOT NULL AND s.lng IS NOT NULL
+                          AND (s.group_id IS NULL OR s.group_id = s.id)""")
+                rows = cur.fetchall() or []
+    except Exception as e:
+        print(f"[winter-watch] query failed: {e!r}", flush=True)
+        return 0
+
+    sent = 0
+    for r in rows:
+        try:
+            grid = _nws_grid_url(r["lat"], r["lng"], r.get("grid_url"))
+            if not grid:
+                continue
+            totals = _nws_winter_totals(grid, r.get("tz_name"))
+            if not totals:
+                continue
+            try:
+                tz = ZoneInfo(r.get("tz_name") or "America/Chicago")
+            except Exception:
+                tz = timezone.utc
+            today = datetime.fromtimestamp(now_ms / 1000, tz=tz).date()
+
+            # The worst day in the window is the storm we talk about.
+            best_day, best = None, {"snow": 0.0, "ice": 0.0}
+            for day, v in totals.items():
+                try:
+                    d = datetime.strptime(day, "%Y-%m-%d").date()
+                except Exception:
+                    continue
+                lead = (d - today).days
+                if lead < 0 or lead > 7:
+                    continue
+                if (v["snow"] + v["ice"] * 40) > (best["snow"] + best["ice"] * 40):
+                    best_day, best = day, v
+            snow, ice = round(best.get("snow", 0), 2), round(best.get("ice", 0), 2)
+            lead = ((datetime.strptime(best_day, "%Y-%m-%d").date() - today).days
+                    if best_day else 99)
+
+            season = today.year if today.month >= 7 else today.year - 1
+            first_snow = (snow >= _WW_FIRST_SNOW_IN
+                          and (r.get("first_snow_season") or 0) != season)
+            meets = (snow >= _WW_SNOW_IN or ice >= _WW_ICE_IN or first_snow)
+
+            told_snow = float(r.get("told_snow_in") or 0)
+            told_ice = float(r.get("told_ice_in") or 0)
+            told_stage = int(r.get("told_stage") or 0)
+            same_storm = (r.get("storm_day") == best_day)
+            stage = 3 if lead <= 2 else (2 if lead <= 7 else 0)
+
+            body = None
+            where = (r.get("label") or "").strip() or "your address"
+            when_txt = (datetime.strptime(best_day, "%Y-%m-%d")
+                        .strftime("%A") if best_day else "")
+
+            if not meets:
+                # Storm we were tracking has fallen apart: say so once.
+                if same_storm and told_stage and (told_snow >= _WW_SNOW_IN
+                                                  or told_ice >= _WW_ICE_IN):
+                    body = (f"WeatherValet update: that system has trended "
+                            f"down. The Weather Service now shows less than "
+                            f"an inch for {where}. We are still watching.")
+                    best_day, snow, ice, stage = None, 0, 0, 0
+                else:
+                    continue
+            elif first_snow:
+                body = (f"WeatherValet: first snow of the season for {where}, "
+                        f"{when_txt}. Even a dusting is slick on cold pavement, "
+                        f"and nobody is driving for it yet. The Weather Service "
+                        f"will have amounts as it gets closer.")
+            elif ice >= _WW_ICE_IN and ice * 40 >= snow:
+                if stage == 3:
+                    body = (f"WeatherValet: the Weather Service expects "
+                            f"{_ww_ice_phrase(ice)} at {where} {when_txt}. "
+                            f"Ice is the one that puts cars in ditches. "
+                            f"Plan to stay put if you can.")
+                else:
+                    body = (f"WeatherValet: the Weather Service is showing "
+                            f"freezing rain or sleet for {where} around "
+                            f"{when_txt}. Too early for amounts. We are "
+                            f"watching it.")
+            elif stage == 3:
+                body = (f"WeatherValet: the Weather Service expects "
+                        f"{_ww_phrase_amount(snow)} at {where} by {when_txt}. "
+                        f"We will tell you if that changes.")
+            else:
+                body = (f"WeatherValet: the Weather Service is showing a "
+                        f"winter system for {where} around {when_txt}. Too "
+                        f"early for amounts, and systems this far out often "
+                        f"fall apart. We are watching it for you.")
+
+            # Speak only on meaningful change.
+            if same_storm and stage and stage == told_stage:
+                moved = max(abs(snow - told_snow), abs(ice - told_ice) * 40)
+                if moved < max(2.0, told_snow * 0.5):
+                    continue
+            # One revision per day; the close-in update is never held back.
+            if (r.get("last_sent_at") and stage != 3
+                    and now_ms - int(r["last_sent_at"]) < 24 * 3600 * 1000):
+                continue
+
+            if r.get("phone"):
+                send_sms(r["phone"], body)
+            if r.get("email"):
+                _send_brief_email(r["email"], "Winter weather for your address",
+                                  f"<p>{_html_escape(body)}</p>", html=True)
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO winter_watch_state
+                             (sentry_id, storm_day, told_snow_in, told_ice_in,
+                              told_stage, last_sent_at, first_snow_season,
+                              grid_url, updated_at)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           ON CONFLICT (sentry_id) DO UPDATE SET
+                             storm_day = EXCLUDED.storm_day,
+                             told_snow_in = EXCLUDED.told_snow_in,
+                             told_ice_in = EXCLUDED.told_ice_in,
+                             told_stage = EXCLUDED.told_stage,
+                             last_sent_at = EXCLUDED.last_sent_at,
+                             first_snow_season = EXCLUDED.first_snow_season,
+                             grid_url = EXCLUDED.grid_url,
+                             updated_at = EXCLUDED.updated_at""",
+                        (r["id"], best_day, snow, ice, stage, now_ms,
+                         season if first_snow else r.get("first_snow_season"),
+                         grid, now_ms))
+            sent += 1
+            print(f"[winter-watch] sent id={r['id']} day={best_day} "
+                  f"snow={snow} ice={ice} stage={stage}", flush=True)
+        except Exception as e:
+            print(f"[winter-watch] id={r.get('id')} failed: {e!r}", flush=True)
+    if sent:
+        print(f"[winter-watch] {sent} message(s)", flush=True)
+    return sent
 
 
 def _stormline_renewal_notice_pass() -> int:
@@ -52151,6 +52498,7 @@ def met_broadcast_brief_send():
         except Exception:
             polygon_geojson = None
     crew_post = (data.get("crew_post") or "").strip()
+    image_url = _normalize_image_url((data.get("image_url") or "").strip()) or ""
 
     if not counties_raw:
         return jsonify({"ok": False, "error": "no-counties",
@@ -52337,6 +52685,9 @@ def met_broadcast_brief_send():
         f"<p><strong>{headline_html}</strong></p>"
         f"<p>{summary_html}</p>"
         + (f"<p><em>Timing:</em> {time_windows_html}</p>" if time_windows else "")
+        + (f'<img src="{image_url}" alt="Forecast graphic" '
+           f'style="max-width:100%;border-radius:8px;margin:6px 0 14px;">'
+           if image_url.startswith("http") else "")
         + f"<p style='color:#666;font-size:12px;'>Sent by your Meteorologist via WeatherValet.</p>"
     )
 
@@ -52361,7 +52712,10 @@ def met_broadcast_brief_send():
         for ch in effective_channels:
             if ch == "sms" and r["phone"]:
                 try:
-                    ok = send_sms(r["phone"], sms_text)
+                    ok = send_sms(r["phone"], sms_text,
+                                  media_url=([image_url]
+                                             if image_url.startswith("http")
+                                             else None))
                     if ok:
                         channels_used.append("sms")
                         any_success = True
@@ -56844,6 +57198,7 @@ def met_thread_send(thread_id):
 
     data = request.get_json(silent=True) or {}
     body = (data.get("body") or "").strip()
+    image_url = _normalize_image_url((data.get("image_url") or "").strip()) or ""
     if not body:
         return jsonify({"ok": False, "error": "empty-message"}), 400
     if len(body) > 4000:
@@ -56905,7 +57260,9 @@ def met_thread_send(thread_id):
                 f"{preview}\n\n"
                 f"View: {portal_url}"
             )
-            send_sms(sub_phone, sms_body)
+            send_sms(sub_phone, sms_body,
+                     media_url=([image_url] if image_url.startswith("http")
+                                else None))
 
         if sub_email:
             # Build the full email so the subscriber gets the actual message
@@ -56919,6 +57276,11 @@ def met_thread_send(thread_id):
                 body_html_paragraphs += (
                     f'<p style="color:#0E1116;font-size:15px;line-height:1.6;'
                     f'margin:0 0 14px;">{_html_escape(para_html)}</p>'
+                )
+            if image_url.startswith("http"):
+                body_html_paragraphs += (
+                    f'<img src="{image_url}" alt="Forecast graphic" '
+                    f'style="max-width:100%;border-radius:8px;margin:4px 0 14px;">'
                 )
             html_inner = (
                 f'<h1 style="color:#0E1116;font-size:20px;margin:0 0 18px;'
