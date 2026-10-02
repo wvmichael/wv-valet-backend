@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-305"
+BACKEND_BUILD = "0702-306"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -5369,6 +5369,34 @@ def _root():
     anything else gets the same JSON this route always returned. Both are
     200, so nothing that was watching this endpoint breaks.
     """
+    # Magic sign-in links are of the form /?auth=verify&token=... — the
+    # shape the old React app handled in the browser. The new server
+    # rendered site has no such JavaScript, so every sign-in link in
+    # every email landed on the homepage and did nothing (Oct 2, 2026).
+    # Consume the token here instead and send them where they were going.
+    if (request.args.get("auth") or "") == "verify" and request.args.get("token"):
+        try:
+            verified = auth_verify()
+            payload = verified[0] if isinstance(verified, tuple) else verified
+            data = payload.get_json(silent=True) or {}
+            if data.get("ok"):
+                intent = (request.args.get("intent") or "sign-in").strip()
+                dest = "/portal"
+                if intent in ("new-account", "password-reset"):
+                    tok = data.get("password_set_token") or ""
+                    dest = f"/portal-setup/{tok}" if tok else "/portal"
+                resp = redirect(dest, code=302)
+                for cookie in payload.headers.getlist("Set-Cookie"):
+                    resp.headers.add("Set-Cookie", cookie)
+                print(f"[auth] magic link consumed at root, intent={intent} "
+                      f"-> {dest}", flush=True)
+                return resp
+            err = data.get("error") or "invalid"
+            return redirect(f"/signin?e={err}", code=302)
+        except Exception as e:
+            print(f"[auth] root magic-link handling failed: {e!r}", flush=True)
+            return redirect("/signin?e=error", code=302)
+
     accept = (request.headers.get("Accept") or "")
     if "text/html" in accept:
         return wv_home_page()
