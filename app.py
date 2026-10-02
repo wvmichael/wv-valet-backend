@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-304"
+BACKEND_BUILD = "0702-305"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -41559,7 +41559,7 @@ def _send_brief_email(email: str, subject: str, body_text: str,
             '<p style="color:#8B8F96;font-size:12px;line-height:1.5;margin:24px 0 0;'
             'padding-top:18px;border-top:1px solid #ECEEF1;">'
             'Adjust your brief preferences or threshold alerts in your '
-            '<a href="https://weathervalet.ai/?portal=1" '
+            '<a href="https://weathervalet.ai/portal" '
             'style="color:#2E4FB8;text-decoration:none;">subscriber portal</a>.</p>'
         )
         # Preheader: first ~90 chars of brief body so inbox preview is useful
@@ -41727,7 +41727,7 @@ def _render_pro_brief_email_html(
   <!-- Footer -->
   <div style="padding:18px 24px;background:#f8f9fa;color:#9ca3af;font-size:11px;line-height:1.5;text-align:center;">
     WeatherValet: your Meteorologist on call.<br>
-    Adjust preferences in your <a href="https://weathervalet.ai/?portal=1" style="color:#2563eb;text-decoration:none;">subscriber portal</a>.
+    Adjust preferences in your <a href="https://weathervalet.ai/portal" style="color:#2563eb;text-decoration:none;">subscriber portal</a>.
   </div>
 
 </div>
