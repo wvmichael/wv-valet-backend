@@ -668,6 +668,20 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS accuracy_email_last_sent_date TEXT;
 -- Only admins can set this; no portal UI exposes it.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS team_cap_override INTEGER;
 
+-- ── Paid seat count (Oct 9, 2026) ──
+-- How many PEOPLE this Pro account has paid for, including the primary.
+-- The $99 base covers 1 person at 1 location; every additional person is
+-- $39/mo. So a cap of (pro_users_paid - 1) added members is what they are
+-- entitled to, and buying another seat raises this number.
+--
+-- Why this column exists: Pro checkout has recorded the purchased person
+-- count in Stripe metadata since Aug 19, 2026, but nothing ever read it
+-- back. The team cap was a per-tier constant (3 for pro_single), and
+-- because Pro checkout never sets wv_tier, every Pro subscriber lands on
+-- pro_single — so the old cap handed out 3 free people to accounts that
+-- had paid for one. This column makes the entitlement equal the invoice.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS pro_users_paid INTEGER NOT NULL DEFAULT 1;
+
 -- ── Operational SMS consent for Mets (May 27, 2026) ──
 -- Records when a Met explicitly consented to receive operational
 -- SMS from WeatherValet (work-related messages: brief assignments,
@@ -10516,6 +10530,28 @@ def stripe_webhook_v2():
                                WHERE id = %s AND trial_status = 'active'""",
                             (user_id,),
                         )
+
+                    # ── Paid seat count (Oct 9, 2026) ──
+                    # Pro checkout writes the purchased person count into
+                    # metadata as pro_users. Until today nothing read it, so
+                    # the team cap had no connection to the invoice. Record it
+                    # now so the portal can only add the people they paid for.
+                    try:
+                        _paid_users = int(session_metadata.get("pro_users") or 1)
+                    except Exception:
+                        _paid_users = 1
+                    _paid_users = max(1, min(50, _paid_users))
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE users SET pro_users_paid = %s WHERE id = %s",
+                                (_paid_users, user_id),
+                            )
+                        print(f"[stripe-webhook] user={user_id} paid for "
+                              f"{_paid_users} people", flush=True)
+                    except Exception as e:
+                        print(f"[stripe-webhook] pro_users_paid write failed: {e!r}",
+                              flush=True)
 
                     # Grant subscriber role
                     newly_granted = _grant_subscriber_role(user_id, conn)
