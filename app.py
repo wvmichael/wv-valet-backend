@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-306"
+BACKEND_BUILD = "0702-307"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -681,6 +681,12 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS team_cap_override INTEGER;
 -- pro_single — so the old cap handed out 3 free people to accounts that
 -- had paid for one. This column makes the entitlement equal the invoice.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS pro_users_paid INTEGER NOT NULL DEFAULT 1;
+
+-- Locations, recorded for the same reason. Additional locations are $49/mo
+-- each. We do not yet offer self-serve location changes in the portal, but
+-- the account page quotes the customer their monthly total, and that number
+-- is wrong for a two-site customer unless we know the count.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS pro_locations_paid INTEGER NOT NULL DEFAULT 1;
 
 -- ── Operational SMS consent for Mets (May 27, 2026) ──
 -- Records when a Met explicitly consented to receive operational
@@ -10540,17 +10546,25 @@ def stripe_webhook_v2():
                         _paid_users = int(session_metadata.get("pro_users") or 1)
                     except Exception:
                         _paid_users = 1
+                    try:
+                        _paid_locs = int(session_metadata.get("pro_locations") or 1)
+                    except Exception:
+                        _paid_locs = 1
                     _paid_users = max(1, min(50, _paid_users))
+                    _paid_locs = max(1, min(50, _paid_locs))
                     try:
                         with conn.cursor() as cur:
                             cur.execute(
-                                "UPDATE users SET pro_users_paid = %s WHERE id = %s",
-                                (_paid_users, user_id),
+                                """UPDATE users SET pro_users_paid = %s,
+                                                    pro_locations_paid = %s
+                                   WHERE id = %s""",
+                                (_paid_users, _paid_locs, user_id),
                             )
                         print(f"[stripe-webhook] user={user_id} paid for "
-                              f"{_paid_users} people", flush=True)
+                              f"{_paid_users} people, {_paid_locs} locations",
+                              flush=True)
                     except Exception as e:
-                        print(f"[stripe-webhook] pro_users_paid write failed: {e!r}",
+                        print(f"[stripe-webhook] pro seat counts write failed: {e!r}",
                               flush=True)
 
                     # Grant subscriber role
@@ -18293,6 +18307,111 @@ def _account_rows(email: str) -> dict:
     return out
 
 
+# ---------------------------------------------------------------------------
+# People on a Pro account (Oct 9, 2026)
+#
+# Pro is $99 for one person at one location, plus $39/mo for each additional
+# person. The API to invite and remove people has existed since the spring,
+# but nothing in the rebuilt site called it, so adding somebody meant an
+# email to us and a hand-edit in the Stripe dashboard. This is the screen
+# that makes it self-serve.
+#
+# The list is server-rendered and actions reload the page rather than
+# patching the DOM. There is no state worth keeping client-side here, and a
+# reload is the honest way to show a billing change that just happened.
+#
+# The $39 is always stated before the button that charges it. The invite
+# endpoint refuses with 402 seat-needed unless buy_seat is passed, so a
+# customer cannot be billed by filling in a form.
+# ---------------------------------------------------------------------------
+
+_PEOPLE_SECTION = """
+<div class=head>People on your account</div>
+<p class=sub style="margin:-4px 0 14px;font-size:15px">__SUMMARY__</p>
+__ROWS__
+<div class=addf>
+  <label for=pn>Their name</label>
+  <input id=pn type=text autocomplete=off placeholder="Jane Dawson">
+  <label for=pe>Their email</label>
+  <input id=pe type=email autocomplete=off placeholder="jane@example.com">
+  <label for=pr>What they do (optional)</label>
+  <input id=pr type=text autocomplete=off placeholder="Farm manager">
+  <button class=btn id=padd>Add this person</button>
+  <p class=msg id=pmsg></p>
+  <div id=pconf style="display:none"></div>
+</div>
+<script>
+(function(){
+  var btn=document.getElementById("padd"),msg=document.getElementById("pmsg"),
+      conf=document.getElementById("pconf"),free=__FREE__;
+  function val(id){return (document.getElementById(id).value||"").trim();}
+  function say(t,cls){msg.textContent=t;msg.className="msg"+(cls?" "+cls:"");}
+  function send(buy){
+    var name=val("pn"),email=val("pe"),role=val("pr");
+    if(!name){say("Enter their name.","bad");return;}
+    if(!email||email.indexOf("@")<0){say("Enter a valid email.","bad");return;}
+    btn.disabled=true;
+    if(!buy){say("Adding...");}else{say("Updating your billing...");}
+    fetch("/api/v1/me/team/invite",{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      credentials:"same-origin",
+      body:JSON.stringify({name:name,email:email,role_label:role,buy_seat:!!buy})})
+    .then(function(r){return r.json().then(function(d){return {s:r.status,d:d};});})
+    .then(function(x){
+      if(x.d&&x.d.ok){
+        say("Added. We have emailed "+name+" a sign-in link.","good");
+        setTimeout(function(){location.reload();},900);
+        return;
+      }
+      if(x.s===402&&x.d&&x.d.error==="seat-needed"){
+        btn.disabled=false;
+        conf.style.display="block";
+        conf.innerHTML="<div class=conf><b>This adds $39 a month</b>"+
+          "<span>You are paying for "+free+" "+(free===1?"person":"people")+
+          " right now. Adding "+esc(name)+" brings your subscription to $39 more "+
+          "a month, charged for the rest of this billing period today. They get "+
+          "their own sign-in, their own daily briefs, and they can message a "+
+          "Meteorologist directly.</span>"+
+          "<div class=cbtns><button class=btn id=pyes>Add "+esc(name)+
+          " for $39/mo</button>"+
+          "<button class=\\"btn ghost\\" id=pno>Never mind</button></div></div>";
+        say("");
+        document.getElementById("pyes").onclick=function(){
+          conf.style.display="none";send(true);};
+        document.getElementById("pno").onclick=function(){
+          conf.style.display="none";say("");};
+        return;
+      }
+      btn.disabled=false;
+      say((x.d&&(x.d.message||x.d.error))||"That did not work. Try again.","bad");
+    })
+    .catch(function(){btn.disabled=false;
+      say("Could not reach us just now. Try again in a moment.","bad");});
+  }
+  function esc(s){var d=document.createElement("span");d.textContent=s;
+    return d.innerHTML;}
+  btn.onclick=function(){conf.style.display="none";send(false);};
+  Array.prototype.forEach.call(document.querySelectorAll("[data-rm]"),function(b){
+    b.onclick=function(){
+      var who=b.getAttribute("data-who")||"this person";
+      if(!confirm("Remove "+who+" from your account? This stops their briefs and "+
+                  "takes $39 a month off your subscription."))return;
+      b.disabled=true;b.textContent="Removing...";
+      fetch("/api/v1/me/team/"+b.getAttribute("data-rm"),
+        {method:"DELETE",credentials:"same-origin"})
+      .then(function(r){return r.json();})
+      .then(function(d){
+        if(d&&d.ok){if(d.note){alert(d.note);}location.reload();}
+        else{b.disabled=false;b.textContent="Remove";
+             alert((d&&d.message)||"Could not remove them. Try again.");}})
+      .catch(function(){b.disabled=false;b.textContent="Remove";
+        alert("Could not reach us just now.");});
+    };
+  });
+})();
+</script>"""
+
+
 _ACCOUNT_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>My WeatherValet</title><meta name=robots content="noindex">
@@ -18322,6 +18441,40 @@ h1{font-size:clamp(27px,4.4vw,40px);font-weight:900;letter-spacing:-.03em;color:
   padding:18px 20px;margin-top:30px;color:#D5E2F5;font-size:15px;line-height:1.65}
 .note b{color:#fff}
 .note a{color:var(--sky);font-weight:700}
+.prow{display:flex;align-items:flex-start;gap:12px;justify-content:space-between;
+  border:1px solid rgba(255,255,255,.14);border-radius:13px;padding:14px 16px;margin-bottom:9px;
+  background:rgba(255,255,255,.035)}
+.prow .who{min-width:0}
+.prow .who b{display:block;font-size:15.5px;color:#fff}
+.prow .who i{display:block;font-style:normal;font-size:13.5px;color:#9FB0C8;margin-top:3px;
+  overflow-wrap:anywhere}
+.prow .st{font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;font-weight:800;
+  padding:3px 9px;border-radius:999px;white-space:nowrap;
+  background:rgba(30,107,255,.18);color:#7FB0FF;border:1px solid rgba(30,107,255,.45)}
+.prow .st.pend{background:rgba(255,183,77,.14);color:#FFC46B;border-color:rgba(255,183,77,.4)}
+.prow .act{display:flex;flex-direction:column;align-items:flex-end;gap:7px}
+.lnk{background:none;border:none;padding:0;font-size:12.5px;font-weight:700;color:#8FA3BE;
+  cursor:pointer;text-decoration:underline}
+.lnk:hover{color:#FF8FA0}
+.addf{border:1px solid rgba(30,107,255,.3);border-radius:14px;padding:18px 18px 16px;
+  background:rgba(30,107,255,.06);margin-top:4px}
+.addf label{display:block;font-size:12px;letter-spacing:.07em;text-transform:uppercase;
+  font-weight:800;color:#A9B4C6;margin:0 0 5px}
+.addf input{width:100%;box-sizing:border-box;background:#0B1120;color:#fff;font-size:15px;
+  border:1.5px solid rgba(255,255,255,.17);border-radius:10px;padding:11px 13px;margin-bottom:13px}
+.addf input:focus{outline:none;border-color:#1E6BFF}
+.btn{display:inline-block;background:#1E6BFF;color:#fff;font-size:15px;font-weight:800;
+  border:none;border-radius:11px;padding:12px 22px;cursor:pointer}
+.btn:disabled{opacity:.55;cursor:default}
+.btn.ghost{background:rgba(255,255,255,.09);color:#D5E2F5}
+.msg{font-size:14.5px;line-height:1.6;margin:12px 0 0;color:#B8C7DE}
+.msg.bad{color:#FF9AA8}
+.msg.good{color:#8FE3B0}
+.conf{border:1.5px solid rgba(255,183,77,.5);background:rgba(255,183,77,.09);
+  border-radius:13px;padding:17px 18px;margin-top:13px;color:#FFE1B3;font-size:14.5px;
+  line-height:1.65}
+.conf b{color:#fff;display:block;margin-bottom:5px;font-size:16px}
+.conf .cbtns{display:flex;gap:9px;margin-top:14px;flex-wrap:wrap}
 </style></head><body>
 __WV_HEADER__
 <div class=wrapx>
@@ -18329,6 +18482,7 @@ __WV_HEADER__
   <h1>__GREETING__</h1>
   <p class=sub>Everything on your account, in one place.</p>
   __BODY__
+  __PEOPLE__
   <div class=note><b>Need to change something?</b> To move an address, change a phone
   number, or cancel, email <a href="mailto:hello@weathervalet.ai">hello@weathervalet.ai</a>
   and a person handles it the same day. Reply STOP to any message to stop texts
@@ -24845,10 +24999,106 @@ def portal_account():
                         "" if st in ("paid", "claimed", "active") else " off",
                         "Booked" if st == "paid" else _html_escape(st.title())))
 
+    # ── Pro plan card (Oct 9, 2026) ───────────────────────────────────
+    # Until today a Pro subscriber opened this page and saw "Nothing on
+    # this account yet", because _account_rows only knows about
+    # Stormline, Sidekick and Watch. The most expensive thing we sell was
+    # the one thing the account page did not mention.
+    _tier_now = (user.get("subscription_tier") or "").lower()
+    if _tier_now in TEAM_ELIGIBLE_TIERS:
+        try:
+            _paid_now = int(user.get("pro_users_paid") or 1)
+        except Exception:
+            _paid_now = 1
+        try:
+            _locs_now = int(user.get("pro_locations_paid") or 1)
+        except Exception:
+            _locs_now = 1
+        _monthly = pro_monthly_cents(_paid_now, _locs_now) / 100.0
+        body = ('<div class=head>Pro</div>'
+                '<div class=card><b>WeatherValet Pro</b>'
+                '<i>Your own Meteorologist team. Daily written briefs, questions '
+                'any time, custom alerts.<br>%d %s &middot; %d %s &middot; '
+                '$%s a month</i>'
+                '<span class=pill>Active</span></div>'
+                % (_paid_now, "person" if _paid_now == 1 else "people",
+                   _locs_now, "location" if _locs_now == 1 else "locations",
+                   ("%.2f" % _monthly).rstrip("0").rstrip("."))) + body
+
     if not body:
         body = ('<div class=empty>Nothing on this account yet. If you bought something with a '
                 'different email, tell us at <a href="/contact">contact</a> and we will join '
                 'them up. Otherwise, <a href="/home">have a look at what we do</a>.</div>')
+
+    # ── People on a Pro account (Oct 9, 2026) ─────────────────────────
+    # Only Pro subscribers see this. Everyone else gets nothing extra —
+    # a Stormline customer has no people to manage and should not be
+    # shown a section that only confuses them.
+    people = ""
+    tier = (user.get("subscription_tier") or "").lower()
+    if tier in TEAM_ELIGIBLE_TIERS:
+        try:
+            paid = int(user.get("pro_users_paid") or 1)
+        except Exception:
+            paid = 1
+        rows_html = ""
+        members = []
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT pmm.id, pmm.status, pmm.role_label,
+                                  u.name, u.email
+                           FROM pro_multi_memberships pmm
+                           JOIN users u ON u.id = pmm.member_user_id
+                           WHERE pmm.primary_user_id = %s
+                             AND pmm.status IN ('pending', 'active')
+                           ORDER BY pmm.invited_at""",
+                        (user["id"],),
+                    )
+                    members = cur.fetchall() or []
+        except Exception as e:
+            print(f"[portal-account] member list failed: {e!r}", flush=True)
+
+        # The primary first, so the list matches what they are billed for.
+        rows_html += (
+            '<div class=prow><div class=who><b>%s</b><i>%s &middot; you</i></div>'
+            '<div class=act><span class=st>Active</span></div></div>'
+            % (_html_escape((user.get("name") or "").strip() or "You"),
+               _html_escape(user.get("email") or "")))
+        for m in members:
+            pending = (m.get("status") or "") == "pending"
+            detail = _html_escape(m.get("email") or "")
+            if m.get("role_label"):
+                detail += " &middot; " + _html_escape(m["role_label"])
+            rows_html += (
+                '<div class=prow><div class=who><b>%s</b><i>%s</i></div>'
+                '<div class=act><span class="st%s">%s</span>'
+                '<button class=lnk data-rm="%d" data-who="%s">Remove</button>'
+                '</div></div>'
+                % (_html_escape(m.get("name") or m.get("email") or ""),
+                   detail,
+                   " pend" if pending else "",
+                   "Invited" if pending else "Active",
+                   int(m["id"]),
+                   _html_escape(m.get("name") or m.get("email") or "them")))
+
+        used = len(members) + 1          # members plus the primary
+        if paid > used:
+            spare = paid - used
+            summary = ("You are paying for %d %s and have %d still to use. "
+                       "Adding anyone beyond that is $39 a month each."
+                       % (paid, "person" if paid == 1 else "people", spare))
+        else:
+            summary = ("You are paying for %d %s. Each additional person is "
+                       "$39 a month, and they get their own sign-in, their own "
+                       "daily briefs, and direct access to a Meteorologist."
+                       % (paid, "person" if paid == 1 else "people"))
+
+        people = (_PEOPLE_SECTION
+                  .replace("__ROWS__", rows_html)
+                  .replace("__SUMMARY__", summary)
+                  .replace("__FREE__", str(paid)))
 
     first = ((user.get("name") or "").strip().split(" ") or [""])[0]
     greeting = ("Hello, %s." % _html_escape(first)) if first else "My WeatherValet."
@@ -24856,7 +25106,8 @@ def portal_account():
     return wv_shell(_ACCOUNT_PAGE
                     .replace("__SPA__", spa)
                     .replace("__GREETING__", greeting)
-                    .replace("__BODY__", body))
+                    .replace("__BODY__", body)
+                    .replace("__PEOPLE__", people))
 
 
 @app.errorhandler(404)
@@ -34320,41 +34571,194 @@ def me_met_context_save():
 #   'removed'  — primary removed them; row kept for audit
 
 
-# Tier defaults for team-member caps. Matches the pricing page:
-#   Pro Single → 3 team members
-#   Pro Multi  → 10 team members
-# Pro Enterprise is open-ended; default it generously and rely on the
-# admin override for anything past that.
-# Updated May 23, 2026 — was hardcoded at 25 across the board. Now
-# tier-aware so the system actually matches what we sell.
-TEAM_CAP_BY_TIER = {
-    "pro_single":     3,
-    "pro_multi":      10,
-    "pro_enterprise": 25,
-}
+# RETIRED Oct 9, 2026 — the per-tier cap table.
+#
+# It read: pro_single 3, pro_multi 10, pro_enterprise 25. Those numbers
+# described a three-tier product that no longer exists; today there is one
+# Pro product at $99 for one person and one location, plus $39 per extra
+# person. Entitlement now comes from users.pro_users_paid via
+# _team_cap_for_user, so it equals what the customer is billed for.
+#
+# Deliberately left here as a comment rather than deleted, because the
+# old numbers show up in mid-2026 support threads and it is useful to be
+# able to see what they were.
 
 
 def _team_cap_for_user(user_id: int, tier: str) -> int:
-    """Resolve the effective team-member cap for this user.
+    """Resolve how many ADDITIONAL people this account may have.
 
-    Priority:
+    Rewritten Oct 9, 2026. The cap is now what they paid for, not a
+    per-tier constant:
+
       1. users.team_cap_override (admin-granted, supersedes everything)
-      2. TEAM_CAP_BY_TIER[tier] (matches pricing page)
-      3. 0 (no tier match → not allowed)
+      2. users.pro_users_paid - 1  (the $99 base covers the primary;
+         every additional person is a $39/mo line item)
+      3. 0
+
+    The old behaviour returned TEAM_CAP_BY_TIER[tier] — 3 for pro_single.
+    Because Pro checkout never sets wv_tier, every Pro subscriber is
+    stored as pro_single, so that constant was handing three free people
+    to accounts billed for one. The number now equals the invoice.
     """
     try:
         with db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT team_cap_override FROM users WHERE id = %s",
+                    """SELECT team_cap_override, pro_users_paid
+                       FROM users WHERE id = %s""",
                     (user_id,),
                 )
                 row = cur.fetchone()
-                if row and row.get("team_cap_override") is not None:
-                    return int(row["team_cap_override"])
+                if row:
+                    if row.get("team_cap_override") is not None:
+                        return max(0, int(row["team_cap_override"]))
+                    paid = row.get("pro_users_paid")
+                    paid = 1 if paid is None else int(paid)
+                    return max(0, paid - 1)
     except Exception as e:
-        print(f"[team-cap] override lookup failed user={user_id}: {e!r}", flush=True)
-    return TEAM_CAP_BY_TIER.get((tier or "").lower(), 0)
+        print(f"[team-cap] lookup failed user={user_id}: {e!r}", flush=True)
+    # Fail closed. A lookup failure must not hand out free seats.
+    return 0
+
+
+def _pro_seat_billing_change(user: dict, delta: int) -> tuple:
+    """Add or remove paid person-seats on a live Pro subscription.
+
+    delta > 0 buys seats, delta < 0 gives them back. Returns
+    (ok: bool, message: str, new_paid_total: int).
+
+    Built Oct 9, 2026. Before this there was no code anywhere that
+    changed a Pro subscription after checkout — the person count was
+    written into Stripe metadata once and never touched again, so adding
+    somebody to an account meant editing the subscription by hand in the
+    Stripe dashboard.
+
+    How it works: Pro checkout builds its line items inline with
+    price_data rather than catalogue price IDs, so there is no stable
+    price ID to look for. We find the additional-person line by its
+    unit_amount ($39) and monthly interval, bump its quantity, and let
+    Stripe prorate. If no such line exists yet (the common case — a
+    one-person account adding their first colleague) we create it.
+
+    Proration is deliberate: they get the person today, so they pay for
+    the rest of this period today. always_invoice means the charge lands
+    now rather than as a surprise on the next invoice.
+    """
+    if not stripe:
+        return (False, "Payments aren't configured.", 0)
+
+    cust = (user.get("stripe_customer_id") or "").strip()
+    if not cust:
+        return (False,
+                "We can't find your billing record. Email hello@weathervalet.ai "
+                "and we'll sort it out the same day.", 0)
+
+    try:
+        paid_now = int(user.get("pro_users_paid") or 1)
+    except Exception:
+        paid_now = 1
+    want = paid_now + int(delta)
+    if want < 1:
+        return (False, "An account needs at least one person.", paid_now)
+    if want > 5:
+        # Same ceiling the public checkout uses. Past five, a person
+        # should be in the room instead of a form.
+        return (False,
+                "For a crew that size we'll build the number with you. Email "
+                "hello@weathervalet.ai and we'll come back the same day.",
+                paid_now)
+
+    try:
+        subs = stripe.Subscription.list(customer=cust, status="active", limit=10)
+        sub = None
+        for s in (subs.get("data") or []):
+            sub = s
+            break
+        if sub is None:
+            return (False,
+                    "We can't find an active subscription on your account. "
+                    "Email hello@weathervalet.ai and we'll take a look.",
+                    paid_now)
+
+        extra_item = None
+        for it in ((sub.get("items") or {}).get("data") or []):
+            price = it.get("price") or {}
+            recurring = price.get("recurring") or {}
+            if (price.get("unit_amount") == PRO_USER_CENTS
+                    and recurring.get("interval") == "month"):
+                extra_item = it
+                break
+
+        extra_wanted = want - 1          # people beyond the included primary
+
+        if extra_item is None:
+            if extra_wanted <= 0:
+                # Nothing to remove and nothing to add.
+                return (True, "", want)
+            stripe.SubscriptionItem.create(
+                subscription=sub["id"],
+                quantity=extra_wanted,
+                price_data={
+                    "currency": "usd",
+                    "unit_amount": PRO_USER_CENTS,
+                    "recurring": {"interval": "month"},
+                    "product_data": {
+                        "name": "WeatherValet Pro - additional person",
+                        "description": ("Their own briefs, and they can message "
+                                        "a Meteorologist."),
+                    },
+                },
+                proration_behavior="always_invoice",
+            )
+        elif extra_wanted <= 0:
+            stripe.SubscriptionItem.delete(
+                extra_item["id"], proration_behavior="always_invoice")
+        else:
+            stripe.SubscriptionItem.modify(
+                extra_item["id"], quantity=extra_wanted,
+                proration_behavior="always_invoice")
+    except Exception as e:
+        print(f"[pro-seats] stripe change failed user={user.get('id')} "
+              f"delta={delta}: {e!r}", flush=True)
+        return (False,
+                "We couldn't update your billing just now. Nothing has changed "
+                "and you haven't been charged. Try again in a moment.",
+                paid_now)
+
+    # Billing moved. Record the new entitlement.
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET pro_users_paid = %s WHERE id = %s",
+                    (want, user["id"]),
+                )
+    except Exception as e:
+        # The charge went through but we failed to record it. Loud log —
+        # this needs a human, because the customer is now paying for a
+        # seat the app won't let them use.
+        print(f"[pro-seats] CRITICAL billed but not recorded user="
+              f"{user.get('id')} want={want}: {e!r}", flush=True)
+        try:
+            _send_team_notification(
+                subject=f"ACTION: seat billed but not recorded (user {user.get('id')})",
+                html_body=(f"<p>Stripe was changed to {want} people for "
+                           f"{_html_escape(user.get('email') or '')} but the "
+                           f"database write failed. Set pro_users_paid={want} "
+                           f"by hand.</p>"),
+                text_body=(f"Stripe was changed to {want} people for "
+                           f"{user.get('email') or ''} but the database write "
+                           f"failed. Set pro_users_paid={want} by hand."))
+        except Exception:
+            pass
+        return (False,
+                "Your billing was updated but we hit a snag saving it. We've "
+                "been alerted and will fix it today — no need to try again.",
+                paid_now)
+
+    print(f"[pro-seats] user={user.get('id')} people {paid_now} -> {want}",
+          flush=True)
+    return (True, "", want)
 
 
 # Set of tiers where team-member management is available at all.
@@ -34496,14 +34900,14 @@ def me_team_invite():
 
     now_ms = int(time.time() * 1000)
 
+    # ── Seat check and, if needed, seat purchase ──────────────────────
+    # Done BEFORE opening the main connection. _pro_seat_billing_change
+    # takes a connection of its own, and calling it from inside an open
+    # cursor nests connections — that is how we produced an
+    # InterfaceError('cursor already closed') in August. Keep it outside.
     try:
         with db() as conn:
             with conn.cursor() as cur:
-                # ── Check team-size cap (tier-aware May 23, 2026) ─────
-                # Pro Single: 3, Pro Multi: 10, Enterprise: 25.
-                # users.team_cap_override (admin-set) supersedes the tier
-                # default if non-null.
-                effective_cap = _team_cap_for_user(user["id"], tier)
                 cur.execute(
                     """SELECT COUNT(*) AS n FROM pro_multi_memberships
                        WHERE primary_user_id = %s
@@ -34511,18 +34915,49 @@ def me_team_invite():
                     (user["id"],),
                 )
                 current_count = cur.fetchone()["n"]
-                if current_count >= effective_cap:
-                    return jsonify({
-                        "ok": False,
-                        "error": "team-cap-reached",
-                        "message": (
-                            f"You've reached your team cap of {effective_cap} "
-                            f"member{'s' if effective_cap != 1 else ''}. "
-                            f"Remove an inactive member to add a new one, "
-                            f"or contact support to upgrade your plan."
-                        ),
-                    }), 400
+                # An email that is ALREADY a member of this account must not
+                # trigger a seat purchase — the invite below is idempotent and
+                # returns the existing membership, so re-sending an invite is
+                # free. Check that here, while we have a cursor.
+                cur.execute(
+                    """SELECT 1 FROM pro_multi_memberships pmm
+                       JOIN users u ON u.id = pmm.member_user_id
+                       WHERE pmm.primary_user_id = %s
+                         AND LOWER(u.email) = %s
+                         AND pmm.status IN ('pending', 'active')""",
+                    (user["id"], member_email),
+                )
+                already_member = cur.fetchone() is not None
+    except Exception as e:
+        print(f"[team-invite] seat precheck failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
 
+    effective_cap = _team_cap_for_user(user["id"], tier)
+    if not already_member and current_count >= effective_cap:
+        # Oct 9, 2026: being at the cap is no longer a dead end. An extra
+        # person is a thing we sell for $39/mo, so the portal offers to buy
+        # the seat. The caller must pass buy_seat=true to confirm the
+        # charge — we never bill somebody as a side effect of them filling
+        # in a form.
+        if not bool(data.get("buy_seat")):
+            return jsonify({
+                "ok": False,
+                "error": "seat-needed",
+                "price_cents": PRO_USER_CENTS,
+                "message": (
+                    "Adding another person is $39 a month. They get their own "
+                    "sign-in, their own briefs, and they can message a "
+                    "Meteorologist directly."
+                ),
+            }), 402
+        ok_seat, seat_msg, _new_total = _pro_seat_billing_change(user, +1)
+        if not ok_seat:
+            return jsonify({"ok": False, "error": "seat-billing-failed",
+                            "message": seat_msg}), 402
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
                 # ── Create or update member's user row ────────────────
                 cur.execute(
                     "SELECT id FROM users WHERE LOWER(email) = LOWER(%s)",
@@ -34696,7 +35131,35 @@ def me_team_remove(membership_id: int):
         print(f"[team-remove] failed: {e!r}", flush=True)
         return jsonify({"ok": False, "error": "db-error"}), 500
 
-    return jsonify({"ok": True})
+    # ── Give the seat back (Oct 9, 2026) ──────────────────────────────
+    # Removing somebody should stop the $39. Done after the membership is
+    # already removed and outside that connection, so a Stripe hiccup
+    # cannot leave the person still on the account. If the credit fails we
+    # tell them plainly rather than silently keep charging: the removal
+    # stands either way, and a human picks up the billing.
+    seat_note = ""
+    try:
+        ok_seat, seat_msg, _total = _pro_seat_billing_change(user, -1)
+        if not ok_seat:
+            seat_note = ("They've been removed. We couldn't adjust your billing "
+                         "automatically — we've been alerted and will credit you.")
+            print(f"[team-remove] seat credit failed user={user.get('id')} "
+                  f"membership={membership_id}: {seat_msg}", flush=True)
+            try:
+                _send_team_notification(
+                    subject=f"ACTION: seat removal not credited (user {user.get('id')})",
+                    html_body=(f"<p>{_html_escape(user.get('email') or '')} removed a "
+                               f"person (membership {membership_id}) but the Stripe "
+                               f"credit failed: {_html_escape(seat_msg)}</p>"),
+                    text_body=(f"{user.get('email') or ''} removed a person "
+                               f"(membership {membership_id}) but the Stripe credit "
+                               f"failed: {seat_msg}"))
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[team-remove] seat credit raised: {e!r}", flush=True)
+
+    return jsonify({"ok": True, "note": seat_note})
 
 
 def _send_membership_invite(membership_id: int) -> bool:
