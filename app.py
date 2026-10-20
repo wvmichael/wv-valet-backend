@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-309"
+BACKEND_BUILD = "0702-310"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -10597,6 +10597,51 @@ def stripe_webhook_v2():
                         print(f"[stripe-webhook] pro seat counts write failed: {e!r}",
                               flush=True)
 
+                    # ── The address they are paying us to watch ──
+                    # Oct 20, 2026. Checkout now requires it, so create the
+                    # saved_location here rather than hoping the customer
+                    # finds the portal and fills it in. A Pro account with
+                    # no location is a Meteorologist with nothing to write
+                    # and a subscriber wondering what they bought.
+                    _addr = (session_metadata.get("pro_address") or "").strip()
+                    if _addr:
+                        try:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    "SELECT 1 FROM saved_locations WHERE user_id = %s",
+                                    (user_id,))
+                                _has_loc = cur.fetchone() is not None
+                            if not _has_loc:
+                                _geo = _geocode_address(_addr)
+                                if _geo:
+                                    _ms = int(time.time() * 1000)
+                                    with conn.cursor() as cur:
+                                        cur.execute(
+                                            """INSERT INTO saved_locations
+                                                 (user_id, label, address_text, lat, lng,
+                                                  county, is_primary, created_at, updated_at)
+                                               VALUES (%s,%s,%s,%s,%s,%s,TRUE,%s,%s)""",
+                                            (user_id, _addr[:80], _addr,
+                                             _geo["lat"], _geo["lng"],
+                                             _geo.get("admin2"), _ms, _ms))
+                                    print(f"[stripe-webhook] user={user_id} location "
+                                          f"set from checkout: {_addr[:60]}", flush=True)
+                                else:
+                                    # Do not fail the signup over a geocode. Flag
+                                    # it so a human fixes it the same day.
+                                    print(f"[stripe-webhook] GEOCODE FAILED for "
+                                          f"user={user_id}: {_addr!r}", flush=True)
+                                    _send_team_notification(
+                                        subject=f"Pro signup needs an address check: {email}",
+                                        html_body=(f"<p>{_html_escape(email)} paid but we could "
+                                                   f"not place <b>{_html_escape(_addr)}</b>. "
+                                                   f"Set their location by hand today.</p>"),
+                                        text_body=(f"{email} paid but we could not place "
+                                                   f"{_addr}. Set their location by hand today."))
+                        except Exception as e:
+                            print(f"[stripe-webhook] pro location write failed: {e!r}",
+                                  flush=True)
+
                     # Grant subscriber role
                     newly_granted = _grant_subscriber_role(user_id, conn)
 
@@ -16706,6 +16751,10 @@ def pro_checkout():
     email = (data.get("email") or "").strip()[:200]
     company = (data.get("company") or "").strip()[:160]
     phone = _normalize_phone((data.get("phone") or "").strip())
+    # Oct 20, 2026: the address is now required. Pro sold for two months
+    # without ever asking where the customer was, so every signup landed in
+    # a Meteorologist's workspace with nothing to forecast for.
+    address = (data.get("address") or "").strip()[:240]
     # `or 1` would quietly turn a 0 into a 1, so read the raw values and
     # let the range check below do the refusing.
     try:
@@ -16715,6 +16764,10 @@ def pro_checkout():
         return jsonify({"ok": False, "error": "Pick how many people and locations."}), 400
     if not email or not is_valid_email(email):
         return jsonify({"ok": False, "error": "Enter a valid work email."}), 400
+    if not address:
+        return jsonify({"ok": False,
+                        "error": "Tell us the address to watch. Without it your "
+                                 "Meteorologist has nowhere to look."}), 400
     if users < 1 or locations < 1:
         return jsonify({"ok": False, "error": "Pick how many people and locations."}), 400
     # Above five of either, a rep should be in the room rather than a form.
@@ -16730,7 +16783,8 @@ def pro_checkout():
             customer_email=email,
             metadata={"wv_product": "pro", "pro_users": str(users),
                       "pro_locations": str(locations), "pro_company": company,
-                      "pro_phone": phone or "", "pro_name": name},
+                      "pro_phone": phone or "", "pro_name": name,
+                      "pro_address": address},
             subscription_data={"metadata": {"wv_product": "pro",
                                             "pro_users": str(users),
                                             "pro_locations": str(locations)}},
@@ -16989,6 +17043,8 @@ __WV_HEADER__
     <label for=p-company>Company (optional)</label><input id=p-company>
     <label for=p-email>Email</label><input id=p-email type=email autocomplete=email>
     <label for=p-phone>Mobile</label><input id=p-phone type=tel placeholder="317-555-0123">
+    <label for=p-address>The address to watch</label><input id=p-address
+      placeholder="1400 W Main St, Lebanon, IN">
     <div id=err class=err></div>
     <button class=go id=p-go>Start Pro</button>
     <div class=fine>Billed monthly through Stripe. Cancel any time. We will email you a link to
@@ -17061,11 +17117,17 @@ __WV_HEADER__
       err.textContent='Enter the email we should send your account link to.';
       err.style.display='block'; return;
     }
+    var address=document.getElementById('p-address').value.trim();
+    if(!address){
+      err.textContent='Tell us the address to watch. Without it your Meteorologist has nowhere to look.';
+      err.style.display='block'; return;
+    }
     btn.disabled=true; btn.textContent='One moment...';
     fetch('/api/v1/pro/checkout',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({name:document.getElementById('p-name').value,
         company:document.getElementById('p-company').value,
         email:email, phone:document.getElementById('p-phone').value,
+        address:address,
         users:u, locations:l})})
       .then(function(r){return r.json();}).then(function(j){
         if(j && j.ok && j.url){ window.location=j.url; return; }
@@ -18702,6 +18764,106 @@ def _account_rows(email: str) -> dict:
 # endpoint refuses with 402 seat-needed unless buy_seat is passed, so a
 # customer cannot be billed by filling in a form.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Where we watch, and when the brief lands (Oct 20, 2026)
+#
+# Pro checkout asks for a name, an email, a phone and a headcount. It has
+# never asked where the customer actually is. The webhook then builds the
+# account with no location, so a Meteorologist opens their workspace and
+# finds a paying subscriber with nothing to forecast for.
+#
+# The API to save a location has existed since spring and nothing in the
+# rebuilt site called it — the old React portal had that screen and this
+# one never got it. Same hole as the sign-in bridge and the seat screen.
+#
+# Delivery time sits here too, because it is a property of "a brief about
+# this address at this hour" and splitting them over two screens means a
+# subscriber sets one and forgets the other.
+# ---------------------------------------------------------------------------
+
+_PLACES_SECTION = """
+<div class=head>Where we are watching</div>
+<p class=sub style="margin:-4px 0 14px;font-size:15px">__PSUMMARY__</p>
+__PROWS__
+<div class=addf>
+  <label for=la>Address, or just town and state</label>
+  <input id=la type=text autocomplete=off placeholder="1400 W Main St, Lebanon, IN">
+  <label for=ll>What to call it (optional)</label>
+  <input id=ll type=text autocomplete=off placeholder="The shop">
+  <button class=btn id=ladd>Add this place</button>
+  <p class=msg id=lmsg></p>
+</div>
+
+<div class=head style="margin-top:34px">When your brief arrives</div>
+<p class=sub style="margin:-4px 0 14px;font-size:15px">Your Meteorologist writes
+it for this time, in your local morning.</p>
+<div class=addf>
+  <label for=bt>Delivery time</label>
+  <input id=bt type=time value="__BRIEFTIME__" style="max-width:190px">
+  <button class=btn id=bsave style="margin-top:4px">Save this time</button>
+  <p class=msg id=bmsg></p>
+</div>
+<script>
+(function(){
+  function val(id){return (document.getElementById(id).value||"").trim();}
+  function say(el,t,cls){el.textContent=t;el.className="msg"+(cls?" "+cls:"");}
+
+  var lb=document.getElementById("ladd"), lm=document.getElementById("lmsg");
+  lb.onclick=function(){
+    var addr=val("la");
+    if(!addr){say(lm,"Enter an address or a town.","bad");return;}
+    lb.disabled=true;say(lm,"Looking it up...");
+    fetch("/api/v1/me/saved-locations",{method:"POST",
+      headers:{"Content-Type":"application/json"},credentials:"same-origin",
+      body:JSON.stringify({address_text:addr,label:val("ll")||addr})})
+    .then(function(r){return r.json().then(function(d){return {s:r.status,d:d};});})
+    .then(function(x){
+      lb.disabled=false;
+      if(x.d&&x.d.ok){say(lm,"Added. Your Meteorologist can see it now.","good");
+        setTimeout(function(){location.reload();},800);return;}
+      var e=(x.d&&x.d.error)||"";
+      say(lm, e==="geocoding-failed"
+        ? "We could not find that one. Try the town and state on their own."
+        : (x.d&&x.d.message)||"That did not work. Try again.","bad");
+    }).catch(function(){lb.disabled=false;
+      say(lm,"Could not reach us just now. Try again in a moment.","bad");});
+  };
+
+  var bb=document.getElementById("bsave"), bm=document.getElementById("bmsg");
+  bb.onclick=function(){
+    var t=val("bt");
+    if(!/^\\d{2}:\\d{2}$/.test(t)){say(bm,"Pick a time.","bad");return;}
+    var tz="America/New_York";
+    try{tz=Intl.DateTimeFormat().resolvedOptions().timeZone||tz;}catch(e){}
+    bb.disabled=true;say(bm,"Saving...");
+    fetch("/api/v1/me/brief-delivery-time",{method:"PATCH",
+      headers:{"Content-Type":"application/json"},credentials:"same-origin",
+      body:JSON.stringify({delivery_time:t,delivery_timezone:tz})})
+    .then(function(r){return r.json();})
+    .then(function(d){bb.disabled=false;
+      if(d&&d.ok){say(bm,"Saved.","good");}
+      else{say(bm,(d&&d.error)||"That did not save.","bad");}})
+    .catch(function(){bb.disabled=false;
+      say(bm,"Could not reach us just now.","bad");});
+  };
+
+  Array.prototype.forEach.call(document.querySelectorAll("[data-rmloc]"),function(b){
+    b.onclick=function(){
+      if(!confirm("Stop watching "+(b.getAttribute("data-locname")||"this place")+"?"))return;
+      b.disabled=true;b.textContent="Removing...";
+      fetch("/api/v1/me/saved-locations/"+b.getAttribute("data-rmloc"),
+        {method:"DELETE",credentials:"same-origin"})
+      .then(function(r){return r.json();})
+      .then(function(d){if(d&&d.ok){location.reload();}
+        else{b.disabled=false;b.textContent="Remove";alert("Could not remove it.");}})
+      .catch(function(){b.disabled=false;b.textContent="Remove";
+        alert("Could not reach us just now.");});
+    };
+  });
+})();
+</script>"""
+
 
 _PEOPLE_SECTION = """
 <div class=head>People on your account</div>
@@ -25412,6 +25574,69 @@ def portal_account():
     # Only Pro subscribers see this. Everyone else gets nothing extra —
     # a Stormline customer has no people to manage and should not be
     # shown a section that only confuses them.
+    # ── Where we watch, and when the brief lands ──────────────────────
+    # First thing a Pro subscriber needs and, until today, the one thing
+    # they had no way to tell us.
+    places = ""
+    _t = (user.get("subscription_tier") or "").lower()
+    if _t in TEAM_ELIGIBLE_TIERS:
+        locs = []
+        brief_time = "07:00"
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT id, label, address_text, county, state, is_primary
+                           FROM saved_locations WHERE user_id = %s
+                           ORDER BY is_primary DESC, id""",
+                        (user["id"],),
+                    )
+                    locs = cur.fetchall() or []
+                    cur.execute(
+                        """SELECT daily_brief_time FROM subscriber_coverage
+                           WHERE user_id = %s""",
+                        (user["id"],),
+                    )
+                    row = cur.fetchone()
+                    if row and row.get("daily_brief_time"):
+                        brief_time = str(row["daily_brief_time"])[:5]
+        except Exception as e:
+            print(f"[portal-account] places lookup failed: {e!r}", flush=True)
+
+        prows = ""
+        for lo in locs:
+            where = _html_escape(lo.get("address_text") or "")
+            extra = ", ".join(x for x in [(lo.get("county") or ""),
+                                          (lo.get("state") or "")] if x)
+            if extra:
+                where += "<br>" + _html_escape(extra)
+            prows += (
+                '<div class=prow><div class=who><b>%s</b><i>%s</i></div>'
+                '<div class=act><span class="st%s">%s</span>'
+                '<button class=lnk data-rmloc="%d" data-locname="%s">Remove</button>'
+                '</div></div>'
+                % (_html_escape(lo.get("label") or "Saved place"), where,
+                   "" if lo.get("is_primary") else " pend",
+                   "Primary" if lo.get("is_primary") else "Also watched",
+                   int(lo["id"]),
+                   _html_escape(lo.get("label") or "this place")))
+
+        if not locs:
+            prows = ('<div class=empty>We do not have an address for you yet, so '
+                     'your Meteorologist has nothing to watch. Add the place you '
+                     'want covered and they will pick it up straight away.</div>')
+            psummary = ("Tell us where to look. It can be a full address or just "
+                        "the town and state.")
+        else:
+            psummary = ("Your Meteorologist watches %s."
+                        % ("this address" if len(locs) == 1
+                           else "these %d addresses" % len(locs)))
+
+        places = (_PLACES_SECTION
+                  .replace("__PROWS__", prows)
+                  .replace("__PSUMMARY__", psummary)
+                  .replace("__BRIEFTIME__", _html_escape(brief_time)))
+
     people = ""
     tier = (user.get("subscription_tier") or "").lower()
     if tier in TEAM_ELIGIBLE_TIERS:
@@ -25485,7 +25710,7 @@ def portal_account():
                     .replace("__SPA__", spa)
                     .replace("__GREETING__", greeting)
                     .replace("__BODY__", body)
-                    .replace("__PEOPLE__", people))
+                    .replace("__PEOPLE__", places + people))
 
 
 @app.errorhandler(404)
