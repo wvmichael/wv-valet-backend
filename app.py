@@ -82,7 +82,7 @@ import urllib.parse
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date as _date
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Optional
@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-307"
+BACKEND_BUILD = "0702-308"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -1003,6 +1003,36 @@ CREATE TABLE IF NOT EXISTS gameday_games (
 );
 
 ALTER TABLE gameday_passes ADD COLUMN IF NOT EXISTS game_id INTEGER;
+
+-- ── Sidekick goes generic (Oct 20, 2026) ──
+-- Sidekick began as Indiana football: eight home Saturdays, a $16 series
+-- pass, and a table whose columns say so (opponent, kickoff, game_no).
+-- It covers any outdoor event now — a county fair, a wedding, a 5K, a
+-- festival — so the rows need a name and a place rather than an opponent.
+--
+-- These columns are added to gameday_games rather than put in a new table
+-- on purpose: gameday_passes, gameday_broadcasts and gameday_reminder_log
+-- all key off game_id, and the Met console claims a game by that id. A
+-- second table would mean rewriting every one of them for no gain.
+--
+-- Old IU rows stay valid. title falls back to the opponent, place to the
+-- venue, so nothing that already sold breaks.
+ALTER TABLE gameday_games ADD COLUMN IF NOT EXISTS title TEXT;
+ALTER TABLE gameday_games ADD COLUMN IF NOT EXISTS place TEXT;
+ALTER TABLE gameday_games ADD COLUMN IF NOT EXISTS city TEXT;
+ALTER TABLE gameday_games ADD COLUMN IF NOT EXISTS state TEXT;
+ALTER TABLE gameday_games ADD COLUMN IF NOT EXISTS start_time TEXT;
+ALTER TABLE gameday_games ADD COLUMN IF NOT EXISTS end_time TEXT;
+ALTER TABLE gameday_games ADD COLUMN IF NOT EXISTS blurb TEXT;
+ALTER TABLE gameday_games ADD COLUMN IF NOT EXISTS created_by INTEGER;
+ALTER TABLE gameday_games ADD COLUMN IF NOT EXISTS created_at BIGINT;
+ALTER TABLE gameday_games ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+
+-- game_no was NOT NULL and unique per venue, which made sense for a fixed
+-- eight-game schedule and makes none for events added one at a time. Drop
+-- the requirement; existing rows keep their numbers.
+ALTER TABLE gameday_games ALTER COLUMN game_no DROP NOT NULL;
+ALTER TABLE gameday_games ALTER COLUMN opponent DROP NOT NULL;
 
 -- Consent record (Aug 17, 2026). Carriers and the TCPA both expect a
 -- provable opt-in per buyer: when they agreed, from what IP, and to which
@@ -5461,7 +5491,7 @@ def sitemap_xml():
         ("/home", "1.0"),
         ("/stormline", "0.9"),
         ("/stormlinedaily", "0.8"),
-        ("/gameday/iu", "0.9"),
+        ("/sidekick", "0.9"),
         ("/watch", "0.8"),
         ("/met-review", "0.8"),
         ("/pro", "0.9"),
@@ -13253,7 +13283,7 @@ WV_HEADER = """<header>
       <a href="/stormline"><b>Stormline</b><i>$12/yr</i></a>
       <a href="/stormlinedaily"><b>Stormline Daily</b><i>$24/yr</i></a>
       <h6>Meteorologists watch your plans</h6>
-      <a href="/gameday/iu"><b>Sidekick</b><i>$16/series</i></a>
+      <a href="/sidekick"><b>Sidekick</b><i>$5 an event</i></a>
       <a href="/met-review"><b>Met Review</b><i>$19</i></a>
       <a href="/watch"><b>Watch</b><i>$49/day &middot; one Met, one event</i></a>
       <a href="/pro"><b>Pro</b><i>from $99/mo</i></a>
@@ -13296,7 +13326,7 @@ WV_HEADER = """<header>
    <a href="/forecast">AI Forecast &middot; Free</a>
    <a href="/stormline">Stormline &middot; $12/yr</a>
    <a href="/stormlinedaily">Stormline Daily &middot; $24/yr</a>
-   <a href="/gameday/iu">Sidekick &middot; $16/series</a>
+   <a href="/sidekick">Sidekick &middot; $5 an event</a>
    <a href="/met-review">Met Review &middot; $19</a>
    <a href="/watch">Watch &middot; $49/event day</a>
    <a href="/pro">Pro &middot; from $99/mo</a>
@@ -13315,7 +13345,7 @@ WV_FOOTER = """<footer>
      <a href="/forecast">AI Forecast</a>
      <a href="/stormline">Stormline</a>
      <a href="/stormlinedaily">Stormline Daily</a>
-     <a href="/gameday/iu">Sidekick</a>
+     <a href="/sidekick">Sidekick</a>
      <a href="/met-review">Met Review</a>
      <a href="/watch">Watch</a>
      <a href="/pro">Pro</a>
@@ -13578,7 +13608,7 @@ ul{padding-left:20px}li{margin-bottom:7px}
 </style></head><body>
 __WV_HEADER__
 <div class=wrap>
-<a class=back href="/gameday/iu">&larr; Back to WeatherValet Sidekick</a>
+<a class=back href="/sidekick">&larr; Back to WeatherValet Sidekick</a>
 <h1>WeatherValet Sidekick: Terms and Text Message Program</h1>
 <p class=eff>Effective August 17, 2026. These terms cover WeatherValet Sidekick passes specifically and
 sit alongside the general <a href="/terms">WeatherValet Terms of Service</a>
@@ -13688,329 +13718,223 @@ __WV_FOOTER__"""
 GAMEDAY_SEASON_CENTS = 1600
 GAMEDAY_SINGLE_CENTS = 500
 
-_GAMEDAY_IU_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
+_SIDEKICK_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>WeatherValet Sidekick - Indiana Football home games in Bloomington - $16 series pass</title>
-<link rel=preconnect href=https://fonts.googleapis.com>
-<link rel=preconnect href=https://fonts.gstatic.com crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;600;800&display=swap" rel=stylesheet>
+<title>Sidekick - a Meteorologist on your event day - WeatherValet</title>
+<meta name=description content="Five dollars puts a certified Meteorologist on your outdoor event: a morning read, live alerts while it runs, and the all-clear. Fairs, weddings, races, games.">
 <style>
 __WV_TOKENS__
-/* Sidekick keeps its crimson, but the header, footer and type come from the
-   shared shell so it belongs to the same company as everything else. */
-:root{--crim:#A6192E;--crim-deep:#7E1322;--night:#140A0C;--bolt:#FFCE44;
-  --accent:#A6192E;--cream:#F3EAD3}
-body{background:var(--night);color:var(--cream);font-size:17px}
-header{background:rgba(20,10,12,.85);border-bottom:1px solid rgba(243,234,211,.14)}
-header .logo span{color:var(--bolt)}
-.nl{color:#E6D8C4}
-.nl:hover{background:rgba(243,234,211,.09)}
-.dd{background:#1B0F12;border-color:rgba(243,234,211,.16)}
-.dd a{color:#EFE3CF}
-.dd a:hover{background:rgba(166,25,46,.3)}
-.dd h6,.dd a i{color:#B79A8E}
-.signin{color:#E6D8C4}
-.burger{border-color:rgba(243,234,211,.2)}
-#mnav{border-color:rgba(243,234,211,.14)}
-footer{background:#0E0709;border-color:rgba(243,234,211,.12);color:var(--cream)}
-footer h6{color:var(--bolt)}
-footer a{color:#B79A8E}
-.legal{border-color:rgba(243,234,211,.09);color:#8A6F73}
-.sec{padding:64px 0;border-top:1px solid rgba(243,234,211,.07)}
-.s-night{background:#140A0C}
-.s-crim{background:linear-gradient(180deg,#1B0D10 0%,#5A1220 55%,#2A0E14 100%)}
-.s-cream{background:linear-gradient(180deg,#F7F1E4 0%,#EDE2CD 100%);color:#231317}
-.s-cream h2,.s-cream h3,.s-cream b,.s-cream strong{color:#1B0F12}
-.s-cream p,.s-cream li{color:#5A4247}
-.inner{max-width:660px;margin:0 auto}
-.field{position:relative;overflow:hidden;background:
-  linear-gradient(180deg,rgba(20,10,12,0) 55%,rgba(20,10,12,.92) 100%),
-  radial-gradient(1200px 500px at 50% -180px,rgba(255,206,68,.20),rgba(255,206,68,0) 60%),
-  repeating-linear-gradient(90deg,rgba(243,234,211,.05) 0 2px,transparent 2px 96px),
-  linear-gradient(180deg,#5E0F1C,#7E1322 45%,#3A0910);
-  padding:36px 18px 34px;text-align:center}
-.brand{font-weight:800;font-size:19px;color:var(--cream);margin-bottom:4px}
-.pname{font-family:"Bebas Neue",Inter,Arial,sans-serif;font-size:clamp(44px,11vw,76px);
-  font-weight:400;letter-spacing:.02em;line-height:.95;margin:0 0 10px;color:var(--cream)}
-.brand .bolt{color:var(--bolt)}
-h1{font-family:'Bebas Neue',Inter,sans-serif;font-weight:400;letter-spacing:.015em;
-   font-size:clamp(62px,13vw,128px);line-height:.88;margin:22px 0 8px;color:var(--cream);text-transform:uppercase}
-h1 .pop{color:var(--bolt)}
-.sub{font-size:clamp(17px,2.8vw,20px);color:#EDD3D3;max-width:600px;margin:12px auto 0;line-height:1.55}
-.sub b{color:var(--cream)}
-.kick{display:inline-flex;align-items:center;gap:10px;margin-top:22px;background:var(--crim);
-  border:2px solid rgba(243,234,211,.35);border-radius:999px;padding:12px 26px;
-  font-family:'Bebas Neue';font-size:25px;letter-spacing:.06em;color:#fff}
-.how{max-width:600px;margin:26px auto 0;font-size:16.5px;line-height:1.6;color:#EDD3D3}
-.how b{color:var(--bolt)}
-.phone-wrap{margin:34px auto 0;max-width:410px;perspective:900px}
-.phone{background:#0D0D10;border:2px solid #2A2A30;border-radius:34px;padding:14px 12px 18px;
-  box-shadow:0 30px 60px rgba(0,0,0,.55),0 0 0 6px rgba(255,206,68,.06);
-  transform:rotateX(3deg);text-align:left}
-.notch{width:96px;height:9px;border-radius:9px;background:#2A2A30;margin:0 auto 12px}
-.thread-head{display:flex;align-items:center;gap:9px;padding:0 6px 10px;border-bottom:1px solid #23232A}
-.avatar{width:32px;height:32px;border-radius:50%;background:var(--crim);display:flex;align-items:center;justify-content:center;font-size:16px}
-.thread-head b{font-size:15px;color:#EDEDF2}
-.thread-head span{display:block;font-size:11.5px;color:#8B8B96}
-.msgs{padding:12px 4px 2px;display:flex;flex-direction:column;gap:9px}
-.stamp{align-self:center;font-size:11px;color:#7A7A86;letter-spacing:.06em;text-transform:uppercase}
-.msg{max-width:90%;background:#1D1D24;border-radius:15px 15px 15px 5px;padding:10px 13px;font-size:14.5px;line-height:1.5;color:#EAEAF0;
-  opacity:0;transform:translateY(8px);animation:pop .45s ease forwards}
-.msg b{color:var(--bolt);font-weight:800}
-.msg.alert{background:#3A1016;border:1px solid #6E1B27}
-.msg.clear{background:#12251A;border:1px solid #1E4D30}
-@keyframes pop{to{opacity:1;transform:none}}
-@media (prefers-reduced-motion: reduce){.msg{animation:none;opacity:1;transform:none}}
-.row3{display:flex;justify-content:center;gap:26px;flex-wrap:wrap;margin:32px auto 4px;max-width:680px}
-.f{display:flex;flex-direction:column;align-items:center;gap:7px;width:170px}
-.f svg{width:36px;height:36px}
-.f span{font-family:'Bebas Neue';font-size:22px;letter-spacing:.08em;color:var(--cream)}
-.f small{font-size:14px;color:#E0BABA;line-height:1.45}
-.ticketzone{background:var(--night);padding:40px 16px 20px}
-.pricing-line{text-align:center;font-size:17px;color:var(--cream);max-width:560px;margin:0 auto 24px;line-height:1.6}
-.pricing-line b{color:var(--bolt)}
-.ticket{position:relative;max-width:540px;margin:0 auto;background:var(--cream);color:var(--ink);
-  border-radius:16px;padding:28px 28px 24px;
-  box-shadow:0 18px 50px rgba(0,0,0,.5)}
-.ticket:before,.ticket:after{content:"";position:absolute;top:50%;width:26px;height:26px;border-radius:50%;background:var(--night);transform:translateY(-50%)}
-.ticket:before{left:-13px}.ticket:after{right:-13px}
-.t-head{display:flex;justify-content:space-between;align-items:baseline;border-bottom:2px dashed rgba(27,20,22,.28);padding-bottom:12px;margin-bottom:14px}
-.t-head .tt{font-family:'Bebas Neue';font-size:33px;letter-spacing:.05em}
-.t-head .pr{font-family:'Bebas Neue';font-size:33px;color:var(--crim)}
-.t-sub{font-size:14px;color:#5B4A4E;margin:-8px 0 14px;letter-spacing:.05em;text-transform:uppercase;font-weight:600}
-.gp{display:flex;align-items:center;gap:10px;margin:0 0 7px;font-size:15px;font-weight:600;letter-spacing:0;
-  text-transform:none;color:#3A2A2E;cursor:pointer}
-.gp:last-child{margin-bottom:0}
-.gp input{width:auto;margin:0;flex:0 0 auto;transform:scale(1.3);accent-color:#A6192E}
-.gp-h{font-size:12.5px;font-weight:800;letter-spacing:.07em;text-transform:uppercase;color:#6E5A5F;margin:0 0 8px}
-.nonaffil{font-size:12.5px;line-height:1.55;color:#6B5F62;margin:14px 0 4px;
-  padding:10px 12px;border:1px solid rgba(27,20,22,.18);border-radius:8px;
-  background:rgba(27,20,22,.03)}
-.consent{display:flex;gap:10px;align-items:flex-start;margin:16px 0 2px;font-size:12.8px;line-height:1.5;
-  font-weight:500;letter-spacing:0;text-transform:none;color:#4A383C;cursor:pointer}
-.consent input{width:auto;margin:2px 0 0;flex:0 0 auto;transform:scale(1.25);accent-color:#A6192E}
-.consent a{color:#A6192E}
-label{display:block;font-size:12.5px;font-weight:800;letter-spacing:.07em;text-transform:uppercase;color:#6E5A5F;margin:12px 0 4px}
-/* Cream fields on the crimson page are deliberate; this is the one warm
-   product. They get the same hover and focus behaviour as the blue pages
-   so the whole family feels like one company. */
-input{width:100%;box-sizing:border-box;padding:14px 15px;border:1.5px solid rgba(27,20,22,.22);
-  border-radius:10px;font-size:17px;background:#FFFDF7;color:var(--ink);
-  transition:border-color .18s,box-shadow .18s}
-input::placeholder{color:#9B8E7E}
-input:hover{border-color:rgba(166,25,46,.45)}
-input:focus{outline:none;border-color:var(--crim);box-shadow:0 0 0 3px rgba(166,25,46,.25)}
-#g-go{box-shadow:0 12px 30px -12px rgba(166,25,46,.9);
-  transition:transform .18s,box-shadow .18s,filter .18s}
-#g-go:hover{filter:brightness(1.08);transform:translateY(-1px);
-  box-shadow:0 16px 38px -12px rgba(166,25,46,1)}
-#g-go:active{transform:translateY(0)}
-#g-go:disabled{opacity:.55;transform:none;box-shadow:none}
-button{width:100%;margin-top:18px;background:var(--crim);color:#fff;border:none;border-radius:10px;padding:16px;
-  font-family:'Bebas Neue';font-size:26px;letter-spacing:.07em;cursor:pointer}
-button:hover{background:var(--crim-deep)}
-button:disabled{opacity:.6}
-.fine{font-size:13px;color:#7A686C;margin-top:12px;line-height:1.6;text-align:center}
-.err{display:none;background:#FBE3E3;border:1px solid #E3A9A9;color:#7E1322;border-radius:8px;padding:10px 12px;margin-top:12px;font-size:15px}
-.why{max-width:560px;margin:36px auto 0;padding:0 6px}
-.why h2{font-family:'Bebas Neue';font-size:34px;letter-spacing:.05em;color:var(--cream);text-align:center;margin:0 0 16px}
-/* Inside the cream room, cream text would be invisible. The room wins. */
-.s-cream .why h2{color:#1B0F12}
-.s-cream .why li,.s-cream .why li b{color:#3A2429}
-.s-cream .why li b{font-weight:700}
-.why ul{list-style:none;padding:0;margin:0}
-.why li{padding:10px 0 10px 36px;position:relative;font-size:16.5px;line-height:1.55;color:#EDD3D3;border-bottom:1px solid rgba(243,234,211,.1)}
-.why li:last-child{border-bottom:none}
-.why li:before{content:"⚡";position:absolute;left:4px;color:var(--bolt)}
-.why li b{color:var(--cream)}
-.foot{text-align:center;font-size:13px;color:#8A6F73;padding:26px 18px 36px;line-height:1.7}
-.foot a{color:#C89AA1}
+:root{--accent:#1E6BFF}
+.sk-wrap{max-width:720px;margin:0 auto;padding:46px 22px 90px}
+.sk-lede{font-size:clamp(30px,5.2vw,46px);line-height:1.1;font-weight:900;
+  letter-spacing:-.035em;margin:0 0 14px;max-width:15ch}
+.sk-sub{font-size:17.5px;line-height:1.6;color:#C6D6F0;margin:0;max-width:52ch}
+.sk-sub b{color:#fff;font-weight:700}
+
+/* The one warm moment on the page: a horizon at daybreak, directly above
+   the list of days somebody is about to buy. Used once, nowhere else. */
+.dawn{height:3px;margin:38px 0 0;border-radius:2px;
+  background:linear-gradient(90deg,#17204A 0%,#2B3A7A 28%,#8C5BD8 54%,#FF9A3C 82%,#FFC46B 100%)}
+.dawn-cap{font-size:13.5px;color:#8FA3BE;margin:11px 0 20px}
+
+/* Event rows. Rules, not cards: this is a list you read down, and eight
+   identical shadowed boxes would hide the dates that matter. */
+.gp{display:grid;grid-template-columns:58px 1fr 30px;gap:16px;align-items:center;
+  padding:17px 4px;border-top:1px solid rgba(255,255,255,.1);cursor:pointer}
+.gp:last-of-type{border-bottom:1px solid rgba(255,255,255,.1)}
+.gp:hover{background:rgba(30,107,255,.07)}
+.gp input{appearance:none;-webkit-appearance:none;width:23px;height:23px;margin:0;
+  border:1.5px solid rgba(255,255,255,.38);border-radius:7px;cursor:pointer;
+  position:relative;background:transparent;justify-self:end}
+.gp input:checked{background:var(--blue);border-color:var(--blue)}
+.gp input:checked:after{content:"";position:absolute;left:7.5px;top:3.5px;width:5px;height:10px;
+  border:solid #fff;border-width:0 2.5px 2.5px 0;transform:rotate(42deg)}
+.gp input:focus-visible{outline:2px solid #fff;outline-offset:2px}
+.gp span{min-width:0}
+.gp b{display:block;font-size:17.5px;font-weight:700;letter-spacing:-.015em;color:#fff}
+.gp i{display:block;font-style:normal;font-size:14.5px;color:#9FB0C8;margin-top:3px;
+  overflow-wrap:anywhere}
+/* Date block: a tear-off calendar leaf. Tabular figures so the columns
+   line up down the list. */
+.dchip{text-align:center;font-variant-numeric:tabular-nums;line-height:1}
+.dchip em{display:block;font-style:normal;font-size:11px;font-weight:800;
+  letter-spacing:.1em;color:#FF9A3C}
+.dchip strong{display:block;font-size:27px;font-weight:900;color:#fff;margin-top:3px;
+  letter-spacing:-.04em}
+.noev{border:1px dashed rgba(126,182,255,.32);border-radius:14px;padding:24px;
+  color:#C6D6F0;font-size:15.5px;line-height:1.65}
+.noev a{color:var(--sky);font-weight:700;text-decoration:underline}
+
+/* Tally. Inert until something is ticked, and it says so. */
+.tally{display:flex;align-items:baseline;justify-content:space-between;gap:14px;
+  margin:26px 0 6px;flex-wrap:wrap}
+.tally .n{font-size:15.5px;color:#9FB0C8}
+.tally .amt{font-size:34px;font-weight:900;letter-spacing:-.04em;
+  font-variant-numeric:tabular-nums}
+.buy{margin-top:16px}
+.buy input[type=text],.buy input[type=email],.buy input[type=tel]{
+  width:100%;box-sizing:border-box;background:#070A11;color:#fff;font-size:16px;
+  font-family:inherit;border:1.5px solid rgba(255,255,255,.17);border-radius:11px;
+  padding:13px 14px;margin-bottom:11px}
+.buy input:focus{outline:none;border-color:var(--blue)}
+.cons{display:flex;gap:11px;align-items:flex-start;font-size:13.5px;line-height:1.55;
+  color:#9FB0C8;margin:4px 0 16px;cursor:pointer}
+.cons input{margin:2px 0 0;width:17px;height:17px;flex:0 0 auto;accent-color:var(--blue)}
+.cons a{color:var(--sky);text-decoration:underline}
+.go{width:100%;background:var(--blue);color:#fff;font-size:17px;font-weight:800;
+  font-family:inherit;border:none;border-radius:12px;padding:16px;cursor:pointer}
+.go:disabled{background:rgba(255,255,255,.08);color:#7B8AA3;cursor:default}
+.err{color:#FF9AA8;font-size:14.5px;margin-top:11px;display:none;line-height:1.55}
+
+/* What you get: a real sequence through one day, so it is a time rail
+   with clock positions rather than three numbered boxes. */
+.rail{margin:54px 0 0;padding:0;list-style:none;position:relative}
+.rail:before{content:"";position:absolute;left:6px;top:10px;bottom:16px;width:1.5px;
+  background:linear-gradient(180deg,#FF9A3C,#1E6BFF 46%,rgba(30,107,255,.15))}
+.rail li{position:relative;padding:0 0 26px 30px}
+.rail li:before{content:"";position:absolute;left:0;top:7px;width:13px;height:13px;
+  border-radius:50%;background:#070A11;border:2.5px solid var(--blue)}
+.rail li:first-child:before{border-color:#FF9A3C}
+.rail h3{margin:0 0 4px;font-size:16.5px;font-weight:800;letter-spacing:-.01em;color:#fff}
+.rail p{margin:0;font-size:15px;line-height:1.65;color:#B8C7DE;max-width:56ch}
+.rail .t{font-size:12.5px;font-weight:800;letter-spacing:.07em;color:#8FA3BE;
+  display:block;margin-bottom:5px;font-variant-numeric:tabular-nums}
+.sk-foot{margin-top:46px;padding-top:22px;border-top:1px solid rgba(255,255,255,.1);
+  font-size:13.5px;line-height:1.7;color:#8FA3BE}
+.sk-foot a{color:var(--sky);text-decoration:underline}
+@media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 </style></head><body>
 __WV_HEADER__
+<div class=sk-wrap>
+  <h1 class=sk-lede>Someone should be watching your sky.</h1>
+  <p class=sk-sub>Five dollars puts a certified Meteorologist on one outdoor day
+  of yours. They read it in the morning, text you if it turns while you are out
+  there, and tell you when it is done. <b>Not an app. A person.</b></p>
 
-<div class=field>
-  <div class=brand><span class=bolt>&#9889;</span> WeatherValet</div>
-  <div class=pname>Sidekick</div>
-  <h1>Rain or shine,<br>know before <span class=pop>kickoff.</span></h1>
-  <p class=sub>A certified Meteorologist on your side for <b>every home football Saturday in
-  Bloomington</b>. Messaged to you live: tailgate outlook, storm alerts, radar updates, the all-clear.</p>
-  <div class=kick>&#127944; Series pass: all 8 home games, $16 &middot; Single game, $5</div>
-  <p class=how>How it works: <b>the Meteorologist's outlook the evening before</b>, a <b>morning brief</b>
-  on game day, and <b>live updates as needed</b> through the day. Hopefully it stays ALL CLEAR, but if the
-  sky has other plans, your Meteorologist messages you as it happens.</p>
+  <div class=dawn role=presentation></div>
+  <p class=dawn-cap>Pick the days you want covered.</p>
 
-  <div class=phone-wrap>
-    <div class=phone aria-hidden=true>
-      <div class=notch></div>
-      <div class=thread-head>
-        <div class=avatar>&#9889;</div>
-        <div><b>WeatherValet Sidekick</b><span>Bloomington</span></div>
-      </div>
-      <div class=msgs>
-        <div class=stamp>Friday 4:30 PM</div>
-        <div class=msg style="animation-delay:.1s">Tomorrow's outlook for Bloomington: <b>dry morning for the tailgate</b>, a line of storms possible mid-afternoon, clearing by evening. I'll be watching it all day for you. &mdash; your WeatherValet Meteorologist</div>
-        <div class=stamp>Saturday 9:02 AM</div>
-        <div class=msg style="animation-delay:.4s">Morning, Bloomington. <b>Tailgate looks dry until about 2 PM.</b> That line of storms is west of Terre Haute, moving east. More from me as it develops. &mdash; your WeatherValet Meteorologist</div>
-        <div class=stamp>2:14 PM</div>
-        <div class="msg alert" style="animation-delay:.7s"><b>Lightning within 8 miles of the stadium.</b> The rain is close behind it, moving in from the west. Looks like a solid soaking, not an all-afternoon washout.</div>
-        <div class=stamp>2:52 PM</div>
-        <div class=msg style="animation-delay:1.0s">Rain is <b>down to sprinkles</b> and the back edge is nearly on us. Nearly done.</div>
-        <div class=stamp>3:05 PM</div>
-        <div class="msg clear" style="animation-delay:1.3s"><b>All clear.</b> The line is east of campus. Rest of the game looks dry. Enjoy it.</div>
-        <div class=stamp>6:48 PM</div>
-        <div class=msg style="animation-delay:1.6s"><b>Dry drive home</b> in all directions. See you next game. &#9889;</div>
-      </div>
-    </div>
+  <form id=skform>
+  <!--WV_GAMEPICKER-->
+
+  <div class=tally>
+    <span class=n id=tally-n>Nothing picked yet</span>
+    <span class=amt id=tally-amt>$0</span>
   </div>
 
-  <div class=row3>
-    <div class=f>
-      <svg viewBox="0 0 24 24" fill="none" stroke="#FFCE44" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4.4" fill="#FFCE44" stroke="none"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.2 5.2l2.1 2.1M16.7 16.7l2.1 2.1M18.8 5.2l-2.1 2.1M7.3 16.7l-2.1 2.1"/></svg>
-      <span>Day-before + morning</span>
-      <small>The outlook the evening before, the brief that morning</small>
-    </div>
-    <div class=f>
-      <svg viewBox="0 0 24 24" fill="#FFCE44"><path d="M13 2 4.5 13.5h5L10 22l8.5-11.5h-5L13 2z"/></svg>
-      <span>Live storm alerts</span>
-      <small>Lightning nearby, when rain starts, and when it stops</small>
-    </div>
-    <div class=f>
-      <svg viewBox="0 0 24 24" fill="none" stroke="#7BD48E" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg>
-      <span>The all-clear</span>
-      <small>So nobody's refreshing radar in the student section</small>
-    </div>
+  <div class=buy>
+    <input type=text id=g-name placeholder="Your name" autocomplete=name>
+    <input type=email id=g-email placeholder="Email for the receipt" autocomplete=email>
+    <input type=tel id=g-phone placeholder="Mobile number for the texts" autocomplete=tel>
+    <label class=cons><input type=checkbox id=g-consent>
+      <span>Text me about the days I picked. Message and data rates may apply,
+      message frequency varies, reply STOP to stop. See the
+      <a href="/gameday/terms">terms</a>.</span></label>
+    <button type=submit class=go id=g-go disabled>Pick a day above</button>
+    <div class=err id=g-err></div>
   </div>
+  </form>
+
+  <ol class=rail>
+    <li><span class=t>MORNING</span>
+      <h3>A read on your day, in plain words</h3>
+      <p>Not a percentage. Your Meteorologist tells you what the day is going
+      to do where you are standing, and what they would do about it.</p></li>
+    <li><span class=t>WHILE IT RUNS</span>
+      <h3>A text the moment it turns</h3>
+      <p>They are watching radar over your spot, not a county. If something is
+      coming, you hear about it with time to move people.</p></li>
+    <li><span class=t>AFTER</span>
+      <h3>The all-clear</h3>
+      <p>The part nobody else gives you. When it has passed and it is safe to
+      go back out, they say so.</p></li>
+  </ol>
+
+  <p class=sk-foot>Five dollars per day, per event. No subscription, no app,
+  nothing to install. Coverage runs from the morning of the day through the end
+  of it. WeatherValet is an independent service and is not affiliated with any
+  school, venue or event named here.<br>
+  Running an event and want it listed? <a href="/contact">Tell us about it.</a></p>
 </div>
-
-<section class="sec s-crim"><div class=wrap><div class=inner>
-<div class=ticketzone>
-  <p class=pricing-line><b>Series pass: all 8 Bloomington home football Saturdays for $16 total.</b><br>
-  Or cover a single game for $5. That's it. No subscription, no app.</p>
-  <div class=ticket>
-    <div class=t-head><span class=tt id=t-title>Series Pass</span><span class=pr id=t-price>$16</span></div>
-    <div class=t-sub id=t-sub>Bloomington &middot; 8 home games &middot; one-time</div>
-    <div style="display:flex;gap:8px;margin-bottom:4px;">
-      <button type=button id=opt-season style="flex:1;margin-top:0;padding:11px;font-size:18px;background:#A6192E;">Series &middot; $16</button>
-      <button type=button id=opt-single style="flex:1;margin-top:0;padding:11px;font-size:18px;background:#FFFDF7;color:#7E1322;border:1.5px solid #A6192E;">Pick games &middot; $5</button>
-    </div>
-    <div id=gamepick style="display:none;margin:10px 0 2px;border:1.5px solid rgba(27,20,22,.22);
-      border-radius:9px;padding:12px 13px;background:#FFFDF7">
-      <div class=gp-h>Pick your game or games &middot; $5 each</div>
-      <!--WV_GAMEPICKER-->
-    </div>
-    <div id=err class=err></div>
-    <label for=g-name>Name</label><input id=g-name autocomplete=name>
-    <label for=g-email>Email</label><input id=g-email type=email autocomplete=email>
-    <label for=g-phone>Mobile (where your messages go)</label><input id=g-phone type=tel autocomplete=tel placeholder="812-555-0123">
-    <label class=consent for=g-consent><input type=checkbox id=g-consent>
-      <span>I agree to receive WeatherValet Sidekick text messages at the number above:
-      the Meteorologist's outlook the evening before, a game day morning brief, live updates if weather
-      threatens the game window, and the all-clear. Frequency varies with the weather, usually two to six
-      messages per game. Message and data rates may apply. Reply STOP to cancel, HELP for help. Text
-      delivery depends on your carrier and is not guaranteed. I agree to the
-      <a href="/gameday/terms" target="_blank" rel=noopener>Sidekick Terms</a> and
-      <a href="/privacy" target="_blank" rel=noopener>Privacy Policy</a>.</span></label>
-    <p class=nonaffil>WeatherValet is an independent weather service. We are not affiliated
-    with, sponsored by, or endorsed by Indiana University or any school.</p>
-    <button id=g-go>Claim my series pass</button>
-    <div class=fine>The series pass covers all 8 home games starting with the opener (including the Friday
-    night game); single passes cover only the games you check above. One-time payment via Stripe.
-    Group of tailgaters? Everyone needs their own pass.</div>
-  </div>
-
-  </div></div></div></section>
-<section class="sec s-cream"><div class=wrap><div class=inner>
-<div class=why>
-    <h2>Why fans sign up</h2>
-    <ul>
-      <li><b>Plan the tailgate with confidence.</b> You'll know the dry window before you load the truck.</li>
-      <li><b>Know what the sky is doing.</b> When lightning is near, you'll hear it from a Meteorologist watching your day.</li>
-      <li><b>Straight talk about the rain.</b> Whether it is worth waiting out, and when a Meteorologist thinks it is easing.</li>
-      <li><b>No app, no radar-squinting.</b> Plain texts on any phone, written by a certified Meteorologist, not an algorithm.</li>
-      <li><b>The drive home, covered too.</b> The day isn't over at the final whistle.</li>
-      <li><b>Two dollars a game.</b> All 8 home games for $16. Cheaper than one stadium bottle of water.</li>
-    </ul>
-  </div>
-
-    <p style="text-align:center;font-size:13px;color:#6B5257;margin:26px auto 0;max-width:560px;line-height:1.7">
-    <a href="/gameday/terms" style="color:#8A1F32">Sidekick Terms and text message program</a>
-    &middot; <a href="/privacy" style="color:#8A1F32">Privacy</a><br>
-    WeatherValet is an independent weather service, not affiliated with or endorsed by
-    Indiana University.</p>
-</div></div></section>
-
+__WV_FOOTER__
 <script>
-var PASS = { type: 'season' };
-try { PASS.ref = new URLSearchParams(location.search).get('ref') || ''; } catch (e) { PASS.ref = ''; }
-function gpBoxes(){ return Array.prototype.slice.call(document.querySelectorAll('.gpick')); }
-function gpChosen(){
-  var out = [];
-  gpBoxes().forEach(function(b){ if (b.checked) { out.push(parseInt(b.value, 10)); } });
-  return out;
-}
-function setType(t){
-  PASS.type = t;
-  var s = document.getElementById('opt-season'), g = document.getElementById('opt-single');
-  var seasonOn = (t === 'season');
-  s.style.background = seasonOn ? '#A6192E' : '#FFFDF7'; s.style.color = seasonOn ? '#fff' : '#7E1322';
-  s.style.border = seasonOn ? 'none' : '1.5px solid #A6192E';
-  g.style.background = seasonOn ? '#FFFDF7' : '#A6192E'; g.style.color = seasonOn ? '#7E1322' : '#fff';
-  g.style.border = seasonOn ? '1.5px solid #A6192E' : 'none';
-  var pick = document.getElementById('gamepick');
-  if (pick) { pick.style.display = seasonOn ? 'none' : 'block'; }
-  var n = seasonOn ? 0 : gpChosen().length;
-  var shown = n || 1;
-  document.getElementById('t-title').textContent = seasonOn
-    ? 'Series Pass' : (n > 1 ? (n + ' Single Games') : 'Single Game');
-  document.getElementById('t-price').textContent = seasonOn ? '$16' : ('$' + (5 * shown));
-  document.getElementById('t-sub').textContent = seasonOn
-    ? 'Bloomington · 8 home games · one-time'
-    : ('Bloomington · ' + shown + (shown > 1 ? ' home games' : ' home game') + ' · one-time');
-  document.getElementById('g-go').textContent = seasonOn
-    ? 'Claim my series pass'
-    : (n > 1 ? ('Cover me for these ' + n + ' games') : 'Cover me for this game');
-}
-document.getElementById('opt-season').addEventListener('click', function(){ setType('season'); });
-document.getElementById('opt-single').addEventListener('click', function(){ setType('single'); });
-gpBoxes().forEach(function(b){ b.addEventListener('change', function(){ setType('single'); }); });
-document.getElementById('g-go').addEventListener('click', function(){
-  var btn = this; btn.disabled = true; btn.textContent = 'One moment...';
-  var err = document.getElementById('err'); err.style.display = 'none';
-  var consent = document.getElementById('g-consent');
-  if (!consent || !consent.checked) {
-    err.textContent = 'Please check the box agreeing to receive Sidekick text messages.';
-    err.style.display = 'block'; btn.disabled = false; setType(PASS.type); return;
-  }
-  var chosen = (PASS.type === 'single') ? gpChosen() : [];
-  if (PASS.type === 'single' && chosen.length === 0) {
-    err.textContent = 'Pick at least one home game above.';
-    err.style.display = 'block'; btn.disabled = false; setType('single'); return;
-  }
-  fetch('/api/v1/gameday/checkout', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      name: document.getElementById('g-name').value,
-      email: document.getElementById('g-email').value,
-      phone: document.getElementById('g-phone').value,
-      pass_type: PASS.type,
-      game_ids: chosen,
-      consent: true,
-      consent_version: 'gameday-2026-08-17',
-      ref: PASS.ref,
-      venue: 'iu'
-    })
-  }).then(function(r){ return r.json(); }).then(function(d){
-    if (d.ok && d.url) { window.location.href = d.url; return; }
-    err.textContent = d.error || 'Something went wrong. Check the fields and try again.';
-    err.style.display = 'block'; btn.disabled = false; setType(PASS.type);
-  }).catch(function(){
-    err.textContent = 'Connection problem. Try again.';
-    err.style.display = 'block'; btn.disabled = false; setType(PASS.type);
-  });
-});
-</script>
+(function(){
+  var PRICE = 5;
+  var form = document.getElementById("skform"),
+      go = document.getElementById("g-go"),
+      err = document.getElementById("g-err"),
+      tn = document.getElementById("tally-n"),
+      ta = document.getElementById("tally-amt");
+  var REF = (new URLSearchParams(window.location.search).get("ref") || "").trim();
 
-__WV_FOOTER__"""
+  function picked(){
+    return Array.prototype.slice.call(document.querySelectorAll(".gpick:checked"))
+      .map(function(b){ return parseInt(b.value, 10); })
+      .filter(function(n){ return n > 0; });
+  }
+  function retally(){
+    var n = picked().length;
+    ta.textContent = "$" + (n * PRICE);
+    if(n === 0){
+      tn.textContent = "Nothing picked yet";
+      go.disabled = true; go.textContent = "Pick a day above";
+    } else {
+      tn.textContent = n + (n === 1 ? " day covered" : " days covered");
+      go.disabled = false;
+      go.textContent = n === 1 ? "Cover my day - $5" : "Cover my days - $" + (n * PRICE);
+    }
+  }
+  Array.prototype.forEach.call(document.querySelectorAll(".gpick"), function(b){
+    b.addEventListener("change", retally);
+  });
+  retally();
+
+  // Nothing on sale: a name-and-card form nobody can submit is clutter, and
+  // "Pick the days you want covered" directly contradicts the empty notice
+  // sitting under it. Show the invitation on its own.
+  if(document.querySelectorAll(".gpick").length === 0){
+    var buy = document.querySelector(".buy"),
+        tally = document.querySelector(".tally"),
+        cap = document.querySelector(".dawn-cap");
+    if(buy){ buy.style.display = "none"; }
+    if(tally){ tally.style.display = "none"; }
+    if(cap){ cap.textContent = "Nothing is on the calendar at the moment."; }
+  }
+
+  form.addEventListener("submit", function(e){
+    e.preventDefault();
+    err.style.display = "none";
+    var chosen = picked();
+    if(!chosen.length){ return; }
+    if(!document.getElementById("g-consent").checked){
+      err.textContent = "Tick the box so we are allowed to text you.";
+      err.style.display = "block"; return;
+    }
+    go.disabled = true; go.textContent = "Taking you to checkout...";
+    fetch("/api/v1/gameday/checkout", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        name: document.getElementById("g-name").value,
+        email: document.getElementById("g-email").value,
+        phone: document.getElementById("g-phone").value,
+        pass_type: "single",
+        game_ids: chosen,
+        consent: true,
+        consent_version: "gameday-2026-08-17",
+        ref: REF
+      })
+    }).then(function(r){ return r.json(); }).then(function(d){
+      if(d.ok && d.url){ window.location.href = d.url; return; }
+      err.textContent = d.error || "Something went wrong. Check the fields and try again.";
+      err.style.display = "block"; retally();
+    }).catch(function(){
+      err.textContent = "Connection problem. Try again.";
+      err.style.display = "block"; retally();
+    });
+  });
+})();
+</script>
+"""
 
 
 @app.get("/gameday/terms")
@@ -14019,19 +13943,29 @@ def gameday_terms_page():
 
 
 @app.get("/sidekick")
-@app.get("/sidekick/iu")
-@app.get("/onduty")
-@app.get("/onduty/iu")
-def _onduty_alias():
-    """New product name, same page. The printed flyer and its QR code point
-    at /gameday/iu, so that path lives forever; this is the name people will
-    type after the rename."""
-    return redirect("/gameday/iu", code=302)
+def sidekick_page():
+    """Sidekick: a Meteorologist on one outdoor day.
+
+    Oct 20, 2026 — this is now the page, and /gameday/iu redirects here.
+    It used to be the other way around: the real page lived at /gameday/iu,
+    was painted in Indiana crimson, and sold eight home football Saturdays.
+    When the season ended it had nothing to sell, which is a strange thing
+    for a weather company in a country that holds fairs, weddings, races and
+    festivals all year.
+    """
+    return wv_shell(_SIDEKICK_PAGE.replace("<!--WV_GAMEPICKER-->",
+                                           _gameday_picker_html()))
 
 
 @app.get("/gameday/iu")
-def gameday_iu_page():
-    return wv_shell(_GAMEDAY_IU_PAGE.replace("<!--WV_GAMEPICKER-->", _gameday_picker_html()))
+@app.get("/sidekick/iu")
+@app.get("/onduty")
+@app.get("/onduty/iu")
+def _sidekick_alias():
+    """Old paths. The printed flyer and its QR code point at /gameday/iu,
+    so that path has to live forever — it just lands on the general page
+    now instead of a football-only one."""
+    return redirect("/sidekick", code=302)
 
 
 @app.route("/api/v1/gameday/checkout", methods=["OPTIONS"])
@@ -14045,7 +13979,11 @@ def gameday_checkout():
     name = (data.get("name") or "").strip()[:120]
     email = (data.get("email") or "").strip()[:200]
     phone = _normalize_phone((data.get("phone") or "").strip())
-    pass_type = "single" if (data.get("pass_type") or "") == "single" else "season"
+    # Oct 20, 2026: Sidekick sells per event now. The season pass was eight
+    # Indiana home Saturdays for $16 — a bundle that only means something
+    # when there is a fixed schedule, and there is not one any more. Passes
+    # already sold as 'season' keep working; we just stop minting new ones.
+    pass_type = "single"
     ref_code = (data.get("ref") or "").strip().lower()[:40] or None
     if ref_code and not re.fullmatch(r"[a-z0-9_-]+", ref_code):
         ref_code = None
@@ -14057,7 +13995,7 @@ def gameday_checkout():
     # to be able to prove who agreed to texts, when, and to what wording.
     if not bool(data.get("consent")):
         return jsonify({"ok": False,
-                        "error": "Please check the box agreeing to receive GameDay text messages."}), 400
+                        "error": "Tick the box so we are allowed to text you."}), 400
     consent_ip = ((request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
                    or request.remote_addr or "")[:64])
     consent_ua = (request.headers.get("User-Agent", "") or "")[:300]
@@ -14097,20 +14035,22 @@ def gameday_checkout():
                          (venue, name, email, phone, pass_type, amount_cents, ref_code, game_id,
                           consent_at, consent_ip, consent_version, consent_user_agent,
                           created_at, updated_at)
-                       VALUES ('iu',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                       VALUES ('event',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
                     (name, email, phone, pass_type, unit_amount, ref_code, game_id,
                      now_ms, consent_ip, GAMEDAY_TERMS_VERSION, consent_ua,
                      now_ms, now_ms))
                 pass_ids.append(cur.fetchone()["id"])
     pass_id = pass_ids[0]
-    if pass_type == "single":
-        picks = [(g.get("d") or "") for g in game_rows]
-        line_name = ("WeatherValet Sidekick - single home game" if quantity == 1
-                     else "WeatherValet Sidekick - %d single home games" % quantity)
-        line_desc = ("; ".join(picks) if quantity <= 4 else "%d home games" % quantity)
-    else:
-        line_name = "WeatherValet Sidekick - Bloomington series pass"
-        line_desc = "All 8 home football games"
+    # The Stripe line is what shows on their card statement and receipt, so
+    # it names the actual events rather than a count.
+    picks = []
+    for g in game_rows:
+        label = (g.get("title") or "Event").strip()
+        d = (g.get("d") or "").strip()
+        picks.append("%s (%s)" % (label, d) if d else label)
+    line_name = ("WeatherValet Sidekick - one event" if quantity == 1
+                 else "WeatherValet Sidekick - %d events" % quantity)
+    line_desc = ("; ".join(picks) if quantity <= 4 else "%d events" % quantity)
     if not stripe:
         return jsonify({"ok": False, "error": "Payments aren't configured yet."}), 503
     try:
@@ -14123,7 +14063,7 @@ def gameday_checkout():
                     "unit_amount": unit_amount,
                     "product_data": {
                         "name": line_name,
-                        "description": (line_desc + ": Meteorologist gameday-morning outlook, live weather alerts during the game window, all-clear. Independent service; not affiliated with Indiana University.")
+                        "description": (line_desc + ": a Meteorologist reads your morning, texts you if the weather turns while you are out there, and sends the all-clear. Independent service; not affiliated with any school, venue or event named here.")
                     },
                 },
             }],
@@ -14333,53 +14273,153 @@ def _seed_gameday_games() -> None:
                            VALUES ('iu',%s,%s,%s,%s,%s)
                            ON CONFLICT (venue, game_no) DO NOTHING""",
                         (no, opp, gdate, kick, tv))
+
+                # Oct 20, 2026: give the football rows the generic fields the
+                # public list now reads. Without this they render as a bare
+                # opponent with no town next to fully-described events like
+                # "Boone County Fair, Lebanon, IN" — which reads as broken
+                # data rather than a football game.
+                #
+                # Only fills what is empty, so a corrected title or a kickoff
+                # time set on the console is never stamped back over.
+                cur.execute(
+                    """UPDATE gameday_games
+                       SET title = COALESCE(NULLIF(title,''),
+                                            'Indiana vs ' || opponent),
+                           place = COALESCE(NULLIF(place,''), 'Memorial Stadium'),
+                           city  = COALESCE(NULLIF(city,''),  'Bloomington'),
+                           state = COALESCE(NULLIF(state,''), 'IN'),
+                           start_time = COALESCE(NULLIF(start_time,''),
+                                                 NULLIF(kickoff,''))
+                       WHERE venue = 'iu' AND opponent IS NOT NULL""")
         print("[gameday] season seed pass complete", flush=True)
     except Exception as e:
         print(f"[gameday] season seed failed: {e!r}", flush=True)
 
 
 def _gameday_upcoming_games() -> list:
-    """Home games still ahead of us, soonest first. Drives the buyer's
-    game picker and the single-game validation."""
+    """Every event still ahead of us, soonest first, across all venues.
+
+    Rewritten Oct 20, 2026. It used to filter venue='iu', which meant the
+    buy page went dead the moment the football season ended — the exact
+    thing that made Sidekick a seasonal product instead of a year-round
+    one. Now it returns whatever is on sale.
+
+    title and place fall back to the old football columns so the Indiana
+    rows already in the table keep working and keep selling.
+    """
     try:
         with db() as conn:
             with conn.cursor() as cur:
-                cur.execute("""SELECT id, opponent, kickoff,
-                                      to_char(game_date, 'Mon FMDD') AS d
-                               FROM gameday_games
-                               WHERE venue = 'iu' AND game_date >= CURRENT_DATE
-                               ORDER BY game_date""")
+                cur.execute("""
+                    SELECT id,
+                           COALESCE(NULLIF(title, ''),
+                                    NULLIF(opponent, ''),
+                                    'Event')                AS title,
+                           COALESCE(NULLIF(place, ''), '')   AS place,
+                           COALESCE(NULLIF(city, ''), '')    AS city,
+                           COALESCE(NULLIF(state, ''), '')   AS state,
+                           COALESCE(NULLIF(start_time, ''),
+                                    NULLIF(kickoff, ''), '') AS start_time,
+                           COALESCE(NULLIF(end_time, ''), '') AS end_time,
+                           COALESCE(NULLIF(blurb, ''), '')    AS blurb,
+                           game_date,
+                           to_char(game_date, 'Mon FMDD')     AS d,
+                           to_char(game_date, 'Dy, Mon FMDD') AS d_long,
+                           to_char(game_date, 'Mon')          AS d_mon,
+                           to_char(game_date, 'FMDD')         AS d_day,
+                           to_char(game_date, 'Dy')           AS d_dow
+                    FROM gameday_games
+                    WHERE game_date >= CURRENT_DATE
+                      AND is_active = TRUE
+                    ORDER BY game_date, id""")
                 return cur.fetchall() or []
     except Exception as e:
-        print(f"[gameday] upcoming games lookup failed: {e!r}", flush=True)
+        print(f"[gameday] upcoming events lookup failed: {e!r}", flush=True)
         return []
 
 
+def _event_where(row: dict) -> str:
+    """'Memorial Stadium, Bloomington, IN' from whichever parts exist."""
+    bits = [(row.get("place") or "").strip(),
+            (row.get("city") or "").strip()]
+    bits = [b for b in bits if b]
+    where = ", ".join(bits)
+    st = (row.get("state") or "").strip()
+    if st:
+        where = (where + ", " + st) if where else st
+    return where
+
+
+def _event_when(row: dict) -> str:
+    """'Sat, Nov 14 - 1:00 PM to 5:00 PM', skipping what we do not know."""
+    when = (row.get("d_long") or row.get("d") or "").strip()
+    start = (row.get("start_time") or "").strip()
+    end = (row.get("end_time") or "").strip()
+    if start and end:
+        when += " · %s to %s" % (start, end)
+    elif start:
+        when += " · %s" % start
+    return when
+
+
 def _gameday_picker_html() -> str:
-    """Checkbox list injected into the buy form. First remaining game is
-    pre-checked so the old one-click 'next game' path still works."""
+    """Checkbox list of what is on sale, injected into the buy form.
+
+    Rewritten Oct 20, 2026 for generic events: each row is a named event
+    with its date and where it is, rather than an opponent and a kickoff
+    time. Nothing is pre-checked any more — with one football schedule
+    there was an obvious next game, but a fair in Lebanon and a wedding in
+    Bloomington are not interchangeable, and a pre-ticked box on a page
+    that charges money is a way to sell somebody the wrong thing.
+    """
     games = _gameday_upcoming_games()
     if not games:
-        return ('<div style="font-size:14.5px;color:#5B4A4E">The home schedule is finished for '
-                'this season. Series passes for next year open in the summer.</div>')
+        return ('<div class=noev>No events are posted right now. If you have one '
+                'coming up, <a href="/contact">tell us about it</a> and we will '
+                'put a Meteorologist on it.</div>')
     out = []
-    for i, g in enumerate(games):
+    for g in games:
+        # The date is the thing a buyer scans for, so it leads the row as a
+        # calendar leaf rather than being buried in a run of middle dots.
+        chip = ('<span class=dchip><em>%s</em><strong>%s</strong></span>'
+                % (_html_escape((g.get("d_mon") or "").upper()),
+                   _html_escape(g.get("d_day") or "")))
+
+        where = _event_where(g)
+        start = (g.get("start_time") or "").strip()
+        end = (g.get("end_time") or "").strip()
+        # "TBA" is not information. If we do not know the time, say nothing
+        # about it and let the place carry the line.
+        if start.upper() in ("TBA", "TBD"):
+            start = ""
+        if start and end:
+            clock = "%s to %s" % (start, end)
+        else:
+            clock = start
+
+        dow = (g.get("d_dow") or "").strip()
+        bits = [b for b in (dow, clock) if b]
+        line = " ".join(bits)
+        if where:
+            line = ("%s at %s" % (line, where)) if line else where
+
         out.append(
-            '<label class=gp><input type=checkbox class=gpick value="%d"%s>'
-            '<span>%s <span style="color:#7A6A6E">&middot; kickoff %s</span></span></label>'
-            % (int(g["id"]), (" checked" if i == 0 else ""),
-               _html_escape(g.get("d") or ""),
-               _html_escape(g.get("kickoff") or "TBA")))
+            '<label class=gp>%s<span><b>%s</b><i>%s</i></span>'
+            '<input type=checkbox class=gpick value="%d"></label>'
+            % (chip, _html_escape(g.get("title") or "Event"),
+               _html_escape(line), int(g["id"])))
     return "".join(out)
 
 
 def _next_gameday_game_id():
-    """The game a single-game pass bought right now covers."""
+    """The soonest event still ahead of us, across every venue."""
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("""SELECT id FROM gameday_games
-                           WHERE venue = 'iu' AND game_date >= CURRENT_DATE
-                           ORDER BY game_date LIMIT 1""")
+                           WHERE game_date >= CURRENT_DATE
+                             AND is_active = TRUE
+                           ORDER BY game_date, id LIMIT 1""")
             r = cur.fetchone()
             return r["id"] if r else None
 
@@ -14405,6 +14445,155 @@ def _require_met_or_admin():
     if "met" in roles or "admin" in roles:
         return user
     return None
+
+
+# ---------------------------------------------------------------------------
+# Posting an event (Oct 20, 2026)
+#
+# Sidekick used to sell one thing: eight Indiana home football Saturdays,
+# seeded in code. Nobody could add anything, so when the season ended the
+# product ended with it.
+#
+# Mets and admins can both post now. A Met knows what is happening in their
+# own area — the county fair, the fall festival, the Friday night game —
+# and waiting on Michael to add it is how an event goes by unsold.
+# ---------------------------------------------------------------------------
+
+@app.route("/api/v1/sidekick/events", methods=["OPTIONS"])
+def _sidekick_events_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/sidekick/events")
+def sidekick_event_create():
+    """Post an event for sale. Met or admin."""
+    user = _require_met_or_admin()
+    if not user:
+        return jsonify({"ok": False, "error": "met-only"}), 403
+    data = request.get_json(silent=True) or {}
+
+    title = (data.get("title") or "").strip()[:160]
+    if not title:
+        return jsonify({"ok": False, "error": "Give the event a name."}), 400
+
+    date_raw = (data.get("date") or "").strip()[:10]
+    try:
+        event_date = _date.fromisoformat(date_raw)
+    except Exception:
+        return jsonify({"ok": False, "error": "Pick a date."}), 400
+    # Indiana's calendar day, not the server's. A Met posting a Friday
+    # night game at 9pm Eastern should not be told the date has passed
+    # because UTC already rolled over.
+    try:
+        today = datetime.now(ZoneInfo("America/Indiana/Indianapolis")).date()
+    except Exception:
+        today = _date.today()
+    if event_date < today:
+        return jsonify({"ok": False,
+                        "error": "That date has already passed."}), 400
+    if event_date > today + timedelta(days=550):
+        return jsonify({"ok": False,
+                        "error": "That is more than a year and a half out. "
+                                 "Post it closer to the date."}), 400
+
+    place = (data.get("place") or "").strip()[:160]
+    city = (data.get("city") or "").strip()[:80]
+    state = (data.get("state") or "").strip().upper()[:2]
+    start_time = (data.get("start_time") or "").strip()[:40]
+    end_time = (data.get("end_time") or "").strip()[:40]
+    blurb = (data.get("blurb") or "").strip()[:400]
+    if not city:
+        return jsonify({"ok": False,
+                        "error": "We need the town so a Meteorologist knows "
+                                 "which sky to watch."}), 400
+
+    now_ms = int(time.time() * 1000)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                # Same name on the same day in the same town is the same
+                # event. Two Mets posting it separately would sell the same
+                # coverage twice under two ids.
+                cur.execute(
+                    """SELECT id FROM gameday_games
+                       WHERE LOWER(COALESCE(NULLIF(title,''), opponent, '')) = LOWER(%s)
+                         AND game_date = %s
+                         AND LOWER(COALESCE(city,'')) = LOWER(%s)
+                         AND is_active = TRUE""",
+                    (title, event_date, city),
+                )
+                dupe = cur.fetchone()
+                if dupe:
+                    return jsonify({
+                        "ok": False, "error": "duplicate",
+                        "event_id": dupe["id"],
+                        "message": "That event is already posted.",
+                    }), 409
+
+                cur.execute(
+                    """INSERT INTO gameday_games
+                         (venue, game_no, opponent, game_date, kickoff,
+                          title, place, city, state, start_time, end_time,
+                          blurb, created_by, created_at, is_active)
+                       VALUES ('event', NULL, NULL, %s, %s,
+                               %s, %s, %s, %s, %s, %s,
+                               %s, %s, %s, TRUE)
+                       RETURNING id""",
+                    (event_date, start_time or "TBA",
+                     title, place, city, state, start_time, end_time,
+                     blurb, user["id"], now_ms),
+                )
+                event_id = cur.fetchone()["id"]
+    except Exception as e:
+        print(f"[sidekick] event create failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+
+    print(f"[sidekick] event {event_id} '{title}' {event_date} posted by "
+          f"{user.get('email')}", flush=True)
+    return jsonify({"ok": True, "event_id": event_id})
+
+
+@app.route("/api/v1/sidekick/events/<int:event_id>", methods=["OPTIONS"])
+def _sidekick_event_one_preflight(event_id):
+    return ("", 204)
+
+
+@app.delete("/api/v1/sidekick/events/<int:event_id>")
+def sidekick_event_remove(event_id: int):
+    """Take an event off sale. Soft — is_active goes false, so anyone who
+    already bought it keeps their coverage and the Met console keeps
+    showing it until it has passed."""
+    user = _require_met_or_admin()
+    if not user:
+        return jsonify({"ok": False, "error": "met-only"}), 403
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT COUNT(*) AS n FROM gameday_passes
+                       WHERE game_id = %s AND status = 'active'""",
+                    (event_id,),
+                )
+                sold = cur.fetchone()["n"]
+                cur.execute(
+                    """UPDATE gameday_games SET is_active = FALSE
+                       WHERE id = %s RETURNING id""",
+                    (event_id,),
+                )
+                if not cur.fetchone():
+                    return jsonify({"ok": False, "error": "not-found"}), 404
+    except Exception as e:
+        print(f"[sidekick] event remove failed: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error"}), 500
+
+    note = ""
+    if sold:
+        note = ("Taken off sale. %d %s already bought it and still need "
+                "covering — they have not been refunded."
+                % (sold, "person" if sold == 1 else "people"))
+    print(f"[sidekick] event {event_id} removed by {user.get('email')} "
+          f"({sold} active passes)", flush=True)
+    return jsonify({"ok": True, "sold": sold, "note": note})
 
 
 @app.get("/portal/sidekick")
@@ -14440,15 +14629,34 @@ textarea{width:100%;box-sizing:border-box;margin-top:10px;background:#0D0D10;col
 .note{font-size:15px;color:#B08A90;margin:8px 0 20px;line-height:1.55}
 </style></head><body>
 <div style="max-width:760px;margin:0 auto;padding:14px 16px 0;display:flex;justify-content:space-between;gap:14px;flex-wrap:wrap"><a href="/portal" style="color:#7EB6FF;font-size:14px;font-weight:700;text-decoration:none">&larr; Your portal</a><a href="__SPA__/" style="color:#8FA6C6;font-size:13.5px;text-decoration:none">Old portal</a></div>
-<div class=top>&#9889; GameDay Console <small>Plain-text broadcasts to everyone covered for each game. No links, under 480 characters. Sends run in the background; counts land in a minute.</small></div>
+<div class=top>&#9889; Sidekick Console <small>Plain-text broadcasts to everyone covered for each event. No links, under 480 characters. Sends run in the background; counts land in a minute.</small></div>
 <div class=wrap>
-<div class=note>Claim your game so the team knows who owns the window. Kickoff TBA? Update it when the TV window firms up; the Monday reminder texts use it.</div>
+<div class=note>Claim your event so the team knows who owns the window. Start time TBA? Update it when it firms up; the Monday reminder texts use it.</div>
+<div class=game id=add-box>
+  <div class=g-head><b>Post an event</b></div>
+  <div class=meta>Anything outdoors in your area that people would pay to have watched &mdash; a fair, a festival, a 5K, a wedding, a Friday night game. It goes on sale the moment you post it.</div>
+  <div class=row>
+    <input class=kick-in style="width:230px" id=ev-title placeholder="Boone County Fair">
+    <input class=kick-in style="width:150px" id=ev-date type=date>
+  </div>
+  <div class=row>
+    <input class=kick-in style="width:200px" id=ev-place placeholder="Fairgrounds (optional)">
+    <input class=kick-in style="width:150px" id=ev-city placeholder="Lebanon">
+    <input class=kick-in style="width:62px" id=ev-state placeholder="IN" maxlength=2>
+  </div>
+  <div class=row>
+    <input class=kick-in style="width:120px" id=ev-start placeholder="9:00 AM">
+    <input class=kick-in style="width:120px" id=ev-end placeholder="10:00 PM">
+    <button class=send id=ev-save>Post it</button>
+  </div>
+  <div class=status id=ev-status></div>
+</div>
 <div class=game id=comp-box>
   <div class=g-head><b>Comp a free pass</b></div>
   <div class=meta>Founder promises and partner passes. Sends the normal welcome text.</div>
   <div class=row><input class=kick-in style="width:160px" id=comp-name placeholder="Name">
   <input class=kick-in style="width:170px" id=comp-phone placeholder="812-555-0123">
-  <button class=send id=comp-send>Comp series pass</button></div>
+  <button class=send id=comp-send>Comp a pass</button></div>
   <div class=status id=comp-status></div>
 </div>
 <div id=games>Loading games&hellip;</div>
@@ -14517,6 +14725,32 @@ document.getElementById('comp-send').addEventListener('click', function(){
     else{st.textContent=d.error||'Comp failed.';st.className='status bad';}
   }).catch(function(){st.textContent='Connection problem.';st.className='status bad';});
 });
+document.getElementById('ev-save').addEventListener('click', function(){
+  var st=document.getElementById('ev-status'), btn=this;
+  function v(id){return document.getElementById(id).value.trim();}
+  if(!v('ev-title')){st.textContent='Give the event a name.';st.className='status bad';return;}
+  if(!v('ev-date')){st.textContent='Pick a date.';st.className='status bad';return;}
+  if(!v('ev-city')){st.textContent='Which town is it in?';st.className='status bad';return;}
+  btn.disabled=true;st.textContent='Posting...';st.className='status';
+  fetch('/api/v1/sidekick/events',{method:'POST',credentials:'include',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({title:v('ev-title'),date:v('ev-date'),place:v('ev-place'),
+      city:v('ev-city'),state:v('ev-state'),start_time:v('ev-start'),end_time:v('ev-end')})})
+  .then(function(r){return r.json().then(function(d){return {s:r.status,d:d};});})
+  .then(function(x){
+    btn.disabled=false;
+    if(x.d&&x.d.ok){
+      st.textContent='Posted. It is on sale now.';st.className='status ok';
+      ['ev-title','ev-place','ev-city','ev-state','ev-start','ev-end','ev-date']
+        .forEach(function(id){document.getElementById(id).value='';});
+      load();
+    } else {
+      st.textContent=(x.d&&(x.d.message||x.d.error))||'Could not post it.';
+      st.className='status bad';
+    }
+  }).catch(function(){btn.disabled=false;st.textContent='Connection problem.';
+    st.className='status bad';});
+});
 load();
 </script></body></html>""").replace("__SPA__", spa)
 
@@ -14563,10 +14797,23 @@ def met_gameday_games():
         return jsonify({"ok": False, "error": "met-only"}), 403
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute("""SELECT g.id, g.game_no, g.opponent, g.game_date::text AS game_date,
-                                  g.kickoff, g.tv, g.claimed_by, u.name AS claimed_name
+            # Oct 20, 2026: every venue, not just Indiana football, and the
+            # generic title/place take precedence over opponent/venue so a
+            # Met sees "Boone County Fair" rather than a blank opponent.
+            cur.execute("""SELECT g.id, g.game_no,
+                                  COALESCE(NULLIF(g.title,''), NULLIF(g.opponent,''),
+                                           'Event') AS opponent,
+                                  g.game_date::text AS game_date,
+                                  COALESCE(NULLIF(g.start_time,''), NULLIF(g.kickoff,''),
+                                           'TBA') AS kickoff,
+                                  g.tv, g.claimed_by, u.name AS claimed_name,
+                                  COALESCE(NULLIF(g.place,''), '')  AS place,
+                                  COALESCE(NULLIF(g.city,''), '')   AS city,
+                                  COALESCE(NULLIF(g.state,''), '')  AS state,
+                                  g.is_active
                            FROM gameday_games g LEFT JOIN users u ON u.id = g.claimed_by
-                           WHERE g.venue = 'iu' ORDER BY g.game_date""")
+                           WHERE g.is_active = TRUE
+                           ORDER BY g.game_date""")
             games = [dict(r) for r in cur.fetchall()]
             for g in games:
                 cur.execute("""SELECT COUNT(*) AS n FROM gameday_passes
@@ -14675,10 +14922,15 @@ def _gameday_monday_reminder_pass() -> int:
             return 0
         with db() as conn:
             with conn.cursor() as cur:
-                cur.execute("""SELECT id, opponent, game_date, kickoff,
+                cur.execute("""SELECT id,
+                                      COALESCE(NULLIF(title,''), NULLIF(opponent,''),
+                                               'your event') AS opponent,
+                                      game_date,
+                                      COALESCE(NULLIF(start_time,''), NULLIF(kickoff,''),
+                                               'TBA') AS kickoff,
                                       to_char(game_date, 'Dy Mon FMDD') AS nice_date
                                FROM gameday_games
-                               WHERE venue = 'iu'
+                               WHERE is_active = TRUE
                                  AND game_date > %s
                                  AND game_date <= %s""",
                             (today, today + _dt.timedelta(days=6)))
@@ -16990,12 +17242,12 @@ __WV_HEADER__
 <section class="sec s-deep"><div class=wrap>
   <p class=robot>Meteorologists watch your plans</p>
   <div class=tiers>
-    <div class=tier><div class=t>Sidekick</div><div class=p>$16/series &middot; $5/day</div>
+    <div class=tier><div class=t>Sidekick</div><div class=p>$5 an event</div>
       <p>The Meteorologist is watching the big day. You're on the list.</p>
       <ul><li>Shared coverage, which is why it is $2 a day</li>
       <li>Outlook the evening before, morning brief, live updates, all clear</li>
       <li>First series: 8 Indiana Football home game days</li></ul>
-      <a class=go href="/gameday/iu">See the days covered &rarr;</a></div>
+      <a class=go href="/sidekick">See the days covered</a></div>
     <div class=tier><div class=t>Met Review</div><div class=p>$19 once</div>
       <p>You have a decision to make. A Meteorologist studies your date and writes you back.</p>
       <ul><li>One date, one place, one written answer</li><li>Nothing recurring</li>
@@ -17740,7 +17992,7 @@ WV_TIERS = {
                   "Official warnings for one exact address. Texts with radar, a phone call for tornadoes, a text when the warning expires."),
     "daily": ("Stormline Daily", "$24/year", "/stormlinedaily",
               "Everything Stormline does, plus a plain forecast every morning at the hour you pick."),
-    "sidekick": ("Sidekick", "$16/series", "/gameday/iu",
+    "sidekick": ("Sidekick", "$5 an event", "/sidekick",
                  "A Meteorologist covering a whole town on a busy day, and you're on the list."),
     "review": ("Met Review", "$19 once", "/met-review",
                "A Meteorologist studies your date and writes you back. One answer, from a person."),
@@ -27453,9 +27705,9 @@ __WV_HEADER__
 
   <p class=robot>Meteorologists watch your plans</p>
   <div class=tiers>
-    <div class=tier><div class=t>Sidekick</div><div class=p>$16/series &middot; $5/day</div>
+    <div class=tier><div class=t>Sidekick</div><div class=p>$5 an event</div>
       <p>The Meteorologist is watching the big day. You're on the list.</p>
-      <a class=go href="/gameday/iu">See the days covered &rarr;</a></div>
+      <a class=go href="/sidekick">See the days covered</a></div>
     <div class=tier><div class=t>Met Review</div><div class=p>$19 once</div>
       <p>You have a decision to make. A Meteorologist studies your date and writes you back.</p>
       <a class=go href="/met-review">Get a review &rarr;</a></div>
@@ -27507,7 +27759,7 @@ __WV_HEADER__
    review:{n:"Met Review",p:"$19 once",k:"You have a decision to make. A Meteorologist studies your date and writes you back.",c:"Get a review",u:"/met-review"},
    storm:{n:"Stormline",p:"$12/year",k:"You don't watch the weather. Stormline watches your address.",c:"Put a Stormline on it",u:"/stormline"},
    daily:{n:"Stormline Daily",p:"$24/year",k:"The forecast finds you every morning. And the warning finds you at 2 AM.",c:"Start the morning message",u:"/stormlinedaily"},
-   side:{n:"Sidekick",p:"$16/series",k:"The Meteorologist is watching the big day. You're on the list.",c:"See the days covered",u:"/gameday/iu"},
+   side:{n:"Sidekick",p:"$5 an event",k:"The Meteorologist is watching the big day. You're on the list.",c:"See the days covered",u:"/sidekick"},
    watch:{n:"Watch",p:"$49/event day",k:"One Meteorologist. One event. Nobody else on the thread.",c:"Book a day",u:"/watch"},
    pro:{n:"Pro",p:"from $99/month",k:"Your own Meteorologist, every day, whenever weather affects your plans.",c:"Build my plan",u:"/pro"}};
   var trail=[];
