@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-308"
+BACKEND_BUILD = "0702-309"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -13724,105 +13724,191 @@ _SIDEKICK_PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=description content="Five dollars puts a certified Meteorologist on your outdoor event: a morning read, live alerts while it runs, and the all-clear. Fairs, weddings, races, games.">
 <style>
 __WV_TOKENS__
-:root{--accent:#1E6BFF}
-.sk-wrap{max-width:720px;margin:0 auto;padding:46px 22px 90px}
-.sk-lede{font-size:clamp(30px,5.2vw,46px);line-height:1.1;font-weight:900;
-  letter-spacing:-.035em;margin:0 0 14px;max-width:15ch}
-.sk-sub{font-size:17.5px;line-height:1.6;color:#C6D6F0;margin:0;max-width:52ch}
-.sk-sub b{color:#fff;font-weight:700}
+:root{--accent:#1E6BFF;--amber:#FF9A3C;--violet:#8C5BD8}
 
-/* The one warm moment on the page: a horizon at daybreak, directly above
-   the list of days somebody is about to buy. Used once, nowhere else. */
-.dawn{height:3px;margin:38px 0 0;border-radius:2px;
-  background:linear-gradient(90deg,#17204A 0%,#2B3A7A 28%,#8C5BD8 54%,#FF9A3C 82%,#FFC46B 100%)}
-.dawn-cap{font-size:13.5px;color:#8FA3BE;margin:11px 0 20px}
+/* ── The sky ──────────────────────────────────────────────────────────
+   The hero is weather itself: night at the top of the screen falling to
+   a lit horizon at the bottom, cloud banks drifting across it, and a
+   radar sweep turning over the whole thing. It is the one place on the
+   page that spends anything, and everything below it stays quiet.      */
+.sky{position:relative;overflow:hidden;isolation:isolate;
+  background:linear-gradient(177deg,#000000 0%,#050A1C 20%,#0D1538 42%,
+    #221A4D 60%,#4A2457 74%,#9A4038 87%,#E8893C 96%,#FFC46B 100%)}
+.sky:before{content:"";position:absolute;inset:0;z-index:0;
+  background:
+    radial-gradient(1.6px 1.6px at 12% 18%,rgba(255,255,255,.75),transparent),
+    radial-gradient(1.4px 1.4px at 73% 11%,rgba(255,255,255,.6),transparent),
+    radial-gradient(1.7px 1.7px at 41% 26%,rgba(255,255,255,.5),transparent),
+    radial-gradient(1.3px 1.3px at 88% 31%,rgba(255,255,255,.45),transparent),
+    radial-gradient(1.5px 1.5px at 24% 39%,rgba(255,255,255,.4),transparent),
+    radial-gradient(1.2px 1.2px at 61% 44%,rgba(255,255,255,.32),transparent),
+    radial-gradient(1.6px 1.6px at 92% 9%,rgba(255,255,255,.55),transparent);
+  opacity:.85}
+/* Cloud banks. Two layers at different speeds so the sky has depth
+   rather than one sheet sliding past. */
+.cl{position:absolute;z-index:1;border-radius:50%;filter:blur(26px);pointer-events:none}
+.cl1{width:460px;height:112px;left:-30%;top:46%;background:rgba(140,91,216,.34);
+  animation:drift 64s linear infinite}
+.cl2{width:620px;height:138px;left:-45%;top:62%;background:rgba(232,137,60,.28);
+  animation:drift 92s linear infinite;animation-delay:-30s}
+.cl3{width:360px;height:92px;left:-25%;top:30%;background:rgba(30,107,255,.26);
+  animation:drift 78s linear infinite;animation-delay:-52s}
+@keyframes drift{from{transform:translateX(0)}to{transform:translateX(230vw)}}
+/* Radar sweep: a quiet rotating wedge, the thing a Meteorologist is
+   actually looking at while your event runs. */
+.radar{position:absolute;z-index:1;right:-120px;top:-110px;width:460px;height:460px;
+  border-radius:50%;opacity:.5;pointer-events:none;
+  background:conic-gradient(from 0deg,rgba(77,143,255,.42) 0deg,
+    rgba(77,143,255,.14) 26deg,transparent 62deg,transparent 360deg);
+  animation:sweep 7.5s linear infinite;
+  -webkit-mask:radial-gradient(circle,#000 62%,transparent 71%);
+          mask:radial-gradient(circle,#000 62%,transparent 71%)}
+@keyframes sweep{to{transform:rotate(360deg)}}
+.rings{position:absolute;z-index:1;right:-120px;top:-110px;width:460px;height:460px;
+  border-radius:50%;opacity:.3;pointer-events:none;
+  background:
+    radial-gradient(circle,transparent 29%,rgba(126,182,255,.4) 29.6%,transparent 30.3%),
+    radial-gradient(circle,transparent 45%,rgba(126,182,255,.32) 45.6%,transparent 46.3%),
+    radial-gradient(circle,transparent 61%,rgba(126,182,255,.24) 61.6%,transparent 62.3%)}
+/* Land. Without it the sunset stops at a ruled line and the whole thing
+   reads as a gradient swatch instead of a sky over somewhere. */
+.horizon{position:absolute;z-index:2;left:0;right:0;bottom:-1px;width:100%;
+  height:118px;display:block;pointer-events:none}
+.sky-in{position:relative;z-index:3;max-width:720px;margin:0 auto;
+  padding:84px 22px 128px}
+.sky h1{font-size:clamp(36px,6.6vw,62px);line-height:1.02;font-weight:900;
+  letter-spacing:-.045em;margin:0 0 18px;max-width:13ch;
+  text-shadow:0 3px 30px rgba(0,0,0,.6)}
+.sky .lede{font-size:clamp(17px,2.3vw,20px);line-height:1.58;color:#E4ECFA;
+  margin:0;max-width:46ch;text-shadow:0 2px 16px rgba(0,0,0,.55)}
+.sky .lede b{color:#fff;font-weight:800}
+.price-pin{display:inline-flex;align-items:baseline;gap:9px;margin:28px 0 0;
+  padding:11px 20px 12px;border-radius:999px;backdrop-filter:blur(8px);
+  background:rgba(0,0,0,.42);border:1px solid rgba(255,255,255,.26)}
+.price-pin b{font-size:27px;font-weight:900;letter-spacing:-.04em;color:#fff}
+.price-pin span{font-size:14.5px;color:#E4ECFA}
+/* The horizon the sky lands on, and the ground the list sits in. */
+.ground{background:#000;position:relative;z-index:4;margin-top:-1px}
 
-/* Event rows. Rules, not cards: this is a list you read down, and eight
-   identical shadowed boxes would hide the dates that matter. */
-.gp{display:grid;grid-template-columns:58px 1fr 30px;gap:16px;align-items:center;
-  padding:17px 4px;border-top:1px solid rgba(255,255,255,.1);cursor:pointer}
-.gp:last-of-type{border-bottom:1px solid rgba(255,255,255,.1)}
-.gp:hover{background:rgba(30,107,255,.07)}
-.gp input{appearance:none;-webkit-appearance:none;width:23px;height:23px;margin:0;
-  border:1.5px solid rgba(255,255,255,.38);border-radius:7px;cursor:pointer;
-  position:relative;background:transparent;justify-self:end}
+/* ── The list ─────────────────────────────────────────────────────── */
+.sk-wrap{max-width:720px;margin:0 auto;padding:0 22px 90px}
+.listhead{display:flex;align-items:baseline;justify-content:space-between;
+  gap:12px;flex-wrap:wrap;padding:44px 0 4px}
+.listhead h2{font-size:23px;font-weight:900;letter-spacing:-.03em;margin:0}
+.listhead span{font-size:14px;color:#8FA3BE}
+.gp{display:grid;grid-template-columns:66px 1fr 26px;gap:17px;align-items:center;
+  padding:18px 18px;margin:11px 0;cursor:pointer;border-radius:15px;
+  border:1.5px solid rgba(255,255,255,.12);background:#070A11;
+  transition:border-color .18s,background .18s,transform .18s}
+.gp:hover{border-color:rgba(77,143,255,.55);transform:translateY(-2px)}
+.gp:has(input:checked){border-color:var(--blue);
+  background:linear-gradient(104deg,rgba(30,107,255,.17),rgba(30,107,255,.05))}
+.gp input{appearance:none;-webkit-appearance:none;width:24px;height:24px;margin:0;
+  border:1.6px solid rgba(255,255,255,.4);border-radius:8px;cursor:pointer;
+  position:relative;background:transparent;justify-self:end;transition:.15s}
 .gp input:checked{background:var(--blue);border-color:var(--blue)}
-.gp input:checked:after{content:"";position:absolute;left:7.5px;top:3.5px;width:5px;height:10px;
-  border:solid #fff;border-width:0 2.5px 2.5px 0;transform:rotate(42deg)}
-.gp input:focus-visible{outline:2px solid #fff;outline-offset:2px}
+.gp input:checked:after{content:"";position:absolute;left:8px;top:3.5px;width:5px;
+  height:11px;border:solid #fff;border-width:0 2.6px 2.6px 0;transform:rotate(42deg)}
+.gp input:focus-visible{outline:2px solid #fff;outline-offset:3px}
 .gp span{min-width:0}
-.gp b{display:block;font-size:17.5px;font-weight:700;letter-spacing:-.015em;color:#fff}
-.gp i{display:block;font-style:normal;font-size:14.5px;color:#9FB0C8;margin-top:3px;
-  overflow-wrap:anywhere}
-/* Date block: a tear-off calendar leaf. Tabular figures so the columns
-   line up down the list. */
-.dchip{text-align:center;font-variant-numeric:tabular-nums;line-height:1}
-.dchip em{display:block;font-style:normal;font-size:11px;font-weight:800;
-  letter-spacing:.1em;color:#FF9A3C}
-.dchip strong{display:block;font-size:27px;font-weight:900;color:#fff;margin-top:3px;
-  letter-spacing:-.04em}
-.noev{border:1px dashed rgba(126,182,255,.32);border-radius:14px;padding:24px;
-  color:#C6D6F0;font-size:15.5px;line-height:1.65}
-.noev a{color:var(--sky);font-weight:700;text-decoration:underline}
+.gp b{display:block;font-size:18px;font-weight:800;letter-spacing:-.02em;color:#fff}
+.gp i{display:block;font-style:normal;font-size:14px;color:#9FB0C8;margin-top:4px;
+  overflow-wrap:anywhere;line-height:1.5}
+/* The date as a torn calendar leaf: amber cap, heavy numeral, a notch of
+   shadow under the fold. */
+.dchip{position:relative;text-align:center;font-variant-numeric:tabular-nums;
+  line-height:1;border-radius:11px;overflow:hidden;background:#0D1424;
+  border:1px solid rgba(255,255,255,.13);padding-bottom:9px}
+.dchip em{display:block;font-style:normal;font-size:10.5px;font-weight:900;
+  letter-spacing:.13em;color:#0B0F1A;background:var(--amber);padding:4px 0 3px}
+.dchip strong{display:block;font-size:28px;font-weight:900;color:#fff;
+  margin-top:8px;letter-spacing:-.045em}
+.noev{border:1.5px dashed rgba(126,182,255,.34);border-radius:16px;padding:30px 26px;
+  color:#C6D6F0;font-size:16px;line-height:1.68;margin:14px 0}
+.noev a{color:var(--sky);font-weight:800;text-decoration:underline}
 
-/* Tally. Inert until something is ticked, and it says so. */
+/* ── Tally + buy ──────────────────────────────────────────────────── */
+.buybox{margin-top:26px;border-radius:19px;padding:24px 22px;
+  border:1.5px solid rgba(30,107,255,.4);
+  background:linear-gradient(170deg,#0C1222,#05080F)}
 .tally{display:flex;align-items:baseline;justify-content:space-between;gap:14px;
-  margin:26px 0 6px;flex-wrap:wrap}
+  flex-wrap:wrap;padding-bottom:17px;margin-bottom:19px;
+  border-bottom:1px solid rgba(255,255,255,.12)}
 .tally .n{font-size:15.5px;color:#9FB0C8}
-.tally .amt{font-size:34px;font-weight:900;letter-spacing:-.04em;
-  font-variant-numeric:tabular-nums}
-.buy{margin-top:16px}
-.buy input[type=text],.buy input[type=email],.buy input[type=tel]{
-  width:100%;box-sizing:border-box;background:#070A11;color:#fff;font-size:16px;
-  font-family:inherit;border:1.5px solid rgba(255,255,255,.17);border-radius:11px;
-  padding:13px 14px;margin-bottom:11px}
-.buy input:focus{outline:none;border-color:var(--blue)}
-.cons{display:flex;gap:11px;align-items:flex-start;font-size:13.5px;line-height:1.55;
-  color:#9FB0C8;margin:4px 0 16px;cursor:pointer}
+.tally .amt{font-size:40px;font-weight:900;letter-spacing:-.05em;
+  font-variant-numeric:tabular-nums;line-height:1}
+.buybox input[type=text],.buybox input[type=email],.buybox input[type=tel]{
+  width:100%;box-sizing:border-box;background:#04070D;color:#fff;font-size:16px;
+  font-family:inherit;border:1.5px solid rgba(255,255,255,.17);border-radius:12px;
+  padding:14px 15px;margin-bottom:11px}
+.buybox input:focus{outline:none;border-color:var(--blue)}
+.cons{display:flex;gap:11px;align-items:flex-start;font-size:13px;line-height:1.55;
+  color:#9FB0C8;margin:5px 0 17px;cursor:pointer}
 .cons input{margin:2px 0 0;width:17px;height:17px;flex:0 0 auto;accent-color:var(--blue)}
 .cons a{color:var(--sky);text-decoration:underline}
-.go{width:100%;background:var(--blue);color:#fff;font-size:17px;font-weight:800;
-  font-family:inherit;border:none;border-radius:12px;padding:16px;cursor:pointer}
-.go:disabled{background:rgba(255,255,255,.08);color:#7B8AA3;cursor:default}
-.err{color:#FF9AA8;font-size:14.5px;margin-top:11px;display:none;line-height:1.55}
+.go{width:100%;background:var(--blue);color:#fff;font-size:17.5px;font-weight:800;
+  font-family:inherit;border:none;border-radius:13px;padding:17px;cursor:pointer;
+  box-shadow:0 14px 34px -14px rgba(30,107,255,.9)}
+.go:disabled{background:rgba(255,255,255,.07);color:#6F7E95;box-shadow:none;cursor:default}
+.err{color:#FF9AA8;font-size:14.5px;margin-top:12px;display:none;line-height:1.55}
 
-/* What you get: a real sequence through one day, so it is a time rail
-   with clock positions rather than three numbered boxes. */
-.rail{margin:54px 0 0;padding:0;list-style:none;position:relative}
-.rail:before{content:"";position:absolute;left:6px;top:10px;bottom:16px;width:1.5px;
-  background:linear-gradient(180deg,#FF9A3C,#1E6BFF 46%,rgba(30,107,255,.15))}
-.rail li{position:relative;padding:0 0 26px 30px}
-.rail li:before{content:"";position:absolute;left:0;top:7px;width:13px;height:13px;
-  border-radius:50%;background:#070A11;border:2.5px solid var(--blue)}
-.rail li:first-child:before{border-color:#FF9A3C}
-.rail h3{margin:0 0 4px;font-size:16.5px;font-weight:800;letter-spacing:-.01em;color:#fff}
-.rail p{margin:0;font-size:15px;line-height:1.65;color:#B8C7DE;max-width:56ch}
-.rail .t{font-size:12.5px;font-weight:800;letter-spacing:.07em;color:#8FA3BE;
-  display:block;margin-bottom:5px;font-variant-numeric:tabular-nums}
-.sk-foot{margin-top:46px;padding-top:22px;border-top:1px solid rgba(255,255,255,.1);
-  font-size:13.5px;line-height:1.7;color:#8FA3BE}
+/* ── The day, in three pictures ───────────────────────────────────── */
+.moments{display:grid;grid-template-columns:1fr;gap:15px;margin:60px 0 0}
+@media(min-width:720px){.moments{grid-template-columns:repeat(3,1fr)}}
+.mo{border:1.5px solid rgba(255,255,255,.12);border-radius:17px;overflow:hidden;
+  background:#070A11}
+.mo .art{display:block;width:100%;height:124px}
+.mo .txt{padding:17px 18px 20px}
+.mo h3{margin:0 0 6px;font-size:16.5px;font-weight:800;letter-spacing:-.015em;color:#fff}
+.mo p{margin:0;font-size:14.5px;line-height:1.62;color:#B8C7DE}
+.mo .t{display:block;font-size:11px;font-weight:900;letter-spacing:.14em;
+  color:#8FA3BE;margin-bottom:7px}
+.sk-foot{margin-top:52px;padding-top:24px;border-top:1px solid rgba(255,255,255,.11);
+  font-size:13.5px;line-height:1.72;color:#8FA3BE}
 .sk-foot a{color:var(--sky);text-decoration:underline}
-@media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+@media(prefers-reduced-motion:reduce){
+  .cl,.radar{animation:none}
+}
+@media(max-width:620px){
+  .sky-in{padding:66px 22px 84px}
+  .radar,.rings{right:-190px;top:-160px;width:380px;height:380px}
+}
 </style></head><body>
 __WV_HEADER__
+<div class=sky>
+  <div class="cl cl1"></div><div class="cl cl2"></div><div class="cl cl3"></div>
+  <div class=rings></div><div class=radar></div>
+  <svg class=horizon viewBox="0 0 1200 118" preserveAspectRatio="none" aria-hidden=true>
+    <path d="M0 62 Q150 36 300 54 T600 44 T900 58 T1200 40 L1200 118 L0 118Z"
+          fill="#1A0E24" opacity=".62"/>
+    <path d="M0 86 Q190 62 380 80 T760 72 T1200 88 L1200 118 L0 118Z"
+          fill="#0A0611" opacity=".88"/>
+    <path d="M0 104 Q240 92 480 102 T960 98 T1200 108 L1200 118 L0 118Z"
+          fill="#000"/>
+  </svg>
+  <div class=sky-in>
+    <h1>Someone should be watching your sky.</h1>
+    <p class=lede>Five dollars puts a certified Meteorologist on one outdoor day
+    of yours. They read it in the morning, text you if it turns while you are out
+    there, and tell you when it has passed. <b>Not an app. A person.</b></p>
+    <div class=price-pin><b>$5</b><span>a day, per event</span></div>
+  </div>
+</div>
+
+<div class=ground>
 <div class=sk-wrap>
-  <h1 class=sk-lede>Someone should be watching your sky.</h1>
-  <p class=sk-sub>Five dollars puts a certified Meteorologist on one outdoor day
-  of yours. They read it in the morning, text you if it turns while you are out
-  there, and tell you when it is done. <b>Not an app. A person.</b></p>
-
-  <div class=dawn role=presentation></div>
-  <p class=dawn-cap>Pick the days you want covered.</p>
-
   <form id=skform>
+  <div class=listhead>
+    <h2>What is coming up</h2>
+    <span id=listnote>Tick the days you want covered</span>
+  </div>
   <!--WV_GAMEPICKER-->
 
-  <div class=tally>
-    <span class=n id=tally-n>Nothing picked yet</span>
-    <span class=amt id=tally-amt>$0</span>
-  </div>
-
-  <div class=buy>
+  <div class=buybox id=buybox>
+    <div class=tally>
+      <span class=n id=tally-n>Nothing picked yet</span>
+      <span class=amt id=tally-amt>$0</span>
+    </div>
     <input type=text id=g-name placeholder="Your name" autocomplete=name>
     <input type=email id=g-email placeholder="Email for the receipt" autocomplete=email>
     <input type=tel id=g-phone placeholder="Mobile number for the texts" autocomplete=tel>
@@ -13835,26 +13921,69 @@ __WV_HEADER__
   </div>
   </form>
 
-  <ol class=rail>
-    <li><span class=t>MORNING</span>
-      <h3>A read on your day, in plain words</h3>
-      <p>Not a percentage. Your Meteorologist tells you what the day is going
-      to do where you are standing, and what they would do about it.</p></li>
-    <li><span class=t>WHILE IT RUNS</span>
-      <h3>A text the moment it turns</h3>
-      <p>They are watching radar over your spot, not a county. If something is
-      coming, you hear about it with time to move people.</p></li>
-    <li><span class=t>AFTER</span>
-      <h3>The all-clear</h3>
-      <p>The part nobody else gives you. When it has passed and it is safe to
-      go back out, they say so.</p></li>
-  </ol>
+  <div class=moments>
+    <div class=mo>
+      <svg class=art viewBox="0 0 300 124" preserveAspectRatio="none" aria-hidden=true>
+        <defs><linearGradient id=dawnG x1=0 y1=0 x2=0 y2=1>
+          <stop offset="0%" stop-color="#1A1140"/><stop offset="52%" stop-color="#8A4A6B"/>
+          <stop offset="100%" stop-color="#FFBE63"/></linearGradient></defs>
+        <rect width="300" height="124" fill="url(#dawnG)"/>
+        <circle cx="214" cy="96" r="25" fill="#FFD98A" opacity=".95"/>
+        <circle cx="214" cy="96" r="42" fill="#FFCE70" opacity=".22"/>
+        <path d="M0 104 Q46 92 92 100 T186 98 T300 106 L300 124 L0 124Z" fill="#120B1E" opacity=".85"/>
+      </svg>
+      <div class=txt><span class=t>MORNING</span>
+        <h3>A read on your day</h3>
+        <p>Not a percentage. What the day is going to do where you are standing,
+        and what they would do about it.</p></div>
+    </div>
+    <div class=mo>
+      <svg class=art viewBox="0 0 300 124" preserveAspectRatio="none" aria-hidden=true>
+        <defs><linearGradient id=stormG x1=0 y1=0 x2=0 y2=1>
+          <stop offset="0%" stop-color="#0A1026"/><stop offset="100%" stop-color="#27335C"/>
+        </linearGradient></defs>
+        <rect width="300" height="124" fill="url(#stormG)"/>
+        <ellipse cx="128" cy="47" rx="74" ry="26" fill="#39456F"/>
+        <ellipse cx="183" cy="54" rx="56" ry="21" fill="#2E3A61"/>
+        <g stroke="#7EB6FF" stroke-width="2.4" stroke-linecap="round" opacity=".7">
+          <line x1="86" y1="78" x2="76" y2="104"/><line x1="116" y1="74" x2="106" y2="100"/>
+          <line x1="146" y1="80" x2="136" y2="106"/><line x1="176" y1="76" x2="166" y2="102"/>
+          <line x1="206" y1="82" x2="196" y2="108"/></g>
+        <path d="M150 52 L138 80 L152 80 L142 108 L170 72 L155 72 L166 52Z" fill="#FFCE44"/>
+      </svg>
+      <div class=txt><span class=t>WHILE IT RUNS</span>
+        <h3>A text the moment it turns</h3>
+        <p>They watch radar over your spot, not your county. You hear about it
+        with time to move people.</p></div>
+    </div>
+    <div class=mo>
+      <svg class=art viewBox="0 0 300 124" preserveAspectRatio="none" aria-hidden=true>
+        <defs><linearGradient id=clearG x1=0 y1=0 x2=0 y2=1>
+          <stop offset="0%" stop-color="#0B1E4A"/><stop offset="100%" stop-color="#5FA8E8"/>
+        </linearGradient></defs>
+        <rect width="300" height="124" fill="url(#clearG)"/>
+        <g fill="none" stroke-width="7" opacity=".85">
+          <path d="M44 124 A106 106 0 0 1 256 124" stroke="#FF8A5C"/>
+          <path d="M58 124 A92 92 0 0 1 242 124" stroke="#FFD166"/>
+          <path d="M72 124 A78 78 0 0 1 228 124" stroke="#7FD99A"/>
+          <path d="M86 124 A64 64 0 0 1 214 124" stroke="#7EB6FF"/>
+        </g>
+        <ellipse cx="62" cy="34" rx="30" ry="12" fill="#fff" opacity=".5"/>
+        <ellipse cx="238" cy="26" rx="22" ry="9" fill="#fff" opacity=".38"/>
+      </svg>
+      <div class=txt><span class=t>AFTER</span>
+        <h3>The all-clear</h3>
+        <p>The part nobody else gives you. When it has passed and it is safe to
+        go back out, they say so.</p></div>
+    </div>
+  </div>
 
   <p class=sk-foot>Five dollars per day, per event. No subscription, no app,
   nothing to install. Coverage runs from the morning of the day through the end
   of it. WeatherValet is an independent service and is not affiliated with any
   school, venue or event named here.<br>
   Running an event and want it listed? <a href="/contact">Tell us about it.</a></p>
+</div>
 </div>
 __WV_FOOTER__
 <script>
@@ -13890,15 +14019,12 @@ __WV_FOOTER__
   retally();
 
   // Nothing on sale: a name-and-card form nobody can submit is clutter, and
-  // "Pick the days you want covered" directly contradicts the empty notice
-  // sitting under it. Show the invitation on its own.
+  // "Tick the days you want covered" contradicts the empty notice under it.
   if(document.querySelectorAll(".gpick").length === 0){
-    var buy = document.querySelector(".buy"),
-        tally = document.querySelector(".tally"),
-        cap = document.querySelector(".dawn-cap");
+    var buy = document.getElementById("buybox"),
+        note = document.getElementById("listnote");
     if(buy){ buy.style.display = "none"; }
-    if(tally){ tally.style.display = "none"; }
-    if(cap){ cap.textContent = "Nothing is on the calendar at the moment."; }
+    if(note){ note.textContent = "Nothing on the calendar yet"; }
   }
 
   form.addEventListener("submit", function(e){
