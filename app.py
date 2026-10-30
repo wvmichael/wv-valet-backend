@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-311"
+BACKEND_BUILD = "0702-312"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -44264,6 +44264,55 @@ def _process_expired_trials() -> None:
                               f"{uid}; reverted to {_pt}, access kept",
                               flush=True)
                         continue
+
+                    # ── Is this "trial" actually a paying customer? ──
+                    # Oct 29, 2026. When an account is restored by hand it
+                    # comes back as a 7-day trial, so a paying customer who
+                    # was switched off by mistake and put back would be
+                    # switched off again a week later, by this very loop.
+                    # Ask Stripe before taking anything away.
+                    if stripe:
+                        try:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    "SELECT email, stripe_customer_id FROM users WHERE id = %s",
+                                    (uid,))
+                                _u = cur.fetchone() or {}
+                            _ids = [(_u.get("stripe_customer_id") or "").strip()]
+                            _ids = [i for i in _ids if i]
+                            if not _ids and (_u.get("email") or ""):
+                                _cl = stripe.Customer.list(email=_u["email"], limit=5)
+                                _ids = [c["id"] for c in (_cl.get("data") or []) if c.get("id")]
+                            _paying = False
+                            for _cid in _ids:
+                                _s = stripe.Subscription.list(customer=_cid,
+                                                              status="all", limit=20)
+                                if any((x.get("status") or "") in
+                                       ("active", "trialing", "past_due")
+                                       for x in (_s.get("data") or [])):
+                                    _paying = True
+                                    break
+                            if _paying:
+                                with conn.cursor() as cur:
+                                    cur.execute(
+                                        """UPDATE users
+                                              SET trial_status = 'converted',
+                                                  subscription_tier =
+                                                    COALESCE(subscription_tier, 'pro_single')
+                                            WHERE id = %s""",
+                                        (uid,))
+                                print(f"[trial-expiry] user {uid} is paying at "
+                                      f"Stripe; kept as a subscriber instead of "
+                                      f"expiring", flush=True)
+                                continue
+                        except Exception as e:
+                            # Could not check. Leave them alone rather than
+                            # cut off someone who may be paying.
+                            print(f"[trial-expiry] could not verify user {uid} "
+                                  f"at Stripe, leaving access in place: {e!r}",
+                                  flush=True)
+                            continue
+
                     _revoke_subscriber_role(uid, conn)
                     with conn.cursor() as cur:
                         cur.execute(
@@ -45499,14 +45548,22 @@ def _repair_wrongly_revoked_subscribers() -> None:
     try:
         with db() as conn:
             with conn.cursor() as cur:
+                # Oct 29, 2026: the first version of this required a stored
+                # stripe_customer_id, and Eric Stoddard did not have one —
+                # so the repair walked straight past the customer it was
+                # written for. The cancellation handler can find somebody by
+                # EMAIL when the id is missing, which means it can revoke an
+                # account we never linked to Stripe. The repair has to be
+                # able to reach just as far, so it takes email-only accounts
+                # too and asks Stripe about them by email.
                 cur.execute(
                     """SELECT id, email, stripe_customer_id
                        FROM users
                        WHERE is_active = TRUE
                          AND subscription_tier IS NULL
-                         AND stripe_customer_id IS NOT NULL
-                         AND stripe_customer_id <> ''
-                       LIMIT 200""")
+                         AND email IS NOT NULL
+                         AND email <> ''
+                       LIMIT 300""")
                 candidates = cur.fetchall() or []
     except Exception as e:
         print(f"[revoke-repair] lookup failed: {e!r}", flush=True)
@@ -45520,15 +45577,39 @@ def _repair_wrongly_revoked_subscribers() -> None:
     fixed = []
     for row in candidates:
         cust = (row.get("stripe_customer_id") or "").strip()
+        email = (row.get("email") or "").strip()
+
+        # Which Stripe customers belong to this person? Normally one, named
+        # on the user row. When it is missing, ask Stripe by email — that is
+        # the same reach the cancellation handler has.
+        customer_ids = [cust] if cust else []
+        found_by_email = False
+        if not customer_ids:
+            try:
+                cl = stripe.Customer.list(email=email, limit=5)
+                customer_ids = [c["id"] for c in (cl.get("data") or []) if c.get("id")]
+                found_by_email = bool(customer_ids)
+            except Exception as e:
+                print(f"[revoke-repair] customer lookup failed for {email}: {e!r}",
+                      flush=True)
+                continue
+        if not customer_ids:
+            continue
+
+        live_cust = None
         try:
-            subs = stripe.Subscription.list(customer=cust, status="all", limit=20)
-            live = any((s.get("status") or "") in ("active", "trialing", "past_due")
-                       for s in (subs.get("data") or []))
+            for cid in customer_ids:
+                subs = stripe.Subscription.list(customer=cid, status="all", limit=20)
+                if any((s.get("status") or "") in ("active", "trialing", "past_due")
+                       for s in (subs.get("data") or [])):
+                    live_cust = cid
+                    break
         except Exception as e:
-            print(f"[revoke-repair] stripe check failed for {cust}: {e!r}", flush=True)
+            print(f"[revoke-repair] stripe check failed for {email}: {e!r}", flush=True)
             continue
-        if not live:
+        if not live_cust:
             continue
+
         try:
             with db() as conn:
                 with conn.cursor() as cur:
@@ -45536,10 +45617,29 @@ def _repair_wrongly_revoked_subscribers() -> None:
                         """UPDATE users SET subscription_tier = 'pro_single'
                            WHERE id = %s AND subscription_tier IS NULL""",
                         (row["id"],))
+                    # Link the billing record while we have it. Without this
+                    # the customer cannot add a person from their own portal
+                    # ("we can't find your billing record"), and the next
+                    # cancellation event has to guess by email all over again.
+                    if found_by_email:
+                        cur.execute(
+                            """UPDATE users SET stripe_customer_id = %s
+                               WHERE id = %s
+                                 AND (stripe_customer_id IS NULL
+                                      OR stripe_customer_id = '')""",
+                            (live_cust, row["id"]))
+                    # A trial flag left on 'active' would expire them again
+                    # in a few days, which is how a hand-restored account
+                    # breaks a second time.
+                    cur.execute(
+                        """UPDATE users SET trial_status = 'converted'
+                           WHERE id = %s AND trial_status = 'active'""",
+                        (row["id"],))
                 _grant_subscriber_role(row["id"], conn)
             fixed.append(row.get("email") or str(row["id"]))
-            print(f"[revoke-repair] restored user={row['id']} "
-                  f"{row.get('email')} (Stripe says still paying)", flush=True)
+            print(f"[revoke-repair] restored user={row['id']} {email} "
+                  f"(Stripe says still paying; customer {live_cust}"
+                  f"{', linked by email' if found_by_email else ''})", flush=True)
         except Exception as e:
             print(f"[revoke-repair] restore failed for user={row['id']}: {e!r}",
                   flush=True)
