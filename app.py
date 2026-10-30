@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-310"
+BACKEND_BUILD = "0702-311"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -10963,6 +10963,71 @@ def stripe_webhook_v2():
                 )
                 _stripe_event_record(event_id, event_type, payload)
                 return jsonify({"received": True, "handled": False, "reason": "no-matching-user"}), 200
+
+            # ── Does this customer still have a live subscription? ──
+            # Oct 29, 2026. This handler used to revoke on the customer id
+            # alone. A customer who CHANGES plan ends one subscription and
+            # starts another on the same customer, so Stripe fires this
+            # event for the old one — and we silently stripped a paying
+            # customer of their tier and their subscriber role.
+            #
+            # That is how Eric Stoddard vanished: his account stayed active,
+            # so his threshold alerts kept paging his Meteorologist, while
+            # every Pro list (which filters on subscription_tier) stopped
+            # showing him. Nobody could message him, and nothing was obviously
+            # broken enough to notice.
+            #
+            # So ask Stripe what else this customer has before taking
+            # anything away.
+            dead_sub_id = (subscription.get("id") or "").strip()
+            still_paying = False
+            check_failed = False
+            try:
+                if stripe:
+                    others = stripe.Subscription.list(
+                        customer=stripe_customer_id, status="all", limit=20)
+                    for s in (others.get("data") or []):
+                        if (s.get("id") or "") == dead_sub_id:
+                            continue
+                        if (s.get("status") or "") in ("active", "trialing", "past_due"):
+                            still_paying = True
+                            break
+                else:
+                    check_failed = True
+            except Exception as e:
+                check_failed = True
+                print(f"[stripe-webhook] could not check other subscriptions "
+                      f"for {stripe_customer_id}: {e!r}", flush=True)
+
+            if still_paying or check_failed:
+                # Leave them alone. Wrongly revoking a paying customer is
+                # invisible and costs us the customer; wrongly keeping a
+                # cancelled one costs us a little service until a human
+                # looks. Fail toward the customer, and tell a human either
+                # way so the second case does not sit forever.
+                why = ("they still have an active subscription" if still_paying
+                       else "we could not reach Stripe to check")
+                print(f"[stripe-webhook] NOT revoking user_id={user_id} "
+                      f"customer={stripe_customer_id}: {why}", flush=True)
+                if check_failed:
+                    try:
+                        _send_team_notification(
+                            subject=f"Check a cancellation by hand: {stripe_customer_id}",
+                            html_body=(f"<p>Stripe reported a cancelled subscription for "
+                                       f"customer {_html_escape(stripe_customer_id)} "
+                                       f"(user {user_id}), but we could not check whether "
+                                       f"they still have another one, so nothing was "
+                                       f"revoked. Please check Stripe.</p>"),
+                            text_body=(f"Cancelled subscription for customer "
+                                       f"{stripe_customer_id} (user {user_id}), but we "
+                                       f"could not check for other subscriptions, so "
+                                       f"nothing was revoked. Please check Stripe."))
+                    except Exception:
+                        pass
+                _stripe_event_record(event_id, event_type, payload)
+                return jsonify({"received": True, "handled": True,
+                                "user_id": user_id, "revoked": False,
+                                "reason": why}), 200
 
             # Revoke the subscriber role. Other roles (admin, crew, met) stay.
             # Note: we do NOT kill their sessions or deactivate the account.
@@ -45412,6 +45477,88 @@ def _school_id_for_sentry_ids(sentry_ids):
     return None, ""
 
 
+def _repair_wrongly_revoked_subscribers() -> None:
+    """Give back access to anyone the cancellation webhook took it from
+    while they were still paying (Oct 29, 2026).
+
+    Until today, `customer.subscription.deleted` revoked on the Stripe
+    customer id alone. A plan change ends one subscription and opens
+    another on the same customer, so changing plan silently cleared the
+    customer's tier and subscriber role. The account stayed active, which
+    is why nothing looked broken: alerts kept firing while the customer
+    disappeared from every Pro list.
+
+    This finds the wreckage: active accounts with no tier but a Stripe
+    customer id, and asks Stripe whether each is in fact still paying.
+    Stripe is the authority — a genuinely cancelled customer is left
+    alone. Runs once per boot, in a thread, because it is network-bound
+    and must not touch the health check.
+    """
+    if not stripe:
+        return
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT id, email, stripe_customer_id
+                       FROM users
+                       WHERE is_active = TRUE
+                         AND subscription_tier IS NULL
+                         AND stripe_customer_id IS NOT NULL
+                         AND stripe_customer_id <> ''
+                       LIMIT 200""")
+                candidates = cur.fetchall() or []
+    except Exception as e:
+        print(f"[revoke-repair] lookup failed: {e!r}", flush=True)
+        return
+
+    if not candidates:
+        return
+    print(f"[revoke-repair] checking {len(candidates)} account(s) with no tier",
+          flush=True)
+
+    fixed = []
+    for row in candidates:
+        cust = (row.get("stripe_customer_id") or "").strip()
+        try:
+            subs = stripe.Subscription.list(customer=cust, status="all", limit=20)
+            live = any((s.get("status") or "") in ("active", "trialing", "past_due")
+                       for s in (subs.get("data") or []))
+        except Exception as e:
+            print(f"[revoke-repair] stripe check failed for {cust}: {e!r}", flush=True)
+            continue
+        if not live:
+            continue
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """UPDATE users SET subscription_tier = 'pro_single'
+                           WHERE id = %s AND subscription_tier IS NULL""",
+                        (row["id"],))
+                _grant_subscriber_role(row["id"], conn)
+            fixed.append(row.get("email") or str(row["id"]))
+            print(f"[revoke-repair] restored user={row['id']} "
+                  f"{row.get('email')} (Stripe says still paying)", flush=True)
+        except Exception as e:
+            print(f"[revoke-repair] restore failed for user={row['id']}: {e!r}",
+                  flush=True)
+
+    if fixed:
+        try:
+            _send_team_notification(
+                subject=f"Restored {len(fixed)} wrongly revoked subscriber(s)",
+                html_body=("<p>These accounts were paying but had lost their Pro "
+                           "tier through the old cancellation bug. Access has been "
+                           "given back:</p><p>"
+                           + "<br>".join(_html_escape(e) for e in fixed) + "</p>"),
+                text_body=("These accounts were paying but had lost their Pro tier "
+                           "through the old cancellation bug. Access restored:\n"
+                           + "\n".join(fixed)))
+        except Exception:
+            pass
+
+
 def _backfill_crew_home_coords() -> None:
     """One-time-ish boot pass (Sep 1, 2026): members with a home label
     but no coordinates get geocoded so radius Missions can find them.
@@ -47991,6 +48138,11 @@ def _ensure_brief_scheduler_started() -> None:
                              daemon=True).start()
         except Exception as e:
             print(f"[crew-backfill] boot thread failed: {e!r}", flush=True)
+        try:
+            threading.Thread(target=_repair_wrongly_revoked_subscribers,
+                             daemon=True).start()
+        except Exception as e:
+            print(f"[revoke-repair] boot thread failed: {e!r}", flush=True)
         try:
             import socket
             host = socket.gethostname()
