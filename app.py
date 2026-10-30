@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-312"
+BACKEND_BUILD = "0702-313"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -33050,6 +33050,11 @@ def admin_restore_subscriber(user_id):
     if "admin" not in (admin.get("roles") or []):
         return jsonify({"ok": False, "error": "forbidden"}), 403
     data = request.get_json(silent=True) or {}
+    # Oct 29, 2026: this only ever restored people as a trial, which is the
+    # wrong shape for the case it gets used for most — a PAYING customer who
+    # was switched off by mistake. Putting a paying customer on a 7-day
+    # trial means somebody has to remember to fix it again next week.
+    paying = bool(data.get("paying"))
     try:
         days = int(data.get("days") or 7)
     except (TypeError, ValueError):
@@ -33062,13 +33067,27 @@ def admin_restore_subscriber(user_id):
             u = cur.fetchone()
             if not u:
                 return jsonify({"ok": False, "error": "no-such-user"}), 404
-            cur.execute(
-                """UPDATE users
-                    SET is_active = TRUE,
-                        subscription_tier = COALESCE(subscription_tier, 'pro_single'),
-                        trial_ends_at = %s
-                  WHERE id = %s""",
-                (now_ms + days * 24 * 3600 * 1000, user_id))
+            if paying:
+                # No end date, and marked converted so no scheduler pass
+                # ever comes back for them.
+                cur.execute(
+                    """UPDATE users
+                        SET is_active = TRUE,
+                            subscription_tier =
+                              COALESCE(subscription_tier, 'pro_single'),
+                            trial_ends_at = NULL,
+                            trial_status = 'converted'
+                      WHERE id = %s""",
+                    (user_id,))
+            else:
+                cur.execute(
+                    """UPDATE users
+                        SET is_active = TRUE,
+                            subscription_tier =
+                              COALESCE(subscription_tier, 'pro_single'),
+                            trial_ends_at = %s
+                      WHERE id = %s""",
+                    (now_ms + days * 24 * 3600 * 1000, user_id))
             cur.execute(
                 """INSERT INTO user_roles (user_id, role, granted_at)
                    VALUES (%s, 'subscriber', %s)
@@ -33087,12 +33106,16 @@ def admin_restore_subscriber(user_id):
         _audit_log(admin["id"], admin.get("name"),
                    "user.restore_subscriber", target_type="user",
                    target_id=user_id,
-                   details={"days": days, "tier": "pro_single"})
+                   details={"days": (None if paying else days),
+                            "paying": paying, "tier": "pro_single"})
     except Exception:
         pass
-    print(f"[admin] {admin.get('email')} restored user {user_id} "
-          f"({u['email']}) as Pro trial subscriber, {days} days", flush=True)
-    return jsonify({"ok": True, "days": days})
+    print(f"[admin] {admin.get('email')} restored user {user_id} ({u['email']}) "
+          + ("as a paying Pro subscriber, no end date"
+             if paying else f"as a Pro trial subscriber, {days} days"),
+          flush=True)
+    return jsonify({"ok": True, "paying": paying,
+                    "days": (None if paying else days)})
 
 
 @app.delete("/api/v1/admin/users/<int:user_id>")
@@ -37450,17 +37473,22 @@ function fsends(list){
 }
 function renderFind(d){
   var out = document.getElementById('find-out');
-  window.__wvRestore = function(uid, el){
+  window.__wvRestore = function(uid, el, paying){
     el.disabled = true;
     fetch('/api/v1/admin/users/' + uid + '/restore-subscriber', {
       method: 'POST', credentials: 'include',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({days: 7})
+      body: JSON.stringify(paying ? {paying: true} : {days: 7})
     }).then(function(r){ return r.json(); }).then(function(d2){
       var m = document.querySelector('[data-restore-msg="' + uid + '"]');
       if (d2.ok) {
-        if (m) m.textContent = 'Restored. They are back in the Subscribers tab and the composer picker.';
-        el.style.display = 'none';
+        if (m) m.textContent = paying
+          ? 'Restored as a paying subscriber. No end date, nothing will switch them off again.'
+          : 'Restored on a 7-day trial. They are back in the Subscribers tab and the composer picker.';
+        var card = el.parentNode;
+        Array.prototype.forEach.call(
+          card.querySelectorAll('[data-restore],[data-restore-paying]'),
+          function(b){ b.style.display = 'none'; });
       } else {
         el.disabled = false;
         if (m) m.textContent = d2.error || 'Could not restore.';
@@ -37480,6 +37508,8 @@ function renderFind(d){
       if (u.hidden_from_subscribers_because.length) {
         html += '<br><span class=warn>Missing from the Subscribers tab: '
           + fesc(u.hidden_from_subscribers_because.join(' and ')) + '.</span>'
+          + ' <button class=mini data-restore-paying="' + u.id + '">'
+          + 'Restore as paying subscriber</button>'
           + ' <button class=mini data-restore="' + u.id + '">'
           + 'Restore as Pro trial (7 days)</button>'
           + ' <span class=dim data-restore-msg="' + u.id + '"></span>';
@@ -37536,6 +37566,10 @@ function renderFind(d){
     });
   }
   out.innerHTML = html;
+  Array.prototype.forEach.call(out.querySelectorAll('[data-restore-paying]'), function(b){
+    b.addEventListener('click', function(){
+      window.__wvRestore(b.getAttribute('data-restore-paying'), b, true); });
+  });
   Array.prototype.forEach.call(out.querySelectorAll('[data-restore]'), function(b){
     b.addEventListener('click', function(){ window.__wvRestore(b.getAttribute('data-restore'), b); });
   });
