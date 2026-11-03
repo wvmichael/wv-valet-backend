@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-314"
+BACKEND_BUILD = "0702-315"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -687,6 +687,22 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS pro_users_paid INTEGER NOT NULL DEFAU
 -- the account page quotes the customer their monthly total, and that number
 -- is wrong for a two-site customer unless we know the count.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS pro_locations_paid INTEGER NOT NULL DEFAULT 1;
+
+-- ── Invoiced annual accounts (Nov 3, 2026) ──
+-- Counties, school districts and anyone else paying on a purchase order have
+-- no Stripe subscription, so nothing renews itself and nothing reminds us.
+-- A year after Sheridan County pays, the only thing standing between us and
+-- a silently lapsed customer is somebody's memory.
+--
+-- invoice_renews_on   the date the next invoice is due to go out
+-- invoice_amount_cents what to invoice (what they paid last time)
+-- invoice_notice_sent  "<renewal date>/<stage>" of the last notice sent, so
+--                      each stage fires once per renewal and never repeats
+ALTER TABLE users ADD COLUMN IF NOT EXISTS invoice_renews_on DATE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS invoice_amount_cents INTEGER;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS invoice_notice_sent TEXT;
+CREATE INDEX IF NOT EXISTS idx_users_invoice_renews
+    ON users(invoice_renews_on) WHERE invoice_renews_on IS NOT NULL;
 
 -- ── Operational SMS consent for Mets (May 27, 2026) ──
 -- Records when a Met explicitly consented to receive operational
@@ -32951,15 +32967,23 @@ def admin_add_paying_subscriber():
                     user_id = cur.fetchone()["id"]
 
                 # Paying Pro, no trial, nothing scheduled to switch them off.
+                # The renewal date is a year out, with the amount to invoice,
+                # so the reminder pass can find them before they lapse.
+                renews_on = (datetime.now(timezone.utc).date()
+                             + timedelta(days=365))
+                yearly_cents = pro_monthly_cents(users_paid, locs_paid) * 12
                 cur.execute(
                     """UPDATE users
                           SET subscription_tier = 'pro_single',
                               pro_users_paid = %s,
                               pro_locations_paid = %s,
                               trial_status = 'converted',
-                              trial_ends_at = NULL
+                              trial_ends_at = NULL,
+                              invoice_renews_on = %s,
+                              invoice_amount_cents = %s,
+                              invoice_notice_sent = NULL
                         WHERE id = %s""",
-                    (users_paid, locs_paid, user_id))
+                    (users_paid, locs_paid, renews_on, yearly_cents, user_id))
 
                 cur.execute(
                     """INSERT INTO user_roles (user_id, role, granted_at)
@@ -33069,6 +33093,8 @@ def admin_add_paying_subscriber():
         "yearly": round(monthly * 12, 2),
         "county": geo.get("admin2") or "",
         "link_sent": link_sent,
+        "renews_on": (datetime.now(timezone.utc).date()
+                      + timedelta(days=365)).isoformat(),
     })
 
 
@@ -37604,7 +37630,8 @@ def admin_find_person():
             # ── users: no role filter, no is_active filter, on purpose ──
             cur.execute(
                 """SELECT id, email, name, phone, subscription_tier,
-                          is_active, created_at
+                          is_active, created_at,
+                          invoice_renews_on, invoice_amount_cents
                      FROM users ORDER BY id LIMIT 3000""")
             all_users = cur.fetchall()
             hits = [u for u in all_users
@@ -37672,6 +37699,13 @@ def admin_find_person():
                     "warning_sends": relays,
                     "crew_sends": crew_notes,
                     "hidden_from_subscribers_because": hidden,
+                    # Invoiced accounts have no Stripe subscription, so the
+                    # renewal date is the only thing that says when they
+                    # need billing again.
+                    "invoice_renews_on": (u["invoice_renews_on"].isoformat()
+                                          if u.get("invoice_renews_on") else ""),
+                    "invoice_amount": (round((u.get("invoice_amount_cents") or 0)/100.0, 2)
+                                       if u.get("invoice_amount_cents") else 0),
                 })
 
             # ── Stormline, including phone2 ──
@@ -37890,6 +37924,13 @@ function renderFind(d){
         + ' &middot; Tier: ' + (u.tier ? fesc(u.tier) : '<span class=dim>none</span>')
         + ' &middot; ' + (u.is_active ? '<span class=okp>active</span>' : '<span class=warn>inactive</span>');
       if (u.primary_met) { html += ' &middot; Met: ' + fesc(u.primary_met); }
+      if (u.invoice_renews_on) {
+        html += '<br><span class=okp>Invoiced account</span> &middot; renews '
+          + fesc(u.invoice_renews_on)
+          + (u.invoice_amount ? ' &middot; invoice $' + u.invoice_amount.toFixed(2) : '')
+          + ' <span class=dim>(nothing renews on its own; you will be reminded '
+          + '60 and 14 days out)</span>';
+      }
       if (u.hidden_from_subscribers_because.length) {
         html += '<br><span class=warn>Missing from the Subscribers tab: '
           + fesc(u.hidden_from_subscribers_because.join(' and ')) + '.</span>'
@@ -44816,6 +44857,10 @@ def _brief_scheduler_loop() -> None:
         except Exception as e:
             print(f"[renewal-notice] tick failed: {e!r}", flush=True)
         try:
+            _invoice_renewal_notice_pass()
+        except Exception as e:
+            print(f"[invoice-renewal] tick failed: {e!r}", flush=True)
+        try:
             _winter_watch_pass()
         except Exception as e:
             print(f"[winter-watch] tick failed: {e!r}", flush=True)
@@ -47360,6 +47405,118 @@ def _winter_watch_pass() -> int:
             print(f"[winter-watch] id={r.get('id')} failed: {e!r}", flush=True)
     if sent:
         print(f"[winter-watch] {sent} message(s)", flush=True)
+    return sent
+
+
+_INVOICE_NOTICE_STAGES = (60, 14)
+
+
+def _invoice_renewal_notice_pass() -> int:
+    """Remind us before an invoiced annual account comes up for renewal
+    (Nov 3, 2026).
+
+    A card subscriber renews itself at Stripe. An invoiced one does not: a
+    county pays once, and twelve months later nothing happens unless a
+    person sends another invoice. This is that person.
+
+    Two notices, 60 days and 14 days out. Sixty because a county's budget
+    and bill run move slowly and that is the lead time to get back onto
+    one; fourteen because by then it needs doing this week.
+
+    The assigned Meteorologist is copied — it is their subscriber and
+    their half of the money, so they should know it is up.
+    """
+    now_ms = int(time.time() * 1000)
+    try:
+        tz = ZoneInfo("America/Indiana/Indianapolis")
+    except Exception:
+        tz = timezone.utc
+    nowl = datetime.fromtimestamp(now_ms / 1000, tz=tz)
+    if nowl.hour < 9 or nowl.hour > 18:
+        return 0
+    today = nowl.date()
+
+    sent = 0
+    for stage in _INVOICE_NOTICE_STAGES:
+        target = today + timedelta(days=stage)
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT u.id, u.name, u.email, u.invoice_renews_on,
+                                  u.invoice_amount_cents, u.invoice_notice_sent,
+                                  u.pro_users_paid, u.pro_locations_paid,
+                                  sc.notes AS cov_notes,
+                                  mu.name AS met_name, mu.email AS met_email
+                             FROM users u
+                        LEFT JOIN subscriber_coverage sc ON sc.user_id = u.id
+                        LEFT JOIN users mu ON mu.id = sc.primary_met_id
+                            WHERE u.is_active = TRUE
+                              AND u.invoice_renews_on = %s""",
+                        (target,))
+                    rows = cur.fetchall() or []
+        except Exception as e:
+            print(f"[invoice-renewal] query failed: {e!r}", flush=True)
+            continue
+
+        for r in rows:
+            key = "%s/%d" % (r["invoice_renews_on"].isoformat(), stage)
+            if (r.get("invoice_notice_sent") or "") == key:
+                continue
+            amount = (r.get("invoice_amount_cents") or 0) / 100.0
+            who = r.get("name") or r.get("email") or "a subscriber"
+            # The coverage note holds the organisation and the PO details
+            # from when the account was made, which is exactly what you
+            # need in hand to raise the next invoice.
+            detail = (r.get("cov_notes") or "").strip()
+            try:
+                extras = []
+                if (r.get("pro_users_paid") or 1) > 1:
+                    extras.append("%d people" % r["pro_users_paid"])
+                if (r.get("pro_locations_paid") or 1) > 1:
+                    extras.append("%d locations" % r["pro_locations_paid"])
+                seats = (", ".join(extras)) or "1 person, 1 location"
+                _send_team_notification(
+                    subject=(f"Invoice renewal in {stage} days: {who}"),
+                    html_body=(
+                        f"<p><b>{_html_escape(who)}</b> is up for renewal on "
+                        f"<b>{r['invoice_renews_on'].strftime('%B %-d, %Y')}</b>"
+                        f" &mdash; {stage} days from now.</p>"
+                        f"<p>Invoice <b>${amount:,.2f}</b> for the year "
+                        f"({_html_escape(seats)}).</p>"
+                        + (f"<p style='color:#555;font-size:13px'>On the account: "
+                           f"{_html_escape(detail)}</p>" if detail else "")
+                        + (f"<p>Their Meteorologist is "
+                           f"{_html_escape(r.get('met_name') or 'not assigned')}.</p>")
+                        + "<p>This account pays by invoice, so nothing renews on "
+                          "its own. If no invoice goes out, they simply stop "
+                          "being a customer.</p>"),
+                    text_body=(
+                        f"{who} is up for renewal on "
+                        f"{r['invoice_renews_on'].isoformat()} ({stage} days away).\n"
+                        f"Invoice ${amount:,.2f} for the year ({seats}).\n"
+                        + (f"On the account: {detail}\n" if detail else "")
+                        + f"Meteorologist: {r.get('met_name') or 'not assigned'}\n"
+                        "This account pays by invoice; nothing renews on its own."),
+                    extra_recipients=([r["met_email"]] if r.get("met_email") else None),
+                )
+            except Exception as e:
+                print(f"[invoice-renewal] send failed user={r['id']}: {e!r}",
+                      flush=True)
+                continue
+
+            try:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """UPDATE users SET invoice_notice_sent = %s
+                               WHERE id = %s""", (key, r["id"]))
+                sent += 1
+                print(f"[invoice-renewal] notified about user={r['id']} "
+                      f"({r.get('email')}) {stage} days out", flush=True)
+            except Exception as e:
+                print(f"[invoice-renewal] stamp failed user={r['id']}: {e!r}",
+                      flush=True)
     return sent
 
 
