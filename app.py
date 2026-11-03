@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-313"
+BACKEND_BUILD = "0702-314"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -20867,6 +20867,36 @@ td select option{background:#0B1424}
 .msg.bad{background:#3A1220;border:1px solid #7C2740;color:#FFC2CE}
 .empty{border:1px dashed rgba(126,182,255,.3);border-radius:13px;padding:24px;color:#B8C7DE;
   text-align:center;font-size:15px}
+/* Add a paying subscriber (Nov 3, 2026) */
+.addwrap{border:1px solid rgba(126,182,255,.26);border-radius:14px;margin:0 0 20px;
+  background:rgba(255,255,255,.03);overflow:hidden}
+.addhead{display:flex;align-items:center;justify-content:space-between;gap:14px;
+  padding:15px 18px;cursor:pointer}
+.addhead b{font-size:16px;color:#fff}
+.addhead i{display:block;font-style:normal;font-size:13.5px;color:#8FA6C6;margin-top:3px}
+.addhead span{font-size:13.5px;color:#7EB6FF;font-weight:700;white-space:nowrap}
+.addbody{display:none;padding:4px 18px 20px;border-top:1px solid rgba(126,182,255,.16)}
+.addbody.on{display:block}
+.fgrid{display:grid;grid-template-columns:1fr;gap:13px;margin-top:16px}
+@media(min-width:760px){.fgrid{grid-template-columns:1fr 1fr}}
+.f label{display:block;font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;
+  font-weight:800;color:#8FA6C6;margin:0 0 5px}
+.f input,.f select{width:100%;box-sizing:border-box;padding:11px 12px;font-size:14.5px;
+  font-family:inherit;color:#EAF1FF;border-radius:9px;background:rgba(255,255,255,.05);
+  border:1px solid rgba(126,182,255,.26)}
+.f input:focus,.f select:focus{outline:none;border-color:var(--blue)}
+.f select option{background:#0B1424}
+.f .hint{display:block;font-size:12.5px;color:#7F8FA6;margin-top:5px;line-height:1.45}
+.fwide{grid-column:1/-1}
+.addcons{display:flex;gap:10px;align-items:flex-start;font-size:13.5px;line-height:1.5;
+  color:#B8C7DE;margin:16px 0 0;cursor:pointer}
+.addcons input{width:17px;height:17px;margin:2px 0 0;flex:0 0 auto;accent-color:var(--blue)}
+.addfoot{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-top:18px}
+.addfoot .price{font-size:14.5px;color:#B8C7DE}
+.addfoot .price b{color:#fff;font-size:18px}
+.addgo{background:var(--accent);color:#fff;border:none;border-radius:10px;
+  padding:13px 24px;font-size:15px;font-weight:800;font-family:inherit;cursor:pointer}
+.addgo:disabled{opacity:.5;cursor:default}
 </style></head><body>
 __WV_HEADER__
 __ADMIN_NAV__
@@ -20882,6 +20912,52 @@ __ADMIN_NAV__
     <button data-t=pro>Pro</button>
     <button data-t=crew>Valet Crew</button>
   </div>
+  <div class=addwrap>
+    <div class=addhead id=addtoggle>
+      <div><b>Add a paying subscriber</b>
+      <i>For customers who pay by invoice or purchase order instead of a card &mdash;
+      counties, school districts, anyone with an accounts payable department.</i></div>
+      <span id=addtoggletxt>Open</span>
+    </div>
+    <div class=addbody id=addbody>
+      <div class=fgrid>
+        <div class=f><label for=a-name>Their name</label>
+          <input id=a-name placeholder="Joseph Herskowitz"></div>
+        <div class=f><label for=a-org>Organisation (optional)</label>
+          <input id=a-org placeholder="Sheridan County Road &amp; Bridge"></div>
+        <div class=f><label for=a-email>Email</label>
+          <input id=a-email type=email placeholder="scrb@sheridancoks.com"></div>
+        <div class=f><label for=a-phone>Mobile for texts (optional)</label>
+          <input id=a-phone type=tel placeholder="785-555-0123"></div>
+        <div class="f fwide"><label for=a-address>Address to watch</label>
+          <input id=a-address placeholder="County shop, Hoxie, KS">
+          <span class=hint>Street address, or just the town and state. This is what
+          the Meteorologist forecasts for and what severe alerts match against.</span></div>
+        <div class=f><label for=a-met>Their Meteorologist</label>
+          <select id=a-met><option value="">Not assigned yet</option></select></div>
+        <div class=f><label for=a-time>Morning brief arrives</label>
+          <input id=a-time type=time value="05:00">
+          <span class=hint>Road crews usually want it early.</span></div>
+        <div class=f><label for=a-users>How many people</label>
+          <input id=a-users type=number min=1 max=20 value=1>
+          <span class=hint>$99 covers one. Each extra person is $39 a month.</span></div>
+        <div class=f><label for=a-locs>How many locations</label>
+          <input id=a-locs type=number min=1 max=20 value=1>
+          <span class=hint>Each extra location is $49 a month.</span></div>
+        <div class="f fwide"><label for=a-bill>Billing note</label>
+          <input id=a-bill placeholder="PO 2026-114, invoiced annually, net 30">
+          <span class=hint>Kept on the account so anyone can see why there is no
+          card on file.</span></div>
+      </div>
+      <label class=addcons><input type=checkbox id=a-consent>
+        <span>They have given written permission to be texted at that number.
+        Required before we can send them anything by SMS.</span></label>
+      <div class=addfoot>
+        <span class=price id=a-price>Monthly <b>$99.00</b> &middot; yearly <b>$1,188.00</b></span>
+        <button class=addgo id=a-go>Create the account</button>
+      </div>
+    </div>
+  </div>
   <div class=bar2>
     <input id=q placeholder="Filter by name, email, phone or address">
     <span class=count id=count></span>
@@ -20893,6 +20969,84 @@ __WV_FOOTER__"""
 
 _ADMIN_SUBS_SCRIPT = """<script>
 (function(){
+  // ── Add a paying subscriber ──
+  var tgl=document.getElementById('addtoggle'), body=document.getElementById('addbody'),
+      tgltxt=document.getElementById('addtoggletxt');
+  tgl.onclick=function(){
+    var open=body.classList.toggle('on');
+    tgltxt.textContent=open?'Close':'Open';
+    if(open){ loadMets(); }
+  };
+  var metsLoaded=false;
+  function loadMets(){
+    if(metsLoaded) return; metsLoaded=true;
+    fetch('/api/v1/admin/mets',{credentials:'include'})
+      .then(function(r){return r.json();})
+      .then(function(d){
+        if(!d||!d.ok||!d.mets) return;
+        var s=document.getElementById('a-met');
+        d.mets.forEach(function(m){
+          var o=document.createElement('option');
+          o.value=m.id; o.textContent=(m.name||m.email);
+          s.appendChild(o);
+        });
+      }).catch(function(){});
+  }
+  function money(n){return '$'+n.toFixed(2).replace(/\\B(?=(\\d{3})+(?!\\d))/g,',');}
+  function reprice(){
+    var u=Math.max(1,parseInt(document.getElementById('a-users').value||'1',10));
+    var l=Math.max(1,parseInt(document.getElementById('a-locs').value||'1',10));
+    var m=99+(u-1)*39+(l-1)*49;
+    document.getElementById('a-price').innerHTML=
+      'Monthly <b>'+money(m)+'</b> &middot; yearly <b>'+money(m*12)+'</b>';
+  }
+  document.getElementById('a-users').addEventListener('input',reprice);
+  document.getElementById('a-locs').addEventListener('input',reprice);
+  reprice();
+
+  var go=document.getElementById('a-go');
+  go.onclick=function(){
+    function v(id){return (document.getElementById(id).value||'').trim();}
+    var m=document.getElementById('msg');
+    function tell(k,t){m.className='msg '+k;m.innerHTML=t;m.style.display='block';
+      m.scrollIntoView({block:'nearest'});}
+    if(!v('a-name')){tell('bad','Enter their name.');return;}
+    if(!v('a-email')){tell('bad','Enter their email.');return;}
+    if(!v('a-address')){tell('bad','Enter the address to watch.');return;}
+    if(v('a-phone') && !document.getElementById('a-consent').checked){
+      tell('bad','Tick the consent box, or clear the phone number. We cannot text '
+        +'somebody without a record that they agreed.');return;}
+    go.disabled=true; go.textContent='Creating...';
+    fetch('/api/v1/admin/subscribers/create',{method:'POST',credentials:'include',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        name:v('a-name'), org:v('a-org'), email:v('a-email'), phone:v('a-phone'),
+        address:v('a-address'), met_id:v('a-met'), brief_time:v('a-time'),
+        users:v('a-users'), locations:v('a-locs'), bill_note:v('a-bill'),
+        consent:document.getElementById('a-consent').checked})})
+    .then(function(r){return r.json().then(function(d){return {s:r.status,d:d};});})
+    .then(function(x){
+      go.disabled=false; go.textContent='Create the account';
+      if(x.d&&x.d.ok){
+        tell('good','<b>Account created.</b> '+esc(v('a-name'))+' is a paying Pro '
+          +'subscriber at '+money(x.d.monthly)+' a month, '+money(x.d.yearly)+' a year.'
+          +(x.d.county?' We placed them in '+esc(x.d.county)+'.':'')
+          +'<br>'+(x.d.link_sent
+            ? 'A sign-in link has been emailed to them, good for 14 days.'
+            : '<b>No sign-in email went out</b> &mdash; send them one from their row.')
+          +'<br>Invoice them for '+money(x.d.yearly)+' when you are ready. '
+          +'Their Meteorologist can start writing today.');
+        ['a-name','a-org','a-email','a-phone','a-address','a-bill']
+          .forEach(function(id){document.getElementById(id).value='';});
+        document.getElementById('a-consent').checked=false;
+        if(typeof load==='function'){ load(); }
+      } else {
+        tell('bad',esc((x.d&&(x.d.message||x.d.error))||'That did not work.'));
+      }
+    }).catch(function(){go.disabled=false;go.textContent='Create the account';
+      tell('bad','Connection problem. Nothing was created.');});
+  };
+
   var tier='stormline', rows=[];
   function esc(t){var d=document.createElement('div');d.textContent=(t===null||t===undefined)?'':t;return d.innerHTML;}
   function say(k,t){var m=document.getElementById('msg');m.className='msg '+k;m.innerHTML=t;m.style.display='block';}
@@ -32685,6 +32839,237 @@ def admin_user_set_location(user_id: int):
             "county": loc_row.get("county") or "",
         },
     }), 200
+
+
+# ---------------------------------------------------------------------------
+# Add a paying subscriber by hand (Nov 3, 2026)
+#
+# Checkout takes a card. Counties, school districts and anyone else who pays
+# on a purchase order cannot use it, and those are the customers Chris is
+# finding — Sheridan County Road & Bridge asked to be invoiced for a year.
+#
+# Until now building one of those accounts meant creating the user through an
+# endpoint with no screen, setting the tier somewhere else, and setting the
+# address nowhere at all, because that screen does not exist either. That is
+# exactly how Eric Stoddard ended up paying for a service that could not see
+# him, and how Deone Horinek ended up with no address.
+#
+# So this does the whole account in one transaction or none of it. Every
+# field the brief scheduler, the Met composer, the alert matcher and the
+# billing screens need gets written together, and the geocode happens BEFORE
+# anything is written so a bad address fails loudly instead of quietly
+# creating half a customer.
+# ---------------------------------------------------------------------------
+
+@app.route("/api/v1/admin/subscribers/create", methods=["OPTIONS"])
+def _admin_add_subscriber_preflight():
+    return ("", 204)
+
+
+@app.post("/api/v1/admin/subscribers/create")
+@require_role("admin")
+def admin_add_paying_subscriber():
+    """Create a complete, paying Pro subscriber. Admin only."""
+    actor = _get_current_user()
+    data = request.get_json(silent=True) or {}
+
+    name = (data.get("name") or "").strip()[:120]
+    email = (data.get("email") or "").strip().lower()[:200]
+    phone = _normalize_phone((data.get("phone") or "").strip())
+    org = (data.get("org") or "").strip()[:160]
+    address = (data.get("address") or "").strip()[:240]
+    brief_time = (data.get("brief_time") or "07:00").strip()[:5]
+    tz = (data.get("timezone") or "America/Chicago").strip()[:64]
+    bill_note = (data.get("bill_note") or "").strip()[:400]
+    consent = bool(data.get("consent"))
+
+    try:
+        users_paid = max(1, min(50, int(data.get("users") or 1)))
+    except Exception:
+        users_paid = 1
+    try:
+        locs_paid = max(1, min(50, int(data.get("locations") or 1)))
+    except Exception:
+        locs_paid = 1
+    met_id = data.get("met_id")
+    try:
+        met_id = int(met_id) if met_id else None
+    except Exception:
+        met_id = None
+
+    if not name:
+        return jsonify({"ok": False, "error": "Enter their name."}), 400
+    if not email or not is_valid_email(email):
+        return jsonify({"ok": False, "error": "Enter a valid email."}), 400
+    if not address:
+        return jsonify({"ok": False,
+                        "error": "Enter the address to watch. Without it their "
+                                 "Meteorologist has nowhere to look and the alert "
+                                 "matcher cannot find them."}), 400
+    if not re.match(r"^\d{1,2}:\d{2}$", brief_time):
+        brief_time = "07:00"
+    if len(brief_time) == 4:
+        brief_time = "0" + brief_time
+    if phone and not consent:
+        return jsonify({"ok": False,
+                        "error": "Tick the consent box. A phone number without a "
+                                 "record of their permission cannot be texted."}), 400
+
+    # Geocode FIRST. A customer we cannot place is not a customer we should
+    # half-create — that is the whole lesson of the last two weeks.
+    geo = _geocode_address(address)
+    if not geo:
+        return jsonify({"ok": False, "error": "bad-address",
+                        "message": ("We could not place that address. Try the "
+                                    "street, town and state, or just the town "
+                                    "and state.")}), 400
+
+    now_ms = int(time.time() * 1000)
+    now_s = now_ts()
+    created = False
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM users WHERE LOWER(email) = LOWER(%s)",
+                            (email,))
+                row = cur.fetchone()
+                if row:
+                    user_id = row["id"]
+                    cur.execute(
+                        """UPDATE users SET name = COALESCE(NULLIF(name,''), %s),
+                                            phone = COALESCE(NULLIF(phone,''), %s),
+                                            is_active = TRUE
+                           WHERE id = %s""",
+                        (name, phone or None, user_id))
+                else:
+                    created = True
+                    cur.execute(
+                        """INSERT INTO users (email, name, phone, created_at,
+                                              is_active, password_must_change)
+                           VALUES (%s,%s,%s,%s,TRUE,TRUE) RETURNING id""",
+                        (email, name, phone or None, now_s))
+                    user_id = cur.fetchone()["id"]
+
+                # Paying Pro, no trial, nothing scheduled to switch them off.
+                cur.execute(
+                    """UPDATE users
+                          SET subscription_tier = 'pro_single',
+                              pro_users_paid = %s,
+                              pro_locations_paid = %s,
+                              trial_status = 'converted',
+                              trial_ends_at = NULL
+                        WHERE id = %s""",
+                    (users_paid, locs_paid, user_id))
+
+                cur.execute(
+                    """INSERT INTO user_roles (user_id, role, granted_at)
+                       VALUES (%s,'subscriber',%s)
+                       ON CONFLICT (user_id, role) DO NOTHING""",
+                    (user_id, now_ms))
+
+                # The address, as the primary location.
+                cur.execute(
+                    "SELECT id FROM saved_locations WHERE user_id = %s AND is_primary = TRUE",
+                    (user_id,))
+                if not cur.fetchone():
+                    cur.execute(
+                        """INSERT INTO saved_locations
+                             (user_id, label, address_text, lat, lng, county,
+                              is_primary, created_at, updated_at)
+                           VALUES (%s,%s,%s,%s,%s,%s,TRUE,%s,%s)""",
+                        (user_id, (org or name)[:80], address,
+                         geo["lat"], geo["lng"], geo.get("admin2"),
+                         now_ms, now_ms))
+
+                # Coverage: who writes for them, when it lands, and why this
+                # account exists at all (the billing note is the paper trail
+                # for an invoiced customer with no Stripe record).
+                note_bits = []
+                if org:
+                    note_bits.append(org)
+                note_bits.append("Invoiced account, created by %s"
+                                 % (actor.get("email") or "an admin"))
+                if bill_note:
+                    note_bits.append(bill_note)
+                if consent and phone:
+                    note_bits.append(
+                        "Texting consent given in writing %s"
+                        % datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+                cur.execute(
+                    """INSERT INTO subscriber_coverage
+                         (user_id, primary_met_id, daily_brief_time,
+                          daily_brief_timezone, notes, updated_at)
+                       VALUES (%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT (user_id) DO UPDATE
+                       SET primary_met_id = COALESCE(EXCLUDED.primary_met_id,
+                                                     subscriber_coverage.primary_met_id),
+                           daily_brief_time = EXCLUDED.daily_brief_time,
+                           daily_brief_timezone = EXCLUDED.daily_brief_timezone,
+                           notes = EXCLUDED.notes,
+                           updated_at = EXCLUDED.updated_at""",
+                    (user_id, met_id, brief_time, tz,
+                     " | ".join(note_bits), now_ms))
+
+                # Without this row the draft scheduler never sees them.
+                try:
+                    bh, bm = int(brief_time[:2]), int(brief_time[3:])
+                    end = (bh * 60 + bm + 30) % (24 * 60)
+                    morning_end = "%02d:%02d" % (end // 60, end % 60)
+                except Exception:
+                    morning_end = "07:30"
+                cur.execute(
+                    """INSERT INTO brief_preferences
+                         (user_id, morning_enabled, morning_window_start,
+                          morning_window_end, evening_enabled, updated_at)
+                       VALUES (%s, TRUE, %s, %s, FALSE, %s)
+                       ON CONFLICT (user_id) DO UPDATE
+                       SET morning_enabled = TRUE,
+                           morning_window_start = EXCLUDED.morning_window_start,
+                           morning_window_end = EXCLUDED.morning_window_end,
+                           updated_at = EXCLUDED.updated_at""",
+                    (user_id, brief_time, morning_end, now_ms))
+    except Exception as e:
+        print(f"[admin-add-sub] failed for {email}: {e!r}", flush=True)
+        return jsonify({"ok": False, "error": "db-error",
+                        "message": "Nothing was created. Tell Claude what this says."}), 500
+
+    # Sign-in link so they never need a password.
+    link_sent = False
+    try:
+        raw = new_secure_token()
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO magic_link_tokens
+                         (token_hash, user_id, created_at, expires_at, ip_requested)
+                       VALUES (%s,%s,%s,%s,%s)""",
+                    (hash_token(raw), user_id, now_s,
+                     now_s + 14 * 24 * 3600, "admin-add-subscriber"))
+        base = os.environ.get("FRONTEND_BASE_URL", "https://weathervalet.ai").rstrip("/")
+        link = f"{base}/?auth=verify&token={raw}&intent=new-account"
+        link_sent = bool(_send_magic_link_email(email, link, intent="new-account"))
+    except Exception as e:
+        print(f"[admin-add-sub] welcome link failed for {email}: {e!r}", flush=True)
+
+    monthly = pro_monthly_cents(users_paid, locs_paid) / 100.0
+    try:
+        _audit_log(actor["id"], actor.get("name"), "subscriber.create_invoiced",
+                   target_type="user", target_id=user_id,
+                   details={"email": email, "users": users_paid,
+                            "locations": locs_paid, "monthly": monthly})
+    except Exception:
+        pass
+    print(f"[admin-add-sub] {actor.get('email')} created paying subscriber "
+          f"{user_id} ({email}) {users_paid}p/{locs_paid}loc "
+          f"${monthly:.2f}/mo", flush=True)
+
+    return jsonify({
+        "ok": True, "user_id": user_id, "created": created,
+        "monthly": round(monthly, 2),
+        "yearly": round(monthly * 12, 2),
+        "county": geo.get("admin2") or "",
+        "link_sent": link_sent,
+    })
 
 
 @app.post("/api/v1/admin/users")
