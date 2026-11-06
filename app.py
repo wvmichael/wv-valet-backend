@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-315"
+BACKEND_BUILD = "0702-319"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -28733,10 +28733,10 @@ def _activate_sentry_group(sentry_ids, stripe_customer_id: str) -> None:
     giver = (row.get("gift_from") or "").strip()
     # A gift recipient never asked for this text, so the first thing it says
     # has to be who sent it. Two different sentences, not one glued together.
-    opener = f"{hello}your WeatherValet Stormline is up"
+    opener = f"WeatherValet Stormline: {hello}you are set"
     if giver:
-        who = f"Hi {first}, " if first else ""
-        opener = f"{who}{giver} set up a WeatherValet Stormline for you"
+        who = f"{first}, " if first else ""
+        opener = f"WeatherValet Stormline: {who}{giver} set this up for you"
     manage = ""
     try:
         with db() as conn:
@@ -28744,7 +28744,7 @@ def _activate_sentry_group(sentry_ids, stripe_customer_id: str) -> None:
                 cur.execute("SELECT manage_token FROM sentry_subscribers WHERE id = %s", (ids[0],))
                 mrow = cur.fetchone()
         if mrow and mrow.get("manage_token"):
-            manage = f" Manage your settings any time: {PUBLIC_BASE_URL}/stormline/manage/{mrow['manage_token']}"
+            manage = f" Settings: {PUBLIC_BASE_URL}/stormline/manage/{mrow['manage_token']}"
     except Exception as e:
         print(f"[stormline] manage link lookup failed: {e!r}", flush=True)
     if len(rows) == 1:
@@ -28755,22 +28755,24 @@ def _activate_sentry_group(sentry_ids, stripe_customer_id: str) -> None:
             named.append(f"{r['label']} ({r['address']})" if r.get("label") else r["address"])
         where = "at " + " and ".join([", ".join(named[:-1]), named[-1]]) if len(named) > 2 \
             else "at " + " and ".join(named)
+    # Rewritten Nov 5, 2026. This ran to four segments and buried the one
+    # line that actually matters — saving the number — at the very end,
+    # which is where a wall of text stops being read. The instruction now
+    # comes second, and the rest is as short as it can be and still be
+    # true.
     pack_bit = ""
     if any(r.get("daily") for r in rows):
-        pack_bit += (" Your morning summary of the National Weather Service forecast "
-                     "starts tomorrow.")
+        pack_bit = " Your morning summary starts tomorrow."
     if any(r.get("pack_allseason") for r in rows):
-        pack_bit = (" Your All-Season pack is on too, so winter storms, frost and "
-                    "freeze, extreme heat, and high wind alerts come through here as well.")
+        pack_bit = (" Your All-Season pack adds winter storms, frost and freeze, "
+                    "extreme heat and high wind." + pack_bit)
     try:
         send_sms(row["phone"],
-                 f"{opener} {where}. "
-                 f"If the National Weather Service puts it inside a severe "
-                 f"thunderstorm, tornado, or flash flood warning, you'll hear from us "
-                 f"here the moment it happens. Tornado warnings also ring your phone "
-                 f"with a voice call.{pack_bit} One important step: save this number as "
-                 f"WeatherValet and allow it in Do Not Disturb, so the 2 AM call "
-                 f"always rings.{manage} - WeatherValet")
+                 f"{opener} {where}. Save this number as WeatherValet and allow "
+                 f"it in Do Not Disturb, so a 2 AM tornado call gets through. "
+                 f"We text when the Weather Service puts your address in a severe "
+                 f"thunderstorm, tornado or flash flood warning. Tornado warnings "
+                 f"also ring your phone.{pack_bit}{manage}")
     except Exception as e:
         print(f"[sentry] welcome sms failed: {e!r}", flush=True)
     try:
@@ -47331,37 +47333,42 @@ def _winter_watch_pass() -> int:
                 # Storm we were tracking has fallen apart: say so once.
                 if same_storm and told_stage and (told_snow >= _WW_SNOW_IN
                                                   or told_ice >= _WW_ICE_IN):
-                    body = (f"WeatherValet update: that system has trended "
+                    body = (f"WeatherValet Stormline: that system has trended "
                             f"down. The Weather Service now shows less than "
-                            f"an inch for {where}. We are still watching.")
+                            f"an inch for {where}. We are still watching it.")
                     best_day, snow, ice, stage = None, 0, 0, 0
                 else:
                     continue
             elif first_snow:
-                body = (f"WeatherValet: first snow of the season for {where}, "
-                        f"{when_txt}. Even a dusting is slick on cold pavement, "
-                        f"and nobody is driving for it yet. The Weather Service "
-                        f"will have amounts as it gets closer.")
+                body = (f"WeatherValet Stormline: first snow of the season for "
+                        f"{where}, {when_txt}. Even a dusting is slick on cold "
+                        f"pavement, and bridges ice before roads do. We will "
+                        f"have amounts as it gets closer.")
             elif ice >= _WW_ICE_IN and ice * 40 >= snow:
                 if stage == 3:
-                    body = (f"WeatherValet: the Weather Service expects "
-                            f"{_ww_ice_phrase(ice)} at {where} {when_txt}. "
-                            f"Ice is the one that puts cars in ditches. "
-                            f"Plan to stay put if you can.")
+                    # State the hazard; do not issue instructions. The
+                    # heavier the ice, the more there is to say about it.
+                    harm = ("Ice makes driving and walking hazardous, and at "
+                            "this amount it brings down limbs and power lines."
+                            if ice >= 0.25 else
+                            "Ice makes driving and walking hazardous.")
+                    body = (f"WeatherValet Stormline: the Weather Service expects "
+                            f"{_ww_ice_phrase(ice)} at {where} {when_txt}. {harm}")
                 else:
-                    body = (f"WeatherValet: the Weather Service is showing "
-                            f"freezing rain or sleet for {where} around "
+                    body = (f"WeatherValet Stormline: the Weather Service is "
+                            f"showing freezing rain or sleet for {where} around "
                             f"{when_txt}. Too early for amounts. We are "
                             f"watching it.")
             elif stage == 3:
-                body = (f"WeatherValet: the Weather Service expects "
+                body = (f"WeatherValet Stormline: the Weather Service expects "
                         f"{_ww_phrase_amount(snow)} at {where} by {when_txt}. "
                         f"We will tell you if that changes.")
             else:
-                body = (f"WeatherValet: the Weather Service is showing a "
-                        f"winter system for {where} around {when_txt}. Too "
-                        f"early for amounts, and systems this far out often "
-                        f"fall apart. We are watching it for you.")
+                body = (f"WeatherValet Stormline: the Weather Service is showing "
+                        f"a winter system for {where} around {when_txt}. Too "
+                        f"early for amounts, and the forecast will likely change "
+                        f"over the next few days. We are watching it and will "
+                        f"update you as it gets closer.")
 
             # Speak only on meaningful change.
             if same_storm and stage and stage == told_stage:
@@ -47587,7 +47594,8 @@ def _stormline_renewal_notice_pass() -> int:
             school_line = (f" A quarter of it goes to {r['school_name']} "
                            f"again this year.")
 
-        body = (f"WeatherValet: your Stormline renews on {when} for {price}. "
+        body = (f"WeatherValet Stormline: your subscription renews on {when} "
+                f"for {price}. "
                 f"We are still watching {where}.{school_line} "
                 f"Nothing to do if you want to keep it. "
                 f"To change or cancel, reply to this text or email "
@@ -48172,20 +48180,75 @@ _SENTRY_PACK_EVENTS = (
 )
 _SENTRY_ALL_EVENTS = _SENTRY_EVENTS + _SENTRY_PACK_EVENTS
 
+# Events where the safety line is an immediate life-safety action and the
+# Weather Service itself issues the same instruction. Everything else gets
+# the hazard in the Weather Service's own words instead (Nov 5, 2026):
+# we relay, we do not tell people what to do.
+_SENTRY_ACT_NOW = ("Tornado Warning", "Severe Thunderstorm Warning",
+                   "Flash Flood Warning", "Snow Squall Warning")
+
+
+def _nws_what_line(alert: dict) -> str:
+    """The storm's actual hazard, in the Weather Service's words.
+
+    An NWS warning description is a set of starred sections:
+
+        * WHAT...Heavy snow expected. Total accumulations of 5 to 9 inches.
+        * WHERE...Portions of north central Kansas.
+        * WHEN...From 6 PM this evening to noon CST Friday.
+        * IMPACTS...Travel could be very difficult.
+
+    WHAT and IMPACTS are the two that say what this particular storm will
+    do. WHERE and WHEN we already tell them better, because we know their
+    address and the expiry time.
+
+    Before this, every Winter Storm Warning carried the same sentence we
+    wrote once in August, so a four-inch snow and a crippling ice storm
+    read identically. Added Nov 5, 2026.
+    """
+    desc = (alert.get("description") or "").strip()
+    if not desc:
+        return ""
+    wanted = {}
+    for chunk in desc.split("*"):
+        chunk = chunk.strip()
+        for key in ("WHAT", "IMPACTS"):
+            if chunk.upper().startswith(key + "..."):
+                text = chunk[len(key) + 3:].strip()
+                # One line: NWS wraps mid-sentence.
+                text = " ".join(text.split())
+                if text and key not in wanted:
+                    wanted[key] = text
+    out = wanted.get("WHAT", "")
+    impacts = wanted.get("IMPACTS", "")
+    if impacts and len(out) + len(impacts) < 230:
+        out = (out + " " + impacts).strip()
+    # Keep the whole text inside a sane number of SMS segments.
+    if len(out) > 240:
+        cut = out[:240].rsplit(". ", 1)[0]
+        out = (cut + ".") if len(cut) > 60 else (out[:237].rstrip() + "...")
+    return out
+
+
+# The fallback line, used only when the Weather Service's own alert carries
+# no usable WHAT text. Rewritten Nov 5, 2026: these state the hazard and
+# stop. We relay weather; we do not instruct people on how to live through
+# it. The four short-fuse warnings above keep their action line, because
+# the Weather Service issues the same one and the margin is minutes.
 _SENTRY_SAFETY = {
     "Tornado Warning": "Take shelter now: interior room, lowest floor, away from windows.",
     "Severe Thunderstorm Warning": "Move indoors, away from windows.",
     "Flash Flood Warning": "Never walk or drive through floodwater. Move to higher ground if water rises.",
-    "Winter Storm Warning": "Travel will be difficult. Keep a charged phone and warm layers in the car.",
-    "Ice Storm Warning": "Ice brings down limbs and power lines. Avoid travel and expect outages.",
-    "Blizzard Warning": "Blowing snow will cut visibility to near zero. Do not travel.",
     "Snow Squall Warning": "Sudden whiteout and icy roads. If driving, slow down, use lights, and exit when safe. Never stop on the roadway.",
-    "Freeze Warning": "Cover or bring in tender plants and protect outdoor pipes and spigots.",
-    "Hard Freeze Warning": "A hard freeze kills unprotected plants. Bring in what you can and drain hoses.",
-    "Frost Advisory": "Frost is likely tonight. Cover tender plants or move pots under shelter.",
-    "Extreme Heat Warning": "Limit outdoor work, drink water early, and check on older neighbors.",
-    "Excessive Heat Warning": "Limit outdoor work, drink water early, and check on older neighbors.",
-    "High Wind Warning": "Secure trash cans, patio furniture, and anything that can become a projectile.",
+    "Winter Storm Warning": "Snow and ice at this level make travel difficult.",
+    "Ice Storm Warning": "Ice at this level brings down limbs and power lines, and makes driving and walking hazardous.",
+    "Blizzard Warning": "Blowing snow will cut visibility to near zero and travel becomes dangerous.",
+    "Freeze Warning": "Temperatures will be low enough to kill tender plants and freeze exposed pipes.",
+    "Hard Freeze Warning": "A hard freeze kills unprotected plants and can burst exposed pipes and spigots.",
+    "Frost Advisory": "Frost is likely tonight and will damage tender plants.",
+    "Extreme Heat Warning": "Heat at this level causes heat illness, especially for older people and anyone working outdoors.",
+    "Excessive Heat Warning": "Heat at this level causes heat illness, especially for older people and anyone working outdoors.",
+    "High Wind Warning": "Winds this strong move unsecured objects and can bring down limbs and power lines.",
 }
 
 
@@ -48282,10 +48345,27 @@ def _sentry_relay_warning(alert: dict) -> int:
             # takes shelter for a warning that does not exist.
             prefix = "REHEARSAL, no warning is in effect. " if alert.get("is_rehearsal") else ""
             hazard = _sentry_hazard_line(alert)
-            body = f"{prefix}WeatherValet Stormline: A {event} includes your address ({where})"
+            # "A Ice Storm Warning" and "A Extreme Heat Warning" have been
+            # going out since the pack launched (caught Nov 5, 2026).
+            article = "An" if event[:1].upper() in "AEIOU" else "A"
+            body = f"{prefix}WeatherValet Stormline: {article} {event} includes your address ({where})"
             body += f" until {until}." if until else "."
-            # Facts first, from the alert itself, then the safety line.
-            body += " " + hazard + _SENTRY_SAFETY.get(event, "")
+            # What this storm will do, in the Weather Service's words. The
+            # tags (wind, hail) come first where NWS gave them, then their
+            # own WHAT and IMPACTS text.
+            body += " " + hazard
+            what = _nws_what_line(alert)
+            if what:
+                body += what if what.endswith((".", "!")) else what + "."
+            elif _SENTRY_SAFETY.get(event):
+                # No usable text from NWS — fall back to our line rather
+                # than send a bare "a warning includes your address".
+                body += _SENTRY_SAFETY[event]
+            # A life-safety instruction still goes out, because the Weather
+            # Service issues the same one and seconds matter.
+            if event in _SENTRY_ACT_NOW and _SENTRY_SAFETY.get(event):
+                if _SENTRY_SAFETY[event].strip() not in body:
+                    body += " " + _SENTRY_SAFETY[event].strip()
             # All-clear only follows the storm warnings. Nobody needs a 3 AM
             # text saying the freeze warning ended.
             if not pack_only:
