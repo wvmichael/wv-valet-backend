@@ -220,7 +220,7 @@ ROSIE_MISSED_BRIEF_ALERTS_ENABLED = (
 
 # Backend build identity (July 2026). Bumped with every shipped app.py so
 # the Command Center's version light can prove what's actually deployed.
-BACKEND_BUILD = "0702-319"
+BACKEND_BUILD = "0702-320"
 
 # Resend key as a module-level name (July 24, 2026). Two email senders,
 # team invites and Crew welcome emails, referenced this bare name but it
@@ -17743,7 +17743,14 @@ def forecast_ticket():
         if temp is not None:
             bits.append(f"Around {round(float(temp))} degrees")
         if isinstance(precip, (int, float)) and precip >= 20:
-            bits.append(f"a {int(precip)}% chance of precipitation")
+            # Words, not a percentage (Nov 6, 2026). The scale is the
+            # Weather Service's own: slight chance, chance, likely, and
+            # then no qualifier at all.
+            p = int(precip)
+            bits.append("rain" if p >= 80 else
+                        "rain likely" if p >= 60 else
+                        "rain possible" if p >= 30 else
+                        "a slight chance of rain")
         if wind:
             bits.append(f"wind near {round(float(wind))} mph")
         paragraph = ", ".join(bits) + "." if bits else "Forecast data is thin right now."
@@ -47632,6 +47639,92 @@ def _stormline_renewal_notice_pass() -> int:
     return sent
 
 
+def _daily_precip_phrase(fc: dict) -> str:
+    """When the rain comes and how much of it, never a percentage.
+
+    This used to print "21% chance of precipitation", which tells a person
+    nothing they can act on and breaks the rule every Meteorologist here
+    writes to: say whether it will rain, when, and how much if the amount
+    is worth knowing (Michael, Nov 6, 2026).
+
+    The Weather Service already writes that in plain words in the period's
+    detailed forecast — "Showers likely, mainly after 2pm. New rainfall
+    amounts between a tenth and quarter of an inch possible." Those are
+    the two sentences worth relaying; the percentage sentence in the same
+    paragraph is the one we drop.
+
+    Speaks only when it can add timing or an amount. Below a real chance,
+    or with nothing specific to say, it stays quiet and lets the Weather
+    Service's own short forecast stand on its own.
+    """
+    detailed = " ".join((fc.get("detailed") or "").split())
+    if not detailed:
+        return ""
+    short = (fc.get("short") or "").lower()
+
+    # What is falling, in the plainest word available.
+    if "snow" in short:
+        noun = "Snow"
+    elif "freezing" in short or "ice" in short or "sleet" in short:
+        noun = "Freezing rain and sleet"
+    elif "storm" in short:
+        noun = "Storms"
+    else:
+        noun = "Rain"
+
+    # Timing, in the Weather Service's own phrasing.
+    timing = ""
+    m = re.search(r"\b(?:mainly |mostly )?(before|after)\s+"
+                  r"(\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?))",
+                  detailed, re.I)
+    if m:
+        timing = "%s %s" % (m.group(1).lower(), m.group(2).lower().replace(" ", ""))
+    else:
+        m2 = re.search(r"\b(this (?:morning|afternoon|evening)|tonight|"
+                       r"late tonight|overnight)\b", detailed, re.I)
+        if m2:
+            timing = m2.group(1).lower()
+
+    # The amount sentence, verbatim, when the Weather Service gave one.
+    amount = ""
+    for sentence in re.split(r"(?<=[.!?])\s+", detailed):
+        s = sentence.strip()
+        if re.match(r"^(new|total)\s", s, re.I) and re.search(
+                r"amount|accumulation", s, re.I):
+            if re.search(r"little or no", s, re.I):
+                break          # "Little or no accumulation" is not news.
+            amount = s.rstrip(".")
+            break
+
+    try:
+        pop = int(fc.get("precip"))
+    except (TypeError, ValueError):
+        pop = 0
+
+    # Nothing specific to add, or not a real chance: say nothing.
+    if not timing and not amount:
+        return ""
+    if pop < 30 and not amount:
+        return ""
+
+    # The short forecast usually names the precipitation already ("Showers
+    # Likely"), so repeating it reads as a stutter: "Snow. Low 29F. Snow
+    # after 11pm." When it has been named, lead with the timing alone.
+    already_named = bool(re.search(
+        r"rain|shower|snow|storm|sleet|ice|icy|freezing|drizzle|flurr",
+        short))
+    if already_named and timing:
+        lead = "Mainly %s" % timing
+    else:
+        lead = noun if pop >= 60 else "%s is possible" % noun
+        if timing:
+            lead = "%s %s" % (lead, timing)
+    out = lead.rstrip(".") + "."
+    if amount:
+        out += " " + amount + "."
+    return out
+
+
 def _stormline_daily_body(fc: dict, where: str) -> str:
     """Build the morning message. Reformatted NWS wording, never rewritten,
     always labeled so nobody mistakes it for a Meteorologist or for an
@@ -47644,9 +47737,9 @@ def _stormline_daily_body(fc: dict, where: str) -> str:
     if fc.get("temp") is not None:
         word = "High" if fc.get("is_daytime") else "Low"
         bits.append(f"{word} {fc['temp']}{fc.get('temp_unit') or 'F'}.")
-    p = fc.get("precip")
-    if isinstance(p, int) and p >= 20:
-        bits.append(f"{p}% chance of precipitation.")
+    precip = _daily_precip_phrase(fc)
+    if precip:
+        bits.append(precip)
     if fc.get("wind"):
         bits.append(f"Wind {fc.get('wind_dir') or ''} {fc['wind']}".strip() + ".")
     if fc.get("next_name") and fc.get("next_temp") is not None:
